@@ -1,0 +1,9 @@
+{
+  "name": "@lilypad/libs",
+  "version": "0.0.1",
+  "main": "index.ts",
+  "author": {"name": "Lilypad Studio"},
+  "contributors": [
+    "Lorenzo Pierro"
+  ]
+}
