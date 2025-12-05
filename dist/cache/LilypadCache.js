@@ -15,13 +15,13 @@ class LilypadCache {
             }
         }
     }
-    set(key, value) {
+    set(key, value, ttl) {
         this.store.set(key, value);
-        this.timeMap.set(key, Date.now());
+        this.timeMap.set(key, Date.now() + (ttl !== null && ttl !== void 0 ? ttl : this.ttl));
     }
     get(key) {
         const timeStored = this.timeMap.get(key);
-        if (timeStored && Date.now() - timeStored < this.ttl) {
+        if (timeStored && Date.now() < timeStored) {
             return this.store.get(key);
         }
         else {
@@ -31,15 +31,26 @@ class LilypadCache {
         }
     }
     async getOrSet(key, valueFn, options = {}) {
-        if (!options.skipCache) {
+        const { skipCache, returnOldOnError } = options;
+        // Capture an existing (non-expired) value for early return or fallback
+        let oldValue;
+        if (returnOldOnError) {
+            oldValue = this.store.get(key);
+        }
+        if (!skipCache) {
             const existing = this.get(key);
             if (existing !== undefined) {
                 return existing;
             }
         }
-        // Check for pending promise to avoid duplicate calls
+        // Check for pending promise to avoid duplicate calls. If there's a
+        // pending promise and the caller requested fallback-on-error, return a
+        // wrapped promise that falls back to `existing` on rejection.
         const pending = this.pendingPromises.get(key);
         if (pending) {
+            if (returnOldOnError && oldValue !== undefined) {
+                return pending.catch(() => oldValue);
+            }
             return pending;
         }
         const promise = valueFn();
@@ -48,6 +59,13 @@ class LilypadCache {
             const value = await promise;
             this.set(key, value);
             return value;
+        }
+        catch (err) {
+            if (returnOldOnError && oldValue !== undefined) {
+                this.set(key, oldValue, options.errorTtl);
+                return oldValue;
+            }
+            throw err;
         }
         finally {
             this.pendingPromises.delete(key);
