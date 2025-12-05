@@ -1,8 +1,10 @@
 class LilypadCache {
     constructor(ttl = 60000, options = {}) {
+        var _a;
         this.pendingPromises = new Map();
         this.store = new Map();
-        this.ttl = ttl;
+        this.defaultTtl = ttl;
+        this.defaultErrorTtl = (_a = options.defaultErrorTtl) !== null && _a !== void 0 ? _a : 5 * 60 * 1000; // 5 minutes;
         this.timeMap = new Map();
         if (options.autoCleanupInterval) {
             if (!Number.isFinite(options.autoCleanupInterval) || options.autoCleanupInterval <= 0) {
@@ -17,11 +19,11 @@ class LilypadCache {
     }
     set(key, value, ttl) {
         this.store.set(key, value);
-        this.timeMap.set(key, Date.now() + (ttl !== null && ttl !== void 0 ? ttl : this.ttl));
+        this.timeMap.set(key, Date.now() + (ttl !== null && ttl !== void 0 ? ttl : this.defaultTtl));
     }
     get(key) {
-        const timeStored = this.timeMap.get(key);
-        if (timeStored && Date.now() < timeStored) {
+        const expirationTime = this.timeMap.get(key);
+        if (expirationTime && Date.now() < expirationTime) {
             return this.store.get(key);
         }
         else {
@@ -31,6 +33,7 @@ class LilypadCache {
         }
     }
     async getOrSet(key, valueFn, options = {}) {
+        var _a;
         const { skipCache, returnOldOnError } = options;
         // Capture an existing (non-expired) value for early return or fallback
         let oldValue;
@@ -57,12 +60,12 @@ class LilypadCache {
         this.pendingPromises.set(key, promise);
         try {
             const value = await promise;
-            this.set(key, value);
+            this.set(key, value, options.ttl);
             return value;
         }
         catch (err) {
             if (returnOldOnError && oldValue !== undefined) {
-                this.set(key, oldValue, options.errorTtl);
+                this.set(key, oldValue, (_a = options.errorTtl) !== null && _a !== void 0 ? _a : this.defaultErrorTtl);
                 return oldValue;
             }
             throw err;
@@ -82,7 +85,7 @@ class LilypadCache {
     purgeExpired() {
         const now = Date.now();
         for (const [key, timeStored] of this.timeMap.entries()) {
-            if (now - timeStored >= this.ttl) {
+            if (now >= timeStored) {
                 this.store.delete(key);
                 this.timeMap.delete(key);
             }

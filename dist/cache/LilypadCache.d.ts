@@ -1,4 +1,5 @@
 export interface LilypadCacheGetOptions {
+    ttl?: number;
     skipCache?: boolean;
     /**
      * If true, when the provided `valueFn` (or an in-flight promise) throws/rejects,
@@ -10,12 +11,14 @@ export interface LilypadCacheGetOptions {
 }
 declare class LilypadCache<K, V> {
     private store;
-    private ttl;
+    private defaultTtl;
+    private defaultErrorTtl;
     private timeMap;
     private cleanupIntervalId?;
     private pendingPromises;
     constructor(ttl?: number, options?: {
         autoCleanupInterval?: number;
+        defaultErrorTtl?: number;
     });
     set(key: K, value: V, ttl?: number): void;
     get(key: K): V | undefined;
