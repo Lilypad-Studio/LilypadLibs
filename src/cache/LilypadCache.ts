@@ -1,5 +1,12 @@
 export interface LilypadCacheGetOptions {
   skipCache?: boolean;
+  /**
+   * If true, when the provided `valueFn` (or an in-flight promise) throws/rejects,
+   * `getOrSet` will return the currently cached value (if any) instead of
+   * rethrowing the error. If there is no cached value the error is rethrown.
+   */
+  returnOldOnError?: boolean;
+  errorTtl?: number;
 }
 
 class LilypadCache<K, V> {
@@ -27,14 +34,14 @@ class LilypadCache<K, V> {
     }
   }
 
-  set(key: K, value: V) {
+  set(key: K, value: V, ttl?: number) {
     this.store.set(key, value);
-    this.timeMap.set(key, Date.now());
+    this.timeMap.set(key, Date.now() + (ttl ?? this.ttl));
   }
 
   get(key: K): V | undefined {
     const timeStored = this.timeMap.get(key);
-    if (timeStored && Date.now() - timeStored < this.ttl) {
+    if (timeStored && Date.now() < timeStored) {
       return this.store.get(key);
     } else {
       this.store.delete(key);
@@ -48,16 +55,29 @@ class LilypadCache<K, V> {
     valueFn: () => Promise<V>,
     options: LilypadCacheGetOptions = {}
   ): Promise<V> {
-    if (!options.skipCache) {
+    const { skipCache, returnOldOnError } = options;
+
+    // Capture an existing (non-expired) value for early return or fallback
+    let oldValue: V | undefined;
+    if (returnOldOnError) {
+      oldValue = this.store.get(key);
+    }
+
+    if (!skipCache) {
       const existing = this.get(key);
       if (existing !== undefined) {
         return existing;
       }
     }
 
-    // Check for pending promise to avoid duplicate calls
+    // Check for pending promise to avoid duplicate calls. If there's a
+    // pending promise and the caller requested fallback-on-error, return a
+    // wrapped promise that falls back to `existing` on rejection.
     const pending = this.pendingPromises.get(key);
     if (pending) {
+      if (returnOldOnError && oldValue !== undefined) {
+        return pending.catch(() => oldValue);
+      }
       return pending;
     }
 
@@ -68,6 +88,12 @@ class LilypadCache<K, V> {
       const value = await promise;
       this.set(key, value);
       return value;
+    } catch (err) {
+      if (returnOldOnError && oldValue !== undefined) {
+        this.set(key, oldValue, options.errorTtl);
+        return oldValue;
+      }
+      throw err;
     } finally {
       this.pendingPromises.delete(key);
     }
