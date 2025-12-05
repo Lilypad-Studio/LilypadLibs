@@ -5,7 +5,6 @@ class LilypadCache {
         this.store = new Map();
         this.defaultTtl = ttl;
         this.defaultErrorTtl = (_a = options.defaultErrorTtl) !== null && _a !== void 0 ? _a : 5 * 60 * 1000; // 5 minutes;
-        this.timeMap = new Map();
         if (options.autoCleanupInterval) {
             if (!Number.isFinite(options.autoCleanupInterval) || options.autoCleanupInterval <= 0) {
                 throw new Error('autoCleanupInterval must be a positive finite number');
@@ -18,17 +17,15 @@ class LilypadCache {
         }
     }
     set(key, value, ttl) {
-        this.store.set(key, value);
-        this.timeMap.set(key, Date.now() + (ttl !== null && ttl !== void 0 ? ttl : this.defaultTtl));
+        this.store.set(key, { value, expirationTime: Date.now() + (ttl !== null && ttl !== void 0 ? ttl : this.defaultTtl) });
     }
     get(key) {
-        const expirationTime = this.timeMap.get(key);
-        if (expirationTime && Date.now() < expirationTime) {
-            return this.store.get(key);
+        const cacheValue = this.store.get(key);
+        if (cacheValue && Date.now() < cacheValue.expirationTime) {
+            return cacheValue.value;
         }
         else {
             this.store.delete(key);
-            this.timeMap.delete(key);
             return undefined;
         }
     }
@@ -38,7 +35,8 @@ class LilypadCache {
         // Capture an existing (non-expired) value for early return or fallback
         let oldValue;
         if (returnOldOnError) {
-            oldValue = this.store.get(key);
+            const cacheValue = this.store.get(key);
+            oldValue = cacheValue ? cacheValue.value : undefined;
         }
         if (!skipCache) {
             const existing = this.get(key);
@@ -76,18 +74,15 @@ class LilypadCache {
     }
     delete(key) {
         this.store.delete(key);
-        this.timeMap.delete(key);
     }
     clear() {
         this.store.clear();
-        this.timeMap.clear();
     }
     purgeExpired() {
         const now = Date.now();
-        for (const [key, timeStored] of this.timeMap.entries()) {
-            if (now >= timeStored) {
+        for (const [key, cacheValue] of this.store.entries()) {
+            if (now >= cacheValue.expirationTime) {
                 this.store.delete(key);
-                this.timeMap.delete(key);
             }
         }
     }

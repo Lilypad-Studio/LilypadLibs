@@ -10,11 +10,15 @@ export interface LilypadCacheGetOptions {
   errorTtl?: number;
 }
 
+interface LilypadCacheValue<V> {
+  value: V;
+  expirationTime: number;
+}
+
 class LilypadCache<K, V> {
-  private store: Map<K, V>;
+  private store: Map<K, LilypadCacheValue<V>>;
   private defaultTtl: number; // time to live in milliseconds
   private defaultErrorTtl: number; // default error TTL in milliseconds
-  private timeMap: Map<K, number>;
   private cleanupIntervalId?: ReturnType<typeof setInterval>;
 
   private pendingPromises: Map<K, Promise<V>> = new Map();
@@ -23,7 +27,6 @@ class LilypadCache<K, V> {
     this.store = new Map();
     this.defaultTtl = ttl;
     this.defaultErrorTtl = options.defaultErrorTtl ?? 5 * 60 * 1000; // 5 minutes;
-    this.timeMap = new Map();
 
     if (options.autoCleanupInterval) {
       if (!Number.isFinite(options.autoCleanupInterval) || options.autoCleanupInterval <= 0) {
@@ -38,17 +41,15 @@ class LilypadCache<K, V> {
   }
 
   set(key: K, value: V, ttl?: number) {
-    this.store.set(key, value);
-    this.timeMap.set(key, Date.now() + (ttl ?? this.defaultTtl));
+    this.store.set(key, { value, expirationTime: Date.now() + (ttl ?? this.defaultTtl) });
   }
 
   get(key: K): V | undefined {
-    const expirationTime = this.timeMap.get(key);
-    if (expirationTime && Date.now() < expirationTime) {
-      return this.store.get(key);
+    const cacheValue = this.store.get(key);
+    if (cacheValue && Date.now() < cacheValue.expirationTime) {
+      return cacheValue.value;
     } else {
       this.store.delete(key);
-      this.timeMap.delete(key);
       return undefined;
     }
   }
@@ -63,7 +64,8 @@ class LilypadCache<K, V> {
     // Capture an existing (non-expired) value for early return or fallback
     let oldValue: V | undefined;
     if (returnOldOnError) {
-      oldValue = this.store.get(key);
+      const cacheValue = this.store.get(key);
+      oldValue = cacheValue ? cacheValue.value : undefined;
     }
 
     if (!skipCache) {
@@ -104,20 +106,17 @@ class LilypadCache<K, V> {
 
   delete(key: K) {
     this.store.delete(key);
-    this.timeMap.delete(key);
   }
 
   clear() {
     this.store.clear();
-    this.timeMap.clear();
   }
 
   purgeExpired() {
     const now = Date.now();
-    for (const [key, timeStored] of this.timeMap.entries()) {
-      if (now >= timeStored) {
+    for (const [key, cacheValue] of this.store.entries()) {
+      if (now >= cacheValue.expirationTime) {
         this.store.delete(key);
-        this.timeMap.delete(key);
       }
     }
   }

@@ -13,7 +13,6 @@ declare class LilypadCache<K, V> {
     private store;
     private defaultTtl;
     private defaultErrorTtl;
-    private timeMap;
     private cleanupIntervalId?;
     private pendingPromises;
     constructor(ttl?: number, options?: {
