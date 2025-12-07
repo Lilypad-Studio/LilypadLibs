@@ -9,6 +9,7 @@ import LilypadLoggerComponent from 'logger/LilypadLoggerComponent';
  */
 export interface LilypadLoggerConstructorOptions<T extends string> {
     components: Record<T, LilypadLoggerComponent<T>[]>;
+    name?: string;
     errorLogging?: (error: unknown) => Promise<void>;
 }
 type ChannelMethods<T extends string> = {
@@ -41,6 +42,8 @@ type ChannelMethods<T extends string> = {
  */
 declare class LilypadLogger<T extends string> {
     private components;
+    private _name?;
+    get __name(): string | undefined;
     constructor(options: LilypadLoggerConstructorOptions<T>);
     /**
      * Registers new logger components for specified types.

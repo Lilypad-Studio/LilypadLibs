@@ -10,6 +10,7 @@ import LilypadLoggerComponent from 'logger/LilypadLoggerComponent';
  */
 export interface LilypadLoggerConstructorOptions<T extends string> {
   components: Record<T, LilypadLoggerComponent<T>[]>;
+  name?: string;
   errorLogging?: (error: unknown) => Promise<void>;
 }
 
@@ -49,7 +50,16 @@ class LilypadLogger<T extends string> {
     LilypadLoggerComponent<T>[]
   >;
 
+  // Optional logger name
+  private _name?: string;
+  get __name(): string | undefined {
+    return this._name;
+  }
+
   constructor(options: LilypadLoggerConstructorOptions<T>) {
+    // Assign logger name if provided
+    this._name = options.name;
+
     // Assign initial components
     for (const [type, comps] of Object.entries(options.components) as [
       T,

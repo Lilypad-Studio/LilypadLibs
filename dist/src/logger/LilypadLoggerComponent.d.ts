@@ -1,3 +1,8 @@
+import type createLogger from './LilypadLogger';
+interface LilypadLoggerComponentOptions<T extends string> {
+    logger: ReturnType<typeof createLogger<T>>;
+    name?: string;
+}
 /**
  * Abstract base class for logging components in the Lilypad library.
  *
@@ -18,6 +23,7 @@
 export default abstract class LilypadLoggerComponent<T extends string> {
     private getTimestamp;
     private formatMessage;
-    output(type: T, message: string): Promise<void>;
+    output(type: T, message: string, options?: LilypadLoggerComponentOptions<T>): Promise<void>;
     protected abstract send(message: string): Promise<void>;
 }
+export {};

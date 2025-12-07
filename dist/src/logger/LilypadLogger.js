@@ -28,7 +28,14 @@ exports.default = createLogger;
  */
 class LilypadLogger {
     components = {};
+    // Optional logger name
+    _name;
+    get __name() {
+        return this._name;
+    }
     constructor(options) {
+        // Assign logger name if provided
+        this._name = options.name;
         // Assign initial components
         for (const [type, comps] of Object.entries(options.components)) {
             // Initialize components array

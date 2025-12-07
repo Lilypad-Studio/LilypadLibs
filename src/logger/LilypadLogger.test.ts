@@ -148,4 +148,54 @@ describe('LilypadLogger', () => {
 
     expect(result).toBe(logger);
   });
+
+  it('should assign logger name if provided', () => {
+    const logger = createLogger<mockType>({
+      components: {
+        info: [mockComponent],
+        error: [],
+      },
+      name: 'TestLogger',
+    });
+
+    expect(logger.__name).toBe('TestLogger');
+  });
+
+  it('should initialize components correctly', () => {
+    const logger = createLogger<mockType>({
+      components: {
+        info: [mockComponent],
+        error: [mockComponent2],
+      },
+    });
+
+    expect(logger['components']['info']).toContain(mockComponent);
+    expect(logger['components']['error']).toContain(mockComponent2);
+  });
+
+  it('should handle multiple messages correctly', async () => {
+    const logger = createLogger<mockType>({
+      components: {
+        info: [mockComponent],
+        error: [mockComponent2],
+      },
+    });
+
+    await logger.info('first message');
+    await logger.info('second message');
+
+    expect(mockComponent.output).toHaveBeenCalledTimes(2);
+  });
+
+  it('should not throw error if no components are registered', async () => {
+    const logger = createLogger<mockType>({
+      components: {
+        info: [],
+        error: [],
+      },
+    });
+
+    await logger.info('test message'); // Should not throw
+    expect(true).toBe(true); // Just to ensure the test passes
+  });
 });

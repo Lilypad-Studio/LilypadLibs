@@ -121,4 +121,45 @@ const LilypadLogger_1 = __importDefault(require("./LilypadLogger"));
         });
         (0, vitest_1.expect)(result).toBe(logger);
     });
+    (0, vitest_1.it)('should assign logger name if provided', () => {
+        const logger = (0, LilypadLogger_1.default)({
+            components: {
+                info: [mockComponent],
+                error: [],
+            },
+            name: 'TestLogger',
+        });
+        (0, vitest_1.expect)(logger.__name).toBe('TestLogger');
+    });
+    (0, vitest_1.it)('should initialize components correctly', () => {
+        const logger = (0, LilypadLogger_1.default)({
+            components: {
+                info: [mockComponent],
+                error: [mockComponent2],
+            },
+        });
+        (0, vitest_1.expect)(logger['components']['info']).toContain(mockComponent);
+        (0, vitest_1.expect)(logger['components']['error']).toContain(mockComponent2);
+    });
+    (0, vitest_1.it)('should handle multiple messages correctly', async () => {
+        const logger = (0, LilypadLogger_1.default)({
+            components: {
+                info: [mockComponent],
+                error: [mockComponent2],
+            },
+        });
+        await logger.info('first message');
+        await logger.info('second message');
+        (0, vitest_1.expect)(mockComponent.output).toHaveBeenCalledTimes(2);
+    });
+    (0, vitest_1.it)('should not throw error if no components are registered', async () => {
+        const logger = (0, LilypadLogger_1.default)({
+            components: {
+                info: [],
+                error: [],
+            },
+        });
+        await logger.info('test message'); // Should not throw
+        (0, vitest_1.expect)(true).toBe(true); // Just to ensure the test passes
+    });
 });
