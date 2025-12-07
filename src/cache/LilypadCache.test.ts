@@ -326,5 +326,97 @@ describe('LilypadCache', () => {
       const customCache = new LilypadCache<string, number>(5000, { autoCleanupInterval: 1000 });
       expect(() => customCache.dispose()).not.toThrow();
     });
+
+    it('should force clear all entries on dispose even if protected', () => {
+      cache.set('key1', 42);
+      cache.set('key2', 99);
+      cache.addProtectedKeys(['key1', 'key2']);
+      cache.dispose();
+      expect(cache.get('key1')).toBeUndefined();
+      expect(cache.get('key2')).toBeUndefined();
+    });
+  });
+
+  describe('edge cases', () => {
+    it('should handle getOrSet with expired pending promise', async () => {
+      const spy = vi.fn(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return 42;
+      });
+      const promise1 = cache.getOrSet('key1', spy);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const promise2 = cache.getOrSet('key1', spy);
+      const [result1, result2] = await Promise.all([promise1, promise2]);
+      expect(result1).toBe(42);
+      expect(result2).toBe(42);
+      expect(spy).toHaveBeenCalledTimes(1);
+    });
+
+    it('should handle multiple errors in pending promises', async () => {
+      const spy = vi.fn(async () => {
+        throw new Error('fetch failed');
+      });
+      cache.set('key1', 42);
+      const promise1 = cache.getOrSet('key1', spy, { returnOldOnError: true });
+      const promise2 = cache.getOrSet('key1', spy, { returnOldOnError: true });
+      const [result1, result2] = await Promise.all([promise1, promise2]);
+      expect(result1).toBe(42);
+      expect(result2).toBe(42);
+    });
+
+    it('should handle invalidate on expired value', async () => {
+      cache.set('key1', 42, 100);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      cache.invalidate('key1');
+      expect(cache.getComprehensive('key1').type).toBeOneOf(['miss', 'expired']);
+    });
+
+    it('should handle clear on empty cache', () => {
+      expect(() => cache.clear()).not.toThrow();
+    });
+
+    it('should handle purgeExpired on empty cache', () => {
+      expect(() => cache.purgeExpired()).not.toThrow();
+    });
+
+    it('should handle dispose multiple times', () => {
+      cache.set('key1', 42);
+      expect(() => {
+        cache.dispose();
+        cache.dispose();
+      }).not.toThrow();
+    });
+
+    it('should reject errorFn that throws', async () => {
+      cache.set('key1', 42, 10);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await expect(
+        cache.getOrSet(
+          'key1',
+          async () => {
+            throw new Error('fetch failed');
+          },
+          {
+            returnOldOnError: true,
+            errorFn: () => {
+              throw new Error('errorFn failed');
+            },
+          }
+        )
+      ).rejects.toThrow('errorFn failed');
+    });
+
+    it('should cache value with default TTL when not specified in getOrSet', async () => {
+      const value = await cache.getOrSet('key1', async () => 42);
+      expect(value).toBe(42);
+      expect(cache.get('key1')).toBe(42);
+    });
+
+    it('should handle getOrSet with 0 TTL', async () => {
+      const value = await cache.getOrSet('key1', async () => 42, { ttl: 0 });
+      expect(value).toBe(42);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(cache.get('key1')).toBeUndefined();
+    });
   });
 });
