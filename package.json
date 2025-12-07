@@ -11,12 +11,14 @@
   ],
   "scripts": {
     "build": "tsc",
-    "lint": "eslint --fix"
+    "lint": "eslint --fix",
+    "test": "vitest"
   },
   "dependencies": {
     "typescript": "^5.9.3"
   },
   "devDependencies": {
+    "@types/node": "^24.10.1",
     "@typescript-eslint/eslint-plugin": "^8.48.1",
     "@typescript-eslint/parser": "^8.48.1",
     "eslint": "^9",
@@ -24,6 +26,7 @@
     "eslint-plugin-import": "^2.31.0",
     "eslint-plugin-prettier": "^5.2.1",
     "eslint-plugin-promise": "^7.2.1",
-    "prettier": "^3.4.2"
+    "prettier": "^3.4.2",
+    "vitest": "^4.0.15"
   }
 }

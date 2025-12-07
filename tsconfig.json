@@ -1,11 +1,17 @@
 {
   "compilerOptions": {
-    "module": "ES2020",
-    "target": "ES2019",
+    "module": "nodenext",
     "outDir": "dist",
+    "moduleResolution": "nodenext",
+    "baseUrl": ".",
     "declaration": true,
     "strict": true,
-    "esModuleInterop": true
+    "esModuleInterop": true,
+    "paths": {
+      "@/*": ["./src/*"],
+      "logger/*": ["./src/logger/*"],
+      "cache/*": ["./src/cache/*"]
+    }
   },
-  "include": ["src"]
+  "include": ["src", "vitest.config.ts"],
 }

@@ -149,17 +149,37 @@ declare class LilypadCache<K, V> {
      */
     getComprehensive(key: K): LilypadCacheValueRetrieval<V>;
     /**
-     * Retrieves a value from the cache for the given key, or computes and stores it if not present or if cache is skipped.
+     * Handles error scenarios during cache retrieval by determining an appropriate value to return.
      *
-     * - If the value is cached and `skipCache` is not set, returns the cached value.
-     * - If a value is being computed for the key, returns the pending promise to avoid duplicate computations.
-     * - If computation fails and `returnOldOnError` is set, returns the previous cached value (if available).
-     * - Supports custom error handling via `errorFn`.
+     * The method follows this order:
+     * 1. If `options.errorFn` is provided and returns a value, that value is used and cached.
+     * 2. If `options.returnOldOnError` is true and a previous value exists (`fetched.type !== 'miss'`), the old value is used.
+     * 3. If no fallback value is determined, the original error is rethrown.
      *
-     * @param key - The cache key to retrieve or set.
-     * @param valueFn - An async function that computes the value if not cached or if cache is skipped.
-     * @param options - Optional settings for cache retrieval and error handling.
-     * @returns A promise resolving to the value for the given key.
+     * The chosen value (from errorFn or old value) is cached with a TTL specified by `options.errorTtl` or the default error TTL.
+     *
+     * @param error - The error encountered during cache retrieval.
+     * @param options - The cache get options, including error handling strategies.
+     * @param key - The cache key associated with the retrieval.
+     * @param fetched - The result of the cache value retrieval, including type and value.
+     * @returns The determined fallback value to return.
+     * @throws Rethrows the original error if no fallback value is determined.
+     */
+    private errorReturn;
+    /**
+     * Gets a value from the cache, or sets it using the provided function if not found.
+     *
+     * Implements a cache-aside pattern with support for concurrent request deduplication.
+     * If the key exists in the cache and skipCache is not enabled, the cached value is returned immediately.
+     * If another request for the same key is already pending, that promise is reused instead of creating a duplicate.
+     *
+     * @template K - The type of the cache key
+     * @template V - The type of the cached value
+     * @param key - The cache key
+     * @param valueFn - An async function that produces the value to cache if it doesn't exist or is expired
+     * @param options - Optional configuration for cache behavior and error handling
+     * @returns A promise that resolves to the cached value or the value produced by valueFn
+     * @throws Will not throw, but will return a handled error value if valueFn rejects and error handling is configured
      */
     getOrSet(key: K, valueFn: () => Promise<V>, options?: LilypadCacheGetOptions<K, V>): Promise<V>;
     /**

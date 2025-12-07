@@ -54,7 +54,7 @@ class LilypadCache {
     constructor(ttl = 60000, options = {}) {
         this.store = new Map();
         this.defaultTtl = ttl;
-        this.defaultErrorTtl = options.defaultErrorTtl ?? 5 * 60 * 1000; // 5 minutes;
+        this.defaultErrorTtl = options.defaultErrorTtl ? options.defaultErrorTtl : 5 * 60 * 1000; // 5 minutes;
         if (options.autoCleanupInterval) {
             if (!Number.isFinite(options.autoCleanupInterval) || options.autoCleanupInterval <= 0) {
                 throw new Error('autoCleanupInterval must be a positive finite number');
@@ -127,40 +127,63 @@ class LilypadCache {
         }
     }
     /**
-     * Retrieves a value from the cache for the given key, or computes and stores it if not present or if cache is skipped.
+     * Handles error scenarios during cache retrieval by determining an appropriate value to return.
      *
-     * - If the value is cached and `skipCache` is not set, returns the cached value.
-     * - If a value is being computed for the key, returns the pending promise to avoid duplicate computations.
-     * - If computation fails and `returnOldOnError` is set, returns the previous cached value (if available).
-     * - Supports custom error handling via `errorFn`.
+     * The method follows this order:
+     * 1. If `options.errorFn` is provided and returns a value, that value is used and cached.
+     * 2. If `options.returnOldOnError` is true and a previous value exists (`fetched.type !== 'miss'`), the old value is used.
+     * 3. If no fallback value is determined, the original error is rethrown.
      *
-     * @param key - The cache key to retrieve or set.
-     * @param valueFn - An async function that computes the value if not cached or if cache is skipped.
-     * @param options - Optional settings for cache retrieval and error handling.
-     * @returns A promise resolving to the value for the given key.
+     * The chosen value (from errorFn or old value) is cached with a TTL specified by `options.errorTtl` or the default error TTL.
+     *
+     * @param error - The error encountered during cache retrieval.
+     * @param options - The cache get options, including error handling strategies.
+     * @param key - The cache key associated with the retrieval.
+     * @param fetched - The result of the cache value retrieval, including type and value.
+     * @returns The determined fallback value to return.
+     * @throws Rethrows the original error if no fallback value is determined.
+     */
+    errorReturn(error, options, key, fetched) {
+        let valueToReturn = undefined;
+        const errorFnRes = options.errorFn?.({ key, error, options, cache: this });
+        if (errorFnRes !== undefined) {
+            // 1. errorFn returned a value, use it (and cache it)
+            valueToReturn = errorFnRes;
+        }
+        if (fetched.type !== 'miss' && options.returnOldOnError && valueToReturn === undefined) {
+            // 2. errorFn not provided or returned undefined, use old value
+            valueToReturn = fetched.value;
+        }
+        if (valueToReturn === undefined) {
+            throw error; // rethrow if no fallback value determined
+        }
+        // Cache the value determined above (either from errorFn or the old value)
+        this.set(key, valueToReturn, options.errorTtl ?? this.defaultErrorTtl);
+        return valueToReturn; // Return the determined value
+    }
+    /**
+     * Gets a value from the cache, or sets it using the provided function if not found.
+     *
+     * Implements a cache-aside pattern with support for concurrent request deduplication.
+     * If the key exists in the cache and skipCache is not enabled, the cached value is returned immediately.
+     * If another request for the same key is already pending, that promise is reused instead of creating a duplicate.
+     *
+     * @template K - The type of the cache key
+     * @template V - The type of the cached value
+     * @param key - The cache key
+     * @param valueFn - An async function that produces the value to cache if it doesn't exist or is expired
+     * @param options - Optional configuration for cache behavior and error handling
+     * @returns A promise that resolves to the cached value or the value produced by valueFn
+     * @throws Will not throw, but will return a handled error value if valueFn rejects and error handling is configured
      */
     async getOrSet(key, valueFn, options = {}) {
         const fetched = this.getComprehensive(key);
         if (!options.skipCache && fetched.type === 'hit') {
             return fetched.value;
         }
-        // Check for pending promise to avoid duplicate calls. If there's a
-        // pending promise and the caller requested fallback-on-error, return a
-        // wrapped promise that falls back to `existing` on rejection.
         const pending = this.pendingPromises.get(key);
         if (pending) {
-            if (options.returnOldOnError && fetched.type !== 'miss') {
-                return pending.catch((error) => {
-                    if (options.errorFn) {
-                        const res = options.errorFn({ key, error, options, cache: this });
-                        if (res !== undefined) {
-                            return res;
-                        }
-                    }
-                    return fetched.value;
-                });
-            }
-            return pending;
+            return pending.catch((error) => this.errorReturn(error, options, key, fetched));
         }
         const promise = valueFn();
         this.pendingPromises.set(key, promise);
@@ -170,17 +193,7 @@ class LilypadCache {
             return value;
         }
         catch (error) {
-            if (options.returnOldOnError && fetched.type !== 'miss') {
-                if (options.errorFn) {
-                    const res = options.errorFn({ key, error, options, cache: this });
-                    if (res !== undefined) {
-                        return res;
-                    }
-                }
-                this.set(key, fetched.value, options.errorTtl ?? this.defaultErrorTtl);
-                return fetched.value;
-            }
-            throw error;
+            return this.errorReturn(error, options, key, fetched);
         }
         finally {
             this.pendingPromises.delete(key);
