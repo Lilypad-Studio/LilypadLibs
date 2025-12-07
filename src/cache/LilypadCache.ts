@@ -9,14 +9,14 @@ export type LilypadCacheGetOptions<K, V> = {
    * If true, bypasses the cache and always calls `valueFn` to get a fresh value.
    */
   skipCache?: boolean;
-  
+
   /**
    * If true, when the provided `valueFn` (or an in-flight promise) throws/rejects,
    * `getOrSet` will return the currently cached value (if any) instead of
    * rethrowing the error. If there is no cached value the error is rethrown.
    */
   returnOldOnError?: boolean;
-  
+
   /**
    * Optional function that is called when an error occurs and `returnOldOnError` is true.
    */
@@ -30,7 +30,7 @@ export type LilypadCacheGetOptions<K, V> = {
    * Optional additional data that can be passed to the errorFn
    */
   data?: unknown;
-}
+};
 
 /**
  * Represents the error context passed to an error handler function when a cache get operation fails.
@@ -47,7 +47,7 @@ type LilypadCacheGetOptionsErrorFn<K, V> = {
   error: unknown;
   options: LilypadCacheGetOptions<K, V>;
   cache: LilypadCache<K, V>;
-}
+};
 
 /**
  * Represents a cached value along with its expiration time.
@@ -59,7 +59,7 @@ type LilypadCacheGetOptionsErrorFn<K, V> = {
 type LilypadCacheValue<V> = {
   value: V;
   expirationTime: number;
-}
+};
 
 /**
  * Represents the result of attempting to retrieve a value from the cache.
@@ -70,10 +70,9 @@ type LilypadCacheValue<V> = {
  *
  * @template V The type of the cached value.
  */
-type LilypadCacheValueRetrieval<V> = (
-  | { type: 'hit' | 'expired' } & LilypadCacheValue<V>
-  | { type: 'miss' }
-)
+type LilypadCacheValueRetrieval<V> =
+  | ({ type: 'hit' | 'expired' } & LilypadCacheValue<V>)
+  | { type: 'miss' };
 
 /**
  * Determines whether a cached value is stale based on its expiration time.
@@ -124,13 +123,16 @@ class LilypadCache<K, V> {
   private store: Map<K, LilypadCacheValue<V>>;
   private defaultTtl: number; // time to live in milliseconds
   private defaultErrorTtl: number; // default error TTL in milliseconds
-  private cleanupIntervalId?: ReturnType<typeof setInterval>;
+  private cleanupIntervalId?: ReturnType<typeof setInterval> & { unref?: () => void };
 
   private pendingPromises: Map<K, Promise<V>> = new Map();
 
   private protectedKeys: Set<K> = new Set();
 
-  constructor(ttl: number = 60000, options: { autoCleanupInterval?: number, defaultErrorTtl?: number } = {}) {
+  constructor(
+    ttl: number = 60000,
+    options: { autoCleanupInterval?: number; defaultErrorTtl?: number } = {}
+  ) {
     this.store = new Map();
     this.defaultTtl = ttl;
     this.defaultErrorTtl = options.defaultErrorTtl ?? 5 * 60 * 1000; // 5 minutes;
@@ -141,8 +143,8 @@ class LilypadCache<K, V> {
       }
       this.cleanupIntervalId = setInterval(() => this.purgeExpired(), options.autoCleanupInterval);
       // prevent keeping the Node.js event loop alive when running in Node.js
-      if (this.cleanupIntervalId && typeof (this.cleanupIntervalId as any).unref === 'function') {
-        (this.cleanupIntervalId as any).unref();
+      if (this.cleanupIntervalId && typeof this.cleanupIntervalId.unref === 'function') {
+        this.cleanupIntervalId.unref();
       }
     }
   }
@@ -210,12 +212,12 @@ class LilypadCache<K, V> {
 
   /**
    * Retrieves a value from the cache for the given key, or computes and stores it if not present or if cache is skipped.
-   * 
+   *
    * - If the value is cached and `skipCache` is not set, returns the cached value.
    * - If a value is being computed for the key, returns the pending promise to avoid duplicate computations.
    * - If computation fails and `returnOldOnError` is set, returns the previous cached value (if available).
    * - Supports custom error handling via `errorFn`.
-   * 
+   *
    * @param key - The cache key to retrieve or set.
    * @param valueFn - An async function that computes the value if not cached or if cache is skipped.
    * @param options - Optional settings for cache retrieval and error handling.
@@ -273,7 +275,7 @@ class LilypadCache<K, V> {
       this.pendingPromises.delete(key);
     }
   }
-  
+
   /**
    * Adds the specified keys to the set of protected keys.
    * Protected keys are typically excluded from certain cache operations
@@ -318,7 +320,7 @@ class LilypadCache<K, V> {
 
   /**
    * Deletes the specified key from the cache.
-   * 
+   *
    * If the key is present in the set of protected keys, the deletion is skipped.
    *
    * @param key - The key to be deleted from the cache.
