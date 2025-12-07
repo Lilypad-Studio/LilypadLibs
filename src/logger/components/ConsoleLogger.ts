@@ -7,14 +7,14 @@ import LilypadLoggerComponent from '../LilypadLoggerComponent';
  *
  * @example
  * ```typescript
- * const logger = new ConsoleLogger<'app'>();
+ * const logger = new LilypadConsoleLogger<'app'>();
  * ```
  *
  * @remarks
  * This logger extends {@link LilypadLoggerComponent} and implements basic console logging functionality.
  * Messages are sent to the standard output using `console.log()`.
  */
-export default class ConsoleLogger<T extends string> extends LilypadLoggerComponent<T> {
+export default class LilypadConsoleLogger<T extends string> extends LilypadLoggerComponent<T> {
   protected async send(message: string): Promise<void> {
     console.log(message);
   }

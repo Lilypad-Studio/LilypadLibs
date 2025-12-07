@@ -51,10 +51,12 @@ class LilypadCache {
     cleanupIntervalId;
     pendingPromises = new Map();
     protectedKeys = new Set();
+    logger;
     constructor(ttl = 60000, options = {}) {
         this.store = new Map();
         this.defaultTtl = ttl;
         this.defaultErrorTtl = options.defaultErrorTtl ? options.defaultErrorTtl : 5 * 60 * 1000; // 5 minutes;
+        this.logger = options.logger;
         if (options.autoCleanupInterval) {
             if (!Number.isFinite(options.autoCleanupInterval) || options.autoCleanupInterval <= 0) {
                 throw new Error('autoCleanupInterval must be a positive finite number');
@@ -144,6 +146,7 @@ class LilypadCache {
      * @throws Rethrows the original error if no fallback value is determined.
      */
     errorReturn(error, options, key, fetched) {
+        this.logger?.error(`Error fetching cache key "${String(key)}": `, error);
         let valueToReturn = undefined;
         const errorFnRes = options.errorFn?.({ key, error, options, cache: this });
         if (errorFnRes !== undefined) {
@@ -301,6 +304,7 @@ class LilypadCache {
      * This method should be called when the cache is no longer needed to free up resources.
      */
     dispose() {
+        this.logger = undefined;
         this.stopCleanupInterval();
         this.clear({ force: true });
     }

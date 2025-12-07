@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import LilypadCache from './LilypadCache';
+import { LilypadLoggerType } from '@/logger/LilypadLogger';
 
 describe('LilypadCache', () => {
   let cache: LilypadCache<string, number>;
@@ -250,18 +251,18 @@ describe('LilypadCache', () => {
 
   describe('purgeExpired', () => {
     it('should remove expired entries', async () => {
-      cache.set('key1', 42, 100);
+      cache.set('key1', 42, 10);
       cache.set('key2', 99, 5000);
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      await new Promise((resolve) => setTimeout(resolve, 50));
       cache.purgeExpired();
       expect(cache.get('key1', false)).toBeUndefined();
       expect(cache.get('key2')).toBe(99);
     });
 
     it('should not remove protected expired entries', async () => {
-      cache.set('key1', 42, 100);
+      cache.set('key1', 42, 10);
       cache.addProtectedKeys(['key1']);
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      await new Promise((resolve) => setTimeout(resolve, 50));
       cache.purgeExpired();
       expect(cache.getComprehensive('key1').type).toBe('expired');
     });
@@ -417,6 +418,128 @@ describe('LilypadCache', () => {
       expect(value).toBe(42);
       await new Promise((resolve) => setTimeout(resolve, 10));
       expect(cache.get('key1')).toBeUndefined();
+    });
+
+    it('should handle logger when provided', async () => {
+      const mockLogger = {
+        error: vi.fn(),
+        warn: vi.fn(),
+        components: {},
+        register: vi.fn(),
+        __name: undefined,
+      } as unknown as LilypadLoggerType<'error' | 'warn'>;
+      const customCache = new LilypadCache<string, number>(1000, { logger: mockLogger });
+      customCache.set('key1', 42, 10);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await customCache.getOrSet(
+        'key1',
+        async () => {
+          throw new Error('fetch failed');
+        },
+        { returnOldOnError: true }
+      );
+      expect(mockLogger.error).toHaveBeenCalled();
+      customCache.dispose();
+    });
+
+    it('should handle getOrSet with expired value and no old value fallback', async () => {
+      cache.set('key1', 42, 10);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await expect(
+        cache.getOrSet('key1', async () => {
+          throw new Error('fetch failed');
+        })
+      ).rejects.toThrow('fetch failed');
+    });
+
+    it('should prioritize errorFn over returnOldOnError', async () => {
+      cache.set('key1', 42, 10);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const errorFn = vi.fn(() => 100);
+      const value = await cache.getOrSet(
+        'key1',
+        async () => {
+          throw new Error('fetch failed');
+        },
+        { errorFn, returnOldOnError: true }
+      );
+      expect(value).toBe(100);
+      expect(errorFn).toHaveBeenCalled();
+    });
+
+    it('should handle getOrSet with skipCache and error', async () => {
+      cache.set('key1', 42);
+      const errorFn = vi.fn(() => 99);
+      const value = await cache.getOrSet(
+        'key1',
+        async () => {
+          throw new Error('fetch failed');
+        },
+        { skipCache: true, errorFn }
+      );
+      expect(value).toBe(99);
+    });
+
+    it('should handle concurrent pending promise errors independently', async () => {
+      const errorFn1 = vi.fn(() => 100);
+      const errorFn2 = vi.fn(() => 200);
+      cache.set('key1', 42);
+      const spy = vi.fn(async () => {
+        throw new Error('fetch failed');
+      });
+      const promise1 = cache.getOrSet('key1', spy, { returnOldOnError: true, errorFn: errorFn1 });
+      const promise2 = cache.getOrSet('key1', spy, { returnOldOnError: true, errorFn: errorFn2 });
+      const [result1, result2] = await Promise.all([promise1, promise2]);
+      expect(result1).toBe(42);
+      expect(result2).toBe(42);
+    });
+
+    it('should use default TTL when not specified in set', async () => {
+      const customCache = new LilypadCache<string, number>(200);
+      customCache.set('key1', 42);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      expect(customCache.get('key1')).toBeUndefined();
+      customCache.dispose();
+    });
+
+    it('should handle negative TTL values', async () => {
+      cache.set('key1', 42, -100);
+      expect(cache.get('key1')).toBeUndefined();
+    });
+
+    it('should handle very large TTL values', async () => {
+      cache.set('key1', 42, Number.MAX_SAFE_INTEGER);
+      expect(cache.get('key1')).toBe(42);
+    });
+
+    it('should handle mixed protected and non-protected keys in clear', () => {
+      cache.set('key1', 42);
+      cache.set('key2', 99);
+      cache.set('key3', 100);
+      cache.addProtectedKeys(['key2']);
+      cache.clear();
+      expect(cache.get('key1')).toBeUndefined();
+      expect(cache.get('key2')).toBe(99);
+      expect(cache.get('key3')).toBeUndefined();
+    });
+
+    it('should handle mixed protected and non-protected keys in purgeExpired', async () => {
+      cache.set('key1', 42, 100);
+      cache.set('key2', 99, 100);
+      cache.set('key3', 100, 5000);
+      cache.addProtectedKeys(['key2']);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      cache.purgeExpired();
+      expect(cache.get('key1', false)).toBeUndefined();
+      expect(cache.getComprehensive('key2').type).toBe('expired');
+      expect(cache.get('key3')).toBe(100);
+    });
+
+    it('should not call errorFn when valueFn succeeds', async () => {
+      const errorFn = vi.fn(() => 99);
+      const value = await cache.getOrSet('key1', async () => 42, { errorFn });
+      expect(value).toBe(42);
+      expect(errorFn).not.toHaveBeenCalled();
     });
   });
 });

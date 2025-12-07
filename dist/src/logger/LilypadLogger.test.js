@@ -40,7 +40,7 @@ const LilypadLogger_1 = __importDefault(require("./LilypadLogger"));
             },
         });
         logger.info('test message');
-        (0, vitest_1.expect)(mockComponent.output).toHaveBeenCalledWith('info', 'test message');
+        (0, vitest_1.expect)(mockComponent.output).toHaveBeenCalledWith('info', 'test message', { logger: logger });
     });
     (0, vitest_1.it)('should stringify non-string messages', () => {
         const logger = (0, LilypadLogger_1.default)({
@@ -51,7 +51,9 @@ const LilypadLogger_1 = __importDefault(require("./LilypadLogger"));
         });
         const obj = { key: 'value' };
         logger.info(obj);
-        (0, vitest_1.expect)(mockComponent.output).toHaveBeenCalledWith('info', JSON.stringify(obj));
+        (0, vitest_1.expect)(mockComponent.output).toHaveBeenCalledWith('info', JSON.stringify(obj), {
+            logger: logger,
+        });
     });
     (0, vitest_1.it)('should route messages to all registered components', async () => {
         const logger = (0, LilypadLogger_1.default)({

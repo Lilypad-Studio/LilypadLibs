@@ -12,8 +12,9 @@ export interface LilypadLoggerConstructorOptions<T extends string> {
     name?: string;
     errorLogging?: (error: unknown) => Promise<void>;
 }
+type ChannelMethodFunction = (...message: unknown[]) => Promise<void>;
 type ChannelMethods<T extends string> = {
-    [K in T]: (message: unknown) => Promise<void>;
+    [K in T]: ChannelMethodFunction;
 };
 /**
  * A generic logger that dynamically creates logging methods based on component types.

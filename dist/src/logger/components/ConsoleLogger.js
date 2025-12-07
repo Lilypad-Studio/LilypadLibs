@@ -11,16 +11,16 @@ const LilypadLoggerComponent_1 = __importDefault(require("../LilypadLoggerCompon
  *
  * @example
  * ```typescript
- * const logger = new ConsoleLogger<'app'>();
+ * const logger = new LilypadConsoleLogger<'app'>();
  * ```
  *
  * @remarks
  * This logger extends {@link LilypadLoggerComponent} and implements basic console logging functionality.
  * Messages are sent to the standard output using `console.log()`.
  */
-class ConsoleLogger extends LilypadLoggerComponent_1.default {
+class LilypadConsoleLogger extends LilypadLoggerComponent_1.default {
     async send(message) {
         console.log(message);
     }
 }
-exports.default = ConsoleLogger;
+exports.default = LilypadConsoleLogger;

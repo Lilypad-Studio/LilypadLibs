@@ -10,7 +10,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.LilypadDiscordLogger = exports.ConsoleLogger = exports.LilypadFileLogger = exports.createLogger = exports.LilypadCache = void 0;
+exports.LilypadDiscordLogger = exports.LilypadConsoleLogger = exports.LilypadFileLogger = exports.createLogger = exports.LilypadCache = void 0;
 /**
  * Cache Module
  */
@@ -27,6 +27,6 @@ Object.defineProperty(exports, "createLogger", { enumerable: true, get: function
 var FileLogger_1 = require("./logger/components/FileLogger");
 Object.defineProperty(exports, "LilypadFileLogger", { enumerable: true, get: function () { return __importDefault(FileLogger_1).default; } });
 var ConsoleLogger_1 = require("./logger/components/ConsoleLogger");
-Object.defineProperty(exports, "ConsoleLogger", { enumerable: true, get: function () { return __importDefault(ConsoleLogger_1).default; } });
+Object.defineProperty(exports, "LilypadConsoleLogger", { enumerable: true, get: function () { return __importDefault(ConsoleLogger_1).default; } });
 var DiscordLogger_1 = require("./logger/components/DiscordLogger");
 Object.defineProperty(exports, "LilypadDiscordLogger", { enumerable: true, get: function () { return __importDefault(DiscordLogger_1).default; } });

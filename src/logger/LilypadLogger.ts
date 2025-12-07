@@ -15,8 +15,9 @@ export interface LilypadLoggerConstructorOptions<T extends string> {
 }
 
 // Define a utility type to map channel keys to method signatures
+type ChannelMethodFunction = (...message: unknown[]) => Promise<void>;
 type ChannelMethods<T extends string> = {
-  [K in T]: (message: unknown) => Promise<void>;
+  [K in T]: ChannelMethodFunction;
 };
 
 /**
@@ -57,6 +58,14 @@ class LilypadLogger<T extends string> {
   }
 
   constructor(options: LilypadLoggerConstructorOptions<T>) {
+    // Check that no T can override existing properties
+    const reservedKeys = new Set(['components', 'register', '__name']);
+    for (const key of Object.keys(options.components)) {
+      if (reservedKeys.has(key)) {
+        throw new Error(`Logger type "${key}" is reserved and cannot be used as a log channel.`);
+      }
+    }
+
     // Assign logger name if provided
     this._name = options.name;
 
@@ -71,28 +80,39 @@ class LilypadLogger<T extends string> {
 
     for (const type of Object.keys(this.components) as T[]) {
       // Create the function that logs to components
-      const logFn = async (message: unknown) => {
-        const promises: Promise<void>[] = [];
-        for (const component of this.components[type]) {
-          try {
-            if (typeof message === 'string') {
-              promises.push(component.output(type, message));
-            } else {
-              promises.push(component.output(type, JSON.stringify(message)));
-            }
-            await Promise.all(promises);
-          } catch (error) {
-            if (options.errorLogging) {
-              await options.errorLogging(error);
-            } else {
-              console.error(`Error in logger component for type "${type}":`, error);
-            }
+      const logFn = async (...message: unknown[]) => {
+        let stringMessage: string = '';
+        for (let i = 0; i < message.length; i++) {
+          if (i > 0) {
+            stringMessage += ' ';
+          }
+          const msgPart = message[i];
+          if (typeof msgPart === 'string') {
+            stringMessage += msgPart;
+          } else {
+            stringMessage += JSON.stringify(msgPart);
+          }
+        }
+
+        try {
+          const promises: Promise<void>[] = [];
+          for (const component of this.components[type]) {
+            promises.push(
+              component.output(type, stringMessage, { logger: this as LilypadLoggerType<T> })
+            );
+          }
+          await Promise.all(promises);
+        } catch (error) {
+          if (options.errorLogging) {
+            await options.errorLogging(error);
+          } else {
+            console.error(`Error in logger component for type "${type}":`, error);
           }
         }
       };
 
       // Assign the function directly to the class instance (this)
-      (this as unknown as ChannelMethods<T>)[type] = logFn;
+      (this as ChannelMethods<T>)[type] = logFn;
     }
   }
 

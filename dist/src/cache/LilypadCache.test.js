@@ -199,17 +199,17 @@ const LilypadCache_1 = __importDefault(require("./LilypadCache"));
     });
     (0, vitest_1.describe)('purgeExpired', () => {
         (0, vitest_1.it)('should remove expired entries', async () => {
-            cache.set('key1', 42, 100);
+            cache.set('key1', 42, 10);
             cache.set('key2', 99, 5000);
-            await new Promise((resolve) => setTimeout(resolve, 150));
+            await new Promise((resolve) => setTimeout(resolve, 50));
             cache.purgeExpired();
             (0, vitest_1.expect)(cache.get('key1', false)).toBeUndefined();
             (0, vitest_1.expect)(cache.get('key2')).toBe(99);
         });
         (0, vitest_1.it)('should not remove protected expired entries', async () => {
-            cache.set('key1', 42, 100);
+            cache.set('key1', 42, 10);
             cache.addProtectedKeys(['key1']);
-            await new Promise((resolve) => setTimeout(resolve, 150));
+            await new Promise((resolve) => setTimeout(resolve, 50));
             cache.purgeExpired();
             (0, vitest_1.expect)(cache.getComprehensive('key1').type).toBe('expired');
         });
@@ -260,6 +260,179 @@ const LilypadCache_1 = __importDefault(require("./LilypadCache"));
         (0, vitest_1.it)('should stop cleanup interval on dispose', () => {
             const customCache = new LilypadCache_1.default(5000, { autoCleanupInterval: 1000 });
             (0, vitest_1.expect)(() => customCache.dispose()).not.toThrow();
+        });
+        (0, vitest_1.it)('should force clear all entries on dispose even if protected', () => {
+            cache.set('key1', 42);
+            cache.set('key2', 99);
+            cache.addProtectedKeys(['key1', 'key2']);
+            cache.dispose();
+            (0, vitest_1.expect)(cache.get('key1')).toBeUndefined();
+            (0, vitest_1.expect)(cache.get('key2')).toBeUndefined();
+        });
+    });
+    (0, vitest_1.describe)('edge cases', () => {
+        (0, vitest_1.it)('should handle getOrSet with expired pending promise', async () => {
+            const spy = vitest_1.vi.fn(async () => {
+                await new Promise((resolve) => setTimeout(resolve, 100));
+                return 42;
+            });
+            const promise1 = cache.getOrSet('key1', spy);
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            const promise2 = cache.getOrSet('key1', spy);
+            const [result1, result2] = await Promise.all([promise1, promise2]);
+            (0, vitest_1.expect)(result1).toBe(42);
+            (0, vitest_1.expect)(result2).toBe(42);
+            (0, vitest_1.expect)(spy).toHaveBeenCalledTimes(1);
+        });
+        (0, vitest_1.it)('should handle multiple errors in pending promises', async () => {
+            const spy = vitest_1.vi.fn(async () => {
+                throw new Error('fetch failed');
+            });
+            cache.set('key1', 42);
+            const promise1 = cache.getOrSet('key1', spy, { returnOldOnError: true });
+            const promise2 = cache.getOrSet('key1', spy, { returnOldOnError: true });
+            const [result1, result2] = await Promise.all([promise1, promise2]);
+            (0, vitest_1.expect)(result1).toBe(42);
+            (0, vitest_1.expect)(result2).toBe(42);
+        });
+        (0, vitest_1.it)('should handle invalidate on expired value', async () => {
+            cache.set('key1', 42, 100);
+            await new Promise((resolve) => setTimeout(resolve, 150));
+            cache.invalidate('key1');
+            (0, vitest_1.expect)(cache.getComprehensive('key1').type).toBeOneOf(['miss', 'expired']);
+        });
+        (0, vitest_1.it)('should handle clear on empty cache', () => {
+            (0, vitest_1.expect)(() => cache.clear()).not.toThrow();
+        });
+        (0, vitest_1.it)('should handle purgeExpired on empty cache', () => {
+            (0, vitest_1.expect)(() => cache.purgeExpired()).not.toThrow();
+        });
+        (0, vitest_1.it)('should handle dispose multiple times', () => {
+            cache.set('key1', 42);
+            (0, vitest_1.expect)(() => {
+                cache.dispose();
+                cache.dispose();
+            }).not.toThrow();
+        });
+        (0, vitest_1.it)('should reject errorFn that throws', async () => {
+            cache.set('key1', 42, 10);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            await (0, vitest_1.expect)(cache.getOrSet('key1', async () => {
+                throw new Error('fetch failed');
+            }, {
+                returnOldOnError: true,
+                errorFn: () => {
+                    throw new Error('errorFn failed');
+                },
+            })).rejects.toThrow('errorFn failed');
+        });
+        (0, vitest_1.it)('should cache value with default TTL when not specified in getOrSet', async () => {
+            const value = await cache.getOrSet('key1', async () => 42);
+            (0, vitest_1.expect)(value).toBe(42);
+            (0, vitest_1.expect)(cache.get('key1')).toBe(42);
+        });
+        (0, vitest_1.it)('should handle getOrSet with 0 TTL', async () => {
+            const value = await cache.getOrSet('key1', async () => 42, { ttl: 0 });
+            (0, vitest_1.expect)(value).toBe(42);
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            (0, vitest_1.expect)(cache.get('key1')).toBeUndefined();
+        });
+        (0, vitest_1.it)('should handle logger when provided', async () => {
+            const mockLogger = {
+                error: vitest_1.vi.fn(),
+                warn: vitest_1.vi.fn(),
+                components: {},
+                register: vitest_1.vi.fn(),
+                __name: undefined,
+            };
+            const customCache = new LilypadCache_1.default(1000, { logger: mockLogger });
+            customCache.set('key1', 42, 10);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            await customCache.getOrSet('key1', async () => {
+                throw new Error('fetch failed');
+            }, { returnOldOnError: true });
+            (0, vitest_1.expect)(mockLogger.error).toHaveBeenCalled();
+            customCache.dispose();
+        });
+        (0, vitest_1.it)('should handle getOrSet with expired value and no old value fallback', async () => {
+            cache.set('key1', 42, 10);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            await (0, vitest_1.expect)(cache.getOrSet('key1', async () => {
+                throw new Error('fetch failed');
+            })).rejects.toThrow('fetch failed');
+        });
+        (0, vitest_1.it)('should prioritize errorFn over returnOldOnError', async () => {
+            cache.set('key1', 42, 10);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            const errorFn = vitest_1.vi.fn(() => 100);
+            const value = await cache.getOrSet('key1', async () => {
+                throw new Error('fetch failed');
+            }, { errorFn, returnOldOnError: true });
+            (0, vitest_1.expect)(value).toBe(100);
+            (0, vitest_1.expect)(errorFn).toHaveBeenCalled();
+        });
+        (0, vitest_1.it)('should handle getOrSet with skipCache and error', async () => {
+            cache.set('key1', 42);
+            const errorFn = vitest_1.vi.fn(() => 99);
+            const value = await cache.getOrSet('key1', async () => {
+                throw new Error('fetch failed');
+            }, { skipCache: true, errorFn });
+            (0, vitest_1.expect)(value).toBe(99);
+        });
+        (0, vitest_1.it)('should handle concurrent pending promise errors independently', async () => {
+            const errorFn1 = vitest_1.vi.fn(() => 100);
+            const errorFn2 = vitest_1.vi.fn(() => 200);
+            cache.set('key1', 42);
+            const spy = vitest_1.vi.fn(async () => {
+                throw new Error('fetch failed');
+            });
+            const promise1 = cache.getOrSet('key1', spy, { returnOldOnError: true, errorFn: errorFn1 });
+            const promise2 = cache.getOrSet('key1', spy, { returnOldOnError: true, errorFn: errorFn2 });
+            const [result1, result2] = await Promise.all([promise1, promise2]);
+            (0, vitest_1.expect)(result1).toBe(42);
+            (0, vitest_1.expect)(result2).toBe(42);
+        });
+        (0, vitest_1.it)('should use default TTL when not specified in set', async () => {
+            const customCache = new LilypadCache_1.default(200);
+            customCache.set('key1', 42);
+            await new Promise((resolve) => setTimeout(resolve, 250));
+            (0, vitest_1.expect)(customCache.get('key1')).toBeUndefined();
+            customCache.dispose();
+        });
+        (0, vitest_1.it)('should handle negative TTL values', async () => {
+            cache.set('key1', 42, -100);
+            (0, vitest_1.expect)(cache.get('key1')).toBeUndefined();
+        });
+        (0, vitest_1.it)('should handle very large TTL values', async () => {
+            cache.set('key1', 42, Number.MAX_SAFE_INTEGER);
+            (0, vitest_1.expect)(cache.get('key1')).toBe(42);
+        });
+        (0, vitest_1.it)('should handle mixed protected and non-protected keys in clear', () => {
+            cache.set('key1', 42);
+            cache.set('key2', 99);
+            cache.set('key3', 100);
+            cache.addProtectedKeys(['key2']);
+            cache.clear();
+            (0, vitest_1.expect)(cache.get('key1')).toBeUndefined();
+            (0, vitest_1.expect)(cache.get('key2')).toBe(99);
+            (0, vitest_1.expect)(cache.get('key3')).toBeUndefined();
+        });
+        (0, vitest_1.it)('should handle mixed protected and non-protected keys in purgeExpired', async () => {
+            cache.set('key1', 42, 100);
+            cache.set('key2', 99, 100);
+            cache.set('key3', 100, 5000);
+            cache.addProtectedKeys(['key2']);
+            await new Promise((resolve) => setTimeout(resolve, 150));
+            cache.purgeExpired();
+            (0, vitest_1.expect)(cache.get('key1', false)).toBeUndefined();
+            (0, vitest_1.expect)(cache.getComprehensive('key2').type).toBe('expired');
+            (0, vitest_1.expect)(cache.get('key3')).toBe(100);
+        });
+        (0, vitest_1.it)('should not call errorFn when valueFn succeeds', async () => {
+            const errorFn = vitest_1.vi.fn(() => 99);
+            const value = await cache.getOrSet('key1', async () => 42, { errorFn });
+            (0, vitest_1.expect)(value).toBe(42);
+            (0, vitest_1.expect)(errorFn).not.toHaveBeenCalled();
         });
     });
 });

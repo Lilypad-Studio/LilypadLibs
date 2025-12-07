@@ -34,6 +34,13 @@ class LilypadLogger {
         return this._name;
     }
     constructor(options) {
+        // Check that no T can override existing properties
+        const reservedKeys = new Set(['components', 'register', '__name']);
+        for (const key of Object.keys(options.components)) {
+            if (reservedKeys.has(key)) {
+                throw new Error(`Logger type "${key}" is reserved and cannot be used as a log channel.`);
+            }
+        }
         // Assign logger name if provided
         this._name = options.name;
         // Assign initial components
@@ -43,25 +50,33 @@ class LilypadLogger {
         }
         for (const type of Object.keys(this.components)) {
             // Create the function that logs to components
-            const logFn = async (message) => {
-                const promises = [];
-                for (const component of this.components[type]) {
-                    try {
-                        if (typeof message === 'string') {
-                            promises.push(component.output(type, message));
-                        }
-                        else {
-                            promises.push(component.output(type, JSON.stringify(message)));
-                        }
-                        await Promise.all(promises);
+            const logFn = async (...message) => {
+                let stringMessage = '';
+                for (let i = 0; i < message.length; i++) {
+                    if (i > 0) {
+                        stringMessage += ' ';
                     }
-                    catch (error) {
-                        if (options.errorLogging) {
-                            await options.errorLogging(error);
-                        }
-                        else {
-                            console.error(`Error in logger component for type "${type}":`, error);
-                        }
+                    const msgPart = message[i];
+                    if (typeof msgPart === 'string') {
+                        stringMessage += msgPart;
+                    }
+                    else {
+                        stringMessage += JSON.stringify(msgPart);
+                    }
+                }
+                try {
+                    const promises = [];
+                    for (const component of this.components[type]) {
+                        promises.push(component.output(type, stringMessage, { logger: this }));
+                    }
+                    await Promise.all(promises);
+                }
+                catch (error) {
+                    if (options.errorLogging) {
+                        await options.errorLogging(error);
+                    }
+                    else {
+                        console.error(`Error in logger component for type "${type}":`, error);
                     }
                 }
             };

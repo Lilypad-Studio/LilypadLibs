@@ -46,7 +46,7 @@ describe('LilypadLogger', () => {
 
     logger.info('test message');
 
-    expect(mockComponent.output).toHaveBeenCalledWith('info', 'test message');
+    expect(mockComponent.output).toHaveBeenCalledWith('info', 'test message', { logger: logger });
   });
 
   it('should stringify non-string messages', () => {
@@ -60,7 +60,9 @@ describe('LilypadLogger', () => {
     const obj = { key: 'value' };
     logger.info(obj);
 
-    expect(mockComponent.output).toHaveBeenCalledWith('info', JSON.stringify(obj));
+    expect(mockComponent.output).toHaveBeenCalledWith('info', JSON.stringify(obj), {
+      logger: logger,
+    });
   });
 
   it('should route messages to all registered components', async () => {

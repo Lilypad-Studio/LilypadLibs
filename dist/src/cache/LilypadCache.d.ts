@@ -1,3 +1,4 @@
+import type { LilypadLoggerType } from '@/logger/LilypadLogger';
 export type LilypadCacheGetOptions<K, V> = {
     /**
      * Optional TTL (time to live) in milliseconds for the cached value.
@@ -110,9 +111,11 @@ declare class LilypadCache<K, V> {
     private cleanupIntervalId?;
     private pendingPromises;
     private protectedKeys;
+    private logger?;
     constructor(ttl?: number, options?: {
         autoCleanupInterval?: number;
         defaultErrorTtl?: number;
+        logger?: LilypadLoggerType<'error' | 'warn'>;
     });
     /**
      * Calculates the expiration timestamp based on the provided TTL (time-to-live) value.

@@ -1,3 +1,5 @@
+import type { LilypadLoggerType } from '@/logger/LilypadLogger';
+
 export type LilypadCacheGetOptions<K, V> = {
   /**
    * Optional TTL (time to live) in milliseconds for the cached value.
@@ -129,13 +131,20 @@ class LilypadCache<K, V> {
 
   private protectedKeys: Set<K> = new Set();
 
+  private logger?: LilypadLoggerType<'error' | 'warn'>;
+
   constructor(
     ttl: number = 60000,
-    options: { autoCleanupInterval?: number; defaultErrorTtl?: number } = {}
+    options: {
+      autoCleanupInterval?: number;
+      defaultErrorTtl?: number;
+      logger?: LilypadLoggerType<'error' | 'warn'>;
+    } = {}
   ) {
     this.store = new Map();
     this.defaultTtl = ttl;
     this.defaultErrorTtl = options.defaultErrorTtl ? options.defaultErrorTtl : 5 * 60 * 1000; // 5 minutes;
+    this.logger = options.logger;
 
     if (options.autoCleanupInterval) {
       if (!Number.isFinite(options.autoCleanupInterval) || options.autoCleanupInterval <= 0) {
@@ -233,6 +242,8 @@ class LilypadCache<K, V> {
     key: K,
     fetched: LilypadCacheValueRetrieval<V>
   ): V {
+    this.logger?.error(`Error fetching cache key "${String(key)}": `, error);
+
     let valueToReturn: V | undefined = undefined;
     const errorFnRes = options.errorFn?.({ key, error, options, cache: this });
 
@@ -406,6 +417,7 @@ class LilypadCache<K, V> {
    * This method should be called when the cache is no longer needed to free up resources.
    */
   dispose() {
+    this.logger = undefined;
     this.stopCleanupInterval();
     this.clear({ force: true });
   }
