@@ -10,7 +10,7 @@
     "Lorenzo Pierro"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsup --dts",
     "lint": "eslint --fix",
     "test": "vitest"
   },
@@ -27,6 +27,7 @@
     "eslint-plugin-prettier": "^5.2.1",
     "eslint-plugin-promise": "^7.2.1",
     "prettier": "^3.4.2",
+    "tsup": "^8.5.1",
     "vitest": "^4.0.15"
   }
 }

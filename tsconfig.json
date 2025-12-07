@@ -13,5 +13,5 @@
       "cache/*": ["./src/cache/*"]
     }
   },
-  "include": ["src", "vitest.config.ts"],
+  "include": ["src", "vitest.config.ts", "tsup.config.ts"],
 }
