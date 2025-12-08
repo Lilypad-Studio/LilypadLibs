@@ -543,5 +543,98 @@ describe('LilypadCache', () => {
       expect(value).toBe(42);
       expect(errorFn).not.toHaveBeenCalled();
     });
+
+    describe('bulkSet, bulkGet, bulkAsyncGet, and bulkSync', () => {
+      it('should set multiple entries with bulkSet (array)', () => {
+        cache.bulkSet([
+          ['key1', 1],
+          ['key2', 2],
+        ]);
+        expect(cache.get('key1')).toBe(1);
+        expect(cache.get('key2')).toBe(2);
+      });
+
+      it('should set multiple entries with bulkSet (Map)', () => {
+        const map = new Map<string, number>([
+          ['key1', 1],
+          ['key2', 2],
+        ]);
+        cache.bulkSet(map);
+        expect(cache.get('key1')).toBe(1);
+        expect(cache.get('key2')).toBe(2);
+      });
+
+      it('should get multiple entries with bulkGet (all)', () => {
+        cache.set('key1', 1);
+        cache.set('key2', 2);
+        const result = cache.bulkGet({});
+        expect(result.get('key1')).toBe(1);
+        expect(result.get('key2')).toBe(2);
+      });
+
+      it('should get multiple entries with bulkGet (keys)', () => {
+        cache.set('key1', 1);
+        cache.set('key2', 2);
+        cache.set('key3', 3);
+        const result = cache.bulkGet({ keys: ['key1', 'key3'] });
+        expect(result.get('key1')).toBe(1);
+        expect(result.get('key3')).toBe(3);
+        expect(result.has('key2')).toBe(false);
+      });
+
+      it('should get multiple entries with bulkAsyncGet', async () => {
+        cache.set('key1', 1);
+        cache.set('key2', 2);
+        const result = await cache.bulkAsyncGet({ keys: ['key1', 'key2'] });
+        expect(result.get('key1')).toBe(1);
+        expect(result.get('key2')).toBe(2);
+      });
+
+      it('should bulkAsyncGet with doSync and syncFn', async () => {
+        const syncFn: () => Promise<[string, number][]> = vi.fn(
+          async () =>
+            [
+              ['keyA', 10],
+              ['keyB', 20],
+            ] as [string, number][]
+        );
+        const result = await cache.bulkAsyncGet({ doSync: true, syncFn });
+        expect(result.get('keyA')).toBe(10);
+        expect(result.get('keyB')).toBe(20);
+        expect(syncFn).toHaveBeenCalled();
+      });
+
+      it('should bulkSync using instance bulkSyncFn', async () => {
+        const customCache = new LilypadCache<string, number>(1000, {
+          bulkSyncFn: async () => [
+            ['keyX', 123],
+            ['keyY', 456],
+          ],
+        });
+        await customCache.bulkSync();
+        expect(customCache.get('keyX')).toBe(123);
+        expect(customCache.get('keyY')).toBe(456);
+        customCache.dispose();
+      });
+
+      it('should not bulkSync again before bulkSyncExpirationTime', async () => {
+        let callCount = 0;
+        const syncFn = vi.fn(async () => {
+          callCount++;
+          return [
+            ['key1', 1],
+            ['key2', 2],
+          ] as [string, number][];
+        });
+        const customCache = new LilypadCache<string, number>(1000, {
+          defaultBulkSyncTtl: 1000,
+          bulkSyncFn: syncFn,
+        });
+        await customCache.bulkSync();
+        await customCache.bulkSync();
+        expect(callCount).toBe(1);
+        customCache.dispose();
+      });
+    });
   });
 });

@@ -1,4 +1,4 @@
-"use strict";Object.defineProperty(exports, "__esModule", {value: true}); function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; } function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } var _class; var _class2; var _class3;// src/flow/LilypadFlowControl.ts
+"use strict";Object.defineProperty(exports, "__esModule", {value: true}); function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; } function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } async function _asyncNullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return await rhsFn(); } } var _class; var _class2; var _class3;// src/flow/LilypadFlowControl.ts
 var LilypadFlowControl = (_class = class {
   
   
@@ -58,7 +58,10 @@ var LilypadFlowControl = (_class = class {
       } catch (error) {
         if (attempts >= (_nullishCoalesce(this.retries, () => ( 0)))) {
           if (errorFn) {
-            return errorFn(error);
+            const result = errorFn(error);
+            if (result !== void 0) {
+              return result;
+            }
           }
           throw error;
         }
@@ -121,7 +124,10 @@ var LilypadFlowControl = (_class = class {
         return await executionFn();
       } catch (error) {
         if (options.errorFn) {
-          return options.errorFn(error);
+          const result = options.errorFn(error);
+          if (result !== void 0) {
+            return result;
+          }
         }
         throw error;
       }
@@ -145,17 +151,34 @@ var LilypadCache = (_class2 = class {
   
   // default error TTL in milliseconds
   
+  
   __init3() {this.protectedKeys = /* @__PURE__ */ new Set()}
   
   
-  constructor(ttl = 6e4, options = {}) {;_class2.prototype.__init3.call(this);
+  
+  /**
+   * Timestamp of the last bulk sync operation.
+   * If the cache is backed by a database or external store,
+   * It's possible that "every entry in the cache" is not the same as "every key in the store".
+   * This timestamp can be used to track when the last bulk sync occurred, which would
+   * have synced the cache with the store.
+   */
+  __init4() {this.bulkSyncExpirationTime = 0}
+  
+  constructor(ttl = 6e4, options = {}) {;_class2.prototype.__init3.call(this);_class2.prototype.__init4.call(this);
     this.store = /* @__PURE__ */ new Map();
     this.defaultTtl = ttl;
+    this.defaultBulkSyncTtl = _nullishCoalesce(options.defaultBulkSyncTtl, () => ( ttl));
+    this.bulkSyncFn = options.bulkSyncFn;
     this.defaultErrorTtl = options.defaultErrorTtl ? options.defaultErrorTtl : 5 * 60 * 1e3;
     this.logger = options.logger;
     this.flowControl = new LilypadFlowControl({
       logger: this.logger,
       timeout: options.flowControlTimeout || 5e3
+    });
+    this.bulkSyncFlowControl = new LilypadFlowControl({
+      logger: this.logger,
+      timeout: options.flowControlTimeout || 3e4
     });
     if (options.autoCleanupInterval) {
       if (!Number.isFinite(options.autoCleanupInterval) || options.autoCleanupInterval <= 0) {
@@ -291,6 +314,87 @@ var LilypadCache = (_class2 = class {
     });
   }
   /**
+   * Synchronizes the cache in bulk by executing the provided sync function.
+   *
+   * This method uses flow control to manage the execution of the bulk sync operation.
+   * If a `syncFn` is provided, it will be used to fetch key-value pairs to synchronize.
+   * Any errors encountered during the sync process are logged.
+   *
+   * @param syncFn - An optional asynchronous function that returns an array of key-value pairs to be synchronized.
+   * @returns A promise that resolves when the bulk sync operation is complete.
+   */
+  async bulkSync(syncFn) {
+    await this.bulkSyncFlowControl.executeFn({
+      functionIdentifier: `LilypadCache-bulkSync`,
+      consumerIdentifier: "",
+      errorFn: (error) => {
+        var _a;
+        (_a = this.logger) == null ? void 0 : _a.error("Error during bulk sync: ", error);
+      },
+      fn: async () => this._bulkSync(syncFn)
+    });
+  }
+  async _bulkSync(syncFn) {
+    var _a;
+    if (Date.now() < this.bulkSyncExpirationTime) {
+      return;
+    }
+    const data = await _asyncNullishCoalesce(await (syncFn == null ? void 0 : syncFn()), async () => ( await ((_a = this.bulkSyncFn) == null ? void 0 : _a.call(this))));
+    const expirationTime = this.createExpirationTime();
+    for (const [key, value] of _nullishCoalesce(data, () => ( []))) {
+      this.store.set(key, { value, expirationTime });
+    }
+    this.bulkSyncExpirationTime = this.createExpirationTime(this.defaultBulkSyncTtl);
+  }
+  /**
+   * Retrieves multiple values from the cache for the specified keys.
+   * If no keys are provided, retrieves all values currently stored in the cache.
+   *
+   * @param options - An object containing an optional array of keys to retrieve.
+   * @returns A `Map` containing the key-value pairs found in the cache.
+   */
+  bulkGet(options) {
+    const result = /* @__PURE__ */ new Map();
+    const keysToGet = _nullishCoalesce(options.keys, () => ( Array.from(this.store.keys())));
+    for (const key of keysToGet) {
+      const value = this.get(key);
+      if (value !== void 0) {
+        result.set(key, value);
+      }
+    }
+    return result;
+  }
+  /**
+   * Retrieves multiple values from the cache asynchronously.
+   * Optionally synchronizes the cache before retrieval using a provided sync function.
+   *
+   * @param options - The options for bulk retrieval.
+   * @param options.keys - An array of keys to retrieve from the cache.
+   * @param options.doSync - If true, synchronizes the cache using `syncFn` before retrieval.
+   * @param options.syncFn - An asynchronous function that returns an array of key-value pairs to sync the cache.
+   * @returns A promise that resolves to a map of keys to their corresponding values.
+   */
+  async bulkAsyncGet(options) {
+    if (options.doSync) {
+      await this.bulkSync(options.syncFn);
+    }
+    return this.bulkGet({ keys: options.keys });
+  }
+  /**
+   * Sets multiple key-value pairs in the cache at once.
+   *
+   * Accepts either a `Map<K, V>` or an array of `[K, V]` tuples.
+   * Each entry is added to the cache using the `set` method.
+   *
+   * @param entries - The entries to set, as a `Map` or an array of key-value tuples.
+   */
+  bulkSet(entries) {
+    const entriesToSet = entries instanceof Map ? Array.from(entries.entries()) : entries;
+    for (const [key, value] of entriesToSet) {
+      this.set(key, value);
+    }
+  }
+  /**
    * Adds the specified keys to the set of protected keys.
    * Protected keys are typically excluded from certain cache operations
    * such as eviction or deletion to ensure their persistence.
@@ -401,13 +505,13 @@ var LilypadCache_default = LilypadCache;
 
 // src/logger/LilypadLogger.ts
 var LilypadLogger = (_class3 = class {
-  __init4() {this.components = {}}
+  __init5() {this.components = {}}
   // Optional logger name
   
   get __name() {
     return this._name;
   }
-  constructor(options) {;_class3.prototype.__init4.call(this);
+  constructor(options) {;_class3.prototype.__init5.call(this);
     const reservedKeys = /* @__PURE__ */ new Set(["components", "register", "__name"]);
     for (const key of Object.keys(options.components)) {
       if (reservedKeys.has(key)) {

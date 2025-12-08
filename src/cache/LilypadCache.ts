@@ -1,7 +1,7 @@
 import { LilypadFlowControl } from '@/flow/LilypadFlowControl';
 import type { LilypadLoggerType } from '@/logger/LilypadLogger';
 
-export type LilypadCacheGetOptions<K, V> = {
+export type LilypadCacheGetOptions<K extends string, V> = {
   /**
    * Optional TTL (time to live) in milliseconds for the cached value.
    * If not provided, the cache's default TTL will be used.
@@ -45,7 +45,7 @@ export type LilypadCacheGetOptions<K, V> = {
  * @property {LilypadCacheGetOptions<K, V>} options - The options used for the cache get operation.
  * @property {LilypadCache<K, V>} cache - The cache instance where the error occurred.
  */
-type LilypadCacheGetOptionsErrorFn<K, V> = {
+type LilypadCacheGetOptionsErrorFn<K extends string, V> = {
   key: K;
   error: unknown;
   options: LilypadCacheGetOptions<K, V>;
@@ -122,10 +122,11 @@ function isStale<V>(retrieval: LilypadCacheValue<V>): boolean {
  * @see {@link purgeExpired}
  * @see {@link dispose}
  */
-class LilypadCache<K, V> {
+class LilypadCache<K extends string, V> {
   private store: Map<K, LilypadCacheValue<V>>;
   private defaultTtl: number; // time to live in milliseconds
   private defaultErrorTtl: number; // default error TTL in milliseconds
+  private defaultBulkSyncTtl: number;
   private cleanupIntervalId?: ReturnType<typeof setInterval> & { unref?: () => void };
 
   private protectedKeys: Set<K> = new Set();
@@ -133,24 +134,44 @@ class LilypadCache<K, V> {
   private logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
 
   private flowControl: LilypadFlowControl<V>;
+  private bulkSyncFlowControl: LilypadFlowControl<void>;
+
+  /**
+   * Timestamp of the last bulk sync operation.
+   * If the cache is backed by a database or external store,
+   * It's possible that "every entry in the cache" is not the same as "every key in the store".
+   * This timestamp can be used to track when the last bulk sync occurred, which would
+   * have synced the cache with the store.
+   */
+  private bulkSyncExpirationTime: number = 0;
+  private bulkSyncFn?: () => Promise<[K, V][]>;
 
   constructor(
     ttl: number = 60000,
     options: {
       autoCleanupInterval?: number;
       defaultErrorTtl?: number;
+      defaultBulkSyncTtl?: number;
+      bulkSyncFn?: () => Promise<[K, V][]>;
       logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
       flowControlTimeout?: number;
     } = {}
   ) {
     this.store = new Map();
     this.defaultTtl = ttl;
+    this.defaultBulkSyncTtl = options.defaultBulkSyncTtl ?? ttl;
+    this.bulkSyncFn = options.bulkSyncFn;
     this.defaultErrorTtl = options.defaultErrorTtl ? options.defaultErrorTtl : 5 * 60 * 1000; // 5 minutes;
     this.logger = options.logger;
 
     this.flowControl = new LilypadFlowControl<V>({
       logger: this.logger,
       timeout: options.flowControlTimeout || 5000,
+    });
+
+    this.bulkSyncFlowControl = new LilypadFlowControl<void>({
+      logger: this.logger,
+      timeout: options.flowControlTimeout || 30000,
     });
 
     if (options.autoCleanupInterval) {
@@ -307,6 +328,93 @@ class LilypadCache<K, V> {
         return value;
       },
     });
+  }
+
+  /**
+   * Synchronizes the cache in bulk by executing the provided sync function.
+   *
+   * This method uses flow control to manage the execution of the bulk sync operation.
+   * If a `syncFn` is provided, it will be used to fetch key-value pairs to synchronize.
+   * Any errors encountered during the sync process are logged.
+   *
+   * @param syncFn - An optional asynchronous function that returns an array of key-value pairs to be synchronized.
+   * @returns A promise that resolves when the bulk sync operation is complete.
+   */
+  async bulkSync(syncFn?: () => Promise<[K, V][]>): Promise<void> {
+    await this.bulkSyncFlowControl.executeFn({
+      functionIdentifier: `LilypadCache-bulkSync`,
+      consumerIdentifier: '',
+      errorFn: (error) => {
+        this.logger?.error('Error during bulk sync: ', error);
+      },
+      fn: async () => this._bulkSync(syncFn),
+    });
+  }
+  private async _bulkSync(syncFn?: () => Promise<[K, V][]>): Promise<void> {
+    if (Date.now() < this.bulkSyncExpirationTime) {
+      return;
+    }
+    const data = (await syncFn?.()) ?? (await this.bulkSyncFn?.());
+    const expirationTime = this.createExpirationTime();
+    for (const [key, value] of data ?? []) {
+      this.store.set(key, { value, expirationTime });
+    }
+    this.bulkSyncExpirationTime = this.createExpirationTime(this.defaultBulkSyncTtl);
+  }
+
+  /**
+   * Retrieves multiple values from the cache for the specified keys.
+   * If no keys are provided, retrieves all values currently stored in the cache.
+   *
+   * @param options - An object containing an optional array of keys to retrieve.
+   * @returns A `Map` containing the key-value pairs found in the cache.
+   */
+  bulkGet(options: { keys?: K[] }): Map<K, V> {
+    const result = new Map<K, V>();
+    const keysToGet = options.keys ?? Array.from(this.store.keys());
+    for (const key of keysToGet) {
+      const value = this.get(key);
+      if (value !== undefined) {
+        result.set(key, value);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Retrieves multiple values from the cache asynchronously.
+   * Optionally synchronizes the cache before retrieval using a provided sync function.
+   *
+   * @param options - The options for bulk retrieval.
+   * @param options.keys - An array of keys to retrieve from the cache.
+   * @param options.doSync - If true, synchronizes the cache using `syncFn` before retrieval.
+   * @param options.syncFn - An asynchronous function that returns an array of key-value pairs to sync the cache.
+   * @returns A promise that resolves to a map of keys to their corresponding values.
+   */
+  async bulkAsyncGet(options: {
+    keys?: K[];
+    doSync?: boolean;
+    syncFn?: () => Promise<[K, V][]>;
+  }): Promise<Map<K, V>> {
+    if (options.doSync) {
+      await this.bulkSync(options.syncFn);
+    }
+    return this.bulkGet({ keys: options.keys });
+  }
+
+  /**
+   * Sets multiple key-value pairs in the cache at once.
+   *
+   * Accepts either a `Map<K, V>` or an array of `[K, V]` tuples.
+   * Each entry is added to the cache using the `set` method.
+   *
+   * @param entries - The entries to set, as a `Map` or an array of key-value tuples.
+   */
+  bulkSet(entries: Map<K, V> | [K, V][]): void {
+    const entriesToSet = entries instanceof Map ? Array.from(entries.entries()) : entries;
+    for (const [key, value] of entriesToSet) {
+      this.set(key, value);
+    }
   }
 
   /**

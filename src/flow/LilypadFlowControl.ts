@@ -8,7 +8,7 @@ export interface FlowControlOptions {
 }
 
 export interface ExecuteFnOptions<T> {
-  errorFn?: (error: unknown) => T;
+  errorFn?: (error: unknown) => T | void;
   functionIdentifier: string;
   consumerIdentifier: string;
   fn: () => Promise<T>;
@@ -105,7 +105,7 @@ export class LilypadFlowControl<T> {
    */
   async executeWithRetries(
     executionFn: () => Promise<T>,
-    errorFn?: (error: unknown) => T,
+    errorFn?: (error: unknown) => T | void,
     backOffTime?: (attempt: number) => number
   ): Promise<T> {
     let attempts = 0;
@@ -116,7 +116,10 @@ export class LilypadFlowControl<T> {
       } catch (error) {
         if (attempts >= (this.retries ?? 0)) {
           if (errorFn) {
-            return errorFn(error);
+            const result = errorFn(error);
+            if (result !== undefined) {
+              return result;
+            }
           }
           throw error;
         }
@@ -189,7 +192,10 @@ export class LilypadFlowControl<T> {
         return await executionFn();
       } catch (error) {
         if (options.errorFn) {
-          return options.errorFn(error);
+          const result = options.errorFn(error);
+          if (result !== undefined) {
+            return result;
+          }
         }
         throw error;
       }

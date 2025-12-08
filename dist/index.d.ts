@@ -97,7 +97,7 @@ type LilypadLoggerType<T extends string> = LilypadLogger<T> & ChannelMethods<T>;
  */
 declare function createLogger<T extends string = 'log' | 'error' | 'warn'>(options: LilypadLoggerConstructorOptions<T>): LilypadLoggerType<T>;
 
-type LilypadCacheGetOptions<K, V> = {
+type LilypadCacheGetOptions<K extends string, V> = {
     /**
      * Optional TTL (time to live) in milliseconds for the cached value.
      * If not provided, the cache's default TTL will be used.
@@ -136,7 +136,7 @@ type LilypadCacheGetOptions<K, V> = {
  * @property {LilypadCacheGetOptions<K, V>} options - The options used for the cache get operation.
  * @property {LilypadCache<K, V>} cache - The cache instance where the error occurred.
  */
-type LilypadCacheGetOptionsErrorFn<K, V> = {
+type LilypadCacheGetOptionsErrorFn<K extends string, V> = {
     key: K;
     error: unknown;
     options: LilypadCacheGetOptions<K, V>;
@@ -202,17 +202,30 @@ type LilypadCacheValueRetrieval<V> = ({
  * @see {@link purgeExpired}
  * @see {@link dispose}
  */
-declare class LilypadCache<K, V> {
+declare class LilypadCache<K extends string, V> {
     private store;
     private defaultTtl;
     private defaultErrorTtl;
+    private defaultBulkSyncTtl;
     private cleanupIntervalId?;
     private protectedKeys;
     private logger?;
     private flowControl;
+    private bulkSyncFlowControl;
+    /**
+     * Timestamp of the last bulk sync operation.
+     * If the cache is backed by a database or external store,
+     * It's possible that "every entry in the cache" is not the same as "every key in the store".
+     * This timestamp can be used to track when the last bulk sync occurred, which would
+     * have synced the cache with the store.
+     */
+    private bulkSyncExpirationTime;
+    private bulkSyncFn?;
     constructor(ttl?: number, options?: {
         autoCleanupInterval?: number;
         defaultErrorTtl?: number;
+        defaultBulkSyncTtl?: number;
+        bulkSyncFn?: () => Promise<[K, V][]>;
         logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
         flowControlTimeout?: number;
     });
@@ -284,6 +297,52 @@ declare class LilypadCache<K, V> {
      * @throws Will not throw, but will return a handled error value if valueFn rejects and error handling is configured
      */
     getOrSet(key: K, valueFn: () => Promise<V>, options?: LilypadCacheGetOptions<K, V>): Promise<V>;
+    /**
+     * Synchronizes the cache in bulk by executing the provided sync function.
+     *
+     * This method uses flow control to manage the execution of the bulk sync operation.
+     * If a `syncFn` is provided, it will be used to fetch key-value pairs to synchronize.
+     * Any errors encountered during the sync process are logged.
+     *
+     * @param syncFn - An optional asynchronous function that returns an array of key-value pairs to be synchronized.
+     * @returns A promise that resolves when the bulk sync operation is complete.
+     */
+    bulkSync(syncFn?: () => Promise<[K, V][]>): Promise<void>;
+    private _bulkSync;
+    /**
+     * Retrieves multiple values from the cache for the specified keys.
+     * If no keys are provided, retrieves all values currently stored in the cache.
+     *
+     * @param options - An object containing an optional array of keys to retrieve.
+     * @returns A `Map` containing the key-value pairs found in the cache.
+     */
+    bulkGet(options: {
+        keys?: K[];
+    }): Map<K, V>;
+    /**
+     * Retrieves multiple values from the cache asynchronously.
+     * Optionally synchronizes the cache before retrieval using a provided sync function.
+     *
+     * @param options - The options for bulk retrieval.
+     * @param options.keys - An array of keys to retrieve from the cache.
+     * @param options.doSync - If true, synchronizes the cache using `syncFn` before retrieval.
+     * @param options.syncFn - An asynchronous function that returns an array of key-value pairs to sync the cache.
+     * @returns A promise that resolves to a map of keys to their corresponding values.
+     */
+    bulkAsyncGet(options: {
+        keys?: K[];
+        doSync?: boolean;
+        syncFn?: () => Promise<[K, V][]>;
+    }): Promise<Map<K, V>>;
+    /**
+     * Sets multiple key-value pairs in the cache at once.
+     *
+     * Accepts either a `Map<K, V>` or an array of `[K, V]` tuples.
+     * Each entry is added to the cache using the `set` method.
+     *
+     * @param entries - The entries to set, as a `Map` or an array of key-value tuples.
+     */
+    bulkSet(entries: Map<K, V> | [K, V][]): void;
     /**
      * Adds the specified keys to the set of protected keys.
      * Protected keys are typically excluded from certain cache operations
@@ -421,7 +480,7 @@ interface FlowControlOptions {
     logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
 }
 interface ExecuteFnOptions<T> {
-    errorFn?: (error: unknown) => T;
+    errorFn?: (error: unknown) => T | void;
     functionIdentifier: string;
     consumerIdentifier: string;
     fn: () => Promise<T>;
@@ -493,7 +552,7 @@ declare class LilypadFlowControl<T> {
      * @returns A promise that resolves with the result of `executionFn`, or with the result of `errorFn` if retries are exhausted.
      * @throws The error thrown by `executionFn` if all retries are exhausted and no `errorFn` is provided.
      */
-    executeWithRetries(executionFn: () => Promise<T>, errorFn?: (error: unknown) => T, backOffTime?: (attempt: number) => number): Promise<T>;
+    executeWithRetries(executionFn: () => Promise<T>, errorFn?: (error: unknown) => T | void, backOffTime?: (attempt: number) => number): Promise<T>;
     /**
      * Enforces a rate limit for a specific consumer and function combination.
      *
