@@ -424,10 +424,12 @@ describe('LilypadCache', () => {
       const mockLogger = {
         error: vi.fn(),
         warn: vi.fn(),
+        info: vi.fn(),
+        debug: vi.fn(),
         components: {},
         register: vi.fn(),
         __name: undefined,
-      } as unknown as LilypadLoggerType<'error' | 'warn'>;
+      } as unknown as LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
       const customCache = new LilypadCache<string, number>(1000, { logger: mockLogger });
       customCache.set('key1', 42, 10);
       await new Promise((resolve) => setTimeout(resolve, 20));

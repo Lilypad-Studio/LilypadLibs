@@ -24,3 +24,9 @@ export type { LilypadLoggerConstructorOptions } from './logger/LilypadLogger';
 export { default as LilypadFileLogger } from './logger/components/FileLogger';
 export { default as LilypadConsoleLogger } from './logger/components/ConsoleLogger';
 export { default as LilypadDiscordLogger } from './logger/components/DiscordLogger';
+
+/**
+ * Flow Control Module
+ */
+export { LilypadFlowControl } from './flow/LilypadFlowControl';
+export type { FlowControlOptions, ExecuteFnOptions } from './flow/LilypadFlowControl';

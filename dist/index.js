@@ -1,22 +1,162 @@
-"use strict";Object.defineProperty(exports, "__esModule", {value: true}); function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; } function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } var _class; var _class2;// src/cache/LilypadCache.ts
+"use strict";Object.defineProperty(exports, "__esModule", {value: true}); function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; } function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } var _class; var _class2; var _class3;// src/flow/LilypadFlowControl.ts
+var LilypadFlowControl = (_class = class {
+  
+  
+  
+  
+  __init() {this.singleFlightMap = /* @__PURE__ */ new Map()}
+  __init2() {this.rateMap = /* @__PURE__ */ new Map()}
+  constructor(options) {;_class.prototype.__init.call(this);_class.prototype.__init2.call(this);
+    this.rate = options == null ? void 0 : options.rate;
+    this.timeout = options == null ? void 0 : options.timeout;
+    this.retries = options == null ? void 0 : options.retries;
+    this.logger = options == null ? void 0 : options.logger;
+  }
+  /**
+   * Executes an asynchronous function with a timeout constraint.
+   *
+   * @template T The type of value returned by the execution function.
+   * @param executionFn An asynchronous function to execute.
+   * @returns A promise that resolves with the result of `executionFn` if it completes before the timeout,
+   *          or rejects with an error if the timeout is exceeded.
+   * @throws {Error} Throws an error with message 'Operation timed out' if the execution exceeds the configured timeout duration.
+   *
+   * @remarks
+   * This method uses `Promise.race()` to implement the timeout mechanism. The timeout is cleared in the finally block
+   * to ensure no memory leaks occur regardless of whether the operation succeeds or times out.
+   */
+  async executeWithTimeout(executionFn) {
+    if (this.timeout === void 0) {
+      return executionFn();
+    }
+    let timeoutId;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => reject(new Error("Operation timed out")), this.timeout);
+    });
+    try {
+      return await Promise.race([executionFn(), timeoutPromise]);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+  /**
+   * Executes a given asynchronous function with retry logic and optional exponential backoff.
+   *
+   * @template T The return type of the execution function.
+   * @param executionFn - The asynchronous function to execute.
+   * @param errorFn - Optional function to handle errors after all retries have been exhausted. If provided, its return value will be returned instead of throwing the error.
+   * @param backOffTime - Optional function to calculate the backoff time (in milliseconds) before each retry attempt. Receives the current attempt number as an argument. Defaults to exponential backoff if not provided.
+   * @returns A promise that resolves with the result of `executionFn`, or with the result of `errorFn` if retries are exhausted.
+   * @throws The error thrown by `executionFn` if all retries are exhausted and no `errorFn` is provided.
+   */
+  async executeWithRetries(executionFn, errorFn, backOffTime) {
+    let attempts = 0;
+    while (true) {
+      try {
+        const result = await executionFn();
+        return result;
+      } catch (error) {
+        if (attempts >= (_nullishCoalesce(this.retries, () => ( 0)))) {
+          if (errorFn) {
+            return errorFn(error);
+          }
+          throw error;
+        }
+        attempts++;
+        const backoffTimeValue = backOffTime ? backOffTime(attempts) : Math.pow(2, attempts) * 100;
+        await new Promise((resolve) => setTimeout(resolve, backoffTimeValue));
+      }
+    }
+  }
+  /**
+   * Enforces a rate limit for a specific consumer and function combination.
+   *
+   * If a rate limit is set, this method checks whether the specified consumer
+   * has invoked the given function within the allowed time interval. If the
+   * rate limit is exceeded, an error is thrown. Otherwise, the invocation time
+   * is recorded.
+   *
+   * @param consumerIdentifier - A unique identifier for the consumer (e.g., user or service).
+   * @param functionIdentifier - A unique identifier for the function being rate-limited.
+   * @throws {Error} If the rate limit is exceeded for the given consumer and function.
+   * @returns A promise that resolves when the rate limit check passes.
+   */
+  async rateLimit(consumerIdentifier, functionIdentifier) {
+    if (this.rate !== void 0) {
+      const rateKey = consumerIdentifier + "#" + functionIdentifier;
+      const now = Date.now();
+      const lastExecution = _nullishCoalesce(this.rateMap.get(rateKey), () => ( 0));
+      if (now - lastExecution < this.rate) {
+        throw new Error(`Rate limit exceeded for ${rateKey}`);
+      }
+      this.rateMap.set(rateKey, now);
+    }
+    return;
+  }
+  /**
+   * Executes a provided function with optional rate limiting, single-flight deduplication,
+   * retries, and timeout handling. Ensures that only one execution per function identifier
+   * is in-flight at a time, and subsequent calls return the same promise until completion.
+   *
+   * @template T - The return type of the function to execute.
+   * @param options - The execution options, including:
+   *   - consumerIdentifier: Unique identifier for the consumer (used for rate limiting).
+   *   - functionIdentifier: Unique identifier for the function (used for single-flight).
+   *   - fn: The function to execute.
+   *   - errorFn: Optional error handler for retries.
+   *   - backOffTime: Optional backoff time between retries.
+   * @returns A promise that resolves with the result of the executed function.
+   */
+  async executeFn(options) {
+    await this.rateLimit(options.consumerIdentifier, options.functionIdentifier);
+    if (this.singleFlightMap.has(options.functionIdentifier)) {
+      return this.singleFlightMap.get(options.functionIdentifier);
+    }
+    const pipeline = async () => {
+      const executionFn = () => this.timeout !== void 0 ? this.executeWithTimeout(options.fn) : options.fn();
+      if (this.retries && this.retries > 0) {
+        return this.executeWithRetries(executionFn, options.errorFn, options.backOffTime);
+      }
+      try {
+        return await executionFn();
+      } catch (error) {
+        if (options.errorFn) {
+          return options.errorFn(error);
+        }
+        throw error;
+      }
+    };
+    const executionPromise = pipeline().finally(() => {
+      this.singleFlightMap.delete(options.functionIdentifier);
+    });
+    this.singleFlightMap.set(options.functionIdentifier, executionPromise);
+    return executionPromise;
+  }
+}, _class);
+
+// src/cache/LilypadCache.ts
 function isStale(retrieval) {
   return Date.now() >= retrieval.expirationTime;
 }
-var LilypadCache = (_class = class {
+var LilypadCache = (_class2 = class {
   
   
   // time to live in milliseconds
   
   // default error TTL in milliseconds
   
-  __init() {this.pendingPromises = /* @__PURE__ */ new Map()}
-  __init2() {this.protectedKeys = /* @__PURE__ */ new Set()}
+  __init3() {this.protectedKeys = /* @__PURE__ */ new Set()}
   
-  constructor(ttl = 6e4, options = {}) {;_class.prototype.__init.call(this);_class.prototype.__init2.call(this);
+  
+  constructor(ttl = 6e4, options = {}) {;_class2.prototype.__init3.call(this);
     this.store = /* @__PURE__ */ new Map();
     this.defaultTtl = ttl;
     this.defaultErrorTtl = options.defaultErrorTtl ? options.defaultErrorTtl : 5 * 60 * 1e3;
     this.logger = options.logger;
+    this.flowControl = new LilypadFlowControl({
+      logger: this.logger,
+      timeout: options.flowControlTimeout || 5e3
+    });
     if (options.autoCleanupInterval) {
       if (!Number.isFinite(options.autoCleanupInterval) || options.autoCleanupInterval <= 0) {
         throw new Error("autoCleanupInterval must be a positive finite number");
@@ -139,21 +279,16 @@ var LilypadCache = (_class = class {
     if (!options.skipCache && fetched.type === "hit") {
       return fetched.value;
     }
-    const pending = this.pendingPromises.get(key);
-    if (pending) {
-      return pending.catch((error) => this.errorReturn(error, options, key, fetched));
-    }
-    const promise = valueFn();
-    this.pendingPromises.set(key, promise);
-    try {
-      const value = await promise;
-      this.set(key, value, options.ttl);
-      return value;
-    } catch (error) {
-      return this.errorReturn(error, options, key, fetched);
-    } finally {
-      this.pendingPromises.delete(key);
-    }
+    return this.flowControl.executeFn({
+      functionIdentifier: `LilypadCache-getOrSet-${String(key)}`,
+      consumerIdentifier: "",
+      errorFn: (error) => this.errorReturn(error, options, key, fetched),
+      fn: async () => {
+        const value = await valueFn();
+        this.set(key, value, options.ttl);
+        return value;
+      }
+    });
   }
   /**
    * Adds the specified keys to the set of protected keys.
@@ -261,18 +396,18 @@ var LilypadCache = (_class = class {
     this.stopCleanupInterval();
     this.clear({ force: true });
   }
-}, _class);
+}, _class2);
 var LilypadCache_default = LilypadCache;
 
 // src/logger/LilypadLogger.ts
-var LilypadLogger = (_class2 = class {
-  __init3() {this.components = {}}
+var LilypadLogger = (_class3 = class {
+  __init4() {this.components = {}}
   // Optional logger name
   
   get __name() {
     return this._name;
   }
-  constructor(options) {;_class2.prototype.__init3.call(this);
+  constructor(options) {;_class3.prototype.__init4.call(this);
     const reservedKeys = /* @__PURE__ */ new Set(["components", "register", "__name"]);
     for (const key of Object.keys(options.components)) {
       if (reservedKeys.has(key)) {
@@ -315,6 +450,11 @@ var LilypadLogger = (_class2 = class {
       };
       this[type] = logFn;
     }
+    if (process.env.NODE_ENV !== "production") {
+      console.log(
+        `LilypadLogger initialized with types: ${Object.keys(this.components).join(", ")} and name: ${_nullishCoalesce(this._name, () => ( "unnamed"))}`
+      );
+    }
   }
   /**
    * Registers new logger components for specified types.
@@ -327,7 +467,7 @@ var LilypadLogger = (_class2 = class {
     }
     return this;
   }
-}, _class2);
+}, _class3);
 function createLogger(options) {
   return new LilypadLogger(options);
 }
@@ -410,5 +550,6 @@ var LilypadDiscordLogger = class extends LilypadLoggerComponent {
 
 
 
-exports.LilypadCache = LilypadCache_default; exports.LilypadConsoleLogger = LilypadConsoleLogger; exports.LilypadDiscordLogger = LilypadDiscordLogger; exports.LilypadFileLogger = LilypadFileLogger; exports.createLogger = createLogger;
+
+exports.LilypadCache = LilypadCache_default; exports.LilypadConsoleLogger = LilypadConsoleLogger; exports.LilypadDiscordLogger = LilypadDiscordLogger; exports.LilypadFileLogger = LilypadFileLogger; exports.LilypadFlowControl = LilypadFlowControl; exports.createLogger = createLogger;
 //# sourceMappingURL=index.js.map

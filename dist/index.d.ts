@@ -207,13 +207,14 @@ declare class LilypadCache<K, V> {
     private defaultTtl;
     private defaultErrorTtl;
     private cleanupIntervalId?;
-    private pendingPromises;
     private protectedKeys;
     private logger?;
+    private flowControl;
     constructor(ttl?: number, options?: {
         autoCleanupInterval?: number;
         defaultErrorTtl?: number;
-        logger?: LilypadLoggerType<'error' | 'warn'>;
+        logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
+        flowControlTimeout?: number;
     });
     /**
      * Calculates the expiration timestamp based on the provided TTL (time-to-live) value.
@@ -413,4 +414,115 @@ declare class LilypadDiscordLogger<T extends string> extends LilypadLoggerCompon
     protected send(message: string): Promise<void>;
 }
 
-export { LilypadCache, type LilypadCacheGetOptions, LilypadConsoleLogger, LilypadDiscordLogger, LilypadFileLogger, type LilypadLoggerConstructorOptions, createLogger };
+interface FlowControlOptions {
+    rate?: number;
+    timeout?: number;
+    retries?: number;
+    logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
+}
+interface ExecuteFnOptions<T> {
+    errorFn?: (error: unknown) => T;
+    functionIdentifier: string;
+    consumerIdentifier: string;
+    fn: () => Promise<T>;
+    backOffTime?: (attempt: number) => number;
+}
+/**
+ * A flow control utility class that manages execution of asynchronous operations with support for
+ * rate limiting, retries, timeouts, and single-flight request deduplication.
+ *
+ * @template T - The type of value resolved by the executed operations.
+ *
+ * @example
+ * ```typescript
+ * const flowControl = new LilypadFlowControl<string>({
+ *   rate: 1000,
+ *   timeout: 5000,
+ *   retries: 3,
+ *   logger: myLogger
+ * });
+ *
+ * const result = await flowControl.executeFn({
+ *   functionIdentifier: 'myFunction',
+ *   consumerIdentifier: 'user123',
+ *   fn: () => fetchData(),
+ *   backOffTime: (attempt) => Math.pow(2, attempt) * 100
+ * });
+ * ```
+ *
+ * @remarks
+ * - **Rate Limiting**: Enforces a minimum interval between executions per consumer/function pair
+ * - **Single-Flight**: Deduplicates concurrent requests for the same function identifier
+ * - **Retries**: Automatically retries failed operations with configurable backoff strategies
+ * - **Timeout**: Fails operations that exceed the specified timeout duration
+ *
+ * @property rate - Minimum milliseconds between executions for rate limiting
+ * @property timeout - Maximum milliseconds to wait for operation completion
+ * @property retries - Maximum number of retry attempts for failed operations
+ * @property logger - Optional logger instance for error, warning, info, and debug messages
+ */
+declare class LilypadFlowControl<T> {
+    private rate?;
+    private timeout?;
+    private retries?;
+    private logger?;
+    private singleFlightMap;
+    private rateMap;
+    constructor(options?: FlowControlOptions);
+    /**
+     * Executes an asynchronous function with a timeout constraint.
+     *
+     * @template T The type of value returned by the execution function.
+     * @param executionFn An asynchronous function to execute.
+     * @returns A promise that resolves with the result of `executionFn` if it completes before the timeout,
+     *          or rejects with an error if the timeout is exceeded.
+     * @throws {Error} Throws an error with message 'Operation timed out' if the execution exceeds the configured timeout duration.
+     *
+     * @remarks
+     * This method uses `Promise.race()` to implement the timeout mechanism. The timeout is cleared in the finally block
+     * to ensure no memory leaks occur regardless of whether the operation succeeds or times out.
+     */
+    executeWithTimeout(executionFn: () => Promise<T>): Promise<T>;
+    /**
+     * Executes a given asynchronous function with retry logic and optional exponential backoff.
+     *
+     * @template T The return type of the execution function.
+     * @param executionFn - The asynchronous function to execute.
+     * @param errorFn - Optional function to handle errors after all retries have been exhausted. If provided, its return value will be returned instead of throwing the error.
+     * @param backOffTime - Optional function to calculate the backoff time (in milliseconds) before each retry attempt. Receives the current attempt number as an argument. Defaults to exponential backoff if not provided.
+     * @returns A promise that resolves with the result of `executionFn`, or with the result of `errorFn` if retries are exhausted.
+     * @throws The error thrown by `executionFn` if all retries are exhausted and no `errorFn` is provided.
+     */
+    executeWithRetries(executionFn: () => Promise<T>, errorFn?: (error: unknown) => T, backOffTime?: (attempt: number) => number): Promise<T>;
+    /**
+     * Enforces a rate limit for a specific consumer and function combination.
+     *
+     * If a rate limit is set, this method checks whether the specified consumer
+     * has invoked the given function within the allowed time interval. If the
+     * rate limit is exceeded, an error is thrown. Otherwise, the invocation time
+     * is recorded.
+     *
+     * @param consumerIdentifier - A unique identifier for the consumer (e.g., user or service).
+     * @param functionIdentifier - A unique identifier for the function being rate-limited.
+     * @throws {Error} If the rate limit is exceeded for the given consumer and function.
+     * @returns A promise that resolves when the rate limit check passes.
+     */
+    rateLimit(consumerIdentifier: string, functionIdentifier: string): Promise<void>;
+    /**
+     * Executes a provided function with optional rate limiting, single-flight deduplication,
+     * retries, and timeout handling. Ensures that only one execution per function identifier
+     * is in-flight at a time, and subsequent calls return the same promise until completion.
+     *
+     * @template T - The return type of the function to execute.
+     * @param options - The execution options, including:
+     *   - consumerIdentifier: Unique identifier for the consumer (used for rate limiting).
+     *   - functionIdentifier: Unique identifier for the function (used for single-flight).
+     *   - fn: The function to execute.
+     *   - errorFn: Optional error handler for retries.
+     *   - backOffTime: Optional backoff time between retries.
+     * @returns A promise that resolves with the result of the executed function.
+     */
+    executeFn(options: ExecuteFnOptions<T>): Promise<T>;
+}
+
+export { type ExecuteFnOptions, type FlowControlOptions, LilypadCache, type LilypadCacheGetOptions, LilypadConsoleLogger, LilypadDiscordLogger, LilypadFileLogger, LilypadFlowControl, type LilypadLoggerConstructorOptions, createLogger };

@@ -1,3 +1,4 @@
+import { LilypadFlowControl } from '@/flow/LilypadFlowControl';
 import type { LilypadLoggerType } from '@/logger/LilypadLogger';
 
 export type LilypadCacheGetOptions<K, V> = {
@@ -127,24 +128,30 @@ class LilypadCache<K, V> {
   private defaultErrorTtl: number; // default error TTL in milliseconds
   private cleanupIntervalId?: ReturnType<typeof setInterval> & { unref?: () => void };
 
-  private pendingPromises: Map<K, Promise<V>> = new Map();
-
   private protectedKeys: Set<K> = new Set();
 
-  private logger?: LilypadLoggerType<'error' | 'warn'>;
+  private logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
+
+  private flowControl: LilypadFlowControl<V>;
 
   constructor(
     ttl: number = 60000,
     options: {
       autoCleanupInterval?: number;
       defaultErrorTtl?: number;
-      logger?: LilypadLoggerType<'error' | 'warn'>;
+      logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
+      flowControlTimeout?: number;
     } = {}
   ) {
     this.store = new Map();
     this.defaultTtl = ttl;
     this.defaultErrorTtl = options.defaultErrorTtl ? options.defaultErrorTtl : 5 * 60 * 1000; // 5 minutes;
     this.logger = options.logger;
+
+    this.flowControl = new LilypadFlowControl<V>({
+      logger: this.logger,
+      timeout: options.flowControlTimeout || 5000,
+    });
 
     if (options.autoCleanupInterval) {
       if (!Number.isFinite(options.autoCleanupInterval) || options.autoCleanupInterval <= 0) {
@@ -290,23 +297,16 @@ class LilypadCache<K, V> {
       return fetched.value;
     }
 
-    const pending = this.pendingPromises.get(key);
-    if (pending) {
-      return pending.catch((error) => this.errorReturn(error, options, key, fetched));
-    }
-
-    const promise = valueFn();
-    this.pendingPromises.set(key, promise);
-
-    try {
-      const value = await promise;
-      this.set(key, value, options.ttl);
-      return value;
-    } catch (error) {
-      return this.errorReturn(error, options, key, fetched);
-    } finally {
-      this.pendingPromises.delete(key);
-    }
+    return this.flowControl.executeFn({
+      functionIdentifier: `LilypadCache-getOrSet-${String(key)}`,
+      consumerIdentifier: '',
+      errorFn: (error) => this.errorReturn(error, options, key, fetched),
+      fn: async () => {
+        const value = await valueFn();
+        this.set(key, value, options.ttl);
+        return value;
+      },
+    });
   }
 
   /**
