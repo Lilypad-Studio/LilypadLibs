@@ -17,10 +17,9 @@ export interface LilypadSerializerConstructorOptions<
   TO extends object,
   KeyMap extends Record<keyof FROM, keyof TO>,
 > {
-  keyMapping: IsBijective<FROM, TO, KeyMap> extends true ? KeyMap : never;
-
   serialization: {
     [K in keyof FROM]: {
+      target: IsBijective<FROM, TO, KeyMap> extends true ? KeyMap[K] : never;
       serialize: (item: FROM) => TO[KeyMap[K]];
       deserialize: (item: TO) => FROM[K];
       default: FROM[K];
@@ -67,7 +66,7 @@ export class LilypadSerializer<
   serialize(input: FROM[]): TO[] {
     return input.map((item) => {
       const packedItem = {} as TO;
-      (Object.keys(this.options.keyMapping) as (keyof FROM)[]).forEach((fromKey) => {
+      (Object.keys(this.options.serialization) as (keyof FROM)[]).forEach((fromKey) => {
         if (!this.options.serialization[fromKey]) {
           return; // Skip if no serialization function is provided
         }
@@ -82,8 +81,8 @@ export class LilypadSerializer<
           return; // Skip undefined serialization results
         }
 
-        const toKey = this.options.keyMapping[fromKey] as keyof TO;
-        packedItem[toKey] = value;
+        const toKey = this.options.serialization[fromKey].target;
+        packedItem[toKey] = value as TO[typeof toKey];
       });
       return packedItem;
     });
@@ -92,8 +91,8 @@ export class LilypadSerializer<
   deserialize(input: TO[]): FROM[] {
     return input.map((item) => {
       const unpackedItem = {} as FROM;
-      (Object.keys(this.options.keyMapping) as (keyof FROM)[]).forEach((fromKey) => {
-        unpackedItem[fromKey as keyof FROM] =
+      (Object.keys(this.options.serialization) as (keyof FROM)[]).forEach((fromKey) => {
+        unpackedItem[fromKey] =
           this.options.serialization[fromKey].deserialize(item) ??
           this.options.serialization[fromKey].default;
       });

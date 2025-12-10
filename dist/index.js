@@ -629,7 +629,7 @@ var LilypadSerializer = class {
   serialize(input) {
     return input.map((item) => {
       const packedItem = {};
-      Object.keys(this.options.keyMapping).forEach((fromKey) => {
+      Object.keys(this.options.serialization).forEach((fromKey) => {
         if (!this.options.serialization[fromKey]) {
           return;
         }
@@ -641,7 +641,7 @@ var LilypadSerializer = class {
         if (value === void 0) {
           return;
         }
-        const toKey = this.options.keyMapping[fromKey];
+        const toKey = this.options.serialization[fromKey].target;
         packedItem[toKey] = value;
       });
       return packedItem;
@@ -650,7 +650,7 @@ var LilypadSerializer = class {
   deserialize(input) {
     return input.map((item) => {
       const unpackedItem = {};
-      Object.keys(this.options.keyMapping).forEach((fromKey) => {
+      Object.keys(this.options.serialization).forEach((fromKey) => {
         unpackedItem[fromKey] = _nullishCoalesce(this.options.serialization[fromKey].deserialize(item), () => ( this.options.serialization[fromKey].default));
       });
       return unpackedItem;

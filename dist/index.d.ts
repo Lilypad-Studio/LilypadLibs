@@ -573,9 +573,9 @@ type InvertRecord<R extends Record<PropertyKey, PropertyKey>> = {
 };
 type IsBijective<A extends object, B extends object, M extends Record<keyof A, keyof B>> = keyof A extends keyof M ? keyof B extends M[keyof A] ? InvertRecord<M> extends Record<keyof B, keyof A> ? true : false : false : false;
 interface LilypadSerializerConstructorOptions<FROM extends object, TO extends object, KeyMap extends Record<keyof FROM, keyof TO>> {
-    keyMapping: IsBijective<FROM, TO, KeyMap> extends true ? KeyMap : never;
     serialization: {
         [K in keyof FROM]: {
+            target: IsBijective<FROM, TO, KeyMap> extends true ? KeyMap[K] : never;
             serialize: (item: FROM) => TO[KeyMap[K]];
             deserialize: (item: TO) => FROM[K];
             default: FROM[K];
