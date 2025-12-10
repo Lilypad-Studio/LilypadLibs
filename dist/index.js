@@ -1,4 +1,4 @@
-"use strict";Object.defineProperty(exports, "__esModule", {value: true}); function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; } function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } async function _asyncNullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return await rhsFn(); } } var _class; var _class2; var _class3;// src/flow/LilypadFlowControl.ts
+"use strict";Object.defineProperty(exports, "__esModule", {value: true}); function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } async function _asyncNullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return await rhsFn(); } } var _class; var _class2; var _class3;// src/flow/LilypadFlowControl.ts
 var LilypadFlowControl = (_class = class {
   
   
@@ -571,9 +571,6 @@ function createLogger(options) {
   return new LilypadLogger(options);
 }
 
-// src/logger/components/FileLogger.ts
-var _fs = require('fs'); var _fs2 = _interopRequireDefault(_fs);
-
 // src/logger/LilypadLoggerComponent.ts
 var LilypadLoggerComponent = class {
   getTimestamp() {
@@ -593,26 +590,6 @@ var LilypadLoggerComponent = class {
   async output(type, message, options) {
     const formattedMessage = this.formatMessage(type, message, options);
     await this.send(formattedMessage);
-  }
-};
-
-// src/logger/components/FileLogger.ts
-var LilypadFileLogger = class extends LilypadLoggerComponent {
-  
-  constructor(filePath) {
-    super();
-    this.filePath = filePath;
-  }
-  send(message) {
-    return new Promise((resolve, reject) => {
-      _fs2.default.appendFile(this.filePath, message + "\n", "utf8", (err) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve();
-        }
-      });
-    });
   }
 };
 
@@ -654,6 +631,9 @@ var LilypadSerializer = class {
       const packedItem = {};
       Object.keys(this.options.keyMapping).forEach((fromKey) => {
         var _a;
+        if (!this.options.serializationMap[fromKey]) {
+          return;
+        }
         const isEqual = _nullishCoalesce(((_a = this.options.equalityMap) == null ? void 0 : _a[fromKey]), () => ( ((v, d) => v === d)));
         if (isEqual(item[fromKey], this.options.fromDefaultValues[fromKey])) {
           return;
@@ -692,6 +672,5 @@ var LilypadSerializer = class {
 
 
 
-
-exports.LilypadCache = LilypadCache_default; exports.LilypadConsoleLogger = LilypadConsoleLogger; exports.LilypadDiscordLogger = LilypadDiscordLogger; exports.LilypadFileLogger = LilypadFileLogger; exports.LilypadFlowControl = LilypadFlowControl; exports.LilypadSerializer = LilypadSerializer; exports.createLogger = createLogger;
+exports.LilypadCache = LilypadCache_default; exports.LilypadConsoleLogger = LilypadConsoleLogger; exports.LilypadDiscordLogger = LilypadDiscordLogger; exports.LilypadFlowControl = LilypadFlowControl; exports.LilypadSerializer = LilypadSerializer; exports.createLogger = createLogger;
 //# sourceMappingURL=index.js.map

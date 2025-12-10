@@ -21,7 +21,6 @@ export type { LilypadLoggerConstructorOptions } from './logger/LilypadLogger';
 /**
  * Logger Default Components
  */
-export { default as LilypadFileLogger } from './logger/components/FileLogger';
 export { default as LilypadConsoleLogger } from './logger/components/ConsoleLogger';
 export { default as LilypadDiscordLogger } from './logger/components/DiscordLogger';
 

@@ -418,22 +418,6 @@ declare class LilypadCache<K extends string, V> {
 }
 
 /**
- * A file-based logger component that extends LilypadLoggerComponent.
- *
- * This logger writes log messages to a specified file on disk. Each message is appended
- * on a new line in UTF-8 encoding.
- *
- * The directory for the log file must exist prior to logging; this class does not create directories.
- *
- * @template T - A string type that represents the log level or category.
- */
-declare class LilypadFileLogger<T extends string> extends LilypadLoggerComponent<T> {
-    private filePath;
-    constructor(filePath: string);
-    protected send(message: string): Promise<void>;
-}
-
-/**
  * A logger component that outputs messages to the console.
  *
  * @template T - A string literal type representing the logger's category or name.
@@ -643,4 +627,4 @@ declare class LilypadSerializer<FROM extends {}, TO extends {}, KeyMap extends R
     deserialize(input: TO[]): FROM[];
 }
 
-export { type ExecuteFnOptions, type FlowControlOptions, LilypadCache, type LilypadCacheGetOptions, LilypadConsoleLogger, LilypadDiscordLogger, LilypadFileLogger, LilypadFlowControl, type LilypadLoggerConstructorOptions, LilypadSerializer, type LilypadSerializerConstructorOptions, createLogger };
+export { type ExecuteFnOptions, type FlowControlOptions, LilypadCache, type LilypadCacheGetOptions, LilypadConsoleLogger, LilypadDiscordLogger, LilypadFlowControl, type LilypadLoggerConstructorOptions, LilypadSerializer, type LilypadSerializerConstructorOptions, createLogger };

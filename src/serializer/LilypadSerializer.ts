@@ -82,6 +82,10 @@ export class LilypadSerializer<
     return input.map((item) => {
       const packedItem = {} as TO;
       (Object.keys(this.options.keyMapping) as (keyof FROM)[]).forEach((fromKey) => {
+        if (!this.options.serializationMap[fromKey]) {
+          return; // Skip if no serialization function is provided
+        }
+
         const isEqual = this.options.equalityMap?.[fromKey] ?? ((v, d) => v === d); // Fallback to strict equality
         if (isEqual(item[fromKey], this.options.fromDefaultValues[fromKey])) {
           return; // Skip default values
