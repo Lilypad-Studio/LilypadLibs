@@ -25,22 +25,22 @@ describe('LilypadCache', () => {
     });
 
     it('should return undefined for expired value', async () => {
-      cache.set('key1', 42, 100);
+      cache.set('key1', 42, 50);
       expect(cache.get('key1')).toBe(42);
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      await new Promise((resolve) => setTimeout(resolve, 80));
       expect(cache.get('key1')).toBeUndefined();
     });
 
     it('should remove expired value from cache', async () => {
-      cache.set('key1', 42, 100);
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      cache.set('key1', 42, 50);
+      await new Promise((resolve) => setTimeout(resolve, 80));
       cache.get('key1');
       expect(cache.getComprehensive('key1')).toEqual({ type: 'miss' });
     });
 
     it('should not remove expired value when removeOld is false', async () => {
-      cache.set('key1', 42, 100);
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      cache.set('key1', 42, 50);
+      await new Promise((resolve) => setTimeout(resolve, 80));
       expect(cache.get('key1', false)).toBeUndefined();
       expect(cache.getComprehensive('key1').type).toBe('expired');
     });
@@ -55,8 +55,8 @@ describe('LilypadCache', () => {
     });
 
     it('should return type expired for stale value', async () => {
-      cache.set('key1', 42, 100);
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      cache.set('key1', 42, 50);
+      await new Promise((resolve) => setTimeout(resolve, 80));
       const result = cache.getComprehensive('key1');
       expect(result.type).toBe('expired');
       expect((result as any).value).toBe(42);
@@ -161,9 +161,9 @@ describe('LilypadCache', () => {
         async () => {
           throw new Error('fetch failed');
         },
-        { returnOldOnError: true, errorTtl: 100 }
+        { returnOldOnError: true, errorTtl: 30 }
       );
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      await new Promise((resolve) => setTimeout(resolve, 60));
       expect(cache.get('key1', false)).toBeUndefined();
     });
 

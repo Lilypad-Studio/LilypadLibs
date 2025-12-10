@@ -554,11 +554,6 @@ var LilypadLogger = (_class3 = class {
       };
       this[type] = logFn;
     }
-    if (process.env.NODE_ENV !== "production") {
-      console.log(
-        `LilypadLogger initialized with types: ${Object.keys(this.components).join(", ")} and name: ${_nullishCoalesce(this._name, () => ( "unnamed"))}`
-      );
-    }
   }
   /**
    * Registers new logger components for specified types.

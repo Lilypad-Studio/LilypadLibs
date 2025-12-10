@@ -114,12 +114,6 @@ class LilypadLogger<T extends string> {
       // Assign the function directly to the class instance (this)
       (this as ChannelMethods<T>)[type] = logFn;
     }
-
-    if (process.env.NODE_ENV !== 'production') {
-      console.log(
-        `LilypadLogger initialized with types: ${Object.keys(this.components).join(', ')} and name: ${this._name ?? 'unnamed'}`
-      );
-    }
   }
 
   /**
