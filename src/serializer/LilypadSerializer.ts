@@ -22,7 +22,7 @@ type IsBijective<A extends object, B extends object, M extends Record<keyof A, k
       : false
     : false;
 
-interface LilypadSerializerConstructorOptions<
+export interface LilypadSerializerConstructorOptions<
   FROM extends object,
   TO extends object,
   KeyMap extends Record<keyof FROM, keyof TO>,

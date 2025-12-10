@@ -644,11 +644,54 @@ var LilypadDiscordLogger = class extends LilypadLoggerComponent {
   }
 };
 
+// src/serializer/LilypadSerializer.ts
+var LilypadSerializer = class {
+  constructor(options) {
+    this.options = options;
+  }
+  serialize(input) {
+    return input.map((item) => {
+      const packedItem = {};
+      Object.keys(this.options.keyMapping).forEach((fromKey) => {
+        var _a;
+        const isEqual = _nullishCoalesce(((_a = this.options.equalityMap) == null ? void 0 : _a[fromKey]), () => ( ((v, d) => v === d)));
+        if (isEqual(item[fromKey], this.options.fromDefaultValues[fromKey])) {
+          return;
+        }
+        const value = this.options.serializationMap[fromKey](item);
+        if (value === void 0) {
+          return;
+        }
+        const toKey = this.options.keyMapping[fromKey];
+        packedItem[toKey] = value;
+      });
+      return packedItem;
+    });
+  }
+  deserialize(input) {
+    return input.map((item) => {
+      const unpackedItem = {};
+      Object.keys(this.options.keyMapping).forEach((fromKey) => {
+        const toKey = this.options.keyMapping[fromKey];
+        if (toKey in item) {
+          unpackedItem[fromKey] = this.options.deserializationMap[toKey](
+            item
+          );
+        } else {
+          unpackedItem[fromKey] = this.options.fromDefaultValues[fromKey];
+        }
+      });
+      return unpackedItem;
+    });
+  }
+};
 
 
 
 
 
 
-exports.LilypadCache = LilypadCache_default; exports.LilypadConsoleLogger = LilypadConsoleLogger; exports.LilypadDiscordLogger = LilypadDiscordLogger; exports.LilypadFileLogger = LilypadFileLogger; exports.LilypadFlowControl = LilypadFlowControl; exports.createLogger = createLogger;
+
+
+exports.LilypadCache = LilypadCache_default; exports.LilypadConsoleLogger = LilypadConsoleLogger; exports.LilypadDiscordLogger = LilypadDiscordLogger; exports.LilypadFileLogger = LilypadFileLogger; exports.LilypadFlowControl = LilypadFlowControl; exports.LilypadSerializer = LilypadSerializer; exports.createLogger = createLogger;
 //# sourceMappingURL=index.js.map

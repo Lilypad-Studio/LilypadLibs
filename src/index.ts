@@ -30,3 +30,9 @@ export { default as LilypadDiscordLogger } from './logger/components/DiscordLogg
  */
 export { LilypadFlowControl } from './flow/LilypadFlowControl';
 export type { FlowControlOptions, ExecuteFnOptions } from './flow/LilypadFlowControl';
+
+/**
+ * Serializer Module
+ */
+export { LilypadSerializer } from './serializer/LilypadSerializer';
+export type { LilypadSerializerConstructorOptions } from './serializer/LilypadSerializer';
