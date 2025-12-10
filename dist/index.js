@@ -630,15 +630,14 @@ var LilypadSerializer = class {
     return input.map((item) => {
       const packedItem = {};
       Object.keys(this.options.keyMapping).forEach((fromKey) => {
-        var _a;
-        if (!this.options.serializationMap[fromKey]) {
+        if (!this.options.serialization[fromKey]) {
           return;
         }
-        const isEqual = _nullishCoalesce(((_a = this.options.equalityMap) == null ? void 0 : _a[fromKey]), () => ( ((v, d) => v === d)));
-        if (isEqual(item[fromKey], this.options.fromDefaultValues[fromKey])) {
+        const isEqual = _nullishCoalesce(this.options.serialization[fromKey].equality, () => ( ((v, d) => v === d)));
+        if (isEqual(item[fromKey], this.options.serialization[fromKey].default)) {
           return;
         }
-        const value = this.options.serializationMap[fromKey](item);
+        const value = this.options.serialization[fromKey].serialize(item);
         if (value === void 0) {
           return;
         }
@@ -652,14 +651,7 @@ var LilypadSerializer = class {
     return input.map((item) => {
       const unpackedItem = {};
       Object.keys(this.options.keyMapping).forEach((fromKey) => {
-        const toKey = this.options.keyMapping[fromKey];
-        if (toKey in item) {
-          unpackedItem[fromKey] = this.options.deserializationMap[toKey](
-            item
-          );
-        } else {
-          unpackedItem[fromKey] = this.options.fromDefaultValues[fromKey];
-        }
+        unpackedItem[fromKey] = _nullishCoalesce(this.options.serialization[fromKey].deserialize(item), () => ( this.options.serialization[fromKey].default));
       });
       return unpackedItem;
     });

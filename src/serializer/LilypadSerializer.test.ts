@@ -14,19 +14,39 @@ describe('LilypadSerializer', () => {
     isActive: boolean;
   }
 
+  type StringWrapper = {
+    value: string;
+  };
+  type NumberWrapper = {
+    value: number;
+  };
+  interface InvertedTarget {
+    isActive: boolean;
+    userName: StringWrapper;
+    userId: NumberWrapper;
+  }
+
+  //const test = { id: 'userId', name: 'userName', active: 'isActive' };
+
   const createSerializer = () =>
     new LilypadSerializer<Source, Target, { id: 'userId'; name: 'userName'; active: 'isActive' }>({
       keyMapping: { id: 'userId', name: 'userName', active: 'isActive' },
-      fromDefaultValues: { id: 0, name: '', active: false },
-      serializationMap: {
-        id: (item) => item.id,
-        name: (item) => item.name,
-        active: (item) => item.active,
-      },
-      deserializationMap: {
-        userId: (item) => item.userId,
-        userName: (item) => item.userName,
-        isActive: (item) => item.isActive,
+      serialization: {
+        id: {
+          serialize: (item) => item.id,
+          deserialize: (item) => item.userId,
+          default: 0,
+        },
+        name: {
+          serialize: (item) => item.name,
+          deserialize: (item) => item.userName,
+          default: '',
+        },
+        active: {
+          serialize: (item) => item.active,
+          deserialize: (item) => item.isActive,
+          default: false,
+        },
       },
     });
 
@@ -54,16 +74,22 @@ describe('LilypadSerializer', () => {
         { id: 'userId'; name: 'userName'; active: 'isActive' }
       >({
         keyMapping: { id: 'userId', name: 'userName', active: 'isActive' },
-        fromDefaultValues: { id: 0, name: '', active: false },
-        serializationMap: {
-          id: () => undefined as unknown as number,
-          name: (item) => item.name,
-          active: (item) => item.active,
-        },
-        deserializationMap: {
-          userId: (item) => item.userId,
-          userName: (item) => item.userName,
-          isActive: (item) => item.isActive,
+        serialization: {
+          id: {
+            serialize: () => undefined as unknown as number,
+            deserialize: (item) => item.userId,
+            default: 0,
+          },
+          name: {
+            serialize: (item) => item.name,
+            deserialize: (item) => item.userName,
+            default: '',
+          },
+          active: {
+            serialize: (item) => item.active,
+            deserialize: (item) => item.isActive,
+            default: false,
+          },
         },
       });
       const input: Source[] = [{ id: 1, name: 'John', active: true }];
@@ -79,17 +105,23 @@ describe('LilypadSerializer', () => {
         { id: 'userId'; name: 'userName'; active: 'isActive' }
       >({
         keyMapping: { id: 'userId', name: 'userName', active: 'isActive' },
-        fromDefaultValues: { id: 0, name: 'aa', active: false },
-        equalityMap: { name: (v, d) => v.length === d.length },
-        serializationMap: {
-          id: (item) => item.id,
-          name: (item) => item.name,
-          active: (item) => item.active,
-        },
-        deserializationMap: {
-          userId: (item) => item.userId,
-          userName: (item) => item.userName,
-          isActive: (item) => item.isActive,
+        serialization: {
+          id: {
+            serialize: (item) => item.id,
+            deserialize: (item) => item.userId,
+            default: 0,
+          },
+          name: {
+            serialize: (item) => item.name,
+            deserialize: (item) => item.userName,
+            equality: (v, d) => v.length === d.length,
+            default: 'aa',
+          },
+          active: {
+            serialize: (item) => item.active,
+            deserialize: (item) => item.isActive,
+            default: false,
+          },
         },
       });
       const input: Source[] = [{ id: 1, name: 'ab', active: true }];
@@ -124,6 +156,54 @@ describe('LilypadSerializer', () => {
       const serialized = serializer.serialize(original);
       const deserialized = serializer.deserialize(serialized);
 
+      expect(deserialized).toEqual(original);
+    });
+
+    it('should handle default values in round-trip', () => {
+      const serializer = createSerializer();
+      const original: Source[] = [{ id: 0, name: '', active: true }];
+      const serialized = serializer.serialize(original);
+
+      expect(serialized).toEqual([{ isActive: true }]);
+
+      const deserialized = serializer.deserialize(serialized);
+
+      expect(deserialized).toEqual(original);
+    });
+  });
+
+  describe('should handle type-inverted key mappings', () => {
+    it('should serialize and deserialize with inverted types', () => {
+      const serializer = new LilypadSerializer<
+        Source,
+        InvertedTarget,
+        { id: 'userId'; name: 'userName'; active: 'isActive' }
+      >({
+        keyMapping: { id: 'userId', name: 'userName', active: 'isActive' },
+        serialization: {
+          id: {
+            serialize: (item) => ({ value: item.id }),
+            deserialize: (item) => item.userId.value,
+            default: 0,
+          },
+          name: {
+            serialize: (item) => ({ value: item.name }),
+            deserialize: (item) => item.userName.value,
+            default: '',
+          },
+          active: {
+            serialize: (item) => item.active,
+            deserialize: (item) => item.isActive,
+            default: false,
+          },
+        },
+      });
+
+      const original: Source[] = [{ id: 7, name: 'Bob', active: false }];
+      const serialized = serializer.serialize(original);
+      expect(serialized).toEqual([{ userId: { value: 7 }, userName: { value: 'Bob' } }]);
+
+      const deserialized = serializer.deserialize(serialized);
       expect(deserialized).toEqual(original);
     });
   });

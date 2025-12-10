@@ -2,16 +2,6 @@ type InvertRecord<R extends Record<PropertyKey, PropertyKey>> = {
   [K in keyof R as R[K]]: K;
 };
 
-type InvertedKeyMap<
-  FROM extends object,
-  TO extends object,
-  KeyMap extends Record<keyof FROM, keyof TO>,
-> = {
-  [K in keyof TO]: {
-    [F in keyof FROM]: KeyMap[F] extends K ? F : never;
-  }[keyof FROM];
-};
-
 type IsBijective<A extends object, B extends object, M extends Record<keyof A, keyof B>> =
   // Same number of keys
   keyof A extends keyof M
@@ -29,17 +19,13 @@ export interface LilypadSerializerConstructorOptions<
 > {
   keyMapping: IsBijective<FROM, TO, KeyMap> extends true ? KeyMap : never;
 
-  fromDefaultValues: { [K in keyof FROM]: FROM[K] };
-  equalityMap?: {
-    [K in keyof FROM]?: (value: FROM[K], defaultValue: FROM[K]) => boolean;
-  };
-
-  serializationMap: {
-    [K in keyof FROM]: (item: FROM) => TO[KeyMap[K]];
-  };
-
-  deserializationMap: {
-    [K in keyof TO]: (item: TO) => FROM[InvertedKeyMap<FROM, TO, KeyMap>[K]];
+  serialization: {
+    [K in keyof FROM]: {
+      serialize: (item: FROM) => TO[KeyMap[K]];
+      deserialize: (item: TO) => FROM[K];
+      default: FROM[K];
+      equality?: (value: FROM[K], defaultValue: FROM[K]) => boolean;
+    };
   };
 }
 
@@ -82,16 +68,16 @@ export class LilypadSerializer<
     return input.map((item) => {
       const packedItem = {} as TO;
       (Object.keys(this.options.keyMapping) as (keyof FROM)[]).forEach((fromKey) => {
-        if (!this.options.serializationMap[fromKey]) {
+        if (!this.options.serialization[fromKey]) {
           return; // Skip if no serialization function is provided
         }
 
-        const isEqual = this.options.equalityMap?.[fromKey] ?? ((v, d) => v === d); // Fallback to strict equality
-        if (isEqual(item[fromKey], this.options.fromDefaultValues[fromKey])) {
+        const isEqual = this.options.serialization[fromKey].equality ?? ((v, d) => v === d); // Fallback to strict equality
+        if (isEqual(item[fromKey], this.options.serialization[fromKey].default)) {
           return; // Skip default values
         }
 
-        const value = this.options.serializationMap[fromKey](item);
+        const value = this.options.serialization[fromKey].serialize(item);
         if (value === undefined) {
           return; // Skip undefined serialization results
         }
@@ -107,15 +93,9 @@ export class LilypadSerializer<
     return input.map((item) => {
       const unpackedItem = {} as FROM;
       (Object.keys(this.options.keyMapping) as (keyof FROM)[]).forEach((fromKey) => {
-        const toKey = this.options.keyMapping[fromKey];
-        // Use the unpacking function if the key exists, otherwise use the default value
-        if (toKey in item) {
-          unpackedItem[fromKey as keyof FROM] = this.options.deserializationMap[toKey](
-            item
-          ) as FROM[keyof FROM];
-        } else {
-          unpackedItem[fromKey as keyof FROM] = this.options.fromDefaultValues[fromKey];
-        }
+        unpackedItem[fromKey as keyof FROM] =
+          this.options.serialization[fromKey].deserialize(item) ??
+          this.options.serialization[fromKey].default;
       });
       return unpackedItem;
     });

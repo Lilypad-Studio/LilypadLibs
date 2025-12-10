@@ -571,25 +571,16 @@ declare class LilypadFlowControl<T> {
 type InvertRecord<R extends Record<PropertyKey, PropertyKey>> = {
     [K in keyof R as R[K]]: K;
 };
-type InvertedKeyMap<FROM extends object, TO extends object, KeyMap extends Record<keyof FROM, keyof TO>> = {
-    [K in keyof TO]: {
-        [F in keyof FROM]: KeyMap[F] extends K ? F : never;
-    }[keyof FROM];
-};
 type IsBijective<A extends object, B extends object, M extends Record<keyof A, keyof B>> = keyof A extends keyof M ? keyof B extends M[keyof A] ? InvertRecord<M> extends Record<keyof B, keyof A> ? true : false : false : false;
 interface LilypadSerializerConstructorOptions<FROM extends object, TO extends object, KeyMap extends Record<keyof FROM, keyof TO>> {
     keyMapping: IsBijective<FROM, TO, KeyMap> extends true ? KeyMap : never;
-    fromDefaultValues: {
-        [K in keyof FROM]: FROM[K];
-    };
-    equalityMap?: {
-        [K in keyof FROM]?: (value: FROM[K], defaultValue: FROM[K]) => boolean;
-    };
-    serializationMap: {
-        [K in keyof FROM]: (item: FROM) => TO[KeyMap[K]];
-    };
-    deserializationMap: {
-        [K in keyof TO]: (item: TO) => FROM[InvertedKeyMap<FROM, TO, KeyMap>[K]];
+    serialization: {
+        [K in keyof FROM]: {
+            serialize: (item: FROM) => TO[KeyMap[K]];
+            deserialize: (item: TO) => FROM[K];
+            default: FROM[K];
+            equality?: (value: FROM[K], defaultValue: FROM[K]) => boolean;
+        };
     };
 }
 /**
