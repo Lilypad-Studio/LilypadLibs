@@ -43,22 +43,24 @@ var LilypadFlowControl = (_class = class {
    * Executes a given asynchronous function with retry logic and optional exponential backoff.
    *
    * @template T The return type of the execution function.
-   * @param executionFn - The asynchronous function to execute.
-   * @param errorFn - Optional function to handle errors after all retries have been exhausted. If provided, its return value will be returned instead of throwing the error.
-   * @param backOffTime - Optional function to calculate the backoff time (in milliseconds) before each retry attempt. Receives the current attempt number as an argument. Defaults to exponential backoff if not provided.
+   * @param options - The options for executing with retries, including:
+   * @param options.executionFn - The asynchronous function to execute.
+   * @param options.errorFn - Optional function to handle errors after all retries have been exhausted. If provided, its return value will be returned instead of throwing the error.
+   * @param options.retries - The maximum number of retry attempts. If not provided, the instance's configured retries will be used.
+   * @param options.backOffTime - Optional function to calculate the backoff time (in milliseconds) before each retry attempt. Receives the current attempt number as an argument. Defaults to exponential backoff if not provided.
    * @returns A promise that resolves with the result of `executionFn`, or with the result of `errorFn` if retries are exhausted.
    * @throws The error thrown by `executionFn` if all retries are exhausted and no `errorFn` is provided.
    */
-  async executeWithRetries(executionFn, errorFn, backOffTime) {
+  async executeWithRetries(options) {
     let attempts = 0;
     while (true) {
       try {
-        const result = await executionFn();
+        const result = await options.executionFn();
         return result;
       } catch (error) {
-        if (attempts >= (_nullishCoalesce(this.retries, () => ( 0)))) {
-          if (errorFn) {
-            const result = errorFn(error);
+        if (attempts >= (_nullishCoalesce(_nullishCoalesce(options.retries, () => ( this.retries)), () => ( 0)))) {
+          if (options.errorFn) {
+            const result = options.errorFn(error);
             if (result !== void 0) {
               return result;
             }
@@ -66,7 +68,7 @@ var LilypadFlowControl = (_class = class {
           throw error;
         }
         attempts++;
-        const backoffTimeValue = backOffTime ? backOffTime(attempts) : Math.pow(2, attempts) * 100;
+        const backoffTimeValue = options.backOffTime ? options.backOffTime(attempts) : Math.pow(2, attempts) * 100;
         await new Promise((resolve) => setTimeout(resolve, backoffTimeValue));
       }
     }
@@ -117,8 +119,14 @@ var LilypadFlowControl = (_class = class {
     }
     const pipeline = async () => {
       const executionFn = () => this.timeout !== void 0 ? this.executeWithTimeout(options.fn) : options.fn();
-      if (this.retries && this.retries > 0) {
-        return this.executeWithRetries(executionFn, options.errorFn, options.backOffTime);
+      const effectiveRetries = _nullishCoalesce(_nullishCoalesce(options.retries, () => ( this.retries)), () => ( 0));
+      if (effectiveRetries > 0) {
+        return this.executeWithRetries({
+          executionFn,
+          retries: effectiveRetries,
+          errorFn: options.errorFn,
+          backOffTime: options.backOffTime
+        });
       }
       try {
         return await executionFn();
@@ -335,12 +343,19 @@ var LilypadCache = (_class2 = class {
     });
   }
   async _bulkSync(syncFn) {
-    var _a;
+    var _a, _b;
     if (Date.now() < this.bulkSyncExpirationTime) {
       return;
     }
     const data = await _asyncNullishCoalesce(await (syncFn == null ? void 0 : syncFn()), async () => ( await ((_a = this.bulkSyncFn) == null ? void 0 : _a.call(this))));
+    if (!data) {
+      (_b = this.logger) == null ? void 0 : _b.warn("Bulk sync function returned no data");
+      return;
+    }
     const expirationTime = this.createExpirationTime();
+    for (const key of this.store.keys()) {
+      this.delete(key) || this.invalidate(key);
+    }
     for (const [key, value] of _nullishCoalesce(data, () => ( []))) {
       this.store.set(key, { value, expirationTime });
     }
@@ -445,9 +460,10 @@ var LilypadCache = (_class2 = class {
    */
   delete(key, options = {}) {
     if (this.protectedKeys.has(key) && !options.force) {
-      return;
+      return false;
     }
     this.store.delete(key);
+    return true;
   }
   /**
    * Removes all entries from the cache.

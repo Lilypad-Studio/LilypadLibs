@@ -379,7 +379,7 @@ declare class LilypadCache<K extends string, V> {
      */
     delete(key: K, options?: {
         force?: boolean;
-    }): void;
+    }): boolean;
     /**
      * Removes all entries from the cache.
      *
@@ -468,6 +468,7 @@ interface ExecuteFnOptions<T> {
     functionIdentifier: string;
     consumerIdentifier: string;
     fn: () => Promise<T>;
+    retries?: number;
     backOffTime?: (attempt: number) => number;
 }
 /**
@@ -530,13 +531,20 @@ declare class LilypadFlowControl<T> {
      * Executes a given asynchronous function with retry logic and optional exponential backoff.
      *
      * @template T The return type of the execution function.
-     * @param executionFn - The asynchronous function to execute.
-     * @param errorFn - Optional function to handle errors after all retries have been exhausted. If provided, its return value will be returned instead of throwing the error.
-     * @param backOffTime - Optional function to calculate the backoff time (in milliseconds) before each retry attempt. Receives the current attempt number as an argument. Defaults to exponential backoff if not provided.
+     * @param options - The options for executing with retries, including:
+     * @param options.executionFn - The asynchronous function to execute.
+     * @param options.errorFn - Optional function to handle errors after all retries have been exhausted. If provided, its return value will be returned instead of throwing the error.
+     * @param options.retries - The maximum number of retry attempts. If not provided, the instance's configured retries will be used.
+     * @param options.backOffTime - Optional function to calculate the backoff time (in milliseconds) before each retry attempt. Receives the current attempt number as an argument. Defaults to exponential backoff if not provided.
      * @returns A promise that resolves with the result of `executionFn`, or with the result of `errorFn` if retries are exhausted.
      * @throws The error thrown by `executionFn` if all retries are exhausted and no `errorFn` is provided.
      */
-    executeWithRetries(executionFn: () => Promise<T>, errorFn?: (error: unknown) => T | void, backOffTime?: (attempt: number) => number): Promise<T>;
+    executeWithRetries(options: {
+        executionFn: () => Promise<T>;
+        retries?: number;
+        errorFn?: (error: unknown) => T | void;
+        backOffTime?: (attempt: number) => number;
+    }): Promise<T>;
     /**
      * Enforces a rate limit for a specific consumer and function combination.
      *

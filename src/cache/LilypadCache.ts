@@ -355,7 +355,14 @@ class LilypadCache<K extends string, V> {
       return;
     }
     const data = (await syncFn?.()) ?? (await this.bulkSyncFn?.());
+    if (!data) {
+      this.logger?.warn('Bulk sync function returned no data');
+      return;
+    }
     const expirationTime = this.createExpirationTime();
+    for (const key of this.store.keys()) {
+      this.delete(key) || this.invalidate(key);
+    }
     for (const [key, value] of data ?? []) {
       this.store.set(key, { value, expirationTime });
     }
@@ -470,9 +477,10 @@ class LilypadCache<K extends string, V> {
    */
   delete(key: K, options: { force?: boolean } = {}) {
     if (this.protectedKeys.has(key) && !options.force) {
-      return;
+      return false;
     }
     this.store.delete(key);
+    return true;
   }
 
   /**

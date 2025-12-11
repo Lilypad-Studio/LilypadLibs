@@ -12,6 +12,7 @@ export interface ExecuteFnOptions<T> {
   functionIdentifier: string;
   consumerIdentifier: string;
   fn: () => Promise<T>;
+  retries?: number;
   backOffTime?: (attempt: number) => number;
 }
 
@@ -97,26 +98,29 @@ export class LilypadFlowControl<T> {
    * Executes a given asynchronous function with retry logic and optional exponential backoff.
    *
    * @template T The return type of the execution function.
-   * @param executionFn - The asynchronous function to execute.
-   * @param errorFn - Optional function to handle errors after all retries have been exhausted. If provided, its return value will be returned instead of throwing the error.
-   * @param backOffTime - Optional function to calculate the backoff time (in milliseconds) before each retry attempt. Receives the current attempt number as an argument. Defaults to exponential backoff if not provided.
+   * @param options - The options for executing with retries, including:
+   * @param options.executionFn - The asynchronous function to execute.
+   * @param options.errorFn - Optional function to handle errors after all retries have been exhausted. If provided, its return value will be returned instead of throwing the error.
+   * @param options.retries - The maximum number of retry attempts. If not provided, the instance's configured retries will be used.
+   * @param options.backOffTime - Optional function to calculate the backoff time (in milliseconds) before each retry attempt. Receives the current attempt number as an argument. Defaults to exponential backoff if not provided.
    * @returns A promise that resolves with the result of `executionFn`, or with the result of `errorFn` if retries are exhausted.
    * @throws The error thrown by `executionFn` if all retries are exhausted and no `errorFn` is provided.
    */
-  async executeWithRetries(
-    executionFn: () => Promise<T>,
-    errorFn?: (error: unknown) => T | void,
-    backOffTime?: (attempt: number) => number
-  ): Promise<T> {
+  async executeWithRetries(options: {
+    executionFn: () => Promise<T>;
+    retries?: number;
+    errorFn?: (error: unknown) => T | void;
+    backOffTime?: (attempt: number) => number;
+  }): Promise<T> {
     let attempts = 0;
     while (true) {
       try {
-        const result = await executionFn();
+        const result = await options.executionFn();
         return result;
       } catch (error) {
-        if (attempts >= (this.retries ?? 0)) {
-          if (errorFn) {
-            const result = errorFn(error);
+        if (attempts >= (options.retries ?? this.retries ?? 0)) {
+          if (options.errorFn) {
+            const result = options.errorFn(error);
             if (result !== undefined) {
               return result;
             }
@@ -124,7 +128,9 @@ export class LilypadFlowControl<T> {
           throw error;
         }
         attempts++;
-        const backoffTimeValue = backOffTime ? backOffTime(attempts) : Math.pow(2, attempts) * 100; // Exponential backoff
+        const backoffTimeValue = options.backOffTime
+          ? options.backOffTime(attempts)
+          : Math.pow(2, attempts) * 100; // Exponential backoff
         await new Promise((resolve) => setTimeout(resolve, backoffTimeValue));
       }
     }
@@ -184,8 +190,14 @@ export class LilypadFlowControl<T> {
       const executionFn = () =>
         this.timeout !== undefined ? this.executeWithTimeout(options.fn) : options.fn();
 
-      if (this.retries && this.retries > 0) {
-        return this.executeWithRetries(executionFn, options.errorFn, options.backOffTime);
+      const effectiveRetries = options.retries ?? this.retries ?? 0;
+      if (effectiveRetries > 0) {
+        return this.executeWithRetries({
+          executionFn: executionFn,
+          retries: effectiveRetries,
+          errorFn: options.errorFn,
+          backOffTime: options.backOffTime,
+        });
       }
 
       try {
