@@ -354,7 +354,7 @@ var LilypadCache = (_class2 = class {
     }
     const expirationTime = this.createExpirationTime();
     for (const key of this.store.keys()) {
-      this.delete(key) || this.invalidate(key);
+      this.delete(key) || this.invalidate(key, { invalidateBulkSync: false });
     }
     for (const [key, value] of _nullishCoalesce(data, () => ( []))) {
       this.store.set(key, { value, expirationTime });
@@ -364,6 +364,7 @@ var LilypadCache = (_class2 = class {
   /**
    * Retrieves multiple values from the cache for the specified keys.
    * If no keys are provided, retrieves all values currently stored in the cache.
+   * If some keys are not found in the cache or they have expired, they are simply omitted from the result.
    *
    * @param options - An object containing an optional array of keys to retrieve.
    * @returns A `Map` containing the key-value pairs found in the cache.
@@ -389,7 +390,7 @@ var LilypadCache = (_class2 = class {
    * @param options.syncFn - An asynchronous function that returns an array of key-value pairs to sync the cache.
    * @returns A promise that resolves to a map of keys to their corresponding values.
    */
-  async bulkAsyncGet(options) {
+  async bulkAsyncGet(options = { keys: void 0, doSync: true, syncFn: void 0 }) {
     if (options.doSync) {
       await this.bulkSync(options.syncFn);
     }
@@ -442,11 +443,16 @@ var LilypadCache = (_class2 = class {
    * by setting its value with a negative expiration time.
    *
    * @param key - The key of the cache entry to invalidate.
+   * @param options - Optional settings for invalidation.
+   * @param options.invalidateBulkSync - If true, forces a bulk sync on the next bulkSync call.
    */
-  invalidate(key) {
+  invalidate(key, options = { invalidateBulkSync: true }) {
     const comprehensive = this.getComprehensive(key);
     if (comprehensive.type === "hit") {
       this.set(key, comprehensive.value, -1);
+    }
+    if (options.invalidateBulkSync && comprehensive.type !== "miss") {
+      this.bulkSyncExpirationTime = 0;
     }
   }
   /**

@@ -312,6 +312,7 @@ declare class LilypadCache<K extends string, V> {
     /**
      * Retrieves multiple values from the cache for the specified keys.
      * If no keys are provided, retrieves all values currently stored in the cache.
+     * If some keys are not found in the cache or they have expired, they are simply omitted from the result.
      *
      * @param options - An object containing an optional array of keys to retrieve.
      * @returns A `Map` containing the key-value pairs found in the cache.
@@ -329,7 +330,7 @@ declare class LilypadCache<K extends string, V> {
      * @param options.syncFn - An asynchronous function that returns an array of key-value pairs to sync the cache.
      * @returns A promise that resolves to a map of keys to their corresponding values.
      */
-    bulkAsyncGet(options: {
+    bulkAsyncGet(options?: {
         keys?: K[];
         doSync?: boolean;
         syncFn?: () => Promise<[K, V][]>;
@@ -366,8 +367,12 @@ declare class LilypadCache<K extends string, V> {
      * by setting its value with a negative expiration time.
      *
      * @param key - The key of the cache entry to invalidate.
+     * @param options - Optional settings for invalidation.
+     * @param options.invalidateBulkSync - If true, forces a bulk sync on the next bulkSync call.
      */
-    invalidate(key: K): void;
+    invalidate(key: K, options?: {
+        invalidateBulkSync?: boolean;
+    }): void;
     /**
      * Deletes the specified key from the cache.
      *

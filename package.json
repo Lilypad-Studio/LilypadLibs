@@ -12,7 +12,8 @@
   "scripts": {
     "build": "tsup --dts",
     "lint": "eslint --fix",
-    "test": "vitest"
+    "test": "vitest",
+    "prepare": "husky"
   },
   "dependencies": {
     "typescript": "^5.9.3"
@@ -26,6 +27,7 @@
     "eslint-plugin-import": "^2.31.0",
     "eslint-plugin-prettier": "^5.2.1",
     "eslint-plugin-promise": "^7.2.1",
+    "husky": "^9.1.7",
     "prettier": "^3.4.2",
     "tsup": "^8.5.1",
     "vitest": "^4.0.15"
