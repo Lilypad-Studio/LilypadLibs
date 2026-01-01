@@ -399,11 +399,13 @@ class LilypadCache<K extends string, V> {
    * @param options.syncFn - An asynchronous function that returns an array of key-value pairs to sync the cache.
    * @returns A promise that resolves to a map of keys to their corresponding values.
    */
-  async bulkAsyncGet(options: {
-    keys?: K[];
-    doSync?: boolean;
-    syncFn?: () => Promise<[K, V][]>;
-  }): Promise<Map<K, V>> {
+  async bulkAsyncGet(
+    options: {
+      keys?: K[];
+      doSync?: boolean;
+      syncFn?: () => Promise<[K, V][]>;
+    } = { keys: undefined, doSync: true, syncFn: undefined }
+  ): Promise<Map<K, V>> {
     if (options.doSync) {
       await this.bulkSync(options.syncFn);
     }

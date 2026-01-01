@@ -662,6 +662,34 @@ describe('LilypadCache', () => {
           expect(cache['bulkSyncExpirationTime']).toBe(0);
         });
 
+        it('should make the next bulkSync call fetch fresh data', async () => {
+          let callCount = 0;
+
+          async function syncFn(): Promise<[string, number][]> {
+            callCount++;
+            return [
+              ['key1', callCount],
+              ['test', 999],
+            ];
+          }
+
+          const customCache = new LilypadCache<string, number>(1000, {
+            defaultBulkSyncTtl: 5000,
+            bulkSyncFn: syncFn,
+          });
+          const value = await customCache.bulkAsyncGet();
+          expect(value.get('key1')).toBe(1);
+          expect(customCache.get('key1')).toBe(1);
+          expect(customCache.get('test')).toBe(999);
+          // Invalidate to force next bulkSync to fetch fresh data
+          customCache.invalidate('key1');
+          const value2 = await customCache.bulkAsyncGet();
+          expect(value2.get('key1')).toBe(2);
+          expect(customCache.get('key1')).toBe(2);
+          expect(customCache.get('test')).toBe(999);
+          customCache.dispose();
+        });
+
         it('should do nothing for a missing key except bulkSyncExpirationTime', () => {
           expect(cache.getComprehensive('missing').type).toBe('miss');
           cache.invalidate('missing');
