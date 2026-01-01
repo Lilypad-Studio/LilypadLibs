@@ -635,6 +635,48 @@ describe('LilypadCache', () => {
         expect(callCount).toBe(1);
         customCache.dispose();
       });
+
+      describe('invalidate', () => {
+        it('should expire a valid cached value', () => {
+          cache.set('key1', 123, 1000);
+          expect(cache.getComprehensive('key1').type).toBe('hit');
+          cache.invalidate('key1');
+          expect(cache.getComprehensive('key1').type).toBe('expired');
+        });
+
+        it('should set bulkSyncExpirationTime to 0 for expired value', () => {
+          cache.set('key1', 123, 1);
+          // Expire the value
+          return new Promise<void>((resolve) => {
+            setTimeout(() => {
+              cache.invalidate('key1');
+              expect(cache['bulkSyncExpirationTime']).toBe(0);
+              resolve();
+            }, 10);
+          });
+        });
+
+        it('should set bulkSyncExpirationTime to 0 for valid value', () => {
+          cache.set('key1', 123, 1000);
+          cache.invalidate('key1');
+          expect(cache['bulkSyncExpirationTime']).toBe(0);
+        });
+
+        it('should do nothing for a missing key except bulkSyncExpirationTime', () => {
+          expect(cache.getComprehensive('missing').type).toBe('miss');
+          cache.invalidate('missing');
+          expect(cache.getComprehensive('missing').type).toBe('miss');
+          expect(cache['bulkSyncExpirationTime']).toBe(0);
+        });
+
+        it('should not change value for already expired key', async () => {
+          cache.set('key1', 123, 10);
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          expect(cache.getComprehensive('key1').type).toBe('expired');
+          cache.invalidate('key1');
+          expect(cache.getComprehensive('key1').type).toBe('expired');
+        });
+      });
     });
   });
 });

@@ -361,7 +361,7 @@ class LilypadCache<K extends string, V> {
     }
     const expirationTime = this.createExpirationTime();
     for (const key of this.store.keys()) {
-      this.delete(key) || this.invalidate(key);
+      this.delete(key) || this.invalidate(key, { invalidateBulkSync: false });
     }
     for (const [key, value] of data ?? []) {
       this.store.set(key, { value, expirationTime });
@@ -372,6 +372,7 @@ class LilypadCache<K extends string, V> {
   /**
    * Retrieves multiple values from the cache for the specified keys.
    * If no keys are provided, retrieves all values currently stored in the cache.
+   * If some keys are not found in the cache or they have expired, they are simply omitted from the result.
    *
    * @param options - An object containing an optional array of keys to retrieve.
    * @returns A `Map` containing the key-value pairs found in the cache.
@@ -458,11 +459,16 @@ class LilypadCache<K extends string, V> {
    * by setting its value with a negative expiration time.
    *
    * @param key - The key of the cache entry to invalidate.
+   * @param options - Optional settings for invalidation.
+   * @param options.invalidateBulkSync - If true, forces a bulk sync on the next bulkSync call.
    */
-  invalidate(key: K) {
+  invalidate(key: K, options: { invalidateBulkSync?: boolean } = { invalidateBulkSync: true }) {
     const comprehensive = this.getComprehensive(key);
     if (comprehensive.type === 'hit') {
       this.set(key, comprehensive.value, -1); // sets to expired
+    }
+    if (options.invalidateBulkSync && comprehensive.type !== 'miss') {
+      this.bulkSyncExpirationTime = 0; // force bulk sync on next bulkSync call
     }
   }
 
