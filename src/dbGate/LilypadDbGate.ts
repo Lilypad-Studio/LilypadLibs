@@ -1,11 +1,11 @@
 import postgres from 'postgres';
 
-type LilypadDbGateOptions = {
+export type LilypadDbGateOptions = {
   connectionString: string;
   listen: { channel: string; callback: (payload: unknown) => void }[];
 };
 
-type LilypadDbSchema<T> = {
+export type LilypadDbSchema<T> = {
   tableName: string;
   primaryKey: keyof T;
   obj: {

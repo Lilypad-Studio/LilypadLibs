@@ -422,6 +422,63 @@ declare class LilypadCache<K extends string, V> {
     dispose(): void;
 }
 
+type LilypadDbGateOptions = {
+    connectionString: string;
+    listen: {
+        channel: string;
+        callback: (payload: unknown) => void;
+    }[];
+};
+type LilypadDbSchema<T> = {
+    tableName: string;
+    primaryKey: keyof T;
+    obj: {
+        [K in keyof T]: {} & ({
+            nullable: false | undefined;
+        } | {
+            nullable: true;
+            default: T[K] | null;
+        });
+    };
+};
+/**
+ * Provides a gateway for interacting with a PostgreSQL database, including CRUD operations and channel-based listeners.
+ *
+ * The `LilypadDbGate` class manages a database connection and allows for:
+ * - Fetching all rows from a table with type safety.
+ * - Inserting, updating, and deleting rows in a table.
+ * - Listening to PostgreSQL channels for notifications and handling them with callbacks.
+ * - Managing multiple listeners and cleaning up resources.
+ *
+ * @example
+ * ```typescript
+ * const dbGate = new LilypadDbGate({
+ *   connectionString: 'postgres://user:pass@host:port/db',
+ *   listen: [
+ *     { channel: 'my_channel', callback: (payload) => console.log(payload) }
+ *   ]
+ * });
+ * ```
+ *
+ * @typeParam T - The type representing the table schema.
+ *
+ * @public
+ */
+declare class LilypadDbGate {
+    private connectionString;
+    private sql;
+    private listeners;
+    private constructor();
+    static create(options: LilypadDbGateOptions): Promise<LilypadDbGate>;
+    getAllFromTable<T>(options: LilypadDbSchema<T>): Promise<T[]>;
+    addToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
+    updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
+    deleteFromTable<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<void>;
+    addListener(channel: string, callback: (payload: unknown) => void): Promise<void>;
+    removeListener(channel: string): Promise<void>;
+    close(): Promise<void>;
+}
+
 /**
  * A logger component that outputs messages to the console.
  *
@@ -631,4 +688,4 @@ declare class LilypadSerializer<FROM extends {}, TO extends {}, KeyMap extends R
     deserialize(input: TO[]): FROM[];
 }
 
-export { type ExecuteFnOptions, type FlowControlOptions, LilypadCache, type LilypadCacheGetOptions, LilypadConsoleLogger, LilypadDiscordLogger, LilypadFlowControl, type LilypadLoggerConstructorOptions, LilypadSerializer, type LilypadSerializerConstructorOptions, createLogger };
+export { type ExecuteFnOptions, type FlowControlOptions, LilypadCache, type LilypadCacheGetOptions, LilypadConsoleLogger, LilypadDbGate, type LilypadDbGateOptions, type LilypadDbSchema, LilypadDiscordLogger, LilypadFlowControl, type LilypadLoggerConstructorOptions, LilypadSerializer, type LilypadSerializerConstructorOptions, createLogger };

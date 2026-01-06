@@ -13,6 +13,12 @@ export { default as LilypadCache } from './cache/LilypadCache';
 export type { LilypadCacheGetOptions } from './cache/LilypadCache';
 
 /**
+ * Database Gateway Module
+ */
+export { LilypadDbGate } from './dbGate/LilypadDbGate';
+export type { LilypadDbGateOptions, LilypadDbSchema } from './dbGate/LilypadDbGate';
+
+/**
  * Logger Module
  */
 export { default as createLogger } from './logger/LilypadLogger';

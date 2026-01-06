@@ -1,4 +1,4 @@
-"use strict";Object.defineProperty(exports, "__esModule", {value: true}); function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } async function _asyncNullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return await rhsFn(); } } var _class; var _class2; var _class3;// src/flow/LilypadFlowControl.ts
+"use strict";Object.defineProperty(exports, "__esModule", {value: true}); function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; } function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } async function _asyncNullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return await rhsFn(); } } var _class; var _class2; var _class3; var _class4;// src/flow/LilypadFlowControl.ts
 var LilypadFlowControl = (_class = class {
   
   
@@ -525,15 +525,99 @@ var LilypadCache = (_class2 = class {
 }, _class2);
 var LilypadCache_default = LilypadCache;
 
+// src/dbGate/LilypadDbGate.ts
+var _postgres = require('postgres'); var _postgres2 = _interopRequireDefault(_postgres);
+var LilypadDbGate = (_class3 = class _LilypadDbGate {
+  __init5() {this.connectionString = "lilypad-db-connection"}
+  
+  __init6() {this.listeners = /* @__PURE__ */ new Map()}
+  constructor(options) {;_class3.prototype.__init5.call(this);_class3.prototype.__init6.call(this);
+    this.connectionString = options.connectionString;
+    this.sql = _postgres2.default.call(void 0, this.connectionString, { ssl: true });
+  }
+  static async create(options) {
+    const instance = new _LilypadDbGate(options);
+    for (const listenOption of options.listen) {
+      await instance.addListener(listenOption.channel, listenOption.callback);
+    }
+    return instance;
+  }
+  async getAllFromTable(options) {
+    const results = await this.sql`SELECT * FROM ${this.sql(options.tableName)}`;
+    const typedResults = [];
+    for (const row of results) {
+      const typedRow = {};
+      for (const key in options.obj) {
+        typedRow[key] = row[key];
+      }
+      typedResults.push(typedRow);
+    }
+    return typedResults;
+  }
+  async addToTable(options, data) {
+    await this.sql`
+      INSERT INTO ${this.sql(options.tableName)} ${this.sql(data)}
+    `;
+  }
+  async updateToTable(options, data) {
+    const updateData = {};
+    const primaryKeyValue = data[options.primaryKey];
+    if (primaryKeyValue === void 0) {
+      throw new Error(`Missing primary key field: ${String(options.primaryKey)}`);
+    }
+    for (const key in options.obj) {
+      if (key !== String(options.primaryKey) && data[key] !== void 0) {
+        updateData[key] = data[key];
+      }
+    }
+    await this.sql`
+      UPDATE ${this.sql(options.tableName)} 
+      SET ${this.sql(updateData)} 
+      WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue}
+    `;
+  }
+  async deleteFromTable(options, primaryKeyValue) {
+    await this.sql`
+      DELETE FROM ${this.sql(options.tableName)} 
+      WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue}
+    `;
+  }
+  async addListener(channel, callback) {
+    if (this.listeners.has(channel)) {
+      throw new Error(`Listener for channel "${channel}" already exists.`);
+    }
+    const connection = _postgres2.default.call(void 0, this.connectionString, { ssl: true });
+    const listener = await connection.listen(channel, (payload) => {
+      callback(payload);
+    });
+    this.listeners.set(channel, { callback, connection, listener });
+  }
+  async removeListener(channel) {
+    const listenerData = this.listeners.get(channel);
+    if (!listenerData) {
+      throw new Error(`No listener found for channel "${channel}".`);
+    }
+    await listenerData.connection.end();
+    this.listeners.delete(channel);
+  }
+  async close() {
+    for (const [channel, listenerData] of this.listeners) {
+      await listenerData.connection.end();
+      this.listeners.delete(channel);
+    }
+    await this.sql.end();
+  }
+}, _class3);
+
 // src/logger/LilypadLogger.ts
-var LilypadLogger = (_class3 = class {
-  __init5() {this.components = {}}
+var LilypadLogger = (_class4 = class {
+  __init7() {this.components = {}}
   // Optional logger name
   
   get __name() {
     return this._name;
   }
-  constructor(options) {;_class3.prototype.__init5.call(this);
+  constructor(options) {;_class4.prototype.__init7.call(this);
     const reservedKeys = /* @__PURE__ */ new Set(["components", "register", "__name"]);
     for (const key of Object.keys(options.components)) {
       if (reservedKeys.has(key)) {
@@ -588,7 +672,7 @@ var LilypadLogger = (_class3 = class {
     }
     return this;
   }
-}, _class3);
+}, _class4);
 function createLogger(options) {
   return new LilypadLogger(options);
 }
@@ -686,5 +770,6 @@ var LilypadSerializer = class {
 
 
 
-exports.LilypadCache = LilypadCache_default; exports.LilypadConsoleLogger = LilypadConsoleLogger; exports.LilypadDiscordLogger = LilypadDiscordLogger; exports.LilypadFlowControl = LilypadFlowControl; exports.LilypadSerializer = LilypadSerializer; exports.createLogger = createLogger;
+
+exports.LilypadCache = LilypadCache_default; exports.LilypadConsoleLogger = LilypadConsoleLogger; exports.LilypadDbGate = LilypadDbGate; exports.LilypadDiscordLogger = LilypadDiscordLogger; exports.LilypadFlowControl = LilypadFlowControl; exports.LilypadSerializer = LilypadSerializer; exports.createLogger = createLogger;
 //# sourceMappingURL=index.js.map
