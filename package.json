@@ -16,6 +16,7 @@
     "prepare": "husky"
   },
   "dependencies": {
+    "postgres": "^3.4.7",
     "typescript": "^5.9.3"
   },
   "devDependencies": {
