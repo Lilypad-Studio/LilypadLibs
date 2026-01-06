@@ -528,17 +528,27 @@ var LilypadCache_default = LilypadCache;
 // src/dbGate/LilypadDbGate.ts
 var _postgres = require('postgres'); var _postgres2 = _interopRequireDefault(_postgres);
 var LilypadDbGate = (_class3 = class _LilypadDbGate {
-  __init5() {this.connectionString = "lilypad-db-connection"}
   
-  __init6() {this.listeners = /* @__PURE__ */ new Map()}
-  constructor(options) {;_class3.prototype.__init5.call(this);_class3.prototype.__init6.call(this);
+  
+  
+  __init5() {this.listeners = /* @__PURE__ */ new Map()}
+  constructor(options) {;_class3.prototype.__init5.call(this);
     this.connectionString = options.connectionString;
-    this.sql = _postgres2.default.call(void 0, this.connectionString, { ssl: true });
+    this.sql = _postgres2.default.call(void 0, this.connectionString);
   }
   static async create(options) {
+    const singleton = options.singleton;
+    if (singleton) {
+      if (singleton.dbgate) {
+        return singleton.dbgate;
+      }
+    }
     const instance = new _LilypadDbGate(options);
     for (const listenOption of options.listen) {
       await instance.addListener(listenOption.channel, listenOption.callback);
+    }
+    if (singleton) {
+      singleton.dbgate = instance;
     }
     return instance;
   }
@@ -590,42 +600,44 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
       WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue}
     `;
   }
+  getListenerConnection() {
+    if (!this.listenerConnection) {
+      this.listenerConnection = _postgres2.default.call(void 0, this.connectionString, {
+        max: 1,
+        idle_timeout: 0,
+        max_lifetime: null
+      });
+    }
+    return this.listenerConnection;
+  }
   async addListener(channel, callback) {
     if (this.listeners.has(channel)) {
       throw new Error(`Listener for channel "${channel}" already exists.`);
     }
-    const connection = _postgres2.default.call(void 0, this.connectionString, { ssl: true });
-    const listener = await connection.listen(channel, (payload) => {
+    await this.getListenerConnection().listen(channel, (payload) => {
       callback(payload);
     });
-    this.listeners.set(channel, { callback, connection, listener });
-  }
-  async removeListener(channel) {
-    const listenerData = this.listeners.get(channel);
-    if (!listenerData) {
-      throw new Error(`No listener found for channel "${channel}".`);
-    }
-    await listenerData.connection.end();
-    this.listeners.delete(channel);
+    this.listeners.set(channel, { callback, connection: this.getListenerConnection() });
   }
   async close() {
-    for (const [channel, listenerData] of this.listeners) {
-      await listenerData.connection.end();
+    var _a;
+    for (const [channel] of this.listeners) {
       this.listeners.delete(channel);
     }
+    await ((_a = this.listenerConnection) == null ? void 0 : _a.end());
     await this.sql.end();
   }
 }, _class3);
 
 // src/logger/LilypadLogger.ts
 var LilypadLogger = (_class4 = class {
-  __init7() {this.components = {}}
+  __init6() {this.components = {}}
   // Optional logger name
   
   get __name() {
     return this._name;
   }
-  constructor(options) {;_class4.prototype.__init7.call(this);
+  constructor(options) {;_class4.prototype.__init6.call(this);
     const reservedKeys = /* @__PURE__ */ new Set(["components", "register", "__name"]);
     for (const key of Object.keys(options.components)) {
       if (reservedKeys.has(key)) {

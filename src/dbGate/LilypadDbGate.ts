@@ -3,6 +3,7 @@ import postgres from 'postgres';
 export type LilypadDbGateOptions = {
   connectionString: string;
   listen: { channel: string; callback: (payload: unknown) => void }[];
+  singleton?: { dbgate: LilypadDbGate | null };
 };
 
 export type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'json';
@@ -41,29 +42,39 @@ export type LilypadDbSchema<T> = {
  * @public
  */
 export class LilypadDbGate {
-  private connectionString: string = 'lilypad-db-connection';
+  private connectionString!: string;
   public sql: postgres.Sql;
+  private listenerConnection: postgres.Sql | undefined;
   private listeners: Map<
     string,
     {
       callback: (payload: unknown) => void;
       connection: postgres.Sql;
-      listener: postgres.ListenMeta;
     }
   > = new Map();
 
   private constructor(options: LilypadDbGateOptions) {
     this.connectionString = options.connectionString;
-    this.sql = postgres(this.connectionString, { ssl: true });
+    this.sql = postgres(this.connectionString);
   }
 
   static async create(options: LilypadDbGateOptions): Promise<LilypadDbGate> {
+    const singleton = options.singleton;
+    if (singleton) {
+      if (singleton.dbgate) {
+        return singleton.dbgate;
+      }
+    }
+
     const instance = new LilypadDbGate(options);
 
     for (const listenOption of options.listen) {
       await instance.addListener(listenOption.channel, listenOption.callback);
     }
 
+    if (singleton) {
+      singleton.dbgate = instance;
+    }
     return instance;
   }
 
@@ -128,34 +139,35 @@ export class LilypadDbGate {
     `;
   }
 
+  private getListenerConnection() {
+    if (!this.listenerConnection) {
+      this.listenerConnection = postgres(this.connectionString, {
+        max: 1,
+        idle_timeout: 0,
+        max_lifetime: null,
+      });
+    }
+    return this.listenerConnection;
+  }
+
   async addListener(channel: string, callback: (payload: unknown) => void) {
     if (this.listeners.has(channel)) {
       throw new Error(`Listener for channel "${channel}" already exists.`);
     }
 
-    const connection = postgres(this.connectionString, { ssl: true });
-    const listener = await connection.listen(channel, (payload) => {
+    await this.getListenerConnection().listen(channel, (payload) => {
       callback(payload);
     });
 
-    this.listeners.set(channel, { callback, connection, listener });
-  }
-
-  async removeListener(channel: string) {
-    const listenerData = this.listeners.get(channel);
-    if (!listenerData) {
-      throw new Error(`No listener found for channel "${channel}".`);
-    }
-
-    await listenerData.connection.end();
-    this.listeners.delete(channel);
+    this.listeners.set(channel, { callback, connection: this.getListenerConnection() });
   }
 
   async close() {
-    for (const [channel, listenerData] of this.listeners) {
-      await listenerData.connection.end();
+    for (const [channel] of this.listeners) {
       this.listeners.delete(channel);
     }
+
+    await this.listenerConnection?.end();
     await this.sql.end();
   }
 }

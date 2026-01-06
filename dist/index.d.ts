@@ -430,6 +430,9 @@ type LilypadDbGateOptions = {
         channel: string;
         callback: (payload: unknown) => void;
     }[];
+    singleton?: {
+        dbgate: LilypadDbGate | null;
+    };
 };
 type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'json';
 type LilypadDbSchema<T> = {
@@ -472,6 +475,7 @@ type LilypadDbSchema<T> = {
 declare class LilypadDbGate {
     private connectionString;
     sql: postgres.Sql;
+    private listenerConnection;
     private listeners;
     private constructor();
     static create(options: LilypadDbGateOptions): Promise<LilypadDbGate>;
@@ -481,8 +485,8 @@ declare class LilypadDbGate {
     addToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
     updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
     deleteFromTable<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<void>;
+    private getListenerConnection;
     addListener(channel: string, callback: (payload: unknown) => void): Promise<void>;
-    removeListener(channel: string): Promise<void>;
     close(): Promise<void>;
 }
 
