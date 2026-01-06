@@ -68,14 +68,18 @@ export class LilypadDbGate {
   }
 
   async getAllFromTable<T>(
-    options: LilypadDbSchema<T> & { rowFn?: (row: unknown) => T }
+    options: LilypadDbSchema<T> & { rowFn?: (row: unknown) => T | null }
   ): Promise<T[]> {
     const results = await this.sql`SELECT * FROM ${this.sql(options.tableName)}`;
     const typedResults: T[] = [];
 
     for (const row of results) {
       if (options.rowFn) {
-        typedResults.push(options.rowFn(row));
+        const res = options.rowFn(row);
+        if (res === null) {
+          continue;
+        }
+        typedResults.push(res);
         continue;
       }
       const typedRow: Partial<T> = {};

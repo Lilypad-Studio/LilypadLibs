@@ -474,7 +474,7 @@ declare class LilypadDbGate {
     private constructor();
     static create(options: LilypadDbGateOptions): Promise<LilypadDbGate>;
     getAllFromTable<T>(options: LilypadDbSchema<T> & {
-        rowFn?: (row: unknown) => T;
+        rowFn?: (row: unknown) => T | null;
     }): Promise<T[]>;
     addToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
     updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;

@@ -547,7 +547,11 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     const typedResults = [];
     for (const row of results) {
       if (options.rowFn) {
-        typedResults.push(options.rowFn(row));
+        const res = options.rowFn(row);
+        if (res === null) {
+          continue;
+        }
+        typedResults.push(res);
         continue;
       }
       const typedRow = {};
