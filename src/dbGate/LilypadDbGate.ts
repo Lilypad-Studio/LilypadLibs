@@ -42,7 +42,7 @@ export type LilypadDbSchema<T> = {
  */
 export class LilypadDbGate {
   private connectionString: string = 'lilypad-db-connection';
-  private sql: postgres.Sql;
+  public sql: postgres.Sql;
   private listeners: Map<
     string,
     {

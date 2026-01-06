@@ -1,3 +1,5 @@
+import postgres from 'postgres';
+
 interface LilypadLoggerComponentOptions<T extends string> {
     logger: ReturnType<typeof createLogger<T>>;
     name?: string;
@@ -469,7 +471,7 @@ type LilypadDbSchema<T> = {
  */
 declare class LilypadDbGate {
     private connectionString;
-    private sql;
+    sql: postgres.Sql;
     private listeners;
     private constructor();
     static create(options: LilypadDbGateOptions): Promise<LilypadDbGate>;
