@@ -102,30 +102,61 @@ export class LilypadDbGate {
     return typedResults;
   }
 
-  async addToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void> {
+  async addToTable<T>(
+    options: LilypadDbSchema<T> & { sanitizationFn?: (data: Partial<T>) => Partial<T> },
+    data: T
+  ): Promise<void> {
+    let insertData: Partial<T> = { ...data };
+    if (options.sanitizationFn) {
+      insertData = { ...insertData, ...options.sanitizationFn(insertData) };
+    }
+
+    if (insertData[options.primaryKey] === undefined) {
+      throw new Error(
+        `Primary key "${String(
+          options.primaryKey
+        )}" is missing in the insert data for table "${options.tableName}".`
+      );
+    }
+
+    await this.sql`
+      INSERT INTO ${this.sql(options.tableName)} ${this.sql(insertData as Record<string, unknown>)}
+    `;
+
+    if (data[options.primaryKey] === undefined || data[options.primaryKey] === null) {
+      throw new Error(
+        `Primary key "${String(
+          options.primaryKey
+        )}" is missing in the insert data for table "${options.tableName}".`
+      );
+    }
+
     await this.sql`
       INSERT INTO ${this.sql(options.tableName)} ${this.sql(data as Record<string, unknown>)}
     `;
   }
 
-  async updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void> {
-    const updateData: Partial<T> = {};
-    const primaryKeyValue = data[options.primaryKey];
-
-    if (primaryKeyValue === undefined) {
-      throw new Error(`Missing primary key field: ${String(options.primaryKey)}`);
+  async updateToTable<T>(
+    options: LilypadDbSchema<T> & { sanitizationFn?: (data: Partial<T>) => Partial<T> },
+    data: T
+  ): Promise<void> {
+    let updateData: Partial<T> = { ...data };
+    if (options.sanitizationFn) {
+      updateData = { ...updateData, ...options.sanitizationFn(updateData) };
     }
 
-    for (const key in options.cols) {
-      if (key !== String(options.primaryKey) && data[key] !== undefined) {
-        updateData[key] = data[key];
-      }
+    if (updateData[options.primaryKey] === undefined || updateData[options.primaryKey] === null) {
+      throw new Error(
+        `Primary key "${String(
+          options.primaryKey
+        )}" is missing in the update data for table "${options.tableName}".`
+      );
     }
 
     await this.sql`
       UPDATE ${this.sql(options.tableName)} 
       SET ${this.sql(updateData as Record<string, unknown>)} 
-      WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue as string}
+      WHERE ${this.sql(String(options.primaryKey))} = ${updateData[options.primaryKey] as string}
     `;
   }
 

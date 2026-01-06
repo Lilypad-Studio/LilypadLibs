@@ -482,8 +482,12 @@ declare class LilypadDbGate {
     getAllFromTable<T>(options: LilypadDbSchema<T> & {
         rowFn?: (row: unknown) => T | null;
     }): Promise<T[]>;
-    addToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
-    updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
+    addToTable<T>(options: LilypadDbSchema<T> & {
+        sanitizationFn?: (data: Partial<T>) => Partial<T>;
+    }, data: T): Promise<void>;
+    updateToTable<T>(options: LilypadDbSchema<T> & {
+        sanitizationFn?: (data: Partial<T>) => Partial<T>;
+    }, data: T): Promise<void>;
     deleteFromTable<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<void>;
     private getListenerConnection;
     addListener(channel: string, callback: (payload: unknown) => void): Promise<void>;

@@ -573,25 +573,47 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     return typedResults;
   }
   async addToTable(options, data) {
+    let insertData = { ...data };
+    if (options.sanitizationFn) {
+      insertData = { ...insertData, ...options.sanitizationFn(insertData) };
+    }
+    if (insertData[options.primaryKey] === void 0) {
+      throw new Error(
+        `Primary key "${String(
+          options.primaryKey
+        )}" is missing in the insert data for table "${options.tableName}".`
+      );
+    }
+    await this.sql`
+      INSERT INTO ${this.sql(options.tableName)} ${this.sql(insertData)}
+    `;
+    if (data[options.primaryKey] === void 0 || data[options.primaryKey] === null) {
+      throw new Error(
+        `Primary key "${String(
+          options.primaryKey
+        )}" is missing in the insert data for table "${options.tableName}".`
+      );
+    }
     await this.sql`
       INSERT INTO ${this.sql(options.tableName)} ${this.sql(data)}
     `;
   }
   async updateToTable(options, data) {
-    const updateData = {};
-    const primaryKeyValue = data[options.primaryKey];
-    if (primaryKeyValue === void 0) {
-      throw new Error(`Missing primary key field: ${String(options.primaryKey)}`);
+    let updateData = { ...data };
+    if (options.sanitizationFn) {
+      updateData = { ...updateData, ...options.sanitizationFn(updateData) };
     }
-    for (const key in options.cols) {
-      if (key !== String(options.primaryKey) && data[key] !== void 0) {
-        updateData[key] = data[key];
-      }
+    if (updateData[options.primaryKey] === void 0 || updateData[options.primaryKey] === null) {
+      throw new Error(
+        `Primary key "${String(
+          options.primaryKey
+        )}" is missing in the update data for table "${options.tableName}".`
+      );
     }
     await this.sql`
       UPDATE ${this.sql(options.tableName)} 
       SET ${this.sql(updateData)} 
-      WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue}
+      WHERE ${this.sql(String(options.primaryKey))} = ${updateData[options.primaryKey]}
     `;
   }
   async deleteFromTable(options, primaryKeyValue) {
