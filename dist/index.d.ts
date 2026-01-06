@@ -429,11 +429,14 @@ type LilypadDbGateOptions = {
         callback: (payload: unknown) => void;
     }[];
 };
+type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'json';
 type LilypadDbSchema<T> = {
     tableName: string;
     primaryKey: keyof T;
-    obj: {
-        [K in keyof T]: {} & ({
+    cols: {
+        [K in keyof T]: {
+            type: LilypadDbColumnType;
+        } & ({
             nullable: false | undefined;
         } | {
             nullable: true;
@@ -470,7 +473,9 @@ declare class LilypadDbGate {
     private listeners;
     private constructor();
     static create(options: LilypadDbGateOptions): Promise<LilypadDbGate>;
-    getAllFromTable<T>(options: LilypadDbSchema<T>): Promise<T[]>;
+    getAllFromTable<T>(options: LilypadDbSchema<T> & {
+        rowFn?: (row: unknown) => T;
+    }): Promise<T[]>;
     addToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
     updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
     deleteFromTable<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<void>;

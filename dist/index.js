@@ -546,8 +546,12 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     const results = await this.sql`SELECT * FROM ${this.sql(options.tableName)}`;
     const typedResults = [];
     for (const row of results) {
+      if (options.rowFn) {
+        typedResults.push(options.rowFn(row));
+        continue;
+      }
       const typedRow = {};
-      for (const key in options.obj) {
+      for (const key in options.cols) {
         typedRow[key] = row[key];
       }
       typedResults.push(typedRow);
@@ -565,7 +569,7 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     if (primaryKeyValue === void 0) {
       throw new Error(`Missing primary key field: ${String(options.primaryKey)}`);
     }
-    for (const key in options.obj) {
+    for (const key in options.cols) {
       if (key !== String(options.primaryKey) && data[key] !== void 0) {
         updateData[key] = data[key];
       }

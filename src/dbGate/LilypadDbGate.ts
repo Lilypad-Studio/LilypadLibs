@@ -5,14 +5,15 @@ export type LilypadDbGateOptions = {
   listen: { channel: string; callback: (payload: unknown) => void }[];
 };
 
+export type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'json';
+
 export type LilypadDbSchema<T> = {
   tableName: string;
   primaryKey: keyof T;
-  obj: {
-    [K in keyof T]: {} & (
-      | { nullable: false | undefined }
-      | { nullable: true; default: T[K] | null }
-    );
+  cols: {
+    [K in keyof T]: {
+      type: LilypadDbColumnType;
+    } & ({ nullable: false | undefined } | { nullable: true; default: T[K] | null });
   };
 };
 
@@ -66,13 +67,19 @@ export class LilypadDbGate {
     return instance;
   }
 
-  async getAllFromTable<T>(options: LilypadDbSchema<T>): Promise<T[]> {
+  async getAllFromTable<T>(
+    options: LilypadDbSchema<T> & { rowFn?: (row: unknown) => T }
+  ): Promise<T[]> {
     const results = await this.sql`SELECT * FROM ${this.sql(options.tableName)}`;
     const typedResults: T[] = [];
 
     for (const row of results) {
+      if (options.rowFn) {
+        typedResults.push(options.rowFn(row));
+        continue;
+      }
       const typedRow: Partial<T> = {};
-      for (const key in options.obj) {
+      for (const key in options.cols) {
         typedRow[key] = row[key];
       }
       typedResults.push(typedRow as T);
@@ -94,7 +101,7 @@ export class LilypadDbGate {
       throw new Error(`Missing primary key field: ${String(options.primaryKey)}`);
     }
 
-    for (const key in options.obj) {
+    for (const key in options.cols) {
       if (key !== String(options.primaryKey) && data[key] !== undefined) {
         updateData[key] = data[key];
       }
