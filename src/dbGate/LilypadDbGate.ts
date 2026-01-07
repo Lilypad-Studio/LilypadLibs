@@ -2,6 +2,7 @@ import postgres from 'postgres';
 
 export type LilypadDbGateOptions = {
   connectionString: string;
+  listenerConnectionString?: string;
   listen: { channel: string; callback: (payload: unknown) => void }[];
   singleton?: { dbgate: LilypadDbGate | null };
 };
@@ -11,6 +12,8 @@ export type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'js
 export type LilypadDbSchema<T> = {
   tableName: string;
   primaryKey: keyof T;
+  insertSanitizationFn?: (data: Partial<T>) => Partial<T>;
+  selectSanitizationFn?: (row: unknown) => T | null;
   cols: {
     [K in keyof T]: {
       type: LilypadDbColumnType;
@@ -43,6 +46,7 @@ export type LilypadDbSchema<T> = {
  */
 export class LilypadDbGate {
   private connectionString!: string;
+  private listenerConnectionString!: string;
   public sql: postgres.Sql;
   private listenerConnection: postgres.Sql | undefined;
   private listeners: Map<
@@ -55,6 +59,7 @@ export class LilypadDbGate {
 
   private constructor(options: LilypadDbGateOptions) {
     this.connectionString = options.connectionString;
+    this.listenerConnectionString = options.listenerConnectionString || options.connectionString;
     this.sql = postgres(this.connectionString);
   }
 
@@ -78,15 +83,13 @@ export class LilypadDbGate {
     return instance;
   }
 
-  async getAllFromTable<T>(
-    options: LilypadDbSchema<T> & { rowFn?: (row: unknown) => T | null }
-  ): Promise<T[]> {
+  async getAllFromTable<T>(options: LilypadDbSchema<T>): Promise<T[]> {
     const results = await this.sql`SELECT * FROM ${this.sql(options.tableName)}`;
     const typedResults: T[] = [];
 
     for (const row of results) {
-      if (options.rowFn) {
-        const res = options.rowFn(row);
+      if (options.selectSanitizationFn) {
+        const res = options.selectSanitizationFn(row);
         if (res === null) {
           continue;
         }
@@ -102,13 +105,36 @@ export class LilypadDbGate {
     return typedResults;
   }
 
-  async addToTable<T>(
-    options: LilypadDbSchema<T> & { sanitizationFn?: (data: Partial<T>) => Partial<T> },
-    data: T
-  ): Promise<void> {
+  async getFromTableByPrimaryKey<T>(
+    options: LilypadDbSchema<T>,
+    primaryKeyValue: T[keyof T]
+  ): Promise<T | null> {
+    const results = await this.sql`
+      SELECT * FROM ${this.sql(options.tableName)} 
+      WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue as string}
+    `;
+
+    if (results.length === 0) {
+      return null;
+    }
+
+    const row = results[0];
+
+    if (options.selectSanitizationFn) {
+      return options.selectSanitizationFn(row);
+    }
+
+    const typedRow: Partial<T> = {};
+    for (const key in options.cols) {
+      typedRow[key] = row[key];
+    }
+    return typedRow as T;
+  }
+
+  async addToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void> {
     let insertData: Partial<T> = { ...data };
-    if (options.sanitizationFn) {
-      insertData = { ...insertData, ...options.sanitizationFn(insertData) };
+    if (options.insertSanitizationFn) {
+      insertData = { ...insertData, ...options.insertSanitizationFn(insertData) };
     }
 
     if (insertData[options.primaryKey] === undefined) {
@@ -136,13 +162,10 @@ export class LilypadDbGate {
     `;
   }
 
-  async updateToTable<T>(
-    options: LilypadDbSchema<T> & { sanitizationFn?: (data: Partial<T>) => Partial<T> },
-    data: T
-  ): Promise<void> {
+  async updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void> {
     let updateData: Partial<T> = { ...data };
-    if (options.sanitizationFn) {
-      updateData = { ...updateData, ...options.sanitizationFn(updateData) };
+    if (options.insertSanitizationFn) {
+      updateData = { ...updateData, ...options.insertSanitizationFn(updateData) };
     }
 
     if (updateData[options.primaryKey] === undefined || updateData[options.primaryKey] === null) {
@@ -172,7 +195,7 @@ export class LilypadDbGate {
 
   private getListenerConnection() {
     if (!this.listenerConnection) {
-      this.listenerConnection = postgres(this.connectionString, {
+      this.listenerConnection = postgres(this.listenerConnectionString, {
         max: 1,
         idle_timeout: 0,
         max_lifetime: null,

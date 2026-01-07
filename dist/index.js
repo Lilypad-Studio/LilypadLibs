@@ -531,9 +531,11 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
   
   
   
+  
   __init5() {this.listeners = /* @__PURE__ */ new Map()}
   constructor(options) {;_class3.prototype.__init5.call(this);
     this.connectionString = options.connectionString;
+    this.listenerConnectionString = options.listenerConnectionString || options.connectionString;
     this.sql = _postgres2.default.call(void 0, this.connectionString);
   }
   static async create(options) {
@@ -556,8 +558,8 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     const results = await this.sql`SELECT * FROM ${this.sql(options.tableName)}`;
     const typedResults = [];
     for (const row of results) {
-      if (options.rowFn) {
-        const res = options.rowFn(row);
+      if (options.selectSanitizationFn) {
+        const res = options.selectSanitizationFn(row);
         if (res === null) {
           continue;
         }
@@ -572,10 +574,28 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     }
     return typedResults;
   }
+  async getFromTableByPrimaryKey(options, primaryKeyValue) {
+    const results = await this.sql`
+      SELECT * FROM ${this.sql(options.tableName)} 
+      WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue}
+    `;
+    if (results.length === 0) {
+      return null;
+    }
+    const row = results[0];
+    if (options.selectSanitizationFn) {
+      return options.selectSanitizationFn(row);
+    }
+    const typedRow = {};
+    for (const key in options.cols) {
+      typedRow[key] = row[key];
+    }
+    return typedRow;
+  }
   async addToTable(options, data) {
     let insertData = { ...data };
-    if (options.sanitizationFn) {
-      insertData = { ...insertData, ...options.sanitizationFn(insertData) };
+    if (options.insertSanitizationFn) {
+      insertData = { ...insertData, ...options.insertSanitizationFn(insertData) };
     }
     if (insertData[options.primaryKey] === void 0) {
       throw new Error(
@@ -600,8 +620,8 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
   }
   async updateToTable(options, data) {
     let updateData = { ...data };
-    if (options.sanitizationFn) {
-      updateData = { ...updateData, ...options.sanitizationFn(updateData) };
+    if (options.insertSanitizationFn) {
+      updateData = { ...updateData, ...options.insertSanitizationFn(updateData) };
     }
     if (updateData[options.primaryKey] === void 0 || updateData[options.primaryKey] === null) {
       throw new Error(
@@ -624,7 +644,7 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
   }
   getListenerConnection() {
     if (!this.listenerConnection) {
-      this.listenerConnection = _postgres2.default.call(void 0, this.connectionString, {
+      this.listenerConnection = _postgres2.default.call(void 0, this.listenerConnectionString, {
         max: 1,
         idle_timeout: 0,
         max_lifetime: null

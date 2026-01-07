@@ -426,6 +426,7 @@ declare class LilypadCache<K extends string, V> {
 
 type LilypadDbGateOptions = {
     connectionString: string;
+    listenerConnectionString?: string;
     listen: {
         channel: string;
         callback: (payload: unknown) => void;
@@ -438,6 +439,8 @@ type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'json';
 type LilypadDbSchema<T> = {
     tableName: string;
     primaryKey: keyof T;
+    insertSanitizationFn?: (data: Partial<T>) => Partial<T>;
+    selectSanitizationFn?: (row: unknown) => T | null;
     cols: {
         [K in keyof T]: {
             type: LilypadDbColumnType;
@@ -474,20 +477,16 @@ type LilypadDbSchema<T> = {
  */
 declare class LilypadDbGate {
     private connectionString;
+    private listenerConnectionString;
     sql: postgres.Sql;
     private listenerConnection;
     private listeners;
     private constructor();
     static create(options: LilypadDbGateOptions): Promise<LilypadDbGate>;
-    getAllFromTable<T>(options: LilypadDbSchema<T> & {
-        rowFn?: (row: unknown) => T | null;
-    }): Promise<T[]>;
-    addToTable<T>(options: LilypadDbSchema<T> & {
-        sanitizationFn?: (data: Partial<T>) => Partial<T>;
-    }, data: T): Promise<void>;
-    updateToTable<T>(options: LilypadDbSchema<T> & {
-        sanitizationFn?: (data: Partial<T>) => Partial<T>;
-    }, data: T): Promise<void>;
+    getAllFromTable<T>(options: LilypadDbSchema<T>): Promise<T[]>;
+    getFromTableByPrimaryKey<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<T | null>;
+    addToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
+    updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
     deleteFromTable<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<void>;
     private getListenerConnection;
     addListener(channel: string, callback: (payload: unknown) => void): Promise<void>;
