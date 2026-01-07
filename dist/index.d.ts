@@ -568,6 +568,7 @@ type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'json' | '
 type LilypadDbSchema<T> = {
     tableName: string;
     primaryKey: keyof T;
+    primaryKeyShouldAutoDetermine?: boolean;
     insertSanitizationFn?: (data: Partial<T>) => Partial<T>;
     selectSanitizationFn?: (row: unknown) => T | null;
     cols: {

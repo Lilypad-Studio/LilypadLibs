@@ -681,7 +681,9 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     if (options.insertSanitizationFn) {
       insertData = { ...insertData, ...options.insertSanitizationFn(insertData) };
     }
-    if (insertData[options.primaryKey] === void 0) {
+    if (options.primaryKeyShouldAutoDetermine) {
+      delete insertData[options.primaryKey];
+    } else if (insertData[options.primaryKey] === void 0 || insertData[options.primaryKey] === null) {
       throw new Error(
         `Primary key "${String(
           options.primaryKey
@@ -691,23 +693,15 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     await this.sql`
       INSERT INTO ${this.sql(options.tableName)} ${this.sql(insertData)}
     `;
-    if (data[options.primaryKey] === void 0 || data[options.primaryKey] === null) {
-      throw new Error(
-        `Primary key "${String(
-          options.primaryKey
-        )}" is missing in the insert data for table "${options.tableName}".`
-      );
-    }
-    await this.sql`
-      INSERT INTO ${this.sql(options.tableName)} ${this.sql(data)}
-    `;
   }
   async updateToTable(options, data) {
     let updateData = { ...data };
     if (options.insertSanitizationFn) {
       updateData = { ...updateData, ...options.insertSanitizationFn(updateData) };
     }
-    if (updateData[options.primaryKey] === void 0 || updateData[options.primaryKey] === null) {
+    if (options.primaryKeyShouldAutoDetermine) {
+      delete updateData[options.primaryKey];
+    } else if (updateData[options.primaryKey] === void 0 || updateData[options.primaryKey] === null) {
       throw new Error(
         `Primary key "${String(
           options.primaryKey

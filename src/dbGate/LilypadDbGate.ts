@@ -12,6 +12,7 @@ export type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'js
 export type LilypadDbSchema<T> = {
   tableName: string;
   primaryKey: keyof T;
+  primaryKeyShouldAutoDetermine?: boolean;
   insertSanitizationFn?: (data: Partial<T>) => Partial<T>;
   selectSanitizationFn?: (row: unknown) => T | null;
   cols: {
@@ -137,7 +138,12 @@ export class LilypadDbGate {
       insertData = { ...insertData, ...options.insertSanitizationFn(insertData) };
     }
 
-    if (insertData[options.primaryKey] === undefined) {
+    if (options.primaryKeyShouldAutoDetermine) {
+      delete insertData[options.primaryKey];
+    } else if (
+      insertData[options.primaryKey] === undefined ||
+      insertData[options.primaryKey] === null
+    ) {
       throw new Error(
         `Primary key "${String(
           options.primaryKey
@@ -148,18 +154,6 @@ export class LilypadDbGate {
     await this.sql`
       INSERT INTO ${this.sql(options.tableName)} ${this.sql(insertData as Record<string, unknown>)}
     `;
-
-    if (data[options.primaryKey] === undefined || data[options.primaryKey] === null) {
-      throw new Error(
-        `Primary key "${String(
-          options.primaryKey
-        )}" is missing in the insert data for table "${options.tableName}".`
-      );
-    }
-
-    await this.sql`
-      INSERT INTO ${this.sql(options.tableName)} ${this.sql(data as Record<string, unknown>)}
-    `;
   }
 
   async updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void> {
@@ -168,7 +162,12 @@ export class LilypadDbGate {
       updateData = { ...updateData, ...options.insertSanitizationFn(updateData) };
     }
 
-    if (updateData[options.primaryKey] === undefined || updateData[options.primaryKey] === null) {
+    if (options.primaryKeyShouldAutoDetermine) {
+      delete updateData[options.primaryKey];
+    } else if (
+      updateData[options.primaryKey] === undefined ||
+      updateData[options.primaryKey] === null
+    ) {
       throw new Error(
         `Primary key "${String(
           options.primaryKey
