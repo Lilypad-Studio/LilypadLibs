@@ -218,7 +218,7 @@ declare class LilypadFlowControl<T> {
     executeFn(options: ExecuteFnOptions<T>): Promise<T>;
 }
 
-type LilypadCacheGetOptions<K extends string | number, V> = {
+type LilypadCacheGetOptions<K extends string, V> = {
     /**
      * Optional TTL (time to live) in milliseconds for the cached value.
      * If not provided, the cache's default TTL will be used.
@@ -257,7 +257,7 @@ type LilypadCacheGetOptions<K extends string | number, V> = {
  * @property {LilypadCacheGetOptions<K, V>} options - The options used for the cache get operation.
  * @property {LilypadCache<K, V>} cache - The cache instance where the error occurred.
  */
-type LilypadCacheGetOptionsErrorFn<K extends string | number, V> = {
+type LilypadCacheGetOptionsErrorFn<K extends string, V> = {
     key: K;
     error: unknown;
     options: LilypadCacheGetOptions<K, V>;
@@ -330,7 +330,7 @@ type LilypadCacheValueRetrieval<V> = ({
  * @see {@link purgeExpired}
  * @see {@link dispose}
  */
-declare class LilypadCache<K extends string | number, V> {
+declare class LilypadCache<K extends string, V> {
     protected store: Map<K, LilypadCacheValue<V>>;
     protected defaultTtl: number;
     protected defaultErrorTtl: number;
@@ -650,7 +650,7 @@ declare class LilypadDbGate {
  * @see LilypadDbGate
  * @see LilypadDbSchema
  */
-declare class LilypadDbCache<K extends (string | number) & V[keyof V], V extends object> extends LilypadCache<K, V> {
+declare class LilypadDbCache<K extends string & V[keyof V], V extends object> extends LilypadCache<K, V> {
     private readonly dbGate;
     constructor(ttl: number, options: ConstructorParameters<typeof LilypadCache<K, V>>[1] & {
         dbGate: {

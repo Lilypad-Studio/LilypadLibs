@@ -1,7 +1,7 @@
 import { LilypadFlowControl } from '@/flow/LilypadFlowControl';
 import type { LilypadLoggerType } from '@/logger/LilypadLogger';
 
-export type LilypadCacheGetOptions<K extends string | number, V> = {
+export type LilypadCacheGetOptions<K extends string, V> = {
   /**
    * Optional TTL (time to live) in milliseconds for the cached value.
    * If not provided, the cache's default TTL will be used.
@@ -45,7 +45,7 @@ export type LilypadCacheGetOptions<K extends string | number, V> = {
  * @property {LilypadCacheGetOptions<K, V>} options - The options used for the cache get operation.
  * @property {LilypadCache<K, V>} cache - The cache instance where the error occurred.
  */
-type LilypadCacheGetOptionsErrorFn<K extends string | number, V> = {
+type LilypadCacheGetOptionsErrorFn<K extends string, V> = {
   key: K;
   error: unknown;
   options: LilypadCacheGetOptions<K, V>;
@@ -130,7 +130,7 @@ function isStale<V>(retrieval: LilypadCacheValue<V>): boolean {
  * @see {@link purgeExpired}
  * @see {@link dispose}
  */
-class LilypadCache<K extends string | number, V> {
+class LilypadCache<K extends string, V> {
   protected store: Map<K, LilypadCacheValue<V>>;
   protected defaultTtl: number; // time to live in milliseconds
   protected defaultErrorTtl: number; // default error TTL in milliseconds
