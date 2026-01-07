@@ -1,3 +1,4 @@
+import type { LilypadDbGate, LilypadDbSchema } from '@/dbGate/LilypadDbGate';
 import { LilypadFlowControl } from '@/flow/LilypadFlowControl';
 import type { LilypadLoggerType } from '@/logger/LilypadLogger';
 
@@ -49,18 +50,19 @@ type LilypadCacheGetOptionsErrorFn<K extends string, V> = {
   key: K;
   error: unknown;
   options: LilypadCacheGetOptions<K, V>;
-  cache: LilypadCache<K, V>;
 };
+
+type LilypadCachedValue<V> = V | null;
 
 /**
  * Represents a cached value along with its expiration time.
  *
  * @template V The type of the value being cached.
- * @property value The actual value stored in the cache.
+ * @property value The actual value stored in the cache. Will be NULL if the associated value does not exist at all, instead of simply not being cached yet.
  * @property expirationTime The UNIX timestamp (in milliseconds) indicating when the cached value expires.
  */
 type LilypadCacheValue<V> = {
-  value: V;
+  value: LilypadCachedValue<V>;
   expirationTime: number;
 };
 
@@ -96,6 +98,13 @@ function isStale<V>(retrieval: LilypadCacheValue<V>): boolean {
  * - Optional fallback to previous values on fetch errors.
  * - Protection of specific keys from deletion or clearing.
  * - Automatic periodic cleanup of expired entries.
+ * - Optional bulk synchronization with an external data source.
+ * - Integration with a database gateway for persistent and updated storage when an invalidation occurs.
+ *
+ * When a value is returned, as a general rule of thumb:
+ * - `undefined` means "not in cache"
+ * - `null` means "in cache, value is null" (as in, the value is known to not exist at all)
+ * - any other value means "in cache, value is X"
  *
  * @typeParam K - The type of the cache keys.
  * @typeParam V - The type of the cache values.
@@ -133,8 +142,10 @@ class LilypadCache<K extends string, V> {
 
   private logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
 
-  private flowControl: LilypadFlowControl<V>;
+  private flowControl: LilypadFlowControl<LilypadCachedValue<V>>;
   private bulkSyncFlowControl: LilypadFlowControl<void>;
+
+  private readonly dbGate?: { gate: LilypadDbGate; schema: LilypadDbSchema<V> };
 
   /**
    * Timestamp of the last bulk sync operation.
@@ -155,6 +166,7 @@ class LilypadCache<K extends string, V> {
       bulkSyncFn?: () => Promise<[K, V][]>;
       logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
       flowControlTimeout?: number;
+      dbGate?: { gate: LilypadDbGate; schema: LilypadDbSchema<V> };
     } = {}
   ) {
     this.store = new Map();
@@ -164,7 +176,7 @@ class LilypadCache<K extends string, V> {
     this.defaultErrorTtl = options.defaultErrorTtl ? options.defaultErrorTtl : 5 * 60 * 1000; // 5 minutes;
     this.logger = options.logger;
 
-    this.flowControl = new LilypadFlowControl<V>({
+    this.flowControl = new LilypadFlowControl<LilypadCachedValue<V>>({
       logger: this.logger,
       timeout: options.flowControlTimeout || 5000,
     });
@@ -173,6 +185,8 @@ class LilypadCache<K extends string, V> {
       logger: this.logger,
       timeout: options.flowControlTimeout || 30000,
     });
+
+    this.dbGate = options.dbGate;
 
     if (options.autoCleanupInterval) {
       if (!Number.isFinite(options.autoCleanupInterval) || options.autoCleanupInterval <= 0) {
@@ -202,7 +216,7 @@ class LilypadCache<K extends string, V> {
    * @param value - The value to store in the cache.
    * @param ttl - Optional. The time-to-live in milliseconds. If not provided, the value will not expire.
    */
-  set(key: K, value: V, ttl?: number) {
+  set(key: K, value: LilypadCachedValue<V>, ttl?: number) {
     this.store.set(key, { value, expirationTime: this.createExpirationTime(ttl) });
   }
 
@@ -214,7 +228,7 @@ class LilypadCache<K extends string, V> {
    * @param key - The key associated with the cached value.
    * @returns The cached value if it exists and is not expired; otherwise, `undefined`.
    */
-  get(key: K, removeOld: boolean = true): V | undefined {
+  get(key: K, removeOld: boolean = true): LilypadCachedValue<V> | undefined {
     const cacheValue = this.store.get(key);
     if (cacheValue && !isStale(cacheValue)) {
       return cacheValue.value;
@@ -269,11 +283,11 @@ class LilypadCache<K extends string, V> {
     options: LilypadCacheGetOptions<K, V>,
     key: K,
     fetched: LilypadCacheValueRetrieval<V>
-  ): V {
+  ): LilypadCachedValue<V> {
     this.logger?.error(`Error fetching cache key "${String(key)}": `, error);
 
-    let valueToReturn: V | undefined = undefined;
-    const errorFnRes = options.errorFn?.({ key, error, options, cache: this });
+    let valueToReturn: LilypadCachedValue<V> | undefined = undefined;
+    const errorFnRes = options.errorFn?.({ key, error, options });
 
     if (errorFnRes !== undefined) {
       // 1. errorFn returned a value, use it (and cache it)
@@ -310,9 +324,9 @@ class LilypadCache<K extends string, V> {
    */
   async getOrSet(
     key: K,
-    valueFn: () => Promise<V>,
+    valueFn: () => Promise<LilypadCachedValue<V>>,
     options: LilypadCacheGetOptions<K, V> = {}
-  ): Promise<V> {
+  ): Promise<LilypadCachedValue<V>> {
     const fetched = this.getComprehensive(key);
     if (!options.skipCache && fetched.type === 'hit') {
       return fetched.value;
@@ -340,7 +354,7 @@ class LilypadCache<K extends string, V> {
    * @param syncFn - An optional asynchronous function that returns an array of key-value pairs to be synchronized.
    * @returns A promise that resolves when the bulk sync operation is complete.
    */
-  async bulkSync(syncFn?: () => Promise<[K, V][]>): Promise<void> {
+  async bulkSync(syncFn?: () => Promise<[K, LilypadCachedValue<V>][]>): Promise<void> {
     await this.bulkSyncFlowControl.executeFn({
       functionIdentifier: `LilypadCache-bulkSync`,
       consumerIdentifier: '',
@@ -350,7 +364,7 @@ class LilypadCache<K extends string, V> {
       fn: async () => this._bulkSync(syncFn),
     });
   }
-  private async _bulkSync(syncFn?: () => Promise<[K, V][]>): Promise<void> {
+  private async _bulkSync(syncFn?: () => Promise<[K, LilypadCachedValue<V>][]>): Promise<void> {
     if (Date.now() < this.bulkSyncExpirationTime) {
       return;
     }
@@ -377,8 +391,8 @@ class LilypadCache<K extends string, V> {
    * @param options - An object containing an optional array of keys to retrieve.
    * @returns A `Map` containing the key-value pairs found in the cache.
    */
-  bulkGet(options: { keys?: K[] }): Map<K, V> {
-    const result = new Map<K, V>();
+  bulkGet(options: { keys?: K[] }): Map<K, LilypadCachedValue<V>> {
+    const result = new Map<K, LilypadCachedValue<V>>();
     const keysToGet = options.keys ?? Array.from(this.store.keys());
     for (const key of keysToGet) {
       const value = this.get(key);
@@ -403,9 +417,9 @@ class LilypadCache<K extends string, V> {
     options: {
       keys?: K[];
       doSync?: boolean;
-      syncFn?: () => Promise<[K, V][]>;
+      syncFn?: () => Promise<[K, LilypadCachedValue<V>][]>;
     } = { keys: undefined, doSync: true, syncFn: undefined }
-  ): Promise<Map<K, V>> {
+  ): Promise<Map<K, LilypadCachedValue<V>>> {
     if (options.doSync) {
       await this.bulkSync(options.syncFn);
     }
@@ -464,14 +478,43 @@ class LilypadCache<K extends string, V> {
    * @param options - Optional settings for invalidation.
    * @param options.invalidateBulkSync - If true, forces a bulk sync on the next bulkSync call.
    */
-  invalidate(key: K, options: { invalidateBulkSync?: boolean } = { invalidateBulkSync: true }) {
+  invalidate(
+    key: K,
+    options: { invalidateBulkSync?: boolean; tryToUpdate?: boolean } = {
+      invalidateBulkSync: true,
+      tryToUpdate: false,
+    }
+  ) {
     const comprehensive = this.getComprehensive(key);
     if (comprehensive.type === 'hit') {
       this.set(key, comprehensive.value, -1); // sets to expired
     }
-    if (options.invalidateBulkSync && comprehensive.type !== 'miss') {
-      this.bulkSyncExpirationTime = 0; // force bulk sync on next bulkSync call
+    if (options.tryToUpdate) {
+      this.update(key as K & V[keyof V]).catch((error) => {
+        this.logger?.error(`Error updating cache key "${String(key)}" after invalidation: `, error);
+        if (options.invalidateBulkSync) {
+          this.bulkSyncExpirationTime = 0; // force bulk sync on next bulkSync call
+        }
+      });
+    } else {
+      if (options.invalidateBulkSync) {
+        this.bulkSyncExpirationTime = 0; // force bulk sync on next bulkSync call
+      }
     }
+  }
+
+  async update(key: K & V[keyof V]) {
+    try {
+      if (this.dbGate && this.dbGate.gate) {
+        const value = await this.dbGate.gate.getFromTableByPrimaryKey<V>(this.dbGate.schema, key);
+        this.set(key, value);
+        return value;
+      }
+    } catch (error) {
+      this.logger?.error(`Error updating cache key "${String(key)}": `, error);
+      throw error;
+    }
+    return undefined;
   }
 
   /**

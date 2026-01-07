@@ -1,5 +1,74 @@
 import postgres from 'postgres';
 
+type LilypadDbGateOptions = {
+    connectionString: string;
+    listenerConnectionString?: string;
+    listen: {
+        channel: string;
+        callback: (payload: unknown) => void;
+    }[];
+    singleton?: {
+        dbgate: LilypadDbGate | null;
+    };
+};
+type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'json';
+type LilypadDbSchema<T> = {
+    tableName: string;
+    primaryKey: keyof T;
+    insertSanitizationFn?: (data: Partial<T>) => Partial<T>;
+    selectSanitizationFn?: (row: unknown) => T | null;
+    cols: {
+        [K in keyof T]: {
+            type: LilypadDbColumnType;
+        } & ({
+            nullable: false | undefined;
+        } | {
+            nullable: true;
+            default: T[K] | null;
+        });
+    };
+};
+/**
+ * Provides a gateway for interacting with a PostgreSQL database, including CRUD operations and channel-based listeners.
+ *
+ * The `LilypadDbGate` class manages a database connection and allows for:
+ * - Fetching all rows from a table with type safety.
+ * - Inserting, updating, and deleting rows in a table.
+ * - Listening to PostgreSQL channels for notifications and handling them with callbacks.
+ * - Managing multiple listeners and cleaning up resources.
+ *
+ * @example
+ * ```typescript
+ * const dbGate = new LilypadDbGate({
+ *   connectionString: 'postgres://user:pass@host:port/db',
+ *   listen: [
+ *     { channel: 'my_channel', callback: (payload) => console.log(payload) }
+ *   ]
+ * });
+ * ```
+ *
+ * @typeParam T - The type representing the table schema.
+ *
+ * @public
+ */
+declare class LilypadDbGate {
+    private connectionString;
+    private listenerConnectionString;
+    sql: postgres.Sql;
+    private listenerConnection;
+    private listeners;
+    private constructor();
+    static create(options: LilypadDbGateOptions): Promise<LilypadDbGate>;
+    getAllFromTable<T>(options: LilypadDbSchema<T>): Promise<T[]>;
+    getFromTableByPrimaryKey<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<T | null>;
+    addToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
+    updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
+    deleteFromTable<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<void>;
+    private getListenerConnection;
+    addListener(channel: string, callback: (payload: unknown) => void): Promise<void>;
+    close(): Promise<void>;
+}
+
 interface LilypadLoggerComponentOptions<T extends string> {
     logger: ReturnType<typeof createLogger<T>>;
     name?: string;
@@ -142,17 +211,17 @@ type LilypadCacheGetOptionsErrorFn<K extends string, V> = {
     key: K;
     error: unknown;
     options: LilypadCacheGetOptions<K, V>;
-    cache: LilypadCache<K, V>;
 };
+type LilypadCachedValue<V> = V | null;
 /**
  * Represents a cached value along with its expiration time.
  *
  * @template V The type of the value being cached.
- * @property value The actual value stored in the cache.
+ * @property value The actual value stored in the cache. Will be NULL if the associated value does not exist at all, instead of simply not being cached yet.
  * @property expirationTime The UNIX timestamp (in milliseconds) indicating when the cached value expires.
  */
 type LilypadCacheValue<V> = {
-    value: V;
+    value: LilypadCachedValue<V>;
     expirationTime: number;
 };
 /**
@@ -178,6 +247,13 @@ type LilypadCacheValueRetrieval<V> = ({
  * - Optional fallback to previous values on fetch errors.
  * - Protection of specific keys from deletion or clearing.
  * - Automatic periodic cleanup of expired entries.
+ * - Optional bulk synchronization with an external data source.
+ * - Integration with a database gateway for persistent and updated storage when an invalidation occurs.
+ *
+ * When a value is returned, as a general rule of thumb:
+ * - `undefined` means "not in cache"
+ * - `null` means "in cache, value is null" (as in, the value is known to not exist at all)
+ * - any other value means "in cache, value is X"
  *
  * @typeParam K - The type of the cache keys.
  * @typeParam V - The type of the cache values.
@@ -214,6 +290,7 @@ declare class LilypadCache<K extends string, V> {
     private logger?;
     private flowControl;
     private bulkSyncFlowControl;
+    private readonly dbGate?;
     /**
      * Timestamp of the last bulk sync operation.
      * If the cache is backed by a database or external store,
@@ -230,6 +307,10 @@ declare class LilypadCache<K extends string, V> {
         bulkSyncFn?: () => Promise<[K, V][]>;
         logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
         flowControlTimeout?: number;
+        dbGate?: {
+            gate: LilypadDbGate;
+            schema: LilypadDbSchema<V>;
+        };
     });
     /**
      * Calculates the expiration timestamp based on the provided TTL (time-to-live) value.
@@ -245,7 +326,7 @@ declare class LilypadCache<K extends string, V> {
      * @param value - The value to store in the cache.
      * @param ttl - Optional. The time-to-live in milliseconds. If not provided, the value will not expire.
      */
-    set(key: K, value: V, ttl?: number): void;
+    set(key: K, value: LilypadCachedValue<V>, ttl?: number): void;
     /**
      * Retrieves a value from the cache associated with the specified key.
      * If the cached value has expired or does not exist, it returns `undefined`.
@@ -254,7 +335,7 @@ declare class LilypadCache<K extends string, V> {
      * @param key - The key associated with the cached value.
      * @returns The cached value if it exists and is not expired; otherwise, `undefined`.
      */
-    get(key: K, removeOld?: boolean): V | undefined;
+    get(key: K, removeOld?: boolean): LilypadCachedValue<V> | undefined;
     /**
      * Retrieves a comprehensive cache value for the specified key, indicating whether the value is a cache hit, expired, or a miss.
      *
@@ -298,7 +379,7 @@ declare class LilypadCache<K extends string, V> {
      * @returns A promise that resolves to the cached value or the value produced by valueFn
      * @throws Will not throw, but will return a handled error value if valueFn rejects and error handling is configured
      */
-    getOrSet(key: K, valueFn: () => Promise<V>, options?: LilypadCacheGetOptions<K, V>): Promise<V>;
+    getOrSet(key: K, valueFn: () => Promise<LilypadCachedValue<V>>, options?: LilypadCacheGetOptions<K, V>): Promise<LilypadCachedValue<V>>;
     /**
      * Synchronizes the cache in bulk by executing the provided sync function.
      *
@@ -309,7 +390,7 @@ declare class LilypadCache<K extends string, V> {
      * @param syncFn - An optional asynchronous function that returns an array of key-value pairs to be synchronized.
      * @returns A promise that resolves when the bulk sync operation is complete.
      */
-    bulkSync(syncFn?: () => Promise<[K, V][]>): Promise<void>;
+    bulkSync(syncFn?: () => Promise<[K, LilypadCachedValue<V>][]>): Promise<void>;
     private _bulkSync;
     /**
      * Retrieves multiple values from the cache for the specified keys.
@@ -321,7 +402,7 @@ declare class LilypadCache<K extends string, V> {
      */
     bulkGet(options: {
         keys?: K[];
-    }): Map<K, V>;
+    }): Map<K, LilypadCachedValue<V>>;
     /**
      * Retrieves multiple values from the cache asynchronously.
      * Optionally synchronizes the cache before retrieval using a provided sync function.
@@ -335,8 +416,8 @@ declare class LilypadCache<K extends string, V> {
     bulkAsyncGet(options?: {
         keys?: K[];
         doSync?: boolean;
-        syncFn?: () => Promise<[K, V][]>;
-    }): Promise<Map<K, V>>;
+        syncFn?: () => Promise<[K, LilypadCachedValue<V>][]>;
+    }): Promise<Map<K, LilypadCachedValue<V>>>;
     /**
      * Sets multiple key-value pairs in the cache at once.
      *
@@ -374,7 +455,9 @@ declare class LilypadCache<K extends string, V> {
      */
     invalidate(key: K, options?: {
         invalidateBulkSync?: boolean;
+        tryToUpdate?: boolean;
     }): void;
+    update(key: K & V[keyof V]): Promise<V | null | undefined>;
     /**
      * Deletes the specified key from the cache.
      *
@@ -422,75 +505,6 @@ declare class LilypadCache<K extends string, V> {
      * This method should be called when the cache is no longer needed to free up resources.
      */
     dispose(): void;
-}
-
-type LilypadDbGateOptions = {
-    connectionString: string;
-    listenerConnectionString?: string;
-    listen: {
-        channel: string;
-        callback: (payload: unknown) => void;
-    }[];
-    singleton?: {
-        dbgate: LilypadDbGate | null;
-    };
-};
-type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'json';
-type LilypadDbSchema<T> = {
-    tableName: string;
-    primaryKey: keyof T;
-    insertSanitizationFn?: (data: Partial<T>) => Partial<T>;
-    selectSanitizationFn?: (row: unknown) => T | null;
-    cols: {
-        [K in keyof T]: {
-            type: LilypadDbColumnType;
-        } & ({
-            nullable: false | undefined;
-        } | {
-            nullable: true;
-            default: T[K] | null;
-        });
-    };
-};
-/**
- * Provides a gateway for interacting with a PostgreSQL database, including CRUD operations and channel-based listeners.
- *
- * The `LilypadDbGate` class manages a database connection and allows for:
- * - Fetching all rows from a table with type safety.
- * - Inserting, updating, and deleting rows in a table.
- * - Listening to PostgreSQL channels for notifications and handling them with callbacks.
- * - Managing multiple listeners and cleaning up resources.
- *
- * @example
- * ```typescript
- * const dbGate = new LilypadDbGate({
- *   connectionString: 'postgres://user:pass@host:port/db',
- *   listen: [
- *     { channel: 'my_channel', callback: (payload) => console.log(payload) }
- *   ]
- * });
- * ```
- *
- * @typeParam T - The type representing the table schema.
- *
- * @public
- */
-declare class LilypadDbGate {
-    private connectionString;
-    private listenerConnectionString;
-    sql: postgres.Sql;
-    private listenerConnection;
-    private listeners;
-    private constructor();
-    static create(options: LilypadDbGateOptions): Promise<LilypadDbGate>;
-    getAllFromTable<T>(options: LilypadDbSchema<T>): Promise<T[]>;
-    getFromTableByPrimaryKey<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<T | null>;
-    addToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
-    updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
-    deleteFromTable<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<void>;
-    private getListenerConnection;
-    addListener(channel: string, callback: (payload: unknown) => void): Promise<void>;
-    close(): Promise<void>;
 }
 
 /**

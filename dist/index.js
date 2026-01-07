@@ -164,6 +164,7 @@ var LilypadCache = (_class2 = class {
   
   
   
+  
   /**
    * Timestamp of the last bulk sync operation.
    * If the cache is backed by a database or external store,
@@ -188,6 +189,7 @@ var LilypadCache = (_class2 = class {
       logger: this.logger,
       timeout: options.flowControlTimeout || 3e4
     });
+    this.dbGate = options.dbGate;
     if (options.autoCleanupInterval) {
       if (!Number.isFinite(options.autoCleanupInterval) || options.autoCleanupInterval <= 0) {
         throw new Error("autoCleanupInterval must be a positive finite number");
@@ -277,7 +279,7 @@ var LilypadCache = (_class2 = class {
     var _a, _b;
     (_a = this.logger) == null ? void 0 : _a.error(`Error fetching cache key "${String(key)}": `, error);
     let valueToReturn = void 0;
-    const errorFnRes = (_b = options.errorFn) == null ? void 0 : _b.call(options, { key, error, options, cache: this });
+    const errorFnRes = (_b = options.errorFn) == null ? void 0 : _b.call(options, { key, error, options });
     if (errorFnRes !== void 0) {
       valueToReturn = errorFnRes;
     }
@@ -446,14 +448,41 @@ var LilypadCache = (_class2 = class {
    * @param options - Optional settings for invalidation.
    * @param options.invalidateBulkSync - If true, forces a bulk sync on the next bulkSync call.
    */
-  invalidate(key, options = { invalidateBulkSync: true }) {
+  invalidate(key, options = {
+    invalidateBulkSync: true,
+    tryToUpdate: false
+  }) {
     const comprehensive = this.getComprehensive(key);
     if (comprehensive.type === "hit") {
       this.set(key, comprehensive.value, -1);
     }
-    if (options.invalidateBulkSync && comprehensive.type !== "miss") {
-      this.bulkSyncExpirationTime = 0;
+    if (options.tryToUpdate) {
+      this.update(key).catch((error) => {
+        var _a;
+        (_a = this.logger) == null ? void 0 : _a.error(`Error updating cache key "${String(key)}" after invalidation: `, error);
+        if (options.invalidateBulkSync) {
+          this.bulkSyncExpirationTime = 0;
+        }
+      });
+    } else {
+      if (options.invalidateBulkSync) {
+        this.bulkSyncExpirationTime = 0;
+      }
     }
+  }
+  async update(key) {
+    var _a;
+    try {
+      if (this.dbGate && this.dbGate.gate) {
+        const value = await this.dbGate.gate.getFromTableByPrimaryKey(this.dbGate.schema, key);
+        this.set(key, value);
+        return value;
+      }
+    } catch (error) {
+      (_a = this.logger) == null ? void 0 : _a.error(`Error updating cache key "${String(key)}": `, error);
+      throw error;
+    }
+    return void 0;
   }
   /**
    * Deletes the specified key from the cache.
