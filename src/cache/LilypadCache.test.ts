@@ -705,39 +705,6 @@ describe('LilypadCache', () => {
           expect(cache.getComprehensive('key1').type).toBe('expired');
         });
 
-        it('should call update when tryToUpdate is true', async () => {
-          const updateSpy = vi.spyOn(cache, 'update').mockResolvedValue(456 as any);
-          cache.set('key1', 123, 1000);
-          await cache.invalidate('key1', { tryToUpdate: true });
-          expect(updateSpy).toHaveBeenCalledWith('key1');
-          updateSpy.mockRestore();
-        });
-
-        it('should log error if update fails and tryToUpdate is true', async () => {
-          const error = new Error('update failed');
-          const logger = {
-            error: vi.fn(),
-            warn: vi.fn(),
-            info: vi.fn(),
-            debug: vi.fn(),
-            components: {},
-            register: vi.fn(),
-            __name: undefined,
-          } as unknown as LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
-          const customCache = new LilypadCache<string, number>(1000, { logger });
-          vi.spyOn(customCache, 'update').mockRejectedValue(error);
-          customCache.set('key1', 123, 1000);
-          await customCache.invalidate('key1', { tryToUpdate: true });
-          // Wait for the catch block to execute
-          await new Promise((resolve) => setTimeout(resolve, 10));
-          expect(logger.error).toHaveBeenCalledWith(
-            'Error updating cache key "key1" after invalidation: ',
-            error
-          );
-          (customCache.update as any).mockRestore();
-          customCache.dispose();
-        });
-
         it('should not set bulkSyncExpirationTime to 0 if invalidateBulkSync is false', () => {
           cache.set('key1', 123, 1000);
           const prev = cache['bulkSyncExpirationTime'];

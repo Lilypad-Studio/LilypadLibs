@@ -10,6 +10,7 @@
  * Cache Module
  */
 export { default as LilypadCache } from './cache/LilypadCache';
+export { default as LilypadDbCache } from './cache/LilypadDbCache';
 export type { LilypadCacheGetOptions } from './cache/LilypadCache';
 
 /**

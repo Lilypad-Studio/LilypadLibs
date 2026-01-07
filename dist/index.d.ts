@@ -1,74 +1,5 @@
 import postgres from 'postgres';
 
-type LilypadDbGateOptions = {
-    connectionString: string;
-    listenerConnectionString?: string;
-    listen: {
-        channel: string;
-        callback: (payload: unknown) => void;
-    }[];
-    singleton?: {
-        dbgate: LilypadDbGate | null;
-    };
-};
-type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'json';
-type LilypadDbSchema<T> = {
-    tableName: string;
-    primaryKey: keyof T;
-    insertSanitizationFn?: (data: Partial<T>) => Partial<T>;
-    selectSanitizationFn?: (row: unknown) => T | null;
-    cols: {
-        [K in keyof T]: {
-            type: LilypadDbColumnType;
-        } & ({
-            nullable: false | undefined;
-        } | {
-            nullable: true;
-            default: T[K] | null;
-        });
-    };
-};
-/**
- * Provides a gateway for interacting with a PostgreSQL database, including CRUD operations and channel-based listeners.
- *
- * The `LilypadDbGate` class manages a database connection and allows for:
- * - Fetching all rows from a table with type safety.
- * - Inserting, updating, and deleting rows in a table.
- * - Listening to PostgreSQL channels for notifications and handling them with callbacks.
- * - Managing multiple listeners and cleaning up resources.
- *
- * @example
- * ```typescript
- * const dbGate = new LilypadDbGate({
- *   connectionString: 'postgres://user:pass@host:port/db',
- *   listen: [
- *     { channel: 'my_channel', callback: (payload) => console.log(payload) }
- *   ]
- * });
- * ```
- *
- * @typeParam T - The type representing the table schema.
- *
- * @public
- */
-declare class LilypadDbGate {
-    private connectionString;
-    private listenerConnectionString;
-    sql: postgres.Sql;
-    private listenerConnection;
-    private listeners;
-    private constructor();
-    static create(options: LilypadDbGateOptions): Promise<LilypadDbGate>;
-    getAllFromTable<T>(options: LilypadDbSchema<T>): Promise<T[]>;
-    getFromTableByPrimaryKey<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<T | null>;
-    addToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
-    updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
-    deleteFromTable<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<void>;
-    private getListenerConnection;
-    addListener(channel: string, callback: (payload: unknown) => void): Promise<void>;
-    close(): Promise<void>;
-}
-
 interface LilypadLoggerComponentOptions<T extends string> {
     logger: ReturnType<typeof createLogger<T>>;
     name?: string;
@@ -167,6 +98,125 @@ type LilypadLoggerType<T extends string> = LilypadLogger<T> & ChannelMethods<T>;
  * ```
  */
 declare function createLogger<T extends string = 'log' | 'error' | 'warn'>(options: LilypadLoggerConstructorOptions<T>): LilypadLoggerType<T>;
+
+interface FlowControlOptions {
+    rate?: number;
+    timeout?: number;
+    retries?: number;
+    logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
+}
+interface ExecuteFnOptions<T> {
+    errorFn?: (error: unknown) => T | void;
+    functionIdentifier: string;
+    consumerIdentifier: string;
+    fn: () => Promise<T>;
+    retries?: number;
+    backOffTime?: (attempt: number) => number;
+}
+/**
+ * A flow control utility class that manages execution of asynchronous operations with support for
+ * rate limiting, retries, timeouts, and single-flight request deduplication.
+ *
+ * @template T - The type of value resolved by the executed operations.
+ *
+ * @example
+ * ```typescript
+ * const flowControl = new LilypadFlowControl<string>({
+ *   rate: 1000,
+ *   timeout: 5000,
+ *   retries: 3,
+ *   logger: myLogger
+ * });
+ *
+ * const result = await flowControl.executeFn({
+ *   functionIdentifier: 'myFunction',
+ *   consumerIdentifier: 'user123',
+ *   fn: () => fetchData(),
+ *   backOffTime: (attempt) => Math.pow(2, attempt) * 100
+ * });
+ * ```
+ *
+ * @remarks
+ * - **Rate Limiting**: Enforces a minimum interval between executions per consumer/function pair
+ * - **Single-Flight**: Deduplicates concurrent requests for the same function identifier
+ * - **Retries**: Automatically retries failed operations with configurable backoff strategies
+ * - **Timeout**: Fails operations that exceed the specified timeout duration
+ *
+ * @property rate - Minimum milliseconds between executions for rate limiting
+ * @property timeout - Maximum milliseconds to wait for operation completion
+ * @property retries - Maximum number of retry attempts for failed operations
+ * @property logger - Optional logger instance for error, warning, info, and debug messages
+ */
+declare class LilypadFlowControl<T> {
+    private rate?;
+    private timeout?;
+    private retries?;
+    private logger?;
+    private singleFlightMap;
+    private rateMap;
+    constructor(options?: FlowControlOptions);
+    /**
+     * Executes an asynchronous function with a timeout constraint.
+     *
+     * @template T The type of value returned by the execution function.
+     * @param executionFn An asynchronous function to execute.
+     * @returns A promise that resolves with the result of `executionFn` if it completes before the timeout,
+     *          or rejects with an error if the timeout is exceeded.
+     * @throws {Error} Throws an error with message 'Operation timed out' if the execution exceeds the configured timeout duration.
+     *
+     * @remarks
+     * This method uses `Promise.race()` to implement the timeout mechanism. The timeout is cleared in the finally block
+     * to ensure no memory leaks occur regardless of whether the operation succeeds or times out.
+     */
+    executeWithTimeout(executionFn: () => Promise<T>): Promise<T>;
+    /**
+     * Executes a given asynchronous function with retry logic and optional exponential backoff.
+     *
+     * @template T The return type of the execution function.
+     * @param options - The options for executing with retries, including:
+     * @param options.executionFn - The asynchronous function to execute.
+     * @param options.errorFn - Optional function to handle errors after all retries have been exhausted. If provided, its return value will be returned instead of throwing the error.
+     * @param options.retries - The maximum number of retry attempts. If not provided, the instance's configured retries will be used.
+     * @param options.backOffTime - Optional function to calculate the backoff time (in milliseconds) before each retry attempt. Receives the current attempt number as an argument. Defaults to exponential backoff if not provided.
+     * @returns A promise that resolves with the result of `executionFn`, or with the result of `errorFn` if retries are exhausted.
+     * @throws The error thrown by `executionFn` if all retries are exhausted and no `errorFn` is provided.
+     */
+    executeWithRetries(options: {
+        executionFn: () => Promise<T>;
+        retries?: number;
+        errorFn?: (error: unknown) => T | void;
+        backOffTime?: (attempt: number) => number;
+    }): Promise<T>;
+    /**
+     * Enforces a rate limit for a specific consumer and function combination.
+     *
+     * If a rate limit is set, this method checks whether the specified consumer
+     * has invoked the given function within the allowed time interval. If the
+     * rate limit is exceeded, an error is thrown. Otherwise, the invocation time
+     * is recorded.
+     *
+     * @param consumerIdentifier - A unique identifier for the consumer (e.g., user or service).
+     * @param functionIdentifier - A unique identifier for the function being rate-limited.
+     * @throws {Error} If the rate limit is exceeded for the given consumer and function.
+     * @returns A promise that resolves when the rate limit check passes.
+     */
+    rateLimit(consumerIdentifier: string, functionIdentifier: string): Promise<void>;
+    /**
+     * Executes a provided function with optional rate limiting, single-flight deduplication,
+     * retries, and timeout handling. Ensures that only one execution per function identifier
+     * is in-flight at a time, and subsequent calls return the same promise until completion.
+     *
+     * @template T - The return type of the function to execute.
+     * @param options - The execution options, including:
+     *   - consumerIdentifier: Unique identifier for the consumer (used for rate limiting).
+     *   - functionIdentifier: Unique identifier for the function (used for single-flight).
+     *   - fn: The function to execute.
+     *   - errorFn: Optional error handler for retries.
+     *   - backOffTime: Optional backoff time between retries.
+     * @returns A promise that resolves with the result of the executed function.
+     */
+    executeFn(options: ExecuteFnOptions<T>): Promise<T>;
+}
 
 type LilypadCacheGetOptions<K extends string, V> = {
     /**
@@ -281,16 +331,17 @@ type LilypadCacheValueRetrieval<V> = ({
  * @see {@link dispose}
  */
 declare class LilypadCache<K extends string, V> {
-    private store;
-    private defaultTtl;
-    private defaultErrorTtl;
-    private defaultBulkSyncTtl;
-    private cleanupIntervalId?;
-    private protectedKeys;
-    private logger?;
-    private flowControl;
-    private bulkSyncFlowControl;
-    private readonly dbGate?;
+    protected store: Map<K, LilypadCacheValue<V>>;
+    protected defaultTtl: number;
+    protected defaultErrorTtl: number;
+    protected defaultBulkSyncTtl: number;
+    protected cleanupIntervalId?: ReturnType<typeof setInterval> & {
+        unref?: () => void;
+    };
+    protected protectedKeys: Set<K>;
+    protected logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
+    protected flowControl: LilypadFlowControl<LilypadCachedValue<V>>;
+    protected bulkSyncFlowControl: LilypadFlowControl<void>;
     /**
      * Timestamp of the last bulk sync operation.
      * If the cache is backed by a database or external store,
@@ -298,8 +349,8 @@ declare class LilypadCache<K extends string, V> {
      * This timestamp can be used to track when the last bulk sync occurred, which would
      * have synced the cache with the store.
      */
-    private bulkSyncExpirationTime;
-    private bulkSyncFn?;
+    protected bulkSyncExpirationTime: number;
+    protected bulkSyncFn?: () => Promise<[K, V][]>;
     constructor(ttl?: number, options?: {
         autoCleanupInterval?: number;
         defaultErrorTtl?: number;
@@ -307,10 +358,6 @@ declare class LilypadCache<K extends string, V> {
         bulkSyncFn?: () => Promise<[K, V][]>;
         logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
         flowControlTimeout?: number;
-        dbGate?: {
-            gate: LilypadDbGate;
-            schema: LilypadDbSchema<V>;
-        };
     });
     /**
      * Calculates the expiration timestamp based on the provided TTL (time-to-live) value.
@@ -457,7 +504,6 @@ declare class LilypadCache<K extends string, V> {
         invalidateBulkSync?: boolean;
         tryToUpdate?: boolean;
     }): void;
-    update(key: K & V[keyof V]): Promise<V | null | undefined>;
     /**
      * Deletes the specified key from the cache.
      *
@@ -507,6 +553,139 @@ declare class LilypadCache<K extends string, V> {
     dispose(): void;
 }
 
+type LilypadDbGateOptions = {
+    connectionString: string;
+    listenerConnectionString?: string;
+    listen: {
+        channel: string;
+        callback: (payload: unknown) => void;
+    }[];
+    singleton?: {
+        dbgate: LilypadDbGate | null;
+    };
+};
+type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'json';
+type LilypadDbSchema<T> = {
+    tableName: string;
+    primaryKey: keyof T;
+    insertSanitizationFn?: (data: Partial<T>) => Partial<T>;
+    selectSanitizationFn?: (row: unknown) => T | null;
+    cols: {
+        [K in keyof T]: {
+            type: LilypadDbColumnType;
+        } & ({
+            nullable: false | undefined;
+        } | {
+            nullable: true;
+            default: T[K] | null;
+        });
+    };
+};
+/**
+ * Provides a gateway for interacting with a PostgreSQL database, including CRUD operations and channel-based listeners.
+ *
+ * The `LilypadDbGate` class manages a database connection and allows for:
+ * - Fetching all rows from a table with type safety.
+ * - Inserting, updating, and deleting rows in a table.
+ * - Listening to PostgreSQL channels for notifications and handling them with callbacks.
+ * - Managing multiple listeners and cleaning up resources.
+ *
+ * @example
+ * ```typescript
+ * const dbGate = new LilypadDbGate({
+ *   connectionString: 'postgres://user:pass@host:port/db',
+ *   listen: [
+ *     { channel: 'my_channel', callback: (payload) => console.log(payload) }
+ *   ]
+ * });
+ * ```
+ *
+ * @typeParam T - The type representing the table schema.
+ *
+ * @public
+ */
+declare class LilypadDbGate {
+    private connectionString;
+    private listenerConnectionString;
+    sql: postgres.Sql;
+    private listenerConnection;
+    private listeners;
+    private constructor();
+    static create(options: LilypadDbGateOptions): Promise<LilypadDbGate>;
+    getAllFromTable<T>(options: LilypadDbSchema<T>): Promise<T[]>;
+    getFromTableByPrimaryKey<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<T | null>;
+    addToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
+    updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
+    deleteFromTable<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<void>;
+    private getListenerConnection;
+    addListener(channel: string, callback: (payload: unknown) => void): Promise<void>;
+    close(): Promise<void>;
+}
+
+/**
+ * A cache class that synchronizes with a database table using a provided database gateway and schema.
+ *
+ * `LilypadDbCache` extends `LilypadCache` to provide automatic cache population and invalidation
+ * by fetching data from a database. It supports bulk synchronization and per-key updates from the database.
+ *
+ * @typeParam K - The type of the cache key, constrained to string and a key of V.
+ * @typeParam V - The type of the cached value, constrained to object.
+ *
+ * @example
+ * ```typescript
+ * const dbCache = new LilypadDbCache<string, MyType>(ttl, {
+ *   dbGate: { gate: myDbGate, schema: mySchema },
+ *   // ...other options
+ * });
+ * ```
+ *
+ * @remarks
+ * - The cache is automatically synchronized with the database using the provided `dbGate`.
+ *   - The synchonization does not happen on cache misses, but only when directly invoked via `update` (or when specified otherwise).
+ * - The `invalidate` method triggers an update from the database for the given key.
+ * - The `bulkAsyncGet` method fetches all items from the database and updates the cache.
+ *
+ * @see LilypadCache
+ * @see LilypadDbGate
+ * @see LilypadDbSchema
+ */
+declare class LilypadDbCache<K extends string & V[keyof V], V extends object> extends LilypadCache<K, V> {
+    private readonly dbGate;
+    constructor(ttl: number, options: ConstructorParameters<typeof LilypadCache<K, V>>[1] & {
+        dbGate: {
+            gate: LilypadDbGate;
+            schema: LilypadDbSchema<V>;
+        };
+    });
+    /**
+     * Invalidates the cache entry for the specified key.
+     *
+     * Attempts to update the cache for the given key. If the update fails,
+     * logs the error and falls back to the base class's invalidate method.
+     *
+     * @param key - The cache key to invalidate.
+     * @param options - Optional settings for invalidation.
+     * @param options.invalidateBulkSync - Whether to invalidate bulk sync (default: true).
+     * @returns A promise that resolves when the invalidation process is complete.
+     */
+    invalidate(key: K, options?: {
+        invalidateBulkSync?: boolean;
+    }): Promise<void>;
+    /**
+     * Updates the cache entry for the specified key by fetching the latest value from the database.
+     *
+     * If the database gateway is available, retrieves the value associated with the given key from the database,
+     * updates the cache with this value, and returns it. If an error occurs during the process, logs the error
+     * and rethrows it. Returns `undefined` if the database gateway is not available.
+     *
+     * @param key - The primary key of the cache entry to update.
+     * @returns A promise that resolves to the updated value from the database, or `undefined` if the update could not be performed.
+     * @throws Rethrows any error encountered during the database fetch or cache update process.
+     */
+    update(key: K): Promise<V | null | undefined>;
+    bulkAsyncGet(): Promise<Map<K, V | null>>;
+}
+
 /**
  * A logger component that outputs messages to the console.
  *
@@ -545,125 +724,6 @@ declare class LilypadDiscordLogger<T extends string> extends LilypadLoggerCompon
     private webhookUrl;
     constructor(webhookUrl: string);
     protected send(message: string): Promise<void>;
-}
-
-interface FlowControlOptions {
-    rate?: number;
-    timeout?: number;
-    retries?: number;
-    logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
-}
-interface ExecuteFnOptions<T> {
-    errorFn?: (error: unknown) => T | void;
-    functionIdentifier: string;
-    consumerIdentifier: string;
-    fn: () => Promise<T>;
-    retries?: number;
-    backOffTime?: (attempt: number) => number;
-}
-/**
- * A flow control utility class that manages execution of asynchronous operations with support for
- * rate limiting, retries, timeouts, and single-flight request deduplication.
- *
- * @template T - The type of value resolved by the executed operations.
- *
- * @example
- * ```typescript
- * const flowControl = new LilypadFlowControl<string>({
- *   rate: 1000,
- *   timeout: 5000,
- *   retries: 3,
- *   logger: myLogger
- * });
- *
- * const result = await flowControl.executeFn({
- *   functionIdentifier: 'myFunction',
- *   consumerIdentifier: 'user123',
- *   fn: () => fetchData(),
- *   backOffTime: (attempt) => Math.pow(2, attempt) * 100
- * });
- * ```
- *
- * @remarks
- * - **Rate Limiting**: Enforces a minimum interval between executions per consumer/function pair
- * - **Single-Flight**: Deduplicates concurrent requests for the same function identifier
- * - **Retries**: Automatically retries failed operations with configurable backoff strategies
- * - **Timeout**: Fails operations that exceed the specified timeout duration
- *
- * @property rate - Minimum milliseconds between executions for rate limiting
- * @property timeout - Maximum milliseconds to wait for operation completion
- * @property retries - Maximum number of retry attempts for failed operations
- * @property logger - Optional logger instance for error, warning, info, and debug messages
- */
-declare class LilypadFlowControl<T> {
-    private rate?;
-    private timeout?;
-    private retries?;
-    private logger?;
-    private singleFlightMap;
-    private rateMap;
-    constructor(options?: FlowControlOptions);
-    /**
-     * Executes an asynchronous function with a timeout constraint.
-     *
-     * @template T The type of value returned by the execution function.
-     * @param executionFn An asynchronous function to execute.
-     * @returns A promise that resolves with the result of `executionFn` if it completes before the timeout,
-     *          or rejects with an error if the timeout is exceeded.
-     * @throws {Error} Throws an error with message 'Operation timed out' if the execution exceeds the configured timeout duration.
-     *
-     * @remarks
-     * This method uses `Promise.race()` to implement the timeout mechanism. The timeout is cleared in the finally block
-     * to ensure no memory leaks occur regardless of whether the operation succeeds or times out.
-     */
-    executeWithTimeout(executionFn: () => Promise<T>): Promise<T>;
-    /**
-     * Executes a given asynchronous function with retry logic and optional exponential backoff.
-     *
-     * @template T The return type of the execution function.
-     * @param options - The options for executing with retries, including:
-     * @param options.executionFn - The asynchronous function to execute.
-     * @param options.errorFn - Optional function to handle errors after all retries have been exhausted. If provided, its return value will be returned instead of throwing the error.
-     * @param options.retries - The maximum number of retry attempts. If not provided, the instance's configured retries will be used.
-     * @param options.backOffTime - Optional function to calculate the backoff time (in milliseconds) before each retry attempt. Receives the current attempt number as an argument. Defaults to exponential backoff if not provided.
-     * @returns A promise that resolves with the result of `executionFn`, or with the result of `errorFn` if retries are exhausted.
-     * @throws The error thrown by `executionFn` if all retries are exhausted and no `errorFn` is provided.
-     */
-    executeWithRetries(options: {
-        executionFn: () => Promise<T>;
-        retries?: number;
-        errorFn?: (error: unknown) => T | void;
-        backOffTime?: (attempt: number) => number;
-    }): Promise<T>;
-    /**
-     * Enforces a rate limit for a specific consumer and function combination.
-     *
-     * If a rate limit is set, this method checks whether the specified consumer
-     * has invoked the given function within the allowed time interval. If the
-     * rate limit is exceeded, an error is thrown. Otherwise, the invocation time
-     * is recorded.
-     *
-     * @param consumerIdentifier - A unique identifier for the consumer (e.g., user or service).
-     * @param functionIdentifier - A unique identifier for the function being rate-limited.
-     * @throws {Error} If the rate limit is exceeded for the given consumer and function.
-     * @returns A promise that resolves when the rate limit check passes.
-     */
-    rateLimit(consumerIdentifier: string, functionIdentifier: string): Promise<void>;
-    /**
-     * Executes a provided function with optional rate limiting, single-flight deduplication,
-     * retries, and timeout handling. Ensures that only one execution per function identifier
-     * is in-flight at a time, and subsequent calls return the same promise until completion.
-     *
-     * @template T - The return type of the function to execute.
-     * @param options - The execution options, including:
-     *   - consumerIdentifier: Unique identifier for the consumer (used for rate limiting).
-     *   - functionIdentifier: Unique identifier for the function (used for single-flight).
-     *   - fn: The function to execute.
-     *   - errorFn: Optional error handler for retries.
-     *   - backOffTime: Optional backoff time between retries.
-     * @returns A promise that resolves with the result of the executed function.
-     */
-    executeFn(options: ExecuteFnOptions<T>): Promise<T>;
 }
 
 type InvertRecord<R extends Record<PropertyKey, PropertyKey>> = {
@@ -716,4 +776,4 @@ declare class LilypadSerializer<FROM extends {}, TO extends {}, KeyMap extends R
     deserialize(input: TO[]): FROM[];
 }
 
-export { type ExecuteFnOptions, type FlowControlOptions, LilypadCache, type LilypadCacheGetOptions, LilypadConsoleLogger, LilypadDbGate, type LilypadDbGateOptions, type LilypadDbSchema, LilypadDiscordLogger, LilypadFlowControl, type LilypadLoggerConstructorOptions, LilypadSerializer, type LilypadSerializerConstructorOptions, createLogger };
+export { type ExecuteFnOptions, type FlowControlOptions, LilypadCache, type LilypadCacheGetOptions, LilypadConsoleLogger, LilypadDbCache, LilypadDbGate, type LilypadDbGateOptions, type LilypadDbSchema, LilypadDiscordLogger, LilypadFlowControl, type LilypadLoggerConstructorOptions, LilypadSerializer, type LilypadSerializerConstructorOptions, createLogger };

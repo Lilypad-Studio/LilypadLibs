@@ -164,7 +164,6 @@ var LilypadCache = (_class2 = class {
   
   
   
-  
   /**
    * Timestamp of the last bulk sync operation.
    * If the cache is backed by a database or external store,
@@ -189,7 +188,6 @@ var LilypadCache = (_class2 = class {
       logger: this.logger,
       timeout: options.flowControlTimeout || 3e4
     });
-    this.dbGate = options.dbGate;
     if (options.autoCleanupInterval) {
       if (!Number.isFinite(options.autoCleanupInterval) || options.autoCleanupInterval <= 0) {
         throw new Error("autoCleanupInterval must be a positive finite number");
@@ -456,33 +454,9 @@ var LilypadCache = (_class2 = class {
     if (comprehensive.type === "hit") {
       this.set(key, comprehensive.value, -1);
     }
-    if (options.tryToUpdate) {
-      this.update(key).catch((error) => {
-        var _a;
-        (_a = this.logger) == null ? void 0 : _a.error(`Error updating cache key "${String(key)}" after invalidation: `, error);
-        if (options.invalidateBulkSync) {
-          this.bulkSyncExpirationTime = 0;
-        }
-      });
-    } else {
-      if (options.invalidateBulkSync) {
-        this.bulkSyncExpirationTime = 0;
-      }
+    if (options.invalidateBulkSync) {
+      this.bulkSyncExpirationTime = 0;
     }
-  }
-  async update(key) {
-    var _a;
-    try {
-      if (this.dbGate && this.dbGate.gate) {
-        const value = await this.dbGate.gate.getFromTableByPrimaryKey(this.dbGate.schema, key);
-        this.set(key, value);
-        return value;
-      }
-    } catch (error) {
-      (_a = this.logger) == null ? void 0 : _a.error(`Error updating cache key "${String(key)}": `, error);
-      throw error;
-    }
-    return void 0;
   }
   /**
    * Deletes the specified key from the cache.
@@ -553,6 +527,71 @@ var LilypadCache = (_class2 = class {
   }
 }, _class2);
 var LilypadCache_default = LilypadCache;
+
+// src/cache/LilypadDbCache.ts
+var LilypadDbCache = class extends LilypadCache_default {
+  
+  constructor(ttl, options) {
+    super(ttl, options);
+    this.dbGate = options.dbGate;
+    this.bulkSyncFn = async () => (await this.dbGate.gate.getAllFromTable(this.dbGate.schema)).map((item) => [
+      item[options.dbGate.schema.primaryKey],
+      item
+    ]);
+  }
+  /**
+   * Invalidates the cache entry for the specified key.
+   *
+   * Attempts to update the cache for the given key. If the update fails,
+   * logs the error and falls back to the base class's invalidate method.
+   *
+   * @param key - The cache key to invalidate.
+   * @param options - Optional settings for invalidation.
+   * @param options.invalidateBulkSync - Whether to invalidate bulk sync (default: true).
+   * @returns A promise that resolves when the invalidation process is complete.
+   */
+  async invalidate(key, options = {
+    invalidateBulkSync: true
+  }) {
+    var _a;
+    try {
+      await this.update(key);
+    } catch (error) {
+      (_a = this.logger) == null ? void 0 : _a.error(`Error updating cache key "${String(key)}" after invalidation: `, error);
+      super.invalidate(key, options);
+    }
+  }
+  /**
+   * Updates the cache entry for the specified key by fetching the latest value from the database.
+   *
+   * If the database gateway is available, retrieves the value associated with the given key from the database,
+   * updates the cache with this value, and returns it. If an error occurs during the process, logs the error
+   * and rethrows it. Returns `undefined` if the database gateway is not available.
+   *
+   * @param key - The primary key of the cache entry to update.
+   * @returns A promise that resolves to the updated value from the database, or `undefined` if the update could not be performed.
+   * @throws Rethrows any error encountered during the database fetch or cache update process.
+   */
+  async update(key) {
+    var _a;
+    try {
+      if (this.dbGate && this.dbGate.gate) {
+        const value = await this.dbGate.gate.getFromTableByPrimaryKey(this.dbGate.schema, key);
+        this.set(key, value);
+        return value;
+      }
+    } catch (error) {
+      (_a = this.logger) == null ? void 0 : _a.error(`Error updating cache key "${String(key)}": `, error);
+      throw error;
+    }
+    return void 0;
+  }
+  async bulkAsyncGet() {
+    return super.bulkAsyncGet({
+      doSync: true
+    });
+  }
+};
 
 // src/dbGate/LilypadDbGate.ts
 var _postgres = require('postgres'); var _postgres2 = _interopRequireDefault(_postgres);
@@ -862,5 +901,6 @@ var LilypadSerializer = class {
 
 
 
-exports.LilypadCache = LilypadCache_default; exports.LilypadConsoleLogger = LilypadConsoleLogger; exports.LilypadDbGate = LilypadDbGate; exports.LilypadDiscordLogger = LilypadDiscordLogger; exports.LilypadFlowControl = LilypadFlowControl; exports.LilypadSerializer = LilypadSerializer; exports.createLogger = createLogger;
+
+exports.LilypadCache = LilypadCache_default; exports.LilypadConsoleLogger = LilypadConsoleLogger; exports.LilypadDbCache = LilypadDbCache; exports.LilypadDbGate = LilypadDbGate; exports.LilypadDiscordLogger = LilypadDiscordLogger; exports.LilypadFlowControl = LilypadFlowControl; exports.LilypadSerializer = LilypadSerializer; exports.createLogger = createLogger;
 //# sourceMappingURL=index.js.map

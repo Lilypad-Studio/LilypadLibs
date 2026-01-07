@@ -1,4 +1,3 @@
-import type { LilypadDbGate, LilypadDbSchema } from '@/dbGate/LilypadDbGate';
 import { LilypadFlowControl } from '@/flow/LilypadFlowControl';
 import type { LilypadLoggerType } from '@/logger/LilypadLogger';
 
@@ -132,20 +131,18 @@ function isStale<V>(retrieval: LilypadCacheValue<V>): boolean {
  * @see {@link dispose}
  */
 class LilypadCache<K extends string, V> {
-  private store: Map<K, LilypadCacheValue<V>>;
-  private defaultTtl: number; // time to live in milliseconds
-  private defaultErrorTtl: number; // default error TTL in milliseconds
-  private defaultBulkSyncTtl: number;
-  private cleanupIntervalId?: ReturnType<typeof setInterval> & { unref?: () => void };
+  protected store: Map<K, LilypadCacheValue<V>>;
+  protected defaultTtl: number; // time to live in milliseconds
+  protected defaultErrorTtl: number; // default error TTL in milliseconds
+  protected defaultBulkSyncTtl: number;
+  protected cleanupIntervalId?: ReturnType<typeof setInterval> & { unref?: () => void };
 
-  private protectedKeys: Set<K> = new Set();
+  protected protectedKeys: Set<K> = new Set();
 
-  private logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
+  protected logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
 
-  private flowControl: LilypadFlowControl<LilypadCachedValue<V>>;
-  private bulkSyncFlowControl: LilypadFlowControl<void>;
-
-  private readonly dbGate?: { gate: LilypadDbGate; schema: LilypadDbSchema<V> };
+  protected flowControl: LilypadFlowControl<LilypadCachedValue<V>>;
+  protected bulkSyncFlowControl: LilypadFlowControl<void>;
 
   /**
    * Timestamp of the last bulk sync operation.
@@ -154,8 +151,8 @@ class LilypadCache<K extends string, V> {
    * This timestamp can be used to track when the last bulk sync occurred, which would
    * have synced the cache with the store.
    */
-  private bulkSyncExpirationTime: number = 0;
-  private bulkSyncFn?: () => Promise<[K, V][]>;
+  protected bulkSyncExpirationTime: number = 0;
+  protected bulkSyncFn?: () => Promise<[K, V][]>;
 
   constructor(
     ttl: number = 60000,
@@ -166,7 +163,6 @@ class LilypadCache<K extends string, V> {
       bulkSyncFn?: () => Promise<[K, V][]>;
       logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
       flowControlTimeout?: number;
-      dbGate?: { gate: LilypadDbGate; schema: LilypadDbSchema<V> };
     } = {}
   ) {
     this.store = new Map();
@@ -185,8 +181,6 @@ class LilypadCache<K extends string, V> {
       logger: this.logger,
       timeout: options.flowControlTimeout || 30000,
     });
-
-    this.dbGate = options.dbGate;
 
     if (options.autoCleanupInterval) {
       if (!Number.isFinite(options.autoCleanupInterval) || options.autoCleanupInterval <= 0) {
@@ -489,32 +483,9 @@ class LilypadCache<K extends string, V> {
     if (comprehensive.type === 'hit') {
       this.set(key, comprehensive.value, -1); // sets to expired
     }
-    if (options.tryToUpdate) {
-      this.update(key as K & V[keyof V]).catch((error) => {
-        this.logger?.error(`Error updating cache key "${String(key)}" after invalidation: `, error);
-        if (options.invalidateBulkSync) {
-          this.bulkSyncExpirationTime = 0; // force bulk sync on next bulkSync call
-        }
-      });
-    } else {
-      if (options.invalidateBulkSync) {
-        this.bulkSyncExpirationTime = 0; // force bulk sync on next bulkSync call
-      }
+    if (options.invalidateBulkSync) {
+      this.bulkSyncExpirationTime = 0; // force bulk sync on next bulkSync call
     }
-  }
-
-  async update(key: K & V[keyof V]) {
-    try {
-      if (this.dbGate && this.dbGate.gate) {
-        const value = await this.dbGate.gate.getFromTableByPrimaryKey<V>(this.dbGate.schema, key);
-        this.set(key, value);
-        return value;
-      }
-    } catch (error) {
-      this.logger?.error(`Error updating cache key "${String(key)}": `, error);
-      throw error;
-    }
-    return undefined;
   }
 
   /**
