@@ -215,7 +215,7 @@ var LilypadCache = (_class2 = class {
    * @param ttl - Optional. The time-to-live in milliseconds. If not provided, the value will not expire.
    */
   set(key, value, ttl) {
-    this.store.set(key, { value, expirationTime: this.createExpirationTime(ttl) });
+    this.store.set(String(key), { value, expirationTime: this.createExpirationTime(ttl) });
   }
   /**
    * Retrieves a value from the cache associated with the specified key.
@@ -357,7 +357,7 @@ var LilypadCache = (_class2 = class {
       this.delete(key) || this.invalidate(key, { invalidateBulkSync: false });
     }
     for (const [key, value] of _nullishCoalesce(data, () => ( []))) {
-      this.store.set(key, { value, expirationTime });
+      this.set(key, value, expirationTime);
     }
     this.bulkSyncExpirationTime = this.createExpirationTime(this.defaultBulkSyncTtl);
   }
