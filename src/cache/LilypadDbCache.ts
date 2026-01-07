@@ -29,7 +29,7 @@ import LilypadCache, { LilypadCachedValueType } from './LilypadCache';
  * @see LilypadDbSchema
  */
 export default class LilypadDbCache<
-  K extends string & V[keyof V],
+  K extends (string | number) & V[keyof V],
   V extends object,
 > extends LilypadCache<K, V> {
   private readonly dbGate: { gate: LilypadDbGate; schema: LilypadDbSchema<V> };
