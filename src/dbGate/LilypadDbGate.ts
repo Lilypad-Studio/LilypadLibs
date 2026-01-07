@@ -162,6 +162,8 @@ export class LilypadDbGate {
       updateData = { ...updateData, ...options.insertSanitizationFn(updateData) };
     }
 
+    const primaryKeyValue: string = updateData[options.primaryKey] as string;
+
     if (options.primaryKeyShouldAutoDetermine) {
       delete updateData[options.primaryKey];
     } else if (
@@ -178,7 +180,7 @@ export class LilypadDbGate {
     await this.sql`
       UPDATE ${this.sql(options.tableName)} 
       SET ${this.sql(updateData as Record<string, unknown>)} 
-      WHERE ${this.sql(String(options.primaryKey))} = ${updateData[options.primaryKey] as string}
+      WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue}
     `;
   }
 

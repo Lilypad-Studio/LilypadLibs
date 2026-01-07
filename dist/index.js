@@ -699,6 +699,7 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     if (options.insertSanitizationFn) {
       updateData = { ...updateData, ...options.insertSanitizationFn(updateData) };
     }
+    const primaryKeyValue = updateData[options.primaryKey];
     if (options.primaryKeyShouldAutoDetermine) {
       delete updateData[options.primaryKey];
     } else if (updateData[options.primaryKey] === void 0 || updateData[options.primaryKey] === null) {
@@ -711,7 +712,7 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     await this.sql`
       UPDATE ${this.sql(options.tableName)} 
       SET ${this.sql(updateData)} 
-      WHERE ${this.sql(String(options.primaryKey))} = ${updateData[options.primaryKey]}
+      WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue}
     `;
   }
   async deleteFromTable(options, primaryKeyValue) {
