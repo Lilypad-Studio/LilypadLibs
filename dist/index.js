@@ -600,10 +600,12 @@ var LilypadDbCache = class extends LilypadCache_default {
     }
     return void 0;
   }
-  async bulkAsyncGet() {
-    return super.bulkAsyncGet({
-      doSync: true
-    });
+  async getAll() {
+    return Array.from(
+      (await super.bulkAsyncGet({
+        doSync: true
+      })).values().filter((item) => item !== void 0)
+    );
   }
 };
 

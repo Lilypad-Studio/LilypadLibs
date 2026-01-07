@@ -564,7 +564,7 @@ type LilypadDbGateOptions = {
         dbgate: LilypadDbGate | null;
     };
 };
-type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'json';
+type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'json' | 'array';
 type LilypadDbSchema<T> = {
     tableName: string;
     primaryKey: keyof T;
@@ -684,7 +684,7 @@ declare class LilypadDbCache<K extends (string | number) & V[keyof V], V extends
      * @throws Rethrows any error encountered during the database fetch or cache update process.
      */
     update(key: K): Promise<V | null | undefined>;
-    bulkAsyncGet(): Promise<Map<K, V | null>>;
+    getAll(): Promise<V[]>;
 }
 
 /**

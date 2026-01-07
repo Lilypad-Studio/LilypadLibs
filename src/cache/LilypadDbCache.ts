@@ -113,9 +113,15 @@ export default class LilypadDbCache<
     return undefined;
   }
 
-  override async bulkAsyncGet(): Promise<Map<K, V | null>> {
-    return super.bulkAsyncGet({
-      doSync: true,
-    });
+  async getAll(): Promise<V[]> {
+    return Array.from(
+      (
+        await super.bulkAsyncGet({
+          doSync: true,
+        })
+      )
+        .values()
+        .filter((item): item is V => item !== undefined)
+    );
   }
 }

@@ -7,7 +7,7 @@ export type LilypadDbGateOptions = {
   singleton?: { dbgate: LilypadDbGate | null };
 };
 
-export type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'json';
+export type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'json' | 'array';
 
 export type LilypadDbSchema<T> = {
   tableName: string;
