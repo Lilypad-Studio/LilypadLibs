@@ -51,7 +51,7 @@ type LilypadCacheGetOptionsErrorFn<K extends string, V> = {
   options: LilypadCacheGetOptions<K, V>;
 };
 
-type LilypadCachedValue<V> = V | null;
+export type LilypadCachedValueType<V> = V | null;
 
 /**
  * Represents a cached value along with its expiration time.
@@ -61,7 +61,7 @@ type LilypadCachedValue<V> = V | null;
  * @property expirationTime The UNIX timestamp (in milliseconds) indicating when the cached value expires.
  */
 type LilypadCacheValue<V> = {
-  value: LilypadCachedValue<V>;
+  value: LilypadCachedValueType<V>;
   expirationTime: number;
 };
 
@@ -141,7 +141,7 @@ class LilypadCache<K extends string, V> {
 
   protected logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
 
-  protected flowControl: LilypadFlowControl<LilypadCachedValue<V>>;
+  protected flowControl: LilypadFlowControl<LilypadCachedValueType<V>>;
   protected bulkSyncFlowControl: LilypadFlowControl<void>;
 
   /**
@@ -172,7 +172,7 @@ class LilypadCache<K extends string, V> {
     this.defaultErrorTtl = options.defaultErrorTtl ? options.defaultErrorTtl : 5 * 60 * 1000; // 5 minutes;
     this.logger = options.logger;
 
-    this.flowControl = new LilypadFlowControl<LilypadCachedValue<V>>({
+    this.flowControl = new LilypadFlowControl<LilypadCachedValueType<V>>({
       logger: this.logger,
       timeout: options.flowControlTimeout || 5000,
     });
@@ -210,7 +210,7 @@ class LilypadCache<K extends string, V> {
    * @param value - The value to store in the cache.
    * @param ttl - Optional. The time-to-live in milliseconds. If not provided, the value will not expire.
    */
-  set(key: K, value: LilypadCachedValue<V>, ttl?: number) {
+  set(key: K, value: LilypadCachedValueType<V>, ttl?: number) {
     this.store.set(key, { value, expirationTime: this.createExpirationTime(ttl) });
   }
 
@@ -222,7 +222,7 @@ class LilypadCache<K extends string, V> {
    * @param key - The key associated with the cached value.
    * @returns The cached value if it exists and is not expired; otherwise, `undefined`.
    */
-  get(key: K, removeOld: boolean = true): LilypadCachedValue<V> | undefined {
+  get(key: K, removeOld: boolean = true): LilypadCachedValueType<V> | undefined {
     const cacheValue = this.store.get(key);
     if (cacheValue && !isStale(cacheValue)) {
       return cacheValue.value;
@@ -277,10 +277,10 @@ class LilypadCache<K extends string, V> {
     options: LilypadCacheGetOptions<K, V>,
     key: K,
     fetched: LilypadCacheValueRetrieval<V>
-  ): LilypadCachedValue<V> {
+  ): LilypadCachedValueType<V> {
     this.logger?.error(`Error fetching cache key "${String(key)}": `, error);
 
-    let valueToReturn: LilypadCachedValue<V> | undefined = undefined;
+    let valueToReturn: LilypadCachedValueType<V> | undefined = undefined;
     const errorFnRes = options.errorFn?.({ key, error, options });
 
     if (errorFnRes !== undefined) {
@@ -318,9 +318,9 @@ class LilypadCache<K extends string, V> {
    */
   async getOrSet(
     key: K,
-    valueFn: () => Promise<LilypadCachedValue<V>>,
+    valueFn: () => Promise<LilypadCachedValueType<V>>,
     options: LilypadCacheGetOptions<K, V> = {}
-  ): Promise<LilypadCachedValue<V>> {
+  ): Promise<LilypadCachedValueType<V>> {
     const fetched = this.getComprehensive(key);
     if (!options.skipCache && fetched.type === 'hit') {
       return fetched.value;
@@ -348,7 +348,7 @@ class LilypadCache<K extends string, V> {
    * @param syncFn - An optional asynchronous function that returns an array of key-value pairs to be synchronized.
    * @returns A promise that resolves when the bulk sync operation is complete.
    */
-  async bulkSync(syncFn?: () => Promise<[K, LilypadCachedValue<V>][]>): Promise<void> {
+  async bulkSync(syncFn?: () => Promise<[K, LilypadCachedValueType<V>][]>): Promise<void> {
     await this.bulkSyncFlowControl.executeFn({
       functionIdentifier: `LilypadCache-bulkSync`,
       consumerIdentifier: '',
@@ -358,7 +358,7 @@ class LilypadCache<K extends string, V> {
       fn: async () => this._bulkSync(syncFn),
     });
   }
-  private async _bulkSync(syncFn?: () => Promise<[K, LilypadCachedValue<V>][]>): Promise<void> {
+  private async _bulkSync(syncFn?: () => Promise<[K, LilypadCachedValueType<V>][]>): Promise<void> {
     if (Date.now() < this.bulkSyncExpirationTime) {
       return;
     }
@@ -385,8 +385,8 @@ class LilypadCache<K extends string, V> {
    * @param options - An object containing an optional array of keys to retrieve.
    * @returns A `Map` containing the key-value pairs found in the cache.
    */
-  bulkGet(options: { keys?: K[] }): Map<K, LilypadCachedValue<V>> {
-    const result = new Map<K, LilypadCachedValue<V>>();
+  bulkGet(options: { keys?: K[] }): Map<K, LilypadCachedValueType<V>> {
+    const result = new Map<K, LilypadCachedValueType<V>>();
     const keysToGet = options.keys ?? Array.from(this.store.keys());
     for (const key of keysToGet) {
       const value = this.get(key);
@@ -411,9 +411,9 @@ class LilypadCache<K extends string, V> {
     options: {
       keys?: K[];
       doSync?: boolean;
-      syncFn?: () => Promise<[K, LilypadCachedValue<V>][]>;
+      syncFn?: () => Promise<[K, LilypadCachedValueType<V>][]>;
     } = { keys: undefined, doSync: true, syncFn: undefined }
-  ): Promise<Map<K, LilypadCachedValue<V>>> {
+  ): Promise<Map<K, LilypadCachedValueType<V>>> {
     if (options.doSync) {
       await this.bulkSync(options.syncFn);
     }

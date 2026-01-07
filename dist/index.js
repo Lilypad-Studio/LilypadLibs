@@ -539,6 +539,20 @@ var LilypadDbCache = class extends LilypadCache_default {
       item
     ]);
   }
+  async getOrFetch(key) {
+    var _a;
+    const cachedValue = super.get(key, false);
+    if (cachedValue !== void 0) {
+      return cachedValue;
+    }
+    try {
+      const value = await this.update(key);
+      return value;
+    } catch (error) {
+      (_a = this.logger) == null ? void 0 : _a.error(`Error fetching and updating cache key "${String(key)}": `, error);
+      return void 0;
+    }
+  }
   /**
    * Invalidates the cache entry for the specified key.
    *

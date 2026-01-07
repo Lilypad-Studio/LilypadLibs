@@ -1,5 +1,5 @@
 import type { LilypadDbGate, LilypadDbSchema } from '@/dbGate/LilypadDbGate';
-import LilypadCache from './LilypadCache';
+import LilypadCache, { LilypadCachedValueType } from './LilypadCache';
 
 /**
  * A cache class that synchronizes with a database table using a provided database gateway and schema.
@@ -49,6 +49,20 @@ export default class LilypadDbCache<
       ]);
   }
 
+  async getOrFetch(key: K): Promise<LilypadCachedValueType<V> | undefined> {
+    const cachedValue = super.get(key, false);
+    if (cachedValue !== undefined) {
+      return cachedValue;
+    }
+    try {
+      const value = await this.update(key);
+      return value;
+    } catch (error) {
+      this.logger?.error(`Error fetching and updating cache key "${String(key)}": `, error);
+      return undefined;
+    }
+  }
+
   /**
    * Invalidates the cache entry for the specified key.
    *
@@ -60,7 +74,7 @@ export default class LilypadDbCache<
    * @param options.invalidateBulkSync - Whether to invalidate bulk sync (default: true).
    * @returns A promise that resolves when the invalidation process is complete.
    */
-  async invalidate(
+  override async invalidate(
     key: K,
     options: { invalidateBulkSync?: boolean } = {
       invalidateBulkSync: true,
@@ -99,7 +113,7 @@ export default class LilypadDbCache<
     return undefined;
   }
 
-  async bulkAsyncGet(): Promise<Map<K, V | null>> {
+  override async bulkAsyncGet(): Promise<Map<K, V | null>> {
     return super.bulkAsyncGet({
       doSync: true,
     });

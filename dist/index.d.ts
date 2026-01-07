@@ -262,7 +262,7 @@ type LilypadCacheGetOptionsErrorFn<K extends string, V> = {
     error: unknown;
     options: LilypadCacheGetOptions<K, V>;
 };
-type LilypadCachedValue<V> = V | null;
+type LilypadCachedValueType<V> = V | null;
 /**
  * Represents a cached value along with its expiration time.
  *
@@ -271,7 +271,7 @@ type LilypadCachedValue<V> = V | null;
  * @property expirationTime The UNIX timestamp (in milliseconds) indicating when the cached value expires.
  */
 type LilypadCacheValue<V> = {
-    value: LilypadCachedValue<V>;
+    value: LilypadCachedValueType<V>;
     expirationTime: number;
 };
 /**
@@ -340,7 +340,7 @@ declare class LilypadCache<K extends string, V> {
     };
     protected protectedKeys: Set<K>;
     protected logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
-    protected flowControl: LilypadFlowControl<LilypadCachedValue<V>>;
+    protected flowControl: LilypadFlowControl<LilypadCachedValueType<V>>;
     protected bulkSyncFlowControl: LilypadFlowControl<void>;
     /**
      * Timestamp of the last bulk sync operation.
@@ -373,7 +373,7 @@ declare class LilypadCache<K extends string, V> {
      * @param value - The value to store in the cache.
      * @param ttl - Optional. The time-to-live in milliseconds. If not provided, the value will not expire.
      */
-    set(key: K, value: LilypadCachedValue<V>, ttl?: number): void;
+    set(key: K, value: LilypadCachedValueType<V>, ttl?: number): void;
     /**
      * Retrieves a value from the cache associated with the specified key.
      * If the cached value has expired or does not exist, it returns `undefined`.
@@ -382,7 +382,7 @@ declare class LilypadCache<K extends string, V> {
      * @param key - The key associated with the cached value.
      * @returns The cached value if it exists and is not expired; otherwise, `undefined`.
      */
-    get(key: K, removeOld?: boolean): LilypadCachedValue<V> | undefined;
+    get(key: K, removeOld?: boolean): LilypadCachedValueType<V> | undefined;
     /**
      * Retrieves a comprehensive cache value for the specified key, indicating whether the value is a cache hit, expired, or a miss.
      *
@@ -426,7 +426,7 @@ declare class LilypadCache<K extends string, V> {
      * @returns A promise that resolves to the cached value or the value produced by valueFn
      * @throws Will not throw, but will return a handled error value if valueFn rejects and error handling is configured
      */
-    getOrSet(key: K, valueFn: () => Promise<LilypadCachedValue<V>>, options?: LilypadCacheGetOptions<K, V>): Promise<LilypadCachedValue<V>>;
+    getOrSet(key: K, valueFn: () => Promise<LilypadCachedValueType<V>>, options?: LilypadCacheGetOptions<K, V>): Promise<LilypadCachedValueType<V>>;
     /**
      * Synchronizes the cache in bulk by executing the provided sync function.
      *
@@ -437,7 +437,7 @@ declare class LilypadCache<K extends string, V> {
      * @param syncFn - An optional asynchronous function that returns an array of key-value pairs to be synchronized.
      * @returns A promise that resolves when the bulk sync operation is complete.
      */
-    bulkSync(syncFn?: () => Promise<[K, LilypadCachedValue<V>][]>): Promise<void>;
+    bulkSync(syncFn?: () => Promise<[K, LilypadCachedValueType<V>][]>): Promise<void>;
     private _bulkSync;
     /**
      * Retrieves multiple values from the cache for the specified keys.
@@ -449,7 +449,7 @@ declare class LilypadCache<K extends string, V> {
      */
     bulkGet(options: {
         keys?: K[];
-    }): Map<K, LilypadCachedValue<V>>;
+    }): Map<K, LilypadCachedValueType<V>>;
     /**
      * Retrieves multiple values from the cache asynchronously.
      * Optionally synchronizes the cache before retrieval using a provided sync function.
@@ -463,8 +463,8 @@ declare class LilypadCache<K extends string, V> {
     bulkAsyncGet(options?: {
         keys?: K[];
         doSync?: boolean;
-        syncFn?: () => Promise<[K, LilypadCachedValue<V>][]>;
-    }): Promise<Map<K, LilypadCachedValue<V>>>;
+        syncFn?: () => Promise<[K, LilypadCachedValueType<V>][]>;
+    }): Promise<Map<K, LilypadCachedValueType<V>>>;
     /**
      * Sets multiple key-value pairs in the cache at once.
      *
@@ -657,6 +657,7 @@ declare class LilypadDbCache<K extends string & V[keyof V], V extends object> ex
             schema: LilypadDbSchema<V>;
         };
     });
+    getOrFetch(key: K): Promise<LilypadCachedValueType<V> | undefined>;
     /**
      * Invalidates the cache entry for the specified key.
      *
