@@ -37,7 +37,6 @@ export default class LilypadDbCache<
   constructor(
     ttl: number,
     options: ConstructorParameters<typeof LilypadCache<K, V>>[1] & {
-      addDefaultDbListener?: boolean;
       dbGate: { gate: LilypadDbGate; schema: LilypadDbSchema<V> };
     }
   ) {
@@ -48,9 +47,6 @@ export default class LilypadDbCache<
         item[options.dbGate.schema.primaryKey] as K,
         item,
       ]);
-    if (options.addDefaultDbListener ?? true) {
-      this.addDefaultDbListener();
-    }
   }
 
   async getOrFetch(key: K): Promise<LilypadCachedValueType<V> | undefined> {
@@ -129,15 +125,16 @@ export default class LilypadDbCache<
     );
   }
 
-  private addDefaultDbListener() {
+  public addDefaultDbListener() {
     this.dbGate.gate.addListener(
       'cache_events',
       'lilypad_db_listener',
       async (payload: unknown) => {
+        this.logger?.debug('Received payload on cache_events channel:', payload);
         if (typeof payload !== 'string') {
           return;
         }
-        let parsedPayload: { table?: string; id?: string };
+        let parsedPayload: { table?: string; id?: string; op: 'UPDATE' | 'DELETE' | 'INSERT' };
         try {
           parsedPayload = JSON.parse(payload);
         } catch (e) {

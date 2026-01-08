@@ -660,7 +660,6 @@ declare class LilypadDbGate {
 declare class LilypadDbCache<K extends string & V[keyof V], V extends object> extends LilypadCache<K, V> {
     private readonly dbGate;
     constructor(ttl: number, options: ConstructorParameters<typeof LilypadCache<K, V>>[1] & {
-        addDefaultDbListener?: boolean;
         dbGate: {
             gate: LilypadDbGate;
             schema: LilypadDbSchema<V>;
@@ -694,7 +693,7 @@ declare class LilypadDbCache<K extends string & V[keyof V], V extends object> ex
      */
     update(key: K): Promise<V | null | undefined>;
     getAll(): Promise<V[]>;
-    private addDefaultDbListener;
+    addDefaultDbListener(): void;
 }
 
 /**

@@ -538,9 +538,6 @@ var LilypadDbCache = class extends LilypadCache_default {
       item[options.dbGate.schema.primaryKey],
       item
     ]);
-    if (_nullishCoalesce(options.addDefaultDbListener, () => ( true))) {
-      this.addDefaultDbListener();
-    }
   }
   async getOrFetch(key) {
     var _a;
@@ -615,7 +612,8 @@ var LilypadDbCache = class extends LilypadCache_default {
       "cache_events",
       "lilypad_db_listener",
       async (payload) => {
-        var _a, _b;
+        var _a, _b, _c;
+        (_a = this.logger) == null ? void 0 : _a.debug("Received payload on cache_events channel:", payload);
         if (typeof payload !== "string") {
           return;
         }
@@ -623,10 +621,10 @@ var LilypadDbCache = class extends LilypadCache_default {
         try {
           parsedPayload = JSON.parse(payload);
         } catch (e) {
-          (_a = this.logger) == null ? void 0 : _a.error("Error parsing cache_events payload:", e);
+          (_b = this.logger) == null ? void 0 : _b.error("Error parsing cache_events payload:", e);
           return;
         }
-        (_b = this.logger) == null ? void 0 : _b.debug("Received cache invalidation for event:", parsedPayload);
+        (_c = this.logger) == null ? void 0 : _c.debug("Received cache invalidation for event:", parsedPayload);
         if (!parsedPayload.id || !parsedPayload.table) {
           return;
         }
