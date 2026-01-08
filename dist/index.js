@@ -532,18 +532,21 @@ var LilypadCache = (_class2 = class {
 var LilypadCache_default = LilypadCache;
 
 // src/cache/LilypadDbCache.ts
+var caches = globalThis.__lilypadDbCaches ??= /* @__PURE__ */ new Map();
 var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
   
   static create(ttl = 6e4, options) {
     const singleton = options.singleton;
+    const cacheKey = _nullishCoalesce(options.singletonIdentifier, () => ( `LilypadDbCache-${options.dbGate.schema.tableName}`));
     if (singleton) {
-      if (singleton.cache) {
-        return singleton.cache;
+      const existingCache = caches.get(cacheKey);
+      if (existingCache) {
+        return existingCache;
       }
     }
     const instance = new _LilypadDbCache(ttl, options);
     if (singleton) {
-      singleton.cache = instance;
+      caches.set(cacheKey, instance);
     }
     return instance;
   }

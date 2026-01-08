@@ -12,6 +12,14 @@ type LilypadDbCacheConstructorOptions<K extends string, V> = ConstructorParamete
   useDefaultDbListener?: boolean;
 };
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type CacheInstance = LilypadDbCache<string, any>;
+
+declare global {
+  var __lilypadDbCaches: Map<string, CacheInstance> | undefined;
+}
+const caches = (globalThis.__lilypadDbCaches ??= new Map<string, CacheInstance>());
+
 /**
  * A cache class that synchronizes with a database table using a provided database gateway and schema.
  *
@@ -48,18 +56,24 @@ export default class LilypadDbCache<
   public static create<K extends string & V[keyof V], V extends object>(
     ttl: number = 60000,
     options: LilypadDbCacheConstructorOptions<K, V> & {
-      singleton?: { cache: LilypadDbCache<K, V> | null };
+      singleton?: boolean;
+      singletonIdentifier?: string;
     }
   ): LilypadDbCache<K, V> {
     const singleton = options.singleton;
+    const cacheKey =
+      options.singletonIdentifier ?? `LilypadDbCache-${options.dbGate.schema.tableName}`;
+
     if (singleton) {
-      if (singleton.cache) {
-        return singleton.cache;
+      const existingCache = caches.get(cacheKey) as LilypadDbCache<K, V> | undefined;
+      if (existingCache) {
+        return existingCache;
       }
     }
+
     const instance = new LilypadDbCache<K, V>(ttl, options);
     if (singleton) {
-      singleton.cache = instance;
+      caches.set(cacheKey, instance);
     }
     return instance;
   }

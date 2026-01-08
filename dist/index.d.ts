@@ -639,6 +639,10 @@ type LilypadDbCacheConstructorOptions<K extends string, V> = ConstructorParamete
     };
     useDefaultDbListener?: boolean;
 };
+type CacheInstance = LilypadDbCache<string, any>;
+declare global {
+    var __lilypadDbCaches: Map<string, CacheInstance> | undefined;
+}
 /**
  * A cache class that synchronizes with a database table using a provided database gateway and schema.
  *
@@ -669,9 +673,8 @@ type LilypadDbCacheConstructorOptions<K extends string, V> = ConstructorParamete
 declare class LilypadDbCache<K extends string & V[keyof V], V extends object> extends LilypadCache<K, V> {
     private readonly dbGate;
     static create<K extends string & V[keyof V], V extends object>(ttl: number | undefined, options: LilypadDbCacheConstructorOptions<K, V> & {
-        singleton?: {
-            cache: LilypadDbCache<K, V> | null;
-        };
+        singleton?: boolean;
+        singletonIdentifier?: string;
     }): LilypadDbCache<K, V>;
     private constructor();
     getOrFetch(key: K): Promise<LilypadCachedValueType<V> | undefined>;
