@@ -88,6 +88,15 @@ function isStale<V>(retrieval: LilypadCacheValue<V>): boolean {
   return Date.now() >= retrieval.expirationTime;
 }
 
+type LilypadCacheConstructorOptions<K extends string, V> = {
+  autoCleanupInterval?: number;
+  defaultErrorTtl?: number;
+  defaultBulkSyncTtl?: number;
+  bulkSyncFn?: () => Promise<[K, V][]>;
+  logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
+  flowControlTimeout?: number;
+};
+
 /**
  * A generic in-memory cache with time-to-live (TTL) support, error fallback, and protection for specific keys.
  *
@@ -131,6 +140,8 @@ function isStale<V>(retrieval: LilypadCacheValue<V>): boolean {
  * @see {@link dispose}
  */
 class LilypadCache<K extends string, V> {
+  public readonly id = `LilypadCache-${Math.random().toString(36).substring(2, 15)}`;
+
   protected store: Map<K, LilypadCacheValue<V>>;
   protected defaultTtl: number; // time to live in milliseconds
   protected defaultErrorTtl: number; // default error TTL in milliseconds
@@ -154,17 +165,7 @@ class LilypadCache<K extends string, V> {
   protected bulkSyncExpirationTime: number = 0;
   protected bulkSyncFn?: () => Promise<[K, V][]>;
 
-  constructor(
-    ttl: number = 60000,
-    options: {
-      autoCleanupInterval?: number;
-      defaultErrorTtl?: number;
-      defaultBulkSyncTtl?: number;
-      bulkSyncFn?: () => Promise<[K, V][]>;
-      logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
-      flowControlTimeout?: number;
-    } = {}
-  ) {
+  public constructor(ttl: number = 60000, options: LilypadCacheConstructorOptions<K, V> = {}) {
     this.store = new Map();
     this.defaultTtl = ttl;
     this.defaultBulkSyncTtl = options.defaultBulkSyncTtl ?? ttl;
@@ -192,6 +193,8 @@ class LilypadCache<K extends string, V> {
         this.cleanupIntervalId.unref();
       }
     }
+
+    this.logger?.debug(`LilypadCache initialized with ID=${this.id}`);
   }
 
   /**
@@ -223,7 +226,7 @@ class LilypadCache<K extends string, V> {
    * @returns The cached value if it exists and is not expired; otherwise, `undefined`.
    */
   get(key: K, removeOld: boolean = true): LilypadCachedValueType<V> | undefined {
-    const cacheValue = this.store.get(key);
+    const cacheValue = this.store.get(String(key) as K);
     if (cacheValue && !isStale(cacheValue)) {
       return cacheValue.value;
     } else {
@@ -244,7 +247,7 @@ class LilypadCache<K extends string, V> {
    * - If the value does not exist, returns an object with `type: 'miss'`.
    */
   getComprehensive(key: K): LilypadCacheValueRetrieval<V> {
-    const cacheValue = this.store.get(key);
+    const cacheValue = this.store.get(String(key) as K);
     if (cacheValue && !isStale(cacheValue)) {
       return { ...cacheValue, type: 'hit' };
     } else {
@@ -501,7 +504,7 @@ class LilypadCache<K extends string, V> {
     if (this.protectedKeys.has(key) && !options.force) {
       return false;
     }
-    this.store.delete(key);
+    this.store.delete(String(key) as K);
     return true;
   }
 

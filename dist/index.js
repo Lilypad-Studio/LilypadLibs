@@ -153,6 +153,7 @@ function isStale(retrieval) {
   return Date.now() >= retrieval.expirationTime;
 }
 var LilypadCache = (_class2 = class {
+  __init3() {this.id = `LilypadCache-${Math.random().toString(36).substring(2, 15)}`}
   
   
   // time to live in milliseconds
@@ -160,7 +161,7 @@ var LilypadCache = (_class2 = class {
   // default error TTL in milliseconds
   
   
-  __init3() {this.protectedKeys = /* @__PURE__ */ new Set()}
+  __init4() {this.protectedKeys = /* @__PURE__ */ new Set()}
   
   
   
@@ -171,9 +172,10 @@ var LilypadCache = (_class2 = class {
    * This timestamp can be used to track when the last bulk sync occurred, which would
    * have synced the cache with the store.
    */
-  __init4() {this.bulkSyncExpirationTime = 0}
+  __init5() {this.bulkSyncExpirationTime = 0}
   
-  constructor(ttl = 6e4, options = {}) {;_class2.prototype.__init3.call(this);_class2.prototype.__init4.call(this);
+  constructor(ttl = 6e4, options = {}) {;_class2.prototype.__init3.call(this);_class2.prototype.__init4.call(this);_class2.prototype.__init5.call(this);
+    var _a;
     this.store = /* @__PURE__ */ new Map();
     this.defaultTtl = ttl;
     this.defaultBulkSyncTtl = _nullishCoalesce(options.defaultBulkSyncTtl, () => ( ttl));
@@ -197,6 +199,7 @@ var LilypadCache = (_class2 = class {
         this.cleanupIntervalId.unref();
       }
     }
+    (_a = this.logger) == null ? void 0 : _a.debug(`LilypadCache initialized with ID=${this.id}`);
   }
   /**
    * Calculates the expiration timestamp based on the provided TTL (time-to-live) value.
@@ -226,7 +229,7 @@ var LilypadCache = (_class2 = class {
    * @returns The cached value if it exists and is not expired; otherwise, `undefined`.
    */
   get(key, removeOld = true) {
-    const cacheValue = this.store.get(key);
+    const cacheValue = this.store.get(String(key));
     if (cacheValue && !isStale(cacheValue)) {
       return cacheValue.value;
     } else {
@@ -246,7 +249,7 @@ var LilypadCache = (_class2 = class {
    * - If the value does not exist, returns an object with `type: 'miss'`.
    */
   getComprehensive(key) {
-    const cacheValue = this.store.get(key);
+    const cacheValue = this.store.get(String(key));
     if (cacheValue && !isStale(cacheValue)) {
       return { ...cacheValue, type: "hit" };
     } else {
@@ -471,7 +474,7 @@ var LilypadCache = (_class2 = class {
     if (this.protectedKeys.has(key) && !options.force) {
       return false;
     }
-    this.store.delete(key);
+    this.store.delete(String(key));
     return true;
   }
   /**
@@ -531,6 +534,19 @@ var LilypadCache_default = LilypadCache;
 // src/cache/LilypadDbCache.ts
 var LilypadDbCache = class extends LilypadCache_default {
   
+  static create(ttl = 6e4, options) {
+    const singleton = options.singleton;
+    if (singleton) {
+      if (singleton.cache) {
+        return singleton.cache;
+      }
+    }
+    const instance = new LilypadCache_default(ttl, options);
+    if (singleton) {
+      singleton.cache = instance;
+    }
+    return instance;
+  }
   constructor(ttl, options) {
     super(ttl, options);
     this.dbGate = options.dbGate;
@@ -655,8 +671,8 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
   
   
   
-  __init5() {this.listeners = /* @__PURE__ */ new Map()}
-  constructor(options) {;_class3.prototype.__init5.call(this);
+  __init6() {this.listeners = /* @__PURE__ */ new Map()}
+  constructor(options) {;_class3.prototype.__init6.call(this);
     this.logger = options.logger;
     this.connectionString = options.connectionString;
     this.listenerConnectionString = options.listenerConnectionString || options.connectionString;
@@ -828,13 +844,13 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
 
 // src/logger/LilypadLogger.ts
 var LilypadLogger = (_class4 = class {
-  __init6() {this.components = {}}
+  __init7() {this.components = {}}
   // Optional logger name
   
   get __name() {
     return this._name;
   }
-  constructor(options) {;_class4.prototype.__init6.call(this);
+  constructor(options) {;_class4.prototype.__init7.call(this);
     const reservedKeys = /* @__PURE__ */ new Set(["components", "register", "__name"]);
     for (const key of Object.keys(options.components)) {
       if (reservedKeys.has(key)) {

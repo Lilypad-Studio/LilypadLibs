@@ -288,6 +288,14 @@ type LilypadCacheValueRetrieval<V> = ({
 } & LilypadCacheValue<V>) | {
     type: 'miss';
 };
+type LilypadCacheConstructorOptions<K extends string, V> = {
+    autoCleanupInterval?: number;
+    defaultErrorTtl?: number;
+    defaultBulkSyncTtl?: number;
+    bulkSyncFn?: () => Promise<[K, V][]>;
+    logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
+    flowControlTimeout?: number;
+};
 /**
  * A generic in-memory cache with time-to-live (TTL) support, error fallback, and protection for specific keys.
  *
@@ -331,6 +339,7 @@ type LilypadCacheValueRetrieval<V> = ({
  * @see {@link dispose}
  */
 declare class LilypadCache<K extends string, V> {
+    readonly id: string;
     protected store: Map<K, LilypadCacheValue<V>>;
     protected defaultTtl: number;
     protected defaultErrorTtl: number;
@@ -351,14 +360,7 @@ declare class LilypadCache<K extends string, V> {
      */
     protected bulkSyncExpirationTime: number;
     protected bulkSyncFn?: () => Promise<[K, V][]>;
-    constructor(ttl?: number, options?: {
-        autoCleanupInterval?: number;
-        defaultErrorTtl?: number;
-        defaultBulkSyncTtl?: number;
-        bulkSyncFn?: () => Promise<[K, V][]>;
-        logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
-        flowControlTimeout?: number;
-    });
+    constructor(ttl?: number, options?: LilypadCacheConstructorOptions<K, V>);
     /**
      * Calculates the expiration timestamp based on the provided TTL (time-to-live) value.
      *
@@ -630,6 +632,13 @@ declare class LilypadDbGate {
     close(): Promise<void>;
 }
 
+type LilypadDbCacheConstructorOptions<K extends string, V> = Exclude<ConstructorParameters<typeof LilypadCache<K, V>>[1], 'bulkSyncFn'> & {
+    dbGate: {
+        gate: LilypadDbGate;
+        schema: LilypadDbSchema<V>;
+    };
+    useDefaultDbListener?: boolean;
+};
 /**
  * A cache class that synchronizes with a database table using a provided database gateway and schema.
  *
@@ -659,13 +668,12 @@ declare class LilypadDbGate {
  */
 declare class LilypadDbCache<K extends string & V[keyof V], V extends object> extends LilypadCache<K, V> {
     private readonly dbGate;
-    constructor(ttl: number, options: ConstructorParameters<typeof LilypadCache<K, V>>[1] & {
-        dbGate: {
-            gate: LilypadDbGate;
-            schema: LilypadDbSchema<V>;
+    static create<K extends string, V>(ttl: number | undefined, options: LilypadDbCacheConstructorOptions<K, V> & {
+        singleton?: {
+            cache: LilypadCache<K, V>;
         };
-        useDefaultDbListener?: boolean;
-    });
+    }): LilypadCache<K, V>;
+    private constructor();
     getOrFetch(key: K): Promise<LilypadCachedValueType<V> | undefined>;
     /**
      * Invalidates the cache entry for the specified key.

@@ -5,6 +5,14 @@ import type {
 } from '@/dbGate/LilypadDbGate';
 import LilypadCache, { LilypadCachedValueType } from './LilypadCache';
 
+type LilypadDbCacheConstructorOptions<K extends string, V> = Exclude<
+  ConstructorParameters<typeof LilypadCache<K, V>>[1],
+  'bulkSyncFn'
+> & {
+  dbGate: { gate: LilypadDbGate; schema: LilypadDbSchema<V> };
+  useDefaultDbListener?: boolean;
+};
+
 /**
  * A cache class that synchronizes with a database table using a provided database gateway and schema.
  *
@@ -38,13 +46,24 @@ export default class LilypadDbCache<
 > extends LilypadCache<K, V> {
   private readonly dbGate: { gate: LilypadDbGate; schema: LilypadDbSchema<V> };
 
-  constructor(
-    ttl: number,
-    options: ConstructorParameters<typeof LilypadCache<K, V>>[1] & {
-      dbGate: { gate: LilypadDbGate; schema: LilypadDbSchema<V> };
-      useDefaultDbListener?: boolean;
+  public static create<K extends string, V>(
+    ttl: number = 60000,
+    options: LilypadDbCacheConstructorOptions<K, V> & { singleton?: { cache: LilypadCache<K, V> } }
+  ): LilypadCache<K, V> {
+    const singleton = options.singleton;
+    if (singleton) {
+      if (singleton.cache) {
+        return singleton.cache;
+      }
     }
-  ) {
+    const instance = new LilypadCache<K, V>(ttl, options);
+    if (singleton) {
+      singleton.cache = instance;
+    }
+    return instance;
+  }
+
+  private constructor(ttl: number, options: LilypadDbCacheConstructorOptions<K, V>) {
     super(ttl, options);
     this.dbGate = options.dbGate;
     this.bulkSyncFn = async () =>
