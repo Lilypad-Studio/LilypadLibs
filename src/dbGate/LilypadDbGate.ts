@@ -1,4 +1,8 @@
 import { LilypadLoggerType } from '@/logger/LilypadLogger';
+import {
+  getLilypadSingletonInstanceAsync,
+  LilypadSingletonAble,
+} from '@/singleton/LilypadSingleton';
 import postgres from 'postgres';
 
 type ListenerCallback = (payload: unknown) => void;
@@ -12,8 +16,9 @@ export type LilypadDbGateOptions = {
   connectionString: string;
   listenerConnectionString?: string;
   listen: ListenerCallbackIdentifier[];
-  singleton?: { dbgate: LilypadDbGate | null };
 };
+
+type LilypadDbGateOptionsWithSingleton = LilypadDbGateOptions & LilypadSingletonAble;
 
 export type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'json' | 'array';
 
@@ -74,26 +79,25 @@ export class LilypadDbGate {
     this.sql = postgres(this.connectionString);
   }
 
-  static async create(options: LilypadDbGateOptions): Promise<LilypadDbGate> {
-    const singleton = options.singleton;
-    if (singleton) {
-      if (singleton.dbgate) {
-        return singleton.dbgate;
-      }
+  static async create(options: LilypadDbGateOptionsWithSingleton): Promise<LilypadDbGate> {
+    if (options.singleton) {
+      const cacheKey = options.singletonIdentifier;
+      return await getLilypadSingletonInstanceAsync<LilypadDbGate>(cacheKey, () =>
+        LilypadDbGate.initializeNew(options)
+      );
     }
 
-    const instance = new LilypadDbGate(options);
+    return await LilypadDbGate.initializeNew(options);
+  }
 
+  private static async initializeNew(options: LilypadDbGateOptions): Promise<LilypadDbGate> {
+    const instance = new LilypadDbGate(options);
     for (const listenOption of options.listen) {
       await instance.addListener({
         channel: listenOption.channel,
         callbackId: listenOption.callbackId,
         callback: listenOption.callback,
       });
-    }
-
-    if (singleton) {
-      singleton.dbgate = instance;
     }
     return instance;
   }

@@ -531,24 +531,41 @@ var LilypadCache = (_class2 = class {
 }, _class2);
 var LilypadCache_default = LilypadCache;
 
+// src/singleton/LilypadSingleton.ts
+var singletonMap = globalThis.__lilypadSingletonMap ??= /* @__PURE__ */ new Map();
+function getLilypadSingletonInstance(identifier, createInstanceFn) {
+  if (singletonMap.has(identifier)) {
+    return singletonMap.get(identifier);
+  }
+  const instance = createInstanceFn();
+  singletonMap.set(identifier, instance);
+  return instance;
+}
+async function getLilypadSingletonInstanceAsync(identifier, createInstanceFn) {
+  if (singletonMap.has(identifier)) {
+    return singletonMap.get(identifier);
+  }
+  const instancePromise = createInstanceFn();
+  singletonMap.set(identifier, instancePromise);
+  try {
+    const instance = await instancePromise;
+    singletonMap.set(identifier, instance);
+    return instance;
+  } catch (error) {
+    singletonMap.delete(identifier);
+    throw error;
+  }
+}
+
 // src/cache/LilypadDbCache.ts
-var caches = globalThis.__lilypadDbCaches ??= /* @__PURE__ */ new Map();
 var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
   
   static create(ttl = 6e4, options) {
-    const singleton = options.singleton;
-    const cacheKey = _nullishCoalesce(options.singletonIdentifier, () => ( `LilypadDbCache-${options.dbGate.schema.tableName}`));
-    if (singleton) {
-      const existingCache = caches.get(cacheKey);
-      if (existingCache) {
-        return existingCache;
-      }
+    if (options.singleton) {
+      const cacheKey = _nullishCoalesce(options.singletonIdentifier, () => ( `LilypadDbCache-${options.dbGate.schema.tableName}`));
+      return getLilypadSingletonInstance(cacheKey, () => new _LilypadDbCache(ttl, options));
     }
-    const instance = new _LilypadDbCache(ttl, options);
-    if (singleton) {
-      caches.set(cacheKey, instance);
-    }
-    return instance;
+    return new _LilypadDbCache(ttl, options);
   }
   constructor(ttl, options) {
     var _a;
@@ -689,12 +706,16 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     this.sql = _postgres2.default.call(void 0, this.connectionString);
   }
   static async create(options) {
-    const singleton = options.singleton;
-    if (singleton) {
-      if (singleton.dbgate) {
-        return singleton.dbgate;
-      }
+    if (options.singleton) {
+      const cacheKey = options.singletonIdentifier;
+      return await getLilypadSingletonInstanceAsync(
+        cacheKey,
+        () => _LilypadDbGate.initializeNew(options)
+      );
     }
+    return await _LilypadDbGate.initializeNew(options);
+  }
+  static async initializeNew(options) {
     const instance = new _LilypadDbGate(options);
     for (const listenOption of options.listen) {
       await instance.addListener({
@@ -702,9 +723,6 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
         callbackId: listenOption.callbackId,
         callback: listenOption.callback
       });
-    }
-    if (singleton) {
-      singleton.dbgate = instance;
     }
     return instance;
   }
@@ -1015,5 +1033,7 @@ var LilypadSerializer = class {
 
 
 
-exports.LilypadCache = LilypadCache_default; exports.LilypadConsoleLogger = LilypadConsoleLogger; exports.LilypadDbCache = LilypadDbCache; exports.LilypadDbGate = LilypadDbGate; exports.LilypadDiscordLogger = LilypadDiscordLogger; exports.LilypadFlowControl = LilypadFlowControl; exports.LilypadSerializer = LilypadSerializer; exports.createLogger = createLogger;
+
+
+exports.LilypadCache = LilypadCache_default; exports.LilypadConsoleLogger = LilypadConsoleLogger; exports.LilypadDbCache = LilypadDbCache; exports.LilypadDbGate = LilypadDbGate; exports.LilypadDiscordLogger = LilypadDiscordLogger; exports.LilypadFlowControl = LilypadFlowControl; exports.LilypadSerializer = LilypadSerializer; exports.createLogger = createLogger; exports.getLilypadSingletonInstance = getLilypadSingletonInstance; exports.getLilypadSingletonInstanceAsync = getLilypadSingletonInstanceAsync;
 //# sourceMappingURL=index.js.map

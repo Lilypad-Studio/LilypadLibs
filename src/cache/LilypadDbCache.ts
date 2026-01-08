@@ -4,6 +4,7 @@ import type {
   ListenerCallbackIdentifier,
 } from '@/dbGate/LilypadDbGate';
 import LilypadCache, { LilypadCachedValueType } from './LilypadCache';
+import { getLilypadSingletonInstance, LilypadSingletonAble } from '@/singleton/LilypadSingleton';
 
 type LilypadDbCacheConstructorOptions<K extends string, V> = ConstructorParameters<
   typeof LilypadCache<K, V>
@@ -11,14 +12,6 @@ type LilypadDbCacheConstructorOptions<K extends string, V> = ConstructorParamete
   dbGate: { gate: LilypadDbGate; schema: LilypadDbSchema<V> };
   useDefaultDbListener?: boolean;
 };
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type CacheInstance = LilypadDbCache<string, any>;
-
-declare global {
-  var __lilypadDbCaches: Map<string, CacheInstance> | undefined;
-}
-const caches = (globalThis.__lilypadDbCaches ??= new Map<string, CacheInstance>());
 
 /**
  * A cache class that synchronizes with a database table using a provided database gateway and schema.
@@ -55,27 +48,15 @@ export default class LilypadDbCache<
 
   public static create<K extends string & V[keyof V], V extends object>(
     ttl: number = 60000,
-    options: LilypadDbCacheConstructorOptions<K, V> & {
-      singleton?: boolean;
-      singletonIdentifier?: string;
-    }
+    options: LilypadDbCacheConstructorOptions<K, V> & LilypadSingletonAble
   ): LilypadDbCache<K, V> {
-    const singleton = options.singleton;
-    const cacheKey =
-      options.singletonIdentifier ?? `LilypadDbCache-${options.dbGate.schema.tableName}`;
-
-    if (singleton) {
-      const existingCache = caches.get(cacheKey) as LilypadDbCache<K, V> | undefined;
-      if (existingCache) {
-        return existingCache;
-      }
+    if (options.singleton) {
+      const cacheKey =
+        options.singletonIdentifier ?? `LilypadDbCache-${options.dbGate.schema.tableName}`;
+      return getLilypadSingletonInstance(cacheKey, () => new LilypadDbCache<K, V>(ttl, options));
     }
 
-    const instance = new LilypadDbCache<K, V>(ttl, options);
-    if (singleton) {
-      caches.set(cacheKey, instance);
-    }
-    return instance;
+    return new LilypadDbCache<K, V>(ttl, options);
   }
 
   private constructor(ttl: number, options: LilypadDbCacheConstructorOptions<K, V>) {

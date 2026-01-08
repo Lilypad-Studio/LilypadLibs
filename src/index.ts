@@ -42,3 +42,12 @@ export type { FlowControlOptions, ExecuteFnOptions } from './flow/LilypadFlowCon
  */
 export { LilypadSerializer } from './serializer/LilypadSerializer';
 export type { LilypadSerializerConstructorOptions } from './serializer/LilypadSerializer';
+
+/**
+ * Singleton Module
+ */
+export {
+  getLilypadSingletonInstance,
+  getLilypadSingletonInstanceAsync,
+} from './singleton/LilypadSingleton';
+export type { LilypadSingletonAble } from './singleton/LilypadSingleton';

@@ -555,6 +555,18 @@ declare class LilypadCache<K extends string, V> {
     dispose(): void;
 }
 
+declare global {
+    var __lilypadSingletonMap: Map<string, unknown> | undefined;
+}
+type LilypadSingletonAble = {
+    singleton: true;
+    singletonIdentifier: string;
+} | {
+    singleton: false | undefined;
+};
+declare function getLilypadSingletonInstance<T>(identifier: string, createInstanceFn: () => T): T;
+declare function getLilypadSingletonInstanceAsync<T>(identifier: string, createInstanceFn: () => Promise<T>): Promise<T>;
+
 type ListenerCallback = (payload: unknown) => void;
 type ListenerCallbackIdentifier = {
     channel: string;
@@ -566,10 +578,8 @@ type LilypadDbGateOptions = {
     connectionString: string;
     listenerConnectionString?: string;
     listen: ListenerCallbackIdentifier[];
-    singleton?: {
-        dbgate: LilypadDbGate | null;
-    };
 };
+type LilypadDbGateOptionsWithSingleton = LilypadDbGateOptions & LilypadSingletonAble;
 type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'json' | 'array';
 type LilypadDbSchema<T> = {
     tableName: string;
@@ -619,7 +629,8 @@ declare class LilypadDbGate {
     protected logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
     private listeners;
     private constructor();
-    static create(options: LilypadDbGateOptions): Promise<LilypadDbGate>;
+    static create(options: LilypadDbGateOptionsWithSingleton): Promise<LilypadDbGate>;
+    private static initializeNew;
     getAllFromTable<T>(options: LilypadDbSchema<T>): Promise<T[]>;
     getFromTableByPrimaryKey<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<T | null>;
     addToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
@@ -639,10 +650,6 @@ type LilypadDbCacheConstructorOptions<K extends string, V> = ConstructorParamete
     };
     useDefaultDbListener?: boolean;
 };
-type CacheInstance = LilypadDbCache<string, any>;
-declare global {
-    var __lilypadDbCaches: Map<string, CacheInstance> | undefined;
-}
 /**
  * A cache class that synchronizes with a database table using a provided database gateway and schema.
  *
@@ -672,10 +679,7 @@ declare global {
  */
 declare class LilypadDbCache<K extends string & V[keyof V], V extends object> extends LilypadCache<K, V> {
     private readonly dbGate;
-    static create<K extends string & V[keyof V], V extends object>(ttl: number | undefined, options: LilypadDbCacheConstructorOptions<K, V> & {
-        singleton?: boolean;
-        singletonIdentifier?: string;
-    }): LilypadDbCache<K, V>;
+    static create<K extends string & V[keyof V], V extends object>(ttl: number | undefined, options: LilypadDbCacheConstructorOptions<K, V> & LilypadSingletonAble): LilypadDbCache<K, V>;
     private constructor();
     getOrFetch(key: K): Promise<LilypadCachedValueType<V> | undefined>;
     /**
@@ -798,4 +802,4 @@ declare class LilypadSerializer<FROM extends {}, TO extends {}, KeyMap extends R
     deserialize(input: TO[]): FROM[];
 }
 
-export { type ExecuteFnOptions, type FlowControlOptions, LilypadCache, type LilypadCacheGetOptions, LilypadConsoleLogger, LilypadDbCache, LilypadDbGate, type LilypadDbGateOptions, type LilypadDbSchema, LilypadDiscordLogger, LilypadFlowControl, type LilypadLoggerConstructorOptions, LilypadSerializer, type LilypadSerializerConstructorOptions, createLogger };
+export { type ExecuteFnOptions, type FlowControlOptions, LilypadCache, type LilypadCacheGetOptions, LilypadConsoleLogger, LilypadDbCache, LilypadDbGate, type LilypadDbGateOptions, type LilypadDbSchema, LilypadDiscordLogger, LilypadFlowControl, type LilypadLoggerConstructorOptions, LilypadSerializer, type LilypadSerializerConstructorOptions, type LilypadSingletonAble, createLogger, getLilypadSingletonInstance, getLilypadSingletonInstanceAsync };
