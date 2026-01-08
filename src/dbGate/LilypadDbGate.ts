@@ -1,9 +1,11 @@
 import postgres from 'postgres';
 
+type ListenerCallback = (payload: unknown) => void;
+type ListenerCallbackObj = { channel: string; callbackId: string; callback: ListenerCallback };
 export type LilypadDbGateOptions = {
   connectionString: string;
   listenerConnectionString?: string;
-  listen: { channel: string; callback: (payload: unknown) => void }[];
+  listen: ListenerCallbackObj[];
   singleton?: { dbgate: LilypadDbGate | null };
 };
 
@@ -53,7 +55,7 @@ export class LilypadDbGate {
   private listeners: Map<
     string,
     {
-      callback: (payload: unknown) => void;
+      listenerCallback: Map<string, ListenerCallback>;
       connection: postgres.Sql;
     }
   > = new Map();
@@ -75,7 +77,11 @@ export class LilypadDbGate {
     const instance = new LilypadDbGate(options);
 
     for (const listenOption of options.listen) {
-      await instance.addListener(listenOption.channel, listenOption.callback);
+      await instance.addListener(
+        listenOption.channel,
+        listenOption.callbackId,
+        listenOption.callback
+      );
     }
 
     if (singleton) {
@@ -205,16 +211,30 @@ export class LilypadDbGate {
     return this.listenerConnection;
   }
 
-  async addListener(channel: string, callback: (payload: unknown) => void) {
-    if (this.listeners.has(channel)) {
-      throw new Error(`Listener for channel "${channel}" already exists.`);
+  private async initializeListener(channel: string) {
+    this.listeners.set(channel, {
+      listenerCallback: new Map(),
+      connection: this.getListenerConnection(),
+    });
+    await this.getListenerConnection().listen(channel, (payload) => {
+      const listener = this.listeners.get(channel);
+      if (listener) {
+        for (const cb of listener.listenerCallback.values()) {
+          cb(payload);
+        }
+      }
+    });
+  }
+
+  async addListener(channel: string, callbackId: string, callback: ListenerCallback) {
+    if (!this.listeners.has(channel)) {
+      await this.initializeListener(channel);
     }
 
-    await this.getListenerConnection().listen(channel, (payload) => {
-      callback(payload);
-    });
-
-    this.listeners.set(channel, { callback, connection: this.getListenerConnection() });
+    const listener = this.listeners.get(channel);
+    if (listener) {
+      listener.listenerCallback.set(callbackId, callback);
+    }
   }
 
   async close() {

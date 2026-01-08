@@ -553,13 +553,16 @@ declare class LilypadCache<K extends string, V> {
     dispose(): void;
 }
 
+type ListenerCallback = (payload: unknown) => void;
+type ListenerCallbackObj = {
+    channel: string;
+    callbackId: string;
+    callback: ListenerCallback;
+};
 type LilypadDbGateOptions = {
     connectionString: string;
     listenerConnectionString?: string;
-    listen: {
-        channel: string;
-        callback: (payload: unknown) => void;
-    }[];
+    listen: ListenerCallbackObj[];
     singleton?: {
         dbgate: LilypadDbGate | null;
     };
@@ -619,7 +622,8 @@ declare class LilypadDbGate {
     updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
     deleteFromTable<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<void>;
     private getListenerConnection;
-    addListener(channel: string, callback: (payload: unknown) => void): Promise<void>;
+    private initializeListener;
+    addListener(channel: string, callbackId: string, callback: ListenerCallback): Promise<void>;
     close(): Promise<void>;
 }
 
@@ -653,6 +657,7 @@ declare class LilypadDbGate {
 declare class LilypadDbCache<K extends string & V[keyof V], V extends object> extends LilypadCache<K, V> {
     private readonly dbGate;
     constructor(ttl: number, options: ConstructorParameters<typeof LilypadCache<K, V>>[1] & {
+        addDefaultDbListener?: boolean;
         dbGate: {
             gate: LilypadDbGate;
             schema: LilypadDbSchema<V>;
@@ -686,6 +691,7 @@ declare class LilypadDbCache<K extends string & V[keyof V], V extends object> ex
      */
     update(key: K): Promise<V | null | undefined>;
     getAll(): Promise<V[]>;
+    private addDefaultDbListener;
 }
 
 /**

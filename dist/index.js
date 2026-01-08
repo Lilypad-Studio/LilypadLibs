@@ -538,6 +538,9 @@ var LilypadDbCache = class extends LilypadCache_default {
       item[options.dbGate.schema.primaryKey],
       item
     ]);
+    if (_nullishCoalesce(options.addDefaultDbListener, () => ( true))) {
+      this.addDefaultDbListener();
+    }
   }
   async getOrFetch(key) {
     var _a;
@@ -607,6 +610,32 @@ var LilypadDbCache = class extends LilypadCache_default {
       })).values().filter((item) => item !== void 0)
     );
   }
+  addDefaultDbListener() {
+    this.dbGate.gate.addListener(
+      "cache_events",
+      "lilypad_db_listener",
+      async (payload) => {
+        var _a, _b;
+        if (typeof payload !== "string") {
+          return;
+        }
+        let parsedPayload;
+        try {
+          parsedPayload = JSON.parse(payload);
+        } catch (e) {
+          (_a = this.logger) == null ? void 0 : _a.error("Error parsing cache_events payload:", e);
+          return;
+        }
+        (_b = this.logger) == null ? void 0 : _b.debug("Received cache invalidation for event:", parsedPayload);
+        if (!parsedPayload.id || !parsedPayload.table) {
+          return;
+        }
+        if (parsedPayload.table === this.dbGate.schema.tableName) {
+          await this.invalidate(String(parsedPayload.id), { invalidateBulkSync: false });
+        }
+      }
+    );
+  }
 };
 
 // src/dbGate/LilypadDbGate.ts
@@ -631,7 +660,11 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     }
     const instance = new _LilypadDbGate(options);
     for (const listenOption of options.listen) {
-      await instance.addListener(listenOption.channel, listenOption.callback);
+      await instance.addListener(
+        listenOption.channel,
+        listenOption.callbackId,
+        listenOption.callback
+      );
     }
     if (singleton) {
       singleton.dbgate = instance;
@@ -731,14 +764,28 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     }
     return this.listenerConnection;
   }
-  async addListener(channel, callback) {
-    if (this.listeners.has(channel)) {
-      throw new Error(`Listener for channel "${channel}" already exists.`);
-    }
-    await this.getListenerConnection().listen(channel, (payload) => {
-      callback(payload);
+  async initializeListener(channel) {
+    this.listeners.set(channel, {
+      listenerCallback: /* @__PURE__ */ new Map(),
+      connection: this.getListenerConnection()
     });
-    this.listeners.set(channel, { callback, connection: this.getListenerConnection() });
+    await this.getListenerConnection().listen(channel, (payload) => {
+      const listener = this.listeners.get(channel);
+      if (listener) {
+        for (const cb of listener.listenerCallback.values()) {
+          cb(payload);
+        }
+      }
+    });
+  }
+  async addListener(channel, callbackId, callback) {
+    if (!this.listeners.has(channel)) {
+      await this.initializeListener(channel);
+    }
+    const listener = this.listeners.get(channel);
+    if (listener) {
+      listener.listenerCallback.set(callbackId, callback);
+    }
   }
   async close() {
     var _a;

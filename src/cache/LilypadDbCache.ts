@@ -37,6 +37,7 @@ export default class LilypadDbCache<
   constructor(
     ttl: number,
     options: ConstructorParameters<typeof LilypadCache<K, V>>[1] & {
+      addDefaultDbListener?: boolean;
       dbGate: { gate: LilypadDbGate; schema: LilypadDbSchema<V> };
     }
   ) {
@@ -47,6 +48,9 @@ export default class LilypadDbCache<
         item[options.dbGate.schema.primaryKey] as K,
         item,
       ]);
+    if (options.addDefaultDbListener ?? true) {
+      this.addDefaultDbListener();
+    }
   }
 
   async getOrFetch(key: K): Promise<LilypadCachedValueType<V> | undefined> {
@@ -122,6 +126,32 @@ export default class LilypadDbCache<
       )
         .values()
         .filter((item): item is V => item !== undefined)
+    );
+  }
+
+  private addDefaultDbListener() {
+    this.dbGate.gate.addListener(
+      'cache_events',
+      'lilypad_db_listener',
+      async (payload: unknown) => {
+        if (typeof payload !== 'string') {
+          return;
+        }
+        let parsedPayload: { table?: string; id?: string };
+        try {
+          parsedPayload = JSON.parse(payload);
+        } catch (e) {
+          this.logger?.error('Error parsing cache_events payload:', e);
+          return;
+        }
+        this.logger?.debug('Received cache invalidation for event:', parsedPayload);
+        if (!parsedPayload.id || !parsedPayload.table) {
+          return;
+        }
+        if (parsedPayload.table === this.dbGate.schema.tableName) {
+          await this.invalidate(String(parsedPayload.id) as K, { invalidateBulkSync: false });
+        }
+      }
     );
   }
 }
