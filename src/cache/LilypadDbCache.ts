@@ -136,9 +136,13 @@ export default class LilypadDbCache<
   public getDefaultDbListener(): ListenerCallbackIdentifier {
     return {
       channel: 'cache_events',
-      callbackId: 'lilypad_db_listener',
+      callbackId: 'lilypad_dbcache_' + this.dbGate.schema.tableName,
       callback: async (payload: unknown) => {
-        this.logger?.debug('Received payload on cache_events channel:', payload);
+        this.logger?.debug(
+          this.dbGate.schema.tableName,
+          'LilypadDbCache handler has received payload on cache_events channel:',
+          payload
+        );
         if (typeof payload !== 'string') {
           return;
         }
@@ -149,11 +153,15 @@ export default class LilypadDbCache<
           this.logger?.error('Error parsing cache_events payload:', e);
           return;
         }
-        this.logger?.debug('Received cache invalidation for event:', parsedPayload);
         if (!parsedPayload.id || !parsedPayload.table) {
           return;
         }
         if (parsedPayload.table === this.dbGate.schema.tableName) {
+          this.logger?.debug(
+            this.dbGate.schema.tableName,
+            'LilypadDbCache handler is processing payload:',
+            parsedPayload
+          );
           await this.invalidate(String(parsedPayload.id) as K, { invalidateBulkSync: false });
         }
       },
