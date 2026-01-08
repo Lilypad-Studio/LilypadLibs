@@ -1,7 +1,7 @@
-import type createLogger from './LilypadLogger';
+import type { LilypadLogger } from './LilypadLogger';
 
 interface LilypadLoggerComponentOptions<T extends string> {
-  logger: ReturnType<typeof createLogger<T>>;
+  logger: ReturnType<typeof LilypadLogger.create<T>>;
   name?: string;
 }
 

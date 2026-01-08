@@ -1,3 +1,4 @@
+import { getLilypadSingletonInstance, LilypadSingletonAble } from '@/singleton/LilypadSingleton';
 import LilypadLoggerComponent from 'logger/LilypadLoggerComponent';
 
 /**
@@ -8,11 +9,11 @@ import LilypadLoggerComponent from 'logger/LilypadLoggerComponent';
  * @property {Record<T, LilypadLoggerComponent<T>[]>} components - A record mapping component names to arrays of logger components.
  * @property {(error: unknown) => void} [errorLogging] - Optional callback function to handle logging errors.
  */
-export interface LilypadLoggerConstructorOptions<T extends string> {
+export type LilypadLoggerConstructorOptions<T extends string> = {
   components: Record<T, LilypadLoggerComponent<T>[]>;
   name?: string;
   errorLogging?: (error: unknown) => Promise<void>;
-}
+} & LilypadSingletonAble;
 
 // Define a utility type to map channel keys to method signatures
 type ChannelMethodFunction = (...message: unknown[]) => Promise<void>;
@@ -45,7 +46,7 @@ type ChannelMethods<T extends string> = {
  * Each method accepts a message string and routes it to all registered components of that type.
  * Errors thrown by components are caught and handled via the errorLogging callback if provided.
  */
-class LilypadLogger<T extends string> {
+export class LilypadLogger<T extends string> {
   private components: Record<T, LilypadLoggerComponent<T>[]> = {} as Record<
     T,
     LilypadLoggerComponent<T>[]
@@ -57,7 +58,40 @@ class LilypadLogger<T extends string> {
     return this._name;
   }
 
-  constructor(options: LilypadLoggerConstructorOptions<T>) {
+  /**
+   * Creates a new LilypadLogger instance or retrieves a singleton instance.
+   *
+   * @template T - The log level type, defaults to 'log' | 'error' | 'warn'
+   * @param options - Configuration options for the logger
+   * @param options.singleton - Whether to use a singleton instance
+   * @param options.singletonIdentifier - Unique identifier for the singleton instance
+   * @returns A LilypadLogger instance typed according to the generic parameter T
+   *
+   * @example
+   * // Create a new logger instance
+   * const logger = LilypadLogger.create({ singleton: false });
+   *
+   * @example
+   * // Create or retrieve a singleton logger
+   * const singletonLogger = LilypadLogger.create({
+   *   singleton: true,
+   *   singletonIdentifier: 'app-logger'
+   * });
+   */
+  public static create<T extends string = 'log' | 'error' | 'warn'>(
+    options: LilypadLoggerConstructorOptions<T>
+  ): LilypadLoggerType<T> {
+    if (options.singleton) {
+      return getLilypadSingletonInstance(
+        options.singletonIdentifier,
+        () => new LilypadLogger<T>(options)
+      ) as LilypadLoggerType<T>;
+    }
+
+    return new LilypadLogger<T>(options) as LilypadLoggerType<T>;
+  }
+
+  private constructor(options: LilypadLoggerConstructorOptions<T>) {
     // Check that no T can override existing properties
     const reservedKeys = new Set(['components', 'register', '__name']);
     for (const key of Object.keys(options.components)) {
@@ -144,9 +178,10 @@ export type LilypadLoggerType<T extends string> = LilypadLogger<T> & ChannelMeth
  *   // logger options
  * });
  * ```
+ * @deprecated Use {@link LilypadLogger.create} instead.
  */
 export default function createLogger<T extends string = 'log' | 'error' | 'warn'>(
   options: LilypadLoggerConstructorOptions<T>
 ): LilypadLoggerType<T> {
-  return new LilypadLogger<T>(options) as LilypadLoggerType<T>;
+  return LilypadLogger.create<T>(options) as LilypadLoggerType<T>;
 }

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import LilypadLoggerComponent from './LilypadLoggerComponent';
-import createLogger from './LilypadLogger';
+import { LilypadLogger } from './LilypadLogger';
 
 type mockType = 'info' | 'error';
 
@@ -25,7 +25,7 @@ describe('LilypadLogger', () => {
   });
 
   it('should create logger with dynamic methods for each channel', () => {
-    const logger = createLogger({
+    const logger = LilypadLogger.create({
       components: {
         info: [mockComponent],
         error: [mockComponent],
@@ -37,7 +37,7 @@ describe('LilypadLogger', () => {
   });
 
   it('should call component.output with string message', () => {
-    const logger = createLogger<mockType>({
+    const logger = LilypadLogger.create<mockType>({
       components: {
         info: [mockComponent],
         error: [mockComponent],
@@ -50,7 +50,7 @@ describe('LilypadLogger', () => {
   });
 
   it('should stringify non-string messages', () => {
-    const logger = createLogger<mockType>({
+    const logger = LilypadLogger.create<mockType>({
       components: {
         info: [mockComponent],
         error: [mockComponent],
@@ -66,7 +66,7 @@ describe('LilypadLogger', () => {
   });
 
   it('should route messages to all registered components', async () => {
-    const logger = createLogger<mockType>({
+    const logger = LilypadLogger.create<mockType>({
       components: {
         info: [mockComponent, mockComponent2],
         error: [mockComponent, mockComponent2],
@@ -85,7 +85,7 @@ describe('LilypadLogger', () => {
     });
     const errorLogging = vi.fn();
 
-    const logger = createLogger<mockType>({
+    const logger = LilypadLogger.create<mockType>({
       components: {
         info: [mockComponent],
         error: [],
@@ -104,7 +104,7 @@ describe('LilypadLogger', () => {
     });
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    const logger = createLogger<mockType>({
+    const logger = LilypadLogger.create<mockType>({
       components: {
         info: [mockComponent],
         error: [],
@@ -118,7 +118,7 @@ describe('LilypadLogger', () => {
   });
 
   it('should register new components', async () => {
-    const logger = createLogger<mockType>({
+    const logger = LilypadLogger.create<mockType>({
       components: {
         info: [mockComponent],
         error: [],
@@ -136,7 +136,7 @@ describe('LilypadLogger', () => {
   });
 
   it('should return this for method chaining on register', () => {
-    const logger = createLogger<mockType>({
+    const logger = LilypadLogger.create<mockType>({
       components: {
         info: [mockComponent],
         error: [],
@@ -152,7 +152,7 @@ describe('LilypadLogger', () => {
   });
 
   it('should assign logger name if provided', () => {
-    const logger = createLogger<mockType>({
+    const logger = LilypadLogger.create<mockType>({
       components: {
         info: [mockComponent],
         error: [],
@@ -164,7 +164,7 @@ describe('LilypadLogger', () => {
   });
 
   it('should initialize components correctly', () => {
-    const logger = createLogger<mockType>({
+    const logger = LilypadLogger.create<mockType>({
       components: {
         info: [mockComponent],
         error: [mockComponent2],
@@ -176,7 +176,7 @@ describe('LilypadLogger', () => {
   });
 
   it('should handle multiple messages correctly', async () => {
-    const logger = createLogger<mockType>({
+    const logger = LilypadLogger.create<mockType>({
       components: {
         info: [mockComponent],
         error: [mockComponent2],
@@ -190,7 +190,7 @@ describe('LilypadLogger', () => {
   });
 
   it('should not throw error if no components are registered', async () => {
-    const logger = createLogger<mockType>({
+    const logger = LilypadLogger.create<mockType>({
       components: {
         info: [],
         error: [],

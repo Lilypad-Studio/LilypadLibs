@@ -1,7 +1,19 @@
 import postgres from 'postgres';
 
+declare global {
+    var __lilypadSingletonMap: Map<string, unknown> | undefined;
+}
+type LilypadSingletonAble = {
+    singleton: true;
+    singletonIdentifier: string;
+} | {
+    singleton?: false;
+};
+declare function getLilypadSingletonInstance<T>(identifier: string, createInstanceFn: () => T): T;
+declare function getLilypadSingletonInstanceAsync<T>(identifier: string, createInstanceFn: () => Promise<T>): Promise<T>;
+
 interface LilypadLoggerComponentOptions<T extends string> {
-    logger: ReturnType<typeof createLogger<T>>;
+    logger: ReturnType<typeof LilypadLogger.create<T>>;
     name?: string;
 }
 /**
@@ -36,11 +48,11 @@ declare abstract class LilypadLoggerComponent<T extends string> {
  * @property {Record<T, LilypadLoggerComponent<T>[]>} components - A record mapping component names to arrays of logger components.
  * @property {(error: unknown) => void} [errorLogging] - Optional callback function to handle logging errors.
  */
-interface LilypadLoggerConstructorOptions<T extends string> {
+type LilypadLoggerConstructorOptions<T extends string> = {
     components: Record<T, LilypadLoggerComponent<T>[]>;
     name?: string;
     errorLogging?: (error: unknown) => Promise<void>;
-}
+} & LilypadSingletonAble;
 type ChannelMethodFunction = (...message: unknown[]) => Promise<void>;
 type ChannelMethods<T extends string> = {
     [K in T]: ChannelMethodFunction;
@@ -74,7 +86,28 @@ declare class LilypadLogger<T extends string> {
     private components;
     private _name?;
     get __name(): string | undefined;
-    constructor(options: LilypadLoggerConstructorOptions<T>);
+    /**
+     * Creates a new LilypadLogger instance or retrieves a singleton instance.
+     *
+     * @template T - The log level type, defaults to 'log' | 'error' | 'warn'
+     * @param options - Configuration options for the logger
+     * @param options.singleton - Whether to use a singleton instance
+     * @param options.singletonIdentifier - Unique identifier for the singleton instance
+     * @returns A LilypadLogger instance typed according to the generic parameter T
+     *
+     * @example
+     * // Create a new logger instance
+     * const logger = LilypadLogger.create({ singleton: false });
+     *
+     * @example
+     * // Create or retrieve a singleton logger
+     * const singletonLogger = LilypadLogger.create({
+     *   singleton: true,
+     *   singletonIdentifier: 'app-logger'
+     * });
+     */
+    static create<T extends string = 'log' | 'error' | 'warn'>(options: LilypadLoggerConstructorOptions<T>): LilypadLoggerType<T>;
+    private constructor();
     /**
      * Registers new logger components for specified types.
      * @param newComponents - A partial record mapping component types to arrays of logger components to register
@@ -96,6 +129,7 @@ type LilypadLoggerType<T extends string> = LilypadLogger<T> & ChannelMethods<T>;
  *   // logger options
  * });
  * ```
+ * @deprecated Use {@link LilypadLogger.create} instead.
  */
 declare function createLogger<T extends string = 'log' | 'error' | 'warn'>(options: LilypadLoggerConstructorOptions<T>): LilypadLoggerType<T>;
 
@@ -554,18 +588,6 @@ declare class LilypadCache<K extends string, V> {
      */
     dispose(): void;
 }
-
-declare global {
-    var __lilypadSingletonMap: Map<string, unknown> | undefined;
-}
-type LilypadSingletonAble = {
-    singleton: true;
-    singletonIdentifier: string;
-} | {
-    singleton: false | undefined;
-};
-declare function getLilypadSingletonInstance<T>(identifier: string, createInstanceFn: () => T): T;
-declare function getLilypadSingletonInstanceAsync<T>(identifier: string, createInstanceFn: () => Promise<T>): Promise<T>;
 
 type ListenerCallback = (payload: unknown) => void;
 type ListenerCallbackIdentifier = {

@@ -871,12 +871,41 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
 }, _class3);
 
 // src/logger/LilypadLogger.ts
-var LilypadLogger = (_class4 = class {
+var LilypadLogger = (_class4 = class _LilypadLogger {
   __init7() {this.components = {}}
   // Optional logger name
   
   get __name() {
     return this._name;
+  }
+  /**
+   * Creates a new LilypadLogger instance or retrieves a singleton instance.
+   *
+   * @template T - The log level type, defaults to 'log' | 'error' | 'warn'
+   * @param options - Configuration options for the logger
+   * @param options.singleton - Whether to use a singleton instance
+   * @param options.singletonIdentifier - Unique identifier for the singleton instance
+   * @returns A LilypadLogger instance typed according to the generic parameter T
+   *
+   * @example
+   * // Create a new logger instance
+   * const logger = LilypadLogger.create({ singleton: false });
+   *
+   * @example
+   * // Create or retrieve a singleton logger
+   * const singletonLogger = LilypadLogger.create({
+   *   singleton: true,
+   *   singletonIdentifier: 'app-logger'
+   * });
+   */
+  static create(options) {
+    if (options.singleton) {
+      return getLilypadSingletonInstance(
+        options.singletonIdentifier,
+        () => new _LilypadLogger(options)
+      );
+    }
+    return new _LilypadLogger(options);
   }
   constructor(options) {;_class4.prototype.__init7.call(this);
     const reservedKeys = /* @__PURE__ */ new Set(["components", "register", "__name"]);
@@ -935,7 +964,7 @@ var LilypadLogger = (_class4 = class {
   }
 }, _class4);
 function createLogger(options) {
-  return new LilypadLogger(options);
+  return LilypadLogger.create(options);
 }
 
 // src/logger/LilypadLoggerComponent.ts

@@ -9,7 +9,7 @@ export type LilypadSingletonAble =
       singletonIdentifier: string;
     }
   | {
-      singleton: false | undefined;
+      singleton?: false;
     };
 
 export function getLilypadSingletonInstance<T>(identifier: string, createInstanceFn: () => T): T {
