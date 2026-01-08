@@ -645,8 +645,10 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
   
   
   
+  
   __init5() {this.listeners = /* @__PURE__ */ new Map()}
   constructor(options) {;_class3.prototype.__init5.call(this);
+    this.logger = options.logger;
     this.connectionString = options.connectionString;
     this.listenerConnectionString = options.listenerConnectionString || options.connectionString;
     this.sql = _postgres2.default.call(void 0, this.connectionString);
@@ -765,20 +767,35 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     return this.listenerConnection;
   }
   async initializeListener(channel) {
+    var _a;
+    (_a = this.logger) == null ? void 0 : _a.debug(`Initializing listener for channel "${channel}".`);
     this.listeners.set(channel, {
       listenerCallback: /* @__PURE__ */ new Map(),
       connection: this.getListenerConnection()
     });
-    await this.getListenerConnection().listen(channel, (payload) => {
-      const listener = this.listeners.get(channel);
-      if (listener) {
-        for (const cb of listener.listenerCallback.values()) {
+    await this.getListenerConnection().listen(
+      channel,
+      this.executeAllListenerCallbacks.bind(this, channel)
+    );
+  }
+  executeAllListenerCallbacks(channel, payload) {
+    var _a;
+    const listener = this.listeners.get(channel);
+    if (listener) {
+      for (const cb of listener.listenerCallback.values()) {
+        try {
           cb(payload);
+        } catch (error) {
+          (_a = this.logger) == null ? void 0 : _a.error(`Error in listener callback for channel "${channel}":`, error);
         }
       }
-    });
+    }
   }
   async addListener(channel, callbackId, callback) {
+    var _a, _b;
+    (_a = this.logger) == null ? void 0 : _a.debug(
+      `Adding listener for channel "${channel}" with callback ID "${callbackId}".`
+    );
     if (!this.listeners.has(channel)) {
       await this.initializeListener(channel);
     }
@@ -786,6 +803,9 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     if (listener) {
       listener.listenerCallback.set(callbackId, callback);
     }
+    (_b = this.logger) == null ? void 0 : _b.debug(
+      `Listener for channel "${channel}" has ${listener ? listener.listenerCallback.size : -1} callbacks.`
+    );
   }
   async close() {
     var _a;

@@ -560,6 +560,7 @@ type ListenerCallbackObj = {
     callback: ListenerCallback;
 };
 type LilypadDbGateOptions = {
+    logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
     connectionString: string;
     listenerConnectionString?: string;
     listen: ListenerCallbackObj[];
@@ -613,6 +614,7 @@ declare class LilypadDbGate {
     private listenerConnectionString;
     sql: postgres.Sql;
     private listenerConnection;
+    protected logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
     private listeners;
     private constructor();
     static create(options: LilypadDbGateOptions): Promise<LilypadDbGate>;
@@ -623,6 +625,7 @@ declare class LilypadDbGate {
     deleteFromTable<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<void>;
     private getListenerConnection;
     private initializeListener;
+    executeAllListenerCallbacks(channel: string, payload: unknown): void;
     addListener(channel: string, callbackId: string, callback: ListenerCallback): Promise<void>;
     close(): Promise<void>;
 }

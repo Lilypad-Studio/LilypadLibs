@@ -1,8 +1,10 @@
+import { LilypadLoggerType } from '@/logger/LilypadLogger';
 import postgres from 'postgres';
 
 type ListenerCallback = (payload: unknown) => void;
 type ListenerCallbackObj = { channel: string; callbackId: string; callback: ListenerCallback };
 export type LilypadDbGateOptions = {
+  logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
   connectionString: string;
   listenerConnectionString?: string;
   listen: ListenerCallbackObj[];
@@ -52,6 +54,7 @@ export class LilypadDbGate {
   private listenerConnectionString!: string;
   public sql: postgres.Sql;
   private listenerConnection: postgres.Sql | undefined;
+  protected logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
   private listeners: Map<
     string,
     {
@@ -61,6 +64,7 @@ export class LilypadDbGate {
   > = new Map();
 
   private constructor(options: LilypadDbGateOptions) {
+    this.logger = options.logger;
     this.connectionString = options.connectionString;
     this.listenerConnectionString = options.listenerConnectionString || options.connectionString;
     this.sql = postgres(this.connectionString);
@@ -212,21 +216,34 @@ export class LilypadDbGate {
   }
 
   private async initializeListener(channel: string) {
+    this.logger?.debug(`Initializing listener for channel "${channel}".`);
     this.listeners.set(channel, {
       listenerCallback: new Map(),
       connection: this.getListenerConnection(),
     });
-    await this.getListenerConnection().listen(channel, (payload) => {
-      const listener = this.listeners.get(channel);
-      if (listener) {
-        for (const cb of listener.listenerCallback.values()) {
+    await this.getListenerConnection().listen(
+      channel,
+      this.executeAllListenerCallbacks.bind(this, channel)
+    );
+  }
+
+  public executeAllListenerCallbacks(channel: string, payload: unknown) {
+    const listener = this.listeners.get(channel);
+    if (listener) {
+      for (const cb of listener.listenerCallback.values()) {
+        try {
           cb(payload);
+        } catch (error) {
+          this.logger?.error(`Error in listener callback for channel "${channel}":`, error);
         }
       }
-    });
+    }
   }
 
   async addListener(channel: string, callbackId: string, callback: ListenerCallback) {
+    this.logger?.debug(
+      `Adding listener for channel "${channel}" with callback ID "${callbackId}".`
+    );
     if (!this.listeners.has(channel)) {
       await this.initializeListener(channel);
     }
@@ -235,6 +252,9 @@ export class LilypadDbGate {
     if (listener) {
       listener.listenerCallback.set(callbackId, callback);
     }
+    this.logger?.debug(
+      `Listener for channel "${channel}" has ${listener ? listener.listenerCallback.size : -1} callbacks.`
+    );
   }
 
   async close() {
