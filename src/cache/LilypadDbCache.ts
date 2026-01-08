@@ -75,6 +75,11 @@ export default class LilypadDbCache<
     if (options.useDefaultDbListener ?? true) {
       this.dbGate.gate.addListener(this.getDefaultDbListener());
     }
+
+    this.logger?.debug(
+      this.id,
+      `LilypadDbCache initialized for table "${this.dbGate.schema.tableName}"`
+    );
   }
 
   async getOrFetch(key: K): Promise<LilypadCachedValueType<V> | undefined> {
@@ -159,6 +164,7 @@ export default class LilypadDbCache<
       callbackId: 'lilypad_dbcache_' + this.dbGate.schema.tableName,
       callback: async (payload: unknown) => {
         this.logger?.debug(
+          this.id,
           this.dbGate.schema.tableName,
           'LilypadDbCache handler has received payload on cache_events channel:',
           payload
@@ -178,6 +184,7 @@ export default class LilypadDbCache<
         }
         if (parsedPayload.table === this.dbGate.schema.tableName) {
           this.logger?.debug(
+            this.id,
             this.dbGate.schema.tableName,
             'LilypadDbCache handler is processing payload:',
             parsedPayload

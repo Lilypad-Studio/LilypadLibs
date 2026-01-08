@@ -548,6 +548,7 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
     return instance;
   }
   constructor(ttl, options) {
+    var _a;
     super(ttl, options);
     this.dbGate = options.dbGate;
     this.bulkSyncFn = async () => (await this.dbGate.gate.getAllFromTable(this.dbGate.schema)).map((item) => [
@@ -557,6 +558,10 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
     if (_nullishCoalesce(options.useDefaultDbListener, () => ( true))) {
       this.dbGate.gate.addListener(this.getDefaultDbListener());
     }
+    (_a = this.logger) == null ? void 0 : _a.debug(
+      this.id,
+      `LilypadDbCache initialized for table "${this.dbGate.schema.tableName}"`
+    );
   }
   async getOrFetch(key) {
     var _a;
@@ -633,6 +638,7 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
       callback: async (payload) => {
         var _a, _b, _c;
         (_a = this.logger) == null ? void 0 : _a.debug(
+          this.id,
           this.dbGate.schema.tableName,
           "LilypadDbCache handler has received payload on cache_events channel:",
           payload
@@ -652,6 +658,7 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
         }
         if (parsedPayload.table === this.dbGate.schema.tableName) {
           (_c = this.logger) == null ? void 0 : _c.debug(
+            this.id,
             this.dbGate.schema.tableName,
             "LilypadDbCache handler is processing payload:",
             parsedPayload
