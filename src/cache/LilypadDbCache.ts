@@ -48,7 +48,7 @@ export default class LilypadDbCache<
   public static create<K extends string & V[keyof V], V extends object>(
     ttl: number = 60000,
     options: LilypadDbCacheConstructorOptions<K, V> & {
-      singleton?: { cache: LilypadDbCache<K, V> };
+      singleton?: { cache: LilypadDbCache<K, V> | null };
     }
   ): LilypadDbCache<K, V> {
     const singleton = options.singleton;

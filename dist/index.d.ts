@@ -670,7 +670,7 @@ declare class LilypadDbCache<K extends string & V[keyof V], V extends object> ex
     private readonly dbGate;
     static create<K extends string & V[keyof V], V extends object>(ttl: number | undefined, options: LilypadDbCacheConstructorOptions<K, V> & {
         singleton?: {
-            cache: LilypadDbCache<K, V>;
+            cache: LilypadDbCache<K, V> | null;
         };
     }): LilypadDbCache<K, V>;
     private constructor();
