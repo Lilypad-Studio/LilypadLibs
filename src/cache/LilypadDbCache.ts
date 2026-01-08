@@ -168,7 +168,7 @@ export default class LilypadDbCache<
         })
       )
         .values()
-        .filter((item): item is V => item !== undefined)
+        .filter((item) => item !== undefined && item !== null)
     );
   }
 

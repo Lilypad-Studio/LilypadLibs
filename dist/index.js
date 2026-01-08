@@ -631,7 +631,7 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
     return Array.from(
       (await super.bulkAsyncGet({
         doSync: true
-      })).values().filter((item) => item !== void 0)
+      })).values().filter((item) => item !== void 0 && item !== null)
     );
   }
   getDefaultDbListener() {
