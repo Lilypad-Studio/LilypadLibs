@@ -22,8 +22,8 @@ export type { LilypadDbGateOptions, LilypadDbSchema } from './dbGate/LilypadDbGa
 /**
  * Logger Module
  */
-export { default as createLogger } from './logger/LilypadLogger';
-export type { LilypadLoggerConstructorOptions } from './logger/LilypadLogger';
+export { default as createLogger, LilypadLogger } from './logger/LilypadLogger';
+export type { LilypadLoggerConstructorOptions, LilypadLoggerType } from './logger/LilypadLogger';
 
 /**
  * Logger Default Components
