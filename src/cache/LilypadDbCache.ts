@@ -5,10 +5,9 @@ import type {
 } from '@/dbGate/LilypadDbGate';
 import LilypadCache, { LilypadCachedValueType } from './LilypadCache';
 
-type LilypadDbCacheConstructorOptions<K extends string, V> = Exclude<
-  ConstructorParameters<typeof LilypadCache<K, V>>[1],
-  'bulkSyncFn'
-> & {
+type LilypadDbCacheConstructorOptions<K extends string, V> = ConstructorParameters<
+  typeof LilypadCache<K, V>
+>[1] & {
   dbGate: { gate: LilypadDbGate; schema: LilypadDbSchema<V> };
   useDefaultDbListener?: boolean;
 };
@@ -46,17 +45,19 @@ export default class LilypadDbCache<
 > extends LilypadCache<K, V> {
   private readonly dbGate: { gate: LilypadDbGate; schema: LilypadDbSchema<V> };
 
-  public static create<K extends string, V>(
+  public static create<K extends string & V[keyof V], V extends object>(
     ttl: number = 60000,
-    options: LilypadDbCacheConstructorOptions<K, V> & { singleton?: { cache: LilypadCache<K, V> } }
-  ): LilypadCache<K, V> {
+    options: LilypadDbCacheConstructorOptions<K, V> & {
+      singleton?: { cache: LilypadDbCache<K, V> };
+    }
+  ): LilypadDbCache<K, V> {
     const singleton = options.singleton;
     if (singleton) {
       if (singleton.cache) {
         return singleton.cache;
       }
     }
-    const instance = new LilypadCache<K, V>(ttl, options);
+    const instance = new LilypadDbCache<K, V>(ttl, options);
     if (singleton) {
       singleton.cache = instance;
     }

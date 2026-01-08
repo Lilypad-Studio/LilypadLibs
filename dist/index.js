@@ -532,7 +532,7 @@ var LilypadCache = (_class2 = class {
 var LilypadCache_default = LilypadCache;
 
 // src/cache/LilypadDbCache.ts
-var LilypadDbCache = class extends LilypadCache_default {
+var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
   
   static create(ttl = 6e4, options) {
     const singleton = options.singleton;
@@ -541,7 +541,7 @@ var LilypadDbCache = class extends LilypadCache_default {
         return singleton.cache;
       }
     }
-    const instance = new LilypadCache_default(ttl, options);
+    const instance = new _LilypadDbCache(ttl, options);
     if (singleton) {
       singleton.cache = instance;
     }

@@ -632,7 +632,7 @@ declare class LilypadDbGate {
     close(): Promise<void>;
 }
 
-type LilypadDbCacheConstructorOptions<K extends string, V> = Exclude<ConstructorParameters<typeof LilypadCache<K, V>>[1], 'bulkSyncFn'> & {
+type LilypadDbCacheConstructorOptions<K extends string, V> = ConstructorParameters<typeof LilypadCache<K, V>>[1] & {
     dbGate: {
         gate: LilypadDbGate;
         schema: LilypadDbSchema<V>;
@@ -668,11 +668,11 @@ type LilypadDbCacheConstructorOptions<K extends string, V> = Exclude<Constructor
  */
 declare class LilypadDbCache<K extends string & V[keyof V], V extends object> extends LilypadCache<K, V> {
     private readonly dbGate;
-    static create<K extends string, V>(ttl: number | undefined, options: LilypadDbCacheConstructorOptions<K, V> & {
+    static create<K extends string & V[keyof V], V extends object>(ttl: number | undefined, options: LilypadDbCacheConstructorOptions<K, V> & {
         singleton?: {
-            cache: LilypadCache<K, V>;
+            cache: LilypadDbCache<K, V>;
         };
-    }): LilypadCache<K, V>;
+    }): LilypadDbCache<K, V>;
     private constructor();
     getOrFetch(key: K): Promise<LilypadCachedValueType<V> | undefined>;
     /**
