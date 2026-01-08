@@ -2,12 +2,16 @@ import { LilypadLoggerType } from '@/logger/LilypadLogger';
 import postgres from 'postgres';
 
 type ListenerCallback = (payload: unknown) => void;
-type ListenerCallbackObj = { channel: string; callbackId: string; callback: ListenerCallback };
+export type ListenerCallbackIdentifier = {
+  channel: string;
+  callbackId: string;
+  callback: ListenerCallback;
+};
 export type LilypadDbGateOptions = {
   logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
   connectionString: string;
   listenerConnectionString?: string;
-  listen: ListenerCallbackObj[];
+  listen: ListenerCallbackIdentifier[];
   singleton?: { dbgate: LilypadDbGate | null };
 };
 
@@ -81,11 +85,11 @@ export class LilypadDbGate {
     const instance = new LilypadDbGate(options);
 
     for (const listenOption of options.listen) {
-      await instance.addListener(
-        listenOption.channel,
-        listenOption.callbackId,
-        listenOption.callback
-      );
+      await instance.addListener({
+        channel: listenOption.channel,
+        callbackId: listenOption.callbackId,
+        callback: listenOption.callback,
+      });
     }
 
     if (singleton) {
@@ -240,7 +244,7 @@ export class LilypadDbGate {
     }
   }
 
-  async addListener(channel: string, callbackId: string, callback: ListenerCallback) {
+  async addListener({ channel, callbackId, callback }: ListenerCallbackIdentifier) {
     this.logger?.debug(
       `Adding listener for channel "${channel}" with callback ID "${callbackId}".`
     );

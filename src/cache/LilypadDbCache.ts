@@ -1,4 +1,8 @@
-import type { LilypadDbGate, LilypadDbSchema } from '@/dbGate/LilypadDbGate';
+import type {
+  LilypadDbGate,
+  LilypadDbSchema,
+  ListenerCallbackIdentifier,
+} from '@/dbGate/LilypadDbGate';
 import LilypadCache, { LilypadCachedValueType } from './LilypadCache';
 
 /**
@@ -38,6 +42,7 @@ export default class LilypadDbCache<
     ttl: number,
     options: ConstructorParameters<typeof LilypadCache<K, V>>[1] & {
       dbGate: { gate: LilypadDbGate; schema: LilypadDbSchema<V> };
+      useDefaultDbListener?: boolean;
     }
   ) {
     super(ttl, options);
@@ -47,6 +52,9 @@ export default class LilypadDbCache<
         item[options.dbGate.schema.primaryKey] as K,
         item,
       ]);
+    if (options.useDefaultDbListener ?? true) {
+      this.dbGate.gate.addListener(this.getDefaultDbListener());
+    }
   }
 
   async getOrFetch(key: K): Promise<LilypadCachedValueType<V> | undefined> {
@@ -125,11 +133,11 @@ export default class LilypadDbCache<
     );
   }
 
-  public addDefaultDbListener() {
-    this.dbGate.gate.addListener(
-      'cache_events',
-      'lilypad_db_listener',
-      async (payload: unknown) => {
+  public getDefaultDbListener(): ListenerCallbackIdentifier {
+    return {
+      channel: 'cache_events',
+      callbackId: 'lilypad_db_listener',
+      callback: async (payload: unknown) => {
         this.logger?.debug('Received payload on cache_events channel:', payload);
         if (typeof payload !== 'string') {
           return;
@@ -148,7 +156,7 @@ export default class LilypadDbCache<
         if (parsedPayload.table === this.dbGate.schema.tableName) {
           await this.invalidate(String(parsedPayload.id) as K, { invalidateBulkSync: false });
         }
-      }
-    );
+      },
+    };
   }
 }

@@ -554,7 +554,7 @@ declare class LilypadCache<K extends string, V> {
 }
 
 type ListenerCallback = (payload: unknown) => void;
-type ListenerCallbackObj = {
+type ListenerCallbackIdentifier = {
     channel: string;
     callbackId: string;
     callback: ListenerCallback;
@@ -563,7 +563,7 @@ type LilypadDbGateOptions = {
     logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
     connectionString: string;
     listenerConnectionString?: string;
-    listen: ListenerCallbackObj[];
+    listen: ListenerCallbackIdentifier[];
     singleton?: {
         dbgate: LilypadDbGate | null;
     };
@@ -626,7 +626,7 @@ declare class LilypadDbGate {
     private getListenerConnection;
     private initializeListener;
     executeAllListenerCallbacks(channel: string, payload: unknown): void;
-    addListener(channel: string, callbackId: string, callback: ListenerCallback): Promise<void>;
+    addListener({ channel, callbackId, callback }: ListenerCallbackIdentifier): Promise<void>;
     close(): Promise<void>;
 }
 
@@ -664,6 +664,7 @@ declare class LilypadDbCache<K extends string & V[keyof V], V extends object> ex
             gate: LilypadDbGate;
             schema: LilypadDbSchema<V>;
         };
+        useDefaultDbListener?: boolean;
     });
     getOrFetch(key: K): Promise<LilypadCachedValueType<V> | undefined>;
     /**
@@ -693,7 +694,7 @@ declare class LilypadDbCache<K extends string & V[keyof V], V extends object> ex
      */
     update(key: K): Promise<V | null | undefined>;
     getAll(): Promise<V[]>;
-    addDefaultDbListener(): void;
+    getDefaultDbListener(): ListenerCallbackIdentifier;
 }
 
 /**

@@ -538,6 +538,9 @@ var LilypadDbCache = class extends LilypadCache_default {
       item[options.dbGate.schema.primaryKey],
       item
     ]);
+    if (_nullishCoalesce(options.useDefaultDbListener, () => ( true))) {
+      this.dbGate.gate.addListener(this.getDefaultDbListener());
+    }
   }
   async getOrFetch(key) {
     var _a;
@@ -607,11 +610,11 @@ var LilypadDbCache = class extends LilypadCache_default {
       })).values().filter((item) => item !== void 0)
     );
   }
-  addDefaultDbListener() {
-    this.dbGate.gate.addListener(
-      "cache_events",
-      "lilypad_db_listener",
-      async (payload) => {
+  getDefaultDbListener() {
+    return {
+      channel: "cache_events",
+      callbackId: "lilypad_db_listener",
+      callback: async (payload) => {
         var _a, _b, _c;
         (_a = this.logger) == null ? void 0 : _a.debug("Received payload on cache_events channel:", payload);
         if (typeof payload !== "string") {
@@ -632,7 +635,7 @@ var LilypadDbCache = class extends LilypadCache_default {
           await this.invalidate(String(parsedPayload.id), { invalidateBulkSync: false });
         }
       }
-    );
+    };
   }
 };
 
@@ -660,11 +663,11 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     }
     const instance = new _LilypadDbGate(options);
     for (const listenOption of options.listen) {
-      await instance.addListener(
-        listenOption.channel,
-        listenOption.callbackId,
-        listenOption.callback
-      );
+      await instance.addListener({
+        channel: listenOption.channel,
+        callbackId: listenOption.callbackId,
+        callback: listenOption.callback
+      });
     }
     if (singleton) {
       singleton.dbgate = instance;
@@ -789,7 +792,7 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
       }
     }
   }
-  async addListener(channel, callbackId, callback) {
+  async addListener({ channel, callbackId, callback }) {
     var _a, _b;
     (_a = this.logger) == null ? void 0 : _a.debug(
       `Adding listener for channel "${channel}" with callback ID "${callbackId}".`
