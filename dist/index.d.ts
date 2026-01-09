@@ -670,7 +670,19 @@ type LilypadDbCacheConstructorOptions<K extends string, V> = ConstructorParamete
         gate: LilypadDbGate;
         schema: LilypadDbSchema<V>;
     };
-    useDefaultDbListener?: boolean;
+} & ({
+    useDefaultDbListener?: false;
+} | {
+    useDefaultDbListener: true;
+    defaultListenerOptions: {
+        automaticallyInvalidateDataBeforeCallback?: boolean;
+        callback?: (payload: LilypadDbCacheDefaultNotificationPayload) => Promise<void> | void;
+    };
+});
+type LilypadDbCacheDefaultNotificationPayload = {
+    table?: string;
+    id?: string;
+    op: 'UPDATE' | 'DELETE' | 'INSERT';
 };
 /**
  * A cache class that synchronizes with a database table using a provided database gateway and schema.
@@ -731,7 +743,10 @@ declare class LilypadDbCache<K extends string & V[keyof V], V extends object> ex
      */
     update(key: K): Promise<V | null | undefined>;
     getAll(): Promise<V[]>;
-    getDefaultDbListener(): ListenerCallbackIdentifier;
+    getDefaultDbListener(options?: {
+        callback?: (payload: LilypadDbCacheDefaultNotificationPayload) => Promise<void> | void;
+        automaticallyInvalidateDataBeforeCallback?: boolean;
+    }): ListenerCallbackIdentifier;
 }
 
 /**

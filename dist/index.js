@@ -199,7 +199,7 @@ var LilypadCache = (_class2 = class {
         this.cleanupIntervalId.unref();
       }
     }
-    (_a = this.logger) == null ? void 0 : _a.debug(`LilypadCache initialized with ID=${this.id}`);
+    (_a = this.logger) == null ? void 0 : _a.debug(this.id, `LilypadCache initialized`);
   }
   /**
    * Calculates the expiration timestamp based on the provided TTL (time-to-live) value.
@@ -278,7 +278,7 @@ var LilypadCache = (_class2 = class {
    */
   errorReturn(error, options, key, fetched) {
     var _a, _b;
-    (_a = this.logger) == null ? void 0 : _a.error(`Error fetching cache key "${String(key)}": `, error);
+    (_a = this.logger) == null ? void 0 : _a.error(this.id, `Error fetching cache key "${String(key)}": `, error);
     let valueToReturn = void 0;
     const errorFnRes = (_b = options.errorFn) == null ? void 0 : _b.call(options, { key, error, options });
     if (errorFnRes !== void 0) {
@@ -340,7 +340,7 @@ var LilypadCache = (_class2 = class {
       consumerIdentifier: "",
       errorFn: (error) => {
         var _a;
-        (_a = this.logger) == null ? void 0 : _a.error("Error during bulk sync: ", error);
+        (_a = this.logger) == null ? void 0 : _a.error(this.id, "Error during bulk sync: ", error);
       },
       fn: async () => this._bulkSync(syncFn)
     });
@@ -352,7 +352,7 @@ var LilypadCache = (_class2 = class {
     }
     const data = await _asyncNullishCoalesce(await (syncFn == null ? void 0 : syncFn()), async () => ( await ((_a = this.bulkSyncFn) == null ? void 0 : _a.call(this))));
     if (!data) {
-      (_b = this.logger) == null ? void 0 : _b.warn("Bulk sync function returned no data");
+      (_b = this.logger) == null ? void 0 : _b.warn(this.id, "Bulk sync function returned no data");
       return;
     }
     const expirationTime = this.createExpirationTime();
@@ -576,7 +576,11 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
       item
     ]);
     if (_nullishCoalesce(options.useDefaultDbListener, () => ( true))) {
-      this.dbGate.gate.addListener(this.getDefaultDbListener());
+      this.dbGate.gate.addListener(
+        this.getDefaultDbListener(
+          options.useDefaultDbListener ? options.defaultListenerOptions : void 0
+        )
+      );
     }
     (_a = this.logger) == null ? void 0 : _a.debug(
       this.id,
@@ -651,12 +655,12 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
       })).values().filter((item) => item !== void 0 && item !== null)
     );
   }
-  getDefaultDbListener() {
+  getDefaultDbListener(options) {
     return {
       channel: "cache_events",
       callbackId: "lilypad_dbcache_" + this.dbGate.schema.tableName,
       callback: async (payload) => {
-        var _a, _b, _c;
+        var _a, _b, _c, _d;
         (_a = this.logger) == null ? void 0 : _a.debug(
           this.id,
           this.dbGate.schema.tableName,
@@ -683,7 +687,11 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
             "LilypadDbCache handler is processing payload:",
             parsedPayload
           );
-          await this.invalidate(String(parsedPayload.id), { invalidateBulkSync: false });
+          if (!(options == null ? void 0 : options.callback) || options.automaticallyInvalidateDataBeforeCallback) {
+            await this.invalidate(String(parsedPayload.id), { invalidateBulkSync: false });
+          }
+          await ((_d = options == null ? void 0 : options.callback) == null ? void 0 : _d.call(options, parsedPayload));
+          return;
         }
       }
     };

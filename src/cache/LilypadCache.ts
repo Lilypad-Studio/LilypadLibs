@@ -194,7 +194,7 @@ class LilypadCache<K extends string, V> {
       }
     }
 
-    this.logger?.debug(`LilypadCache initialized with ID=${this.id}`);
+    this.logger?.debug(this.id, `LilypadCache initialized`);
   }
 
   /**
@@ -281,7 +281,7 @@ class LilypadCache<K extends string, V> {
     key: K,
     fetched: LilypadCacheValueRetrieval<V>
   ): LilypadCachedValueType<V> {
-    this.logger?.error(`Error fetching cache key "${String(key)}": `, error);
+    this.logger?.error(this.id, `Error fetching cache key "${String(key)}": `, error);
 
     let valueToReturn: LilypadCachedValueType<V> | undefined = undefined;
     const errorFnRes = options.errorFn?.({ key, error, options });
@@ -356,7 +356,7 @@ class LilypadCache<K extends string, V> {
       functionIdentifier: `LilypadCache-bulkSync`,
       consumerIdentifier: '',
       errorFn: (error) => {
-        this.logger?.error('Error during bulk sync: ', error);
+        this.logger?.error(this.id, 'Error during bulk sync: ', error);
       },
       fn: async () => this._bulkSync(syncFn),
     });
@@ -367,7 +367,7 @@ class LilypadCache<K extends string, V> {
     }
     const data = (await syncFn?.()) ?? (await this.bulkSyncFn?.());
     if (!data) {
-      this.logger?.warn('Bulk sync function returned no data');
+      this.logger?.warn(this.id, 'Bulk sync function returned no data');
       return;
     }
     const expirationTime = this.createExpirationTime();

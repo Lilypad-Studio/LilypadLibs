@@ -10,7 +10,23 @@ type LilypadDbCacheConstructorOptions<K extends string, V> = ConstructorParamete
   typeof LilypadCache<K, V>
 >[1] & {
   dbGate: { gate: LilypadDbGate; schema: LilypadDbSchema<V> };
-  useDefaultDbListener?: boolean;
+} & (
+    | {
+        useDefaultDbListener?: false;
+      }
+    | {
+        useDefaultDbListener: true;
+        defaultListenerOptions: {
+          automaticallyInvalidateDataBeforeCallback?: boolean;
+          callback?: (payload: LilypadDbCacheDefaultNotificationPayload) => Promise<void> | void;
+        };
+      }
+  );
+
+type LilypadDbCacheDefaultNotificationPayload = {
+  table?: string;
+  id?: string;
+  op: 'UPDATE' | 'DELETE' | 'INSERT';
 };
 
 /**
@@ -67,8 +83,13 @@ export default class LilypadDbCache<
         item[options.dbGate.schema.primaryKey] as K,
         item,
       ]);
+
     if (options.useDefaultDbListener ?? true) {
-      this.dbGate.gate.addListener(this.getDefaultDbListener());
+      this.dbGate.gate.addListener(
+        this.getDefaultDbListener(
+          options.useDefaultDbListener ? options.defaultListenerOptions : undefined
+        )
+      );
     }
 
     this.logger?.debug(
@@ -153,7 +174,10 @@ export default class LilypadDbCache<
     );
   }
 
-  public getDefaultDbListener(): ListenerCallbackIdentifier {
+  public getDefaultDbListener(options?: {
+    callback?: (payload: LilypadDbCacheDefaultNotificationPayload) => Promise<void> | void;
+    automaticallyInvalidateDataBeforeCallback?: boolean;
+  }): ListenerCallbackIdentifier {
     return {
       channel: 'cache_events',
       callbackId: 'lilypad_dbcache_' + this.dbGate.schema.tableName,
@@ -184,7 +208,11 @@ export default class LilypadDbCache<
             'LilypadDbCache handler is processing payload:',
             parsedPayload
           );
-          await this.invalidate(String(parsedPayload.id) as K, { invalidateBulkSync: false });
+          if (!options?.callback || options.automaticallyInvalidateDataBeforeCallback) {
+            await this.invalidate(String(parsedPayload.id) as K, { invalidateBulkSync: false });
+          }
+          await options?.callback?.(parsedPayload);
+          return;
         }
       },
     };
