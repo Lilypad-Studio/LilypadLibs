@@ -839,4 +839,4 @@ declare class LilypadSerializer<FROM extends {}, TO extends {}, KeyMap extends R
     deserialize(input: TO[]): FROM[];
 }
 
-export { type ExecuteFnOptions, type FlowControlOptions, LilypadCache, type LilypadCacheGetOptions, LilypadConsoleLogger, LilypadDbCache, LilypadDbGate, type LilypadDbGateOptions, type LilypadDbSchema, LilypadDiscordLogger, LilypadFlowControl, LilypadLogger, type LilypadLoggerConstructorOptions, type LilypadLoggerType, LilypadSerializer, type LilypadSerializerConstructorOptions, type LilypadSingletonAble, createLogger, getLilypadSingletonInstance, getLilypadSingletonInstanceAsync };
+export { type ExecuteFnOptions, type FlowControlOptions, LilypadCache, type LilypadCacheGetOptions, LilypadConsoleLogger, LilypadDbCache, type LilypadDbCacheDefaultNotificationPayload, LilypadDbGate, type LilypadDbGateOptions, type LilypadDbSchema, LilypadDiscordLogger, LilypadFlowControl, LilypadLogger, type LilypadLoggerConstructorOptions, type LilypadLoggerType, LilypadSerializer, type LilypadSerializerConstructorOptions, type LilypadSingletonAble, createLogger, getLilypadSingletonInstance, getLilypadSingletonInstanceAsync };

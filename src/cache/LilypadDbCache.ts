@@ -23,7 +23,7 @@ type LilypadDbCacheConstructorOptions<K extends string, V> = ConstructorParamete
       }
   );
 
-type LilypadDbCacheDefaultNotificationPayload = {
+export type LilypadDbCacheDefaultNotificationPayload = {
   table?: string;
   id?: string;
   op: 'UPDATE' | 'DELETE' | 'INSERT';
