@@ -79,7 +79,7 @@ export default class LilypadDbCache<
     super(ttl, options);
     this.dbGate = options.dbGate;
     this.bulkSyncFn = async () =>
-      (await this.dbGate.gate.getAllFromTable<V>(this.dbGate.schema)).map((item) => [
+      (await this.dbGate.gate.selectAllFromTable<V>(this.dbGate.schema)).map((item) => [
         item[options.dbGate.schema.primaryKey] as K,
         item,
       ]);
@@ -98,6 +98,14 @@ export default class LilypadDbCache<
     );
   }
 
+  /**
+   * Retrieves a cached value by key, or fetches and updates it if not found in cache.
+   * @template K - The type of the cache key.
+   * @template V - The type of the cached value.
+   * @param key - The cache key to retrieve or fetch.
+   * @returns A promise that resolves to the cached value, or undefined if the key doesn't exist or an error occurs during fetching.
+   * @throws Does not throw; errors are caught and logged internally.
+   */
   async getOrFetch(key: K): Promise<LilypadCachedValueType<V> | undefined> {
     const cachedValue = super.get(key, false);
     if (cachedValue !== undefined) {
@@ -151,7 +159,10 @@ export default class LilypadDbCache<
   async update(key: K) {
     try {
       if (this.dbGate && this.dbGate.gate) {
-        const value = await this.dbGate.gate.getFromTableByPrimaryKey<V>(this.dbGate.schema, key);
+        const value = await this.dbGate.gate.selectFromTableByPrimaryKey<V>(
+          this.dbGate.schema,
+          key
+        );
         this.set(key, value);
         return value;
       }
@@ -162,11 +173,12 @@ export default class LilypadDbCache<
     return undefined;
   }
 
-  async getAll(): Promise<V[]> {
+  async getAll(keys?: K[]): Promise<V[]> {
     return Array.from(
       (
         await super.bulkAsyncGet({
           doSync: true,
+          keys: keys,
         })
       )
         .values()
@@ -174,7 +186,7 @@ export default class LilypadDbCache<
     );
   }
 
-  public getDefaultDbListener(options?: {
+  protected getDefaultDbListener(options?: {
     callback?: (payload: LilypadDbCacheDefaultNotificationPayload) => Promise<void> | void;
     automaticallyInvalidateDataBeforeCallback?: boolean;
   }): ListenerCallbackIdentifier {
@@ -209,12 +221,60 @@ export default class LilypadDbCache<
             parsedPayload
           );
           if (!options?.callback || options.automaticallyInvalidateDataBeforeCallback) {
-            await this.invalidate(String(parsedPayload.id) as K, { invalidateBulkSync: false });
+            if (parsedPayload.op === 'DELETE') {
+              this.delete(String(parsedPayload.id) as K, { setNull: true });
+            } else {
+              await this.invalidate(String(parsedPayload.id) as K, { invalidateBulkSync: false });
+            }
           }
           await options?.callback?.(parsedPayload);
           return;
         }
       },
     };
+  }
+
+  private getItemPrimaryKeyValue(item: V): V[keyof V] {
+    const keyValue = item[this.dbGate.schema.primaryKey];
+    if (keyValue === undefined) {
+      throw new Error(
+        `Primary key "${String(
+          this.dbGate.schema.primaryKey
+        )}" is missing in the item data for table "${this.dbGate.schema.tableName}".`
+      );
+    }
+    return keyValue;
+  }
+
+  private isOldItemTheSameAsNewOne(newItem: V, oldKey: K): boolean {
+    const oldItem = this.get(oldKey, false);
+    return JSON.stringify(newItem) === JSON.stringify(oldItem);
+  }
+
+  async sqlCreate(item: V): Promise<void> {
+    const keyValue = this.getItemPrimaryKeyValue(item);
+
+    if (this.isOldItemTheSameAsNewOne(item, keyValue as K)) {
+      return;
+    }
+
+    await this.dbGate.gate.insertToTable<V>(this.dbGate.schema, item);
+    this.set(keyValue as K, item);
+  }
+
+  async sqlUpdate(item: V): Promise<void> {
+    const keyValue = this.getItemPrimaryKeyValue(item);
+
+    if (this.isOldItemTheSameAsNewOne(item, keyValue as K)) {
+      return;
+    }
+
+    await this.dbGate.gate.updateToTable<V>(this.dbGate.schema, item);
+    this.set(keyValue as K, item);
+  }
+
+  async sqlDelete(key: K): Promise<void> {
+    await this.dbGate.gate.deleteFromTable<V>(this.dbGate.schema, key);
+    this.delete(key, { setNull: true });
   }
 }

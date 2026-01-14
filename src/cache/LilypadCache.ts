@@ -499,10 +499,15 @@ class LilypadCache<K extends string, V> {
    * @param key - The key to be deleted from the cache.
    * @param options - Optional settings for deletion.
    * @param options.force - If true, forces deletion even if the key is protected.
+   * @param options.setNull - If true, sets the value to null instead of deleting the entry.
    */
-  delete(key: K, options: { force?: boolean } = {}) {
+  delete(key: K, options: { force?: boolean; setNull?: boolean } = {}) {
     if (this.protectedKeys.has(key) && !options.force) {
       return false;
+    }
+    if (options.setNull) {
+      this.set(key, null);
+      return true;
     }
     this.store.delete(String(key) as K);
     return true;
@@ -516,8 +521,9 @@ class LilypadCache<K extends string, V> {
    *
    * @param options - Optional settings for the clear operation.
    * @param options.force - If `true`, forces deletion of entries regardless of other conditions.
+   * @param options.setNull - If `true`, sets the value to null instead of deleting the entry.
    */
-  clear(options: { force?: boolean } = {}) {
+  clear(options: Parameters<typeof this.delete>[1] = {}) {
     for (const key of this.store.keys()) {
       this.delete(key, options);
     }

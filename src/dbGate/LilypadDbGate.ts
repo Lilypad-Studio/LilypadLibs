@@ -102,7 +102,9 @@ export class LilypadDbGate {
     return instance;
   }
 
-  async getAllFromTable<T>(options: LilypadDbSchema<T>): Promise<T[]> {
+  // CRUD OPERATIONS
+
+  async selectAllFromTable<T>(options: LilypadDbSchema<T>): Promise<T[]> {
     const results = await this.sql`SELECT * FROM ${this.sql(options.tableName)}`;
     const typedResults: T[] = [];
 
@@ -124,7 +126,7 @@ export class LilypadDbGate {
     return typedResults;
   }
 
-  async getFromTableByPrimaryKey<T>(
+  async selectFromTableByPrimaryKey<T>(
     options: LilypadDbSchema<T>,
     primaryKeyValue: T[keyof T]
   ): Promise<T | null> {
@@ -150,7 +152,7 @@ export class LilypadDbGate {
     return typedRow as T;
   }
 
-  async addToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void> {
+  async insertToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void> {
     let insertData: Partial<T> = { ...data };
     if (options.insertSanitizationFn) {
       insertData = { ...insertData, ...options.insertSanitizationFn(insertData) };
@@ -212,6 +214,19 @@ export class LilypadDbGate {
     `;
   }
 
+  // LISTENER MANAGEMENT
+
+  /**
+   * Retrieves the singleton listener database connection.
+   *
+   * If the listener connection does not already exist, this method initializes it
+   * using the provided connection string and specific connection options:
+   * - `max`: Limits the pool to a single connection.
+   * - `idle_timeout`: Disables idle timeout for the connection.
+   * - `max_lifetime`: Disables maximum lifetime for the connection.
+   *
+   * @returns The singleton listener database connection instance.
+   */
   private getListenerConnection() {
     if (!this.listenerConnection) {
       this.listenerConnection = postgres(this.listenerConnectionString, {
@@ -223,6 +238,17 @@ export class LilypadDbGate {
     return this.listenerConnection;
   }
 
+  /**
+   * Initializes a listener for the specified channel.
+   *
+   * This method sets up a new listener entry in the `listeners` map for the given channel,
+   * associates a callback map and a database connection, and starts listening for events
+   * on the specified channel. When an event is received, all registered listener callbacks
+   * for that channel are executed.
+   *
+   * @param channel - The name of the channel to listen on.
+   * @returns A promise that resolves when the listener has been successfully initialized.
+   */
   private async initializeListener(channel: string) {
     this.logger?.debug(`Initializing listener for channel "${channel}".`);
     this.listeners.set(channel, {
@@ -235,6 +261,15 @@ export class LilypadDbGate {
     );
   }
 
+  /**
+   * Executes all registered listener callbacks for a given channel, passing the provided payload to each callback.
+   *
+   * Iterates through all callbacks associated with the specified channel and invokes them with the given payload.
+   * If any callback throws an error, it is caught and logged using the logger (if available).
+   *
+   * @param channel - The name of the channel whose listener callbacks should be executed.
+   * @param payload - The data to pass to each listener callback.
+   */
   public executeAllListenerCallbacks(channel: string, payload: unknown) {
     const listener = this.listeners.get(channel);
     if (listener) {
@@ -248,6 +283,20 @@ export class LilypadDbGate {
     }
   }
 
+  /**
+   * Adds a listener callback for a specified channel.
+   *
+   * If the channel does not already have a listener, it initializes one.
+   * The callback is associated with the provided `callbackId` and stored for the channel.
+   * Logs debug information about the addition and the current number of callbacks for the channel.
+   *
+   * @param params - An object containing:
+   *   @param params.channel - The name of the channel to listen to.
+   *   @param params.callbackId - A unique identifier for the callback.
+   *   @param params.callback - The callback function to be invoked for the channel.
+   *
+   * @returns A promise that resolves when the listener has been added.
+   */
   async addListener({ channel, callbackId, callback }: ListenerCallbackIdentifier) {
     this.logger?.debug(
       `Adding listener for channel "${channel}" with callback ID "${callbackId}".`

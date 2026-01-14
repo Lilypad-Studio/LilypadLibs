@@ -548,9 +548,11 @@ declare class LilypadCache<K extends string, V> {
      * @param key - The key to be deleted from the cache.
      * @param options - Optional settings for deletion.
      * @param options.force - If true, forces deletion even if the key is protected.
+     * @param options.setNull - If true, sets the value to null instead of deleting the entry.
      */
     delete(key: K, options?: {
         force?: boolean;
+        setNull?: boolean;
     }): boolean;
     /**
      * Removes all entries from the cache.
@@ -560,10 +562,9 @@ declare class LilypadCache<K extends string, V> {
      *
      * @param options - Optional settings for the clear operation.
      * @param options.force - If `true`, forces deletion of entries regardless of other conditions.
+     * @param options.setNull - If `true`, sets the value to null instead of deleting the entry.
      */
-    clear(options?: {
-        force?: boolean;
-    }): void;
+    clear(options?: Parameters<typeof this.delete>[1]): void;
     /**
      * Removes all expired entries from the cache.
      *
@@ -653,14 +654,59 @@ declare class LilypadDbGate {
     private constructor();
     static create(options: LilypadDbGateOptionsWithSingleton): Promise<LilypadDbGate>;
     private static initializeNew;
-    getAllFromTable<T>(options: LilypadDbSchema<T>): Promise<T[]>;
-    getFromTableByPrimaryKey<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<T | null>;
-    addToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
+    selectAllFromTable<T>(options: LilypadDbSchema<T>): Promise<T[]>;
+    selectFromTableByPrimaryKey<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<T | null>;
+    insertToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
     updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
     deleteFromTable<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<void>;
+    /**
+     * Retrieves the singleton listener database connection.
+     *
+     * If the listener connection does not already exist, this method initializes it
+     * using the provided connection string and specific connection options:
+     * - `max`: Limits the pool to a single connection.
+     * - `idle_timeout`: Disables idle timeout for the connection.
+     * - `max_lifetime`: Disables maximum lifetime for the connection.
+     *
+     * @returns The singleton listener database connection instance.
+     */
     private getListenerConnection;
+    /**
+     * Initializes a listener for the specified channel.
+     *
+     * This method sets up a new listener entry in the `listeners` map for the given channel,
+     * associates a callback map and a database connection, and starts listening for events
+     * on the specified channel. When an event is received, all registered listener callbacks
+     * for that channel are executed.
+     *
+     * @param channel - The name of the channel to listen on.
+     * @returns A promise that resolves when the listener has been successfully initialized.
+     */
     private initializeListener;
+    /**
+     * Executes all registered listener callbacks for a given channel, passing the provided payload to each callback.
+     *
+     * Iterates through all callbacks associated with the specified channel and invokes them with the given payload.
+     * If any callback throws an error, it is caught and logged using the logger (if available).
+     *
+     * @param channel - The name of the channel whose listener callbacks should be executed.
+     * @param payload - The data to pass to each listener callback.
+     */
     executeAllListenerCallbacks(channel: string, payload: unknown): void;
+    /**
+     * Adds a listener callback for a specified channel.
+     *
+     * If the channel does not already have a listener, it initializes one.
+     * The callback is associated with the provided `callbackId` and stored for the channel.
+     * Logs debug information about the addition and the current number of callbacks for the channel.
+     *
+     * @param params - An object containing:
+     *   @param params.channel - The name of the channel to listen to.
+     *   @param params.callbackId - A unique identifier for the callback.
+     *   @param params.callback - The callback function to be invoked for the channel.
+     *
+     * @returns A promise that resolves when the listener has been added.
+     */
     addListener({ channel, callbackId, callback }: ListenerCallbackIdentifier): Promise<void>;
     close(): Promise<void>;
 }
@@ -715,6 +761,14 @@ declare class LilypadDbCache<K extends string & V[keyof V], V extends object> ex
     private readonly dbGate;
     static create<K extends string & V[keyof V], V extends object>(ttl: number | undefined, options: LilypadDbCacheConstructorOptions<K, V> & LilypadSingletonAble): LilypadDbCache<K, V>;
     private constructor();
+    /**
+     * Retrieves a cached value by key, or fetches and updates it if not found in cache.
+     * @template K - The type of the cache key.
+     * @template V - The type of the cached value.
+     * @param key - The cache key to retrieve or fetch.
+     * @returns A promise that resolves to the cached value, or undefined if the key doesn't exist or an error occurs during fetching.
+     * @throws Does not throw; errors are caught and logged internally.
+     */
     getOrFetch(key: K): Promise<LilypadCachedValueType<V> | undefined>;
     /**
      * Invalidates the cache entry for the specified key.
@@ -742,11 +796,16 @@ declare class LilypadDbCache<K extends string & V[keyof V], V extends object> ex
      * @throws Rethrows any error encountered during the database fetch or cache update process.
      */
     update(key: K): Promise<V | null | undefined>;
-    getAll(): Promise<V[]>;
-    getDefaultDbListener(options?: {
+    getAll(keys?: K[]): Promise<V[]>;
+    protected getDefaultDbListener(options?: {
         callback?: (payload: LilypadDbCacheDefaultNotificationPayload) => Promise<void> | void;
         automaticallyInvalidateDataBeforeCallback?: boolean;
     }): ListenerCallbackIdentifier;
+    private getItemPrimaryKeyValue;
+    private isOldItemTheSameAsNewOne;
+    sqlCreate(item: V): Promise<void>;
+    sqlUpdate(item: V): Promise<void>;
+    sqlDelete(key: K): Promise<void>;
 }
 
 /**

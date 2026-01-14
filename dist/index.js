@@ -469,10 +469,15 @@ var LilypadCache = (_class2 = class {
    * @param key - The key to be deleted from the cache.
    * @param options - Optional settings for deletion.
    * @param options.force - If true, forces deletion even if the key is protected.
+   * @param options.setNull - If true, sets the value to null instead of deleting the entry.
    */
   delete(key, options = {}) {
     if (this.protectedKeys.has(key) && !options.force) {
       return false;
+    }
+    if (options.setNull) {
+      this.set(key, null);
+      return true;
     }
     this.store.delete(String(key));
     return true;
@@ -485,6 +490,7 @@ var LilypadCache = (_class2 = class {
    *
    * @param options - Optional settings for the clear operation.
    * @param options.force - If `true`, forces deletion of entries regardless of other conditions.
+   * @param options.setNull - If `true`, sets the value to null instead of deleting the entry.
    */
   clear(options = {}) {
     for (const key of this.store.keys()) {
@@ -571,7 +577,7 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
     var _a;
     super(ttl, options);
     this.dbGate = options.dbGate;
-    this.bulkSyncFn = async () => (await this.dbGate.gate.getAllFromTable(this.dbGate.schema)).map((item) => [
+    this.bulkSyncFn = async () => (await this.dbGate.gate.selectAllFromTable(this.dbGate.schema)).map((item) => [
       item[options.dbGate.schema.primaryKey],
       item
     ]);
@@ -587,6 +593,14 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
       `LilypadDbCache initialized for table "${this.dbGate.schema.tableName}"`
     );
   }
+  /**
+   * Retrieves a cached value by key, or fetches and updates it if not found in cache.
+   * @template K - The type of the cache key.
+   * @template V - The type of the cached value.
+   * @param key - The cache key to retrieve or fetch.
+   * @returns A promise that resolves to the cached value, or undefined if the key doesn't exist or an error occurs during fetching.
+   * @throws Does not throw; errors are caught and logged internally.
+   */
   async getOrFetch(key) {
     var _a;
     const cachedValue = super.get(key, false);
@@ -638,7 +652,10 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
     var _a;
     try {
       if (this.dbGate && this.dbGate.gate) {
-        const value = await this.dbGate.gate.getFromTableByPrimaryKey(this.dbGate.schema, key);
+        const value = await this.dbGate.gate.selectFromTableByPrimaryKey(
+          this.dbGate.schema,
+          key
+        );
         this.set(key, value);
         return value;
       }
@@ -648,10 +665,11 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
     }
     return void 0;
   }
-  async getAll() {
+  async getAll(keys) {
     return Array.from(
       (await super.bulkAsyncGet({
-        doSync: true
+        doSync: true,
+        keys
       })).values().filter((item) => item !== void 0 && item !== null)
     );
   }
@@ -688,13 +706,52 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
             parsedPayload
           );
           if (!(options == null ? void 0 : options.callback) || options.automaticallyInvalidateDataBeforeCallback) {
-            await this.invalidate(String(parsedPayload.id), { invalidateBulkSync: false });
+            if (parsedPayload.op === "DELETE") {
+              this.delete(String(parsedPayload.id), { setNull: true });
+            } else {
+              await this.invalidate(String(parsedPayload.id), { invalidateBulkSync: false });
+            }
           }
           await ((_d = options == null ? void 0 : options.callback) == null ? void 0 : _d.call(options, parsedPayload));
           return;
         }
       }
     };
+  }
+  getItemPrimaryKeyValue(item) {
+    const keyValue = item[this.dbGate.schema.primaryKey];
+    if (keyValue === void 0) {
+      throw new Error(
+        `Primary key "${String(
+          this.dbGate.schema.primaryKey
+        )}" is missing in the item data for table "${this.dbGate.schema.tableName}".`
+      );
+    }
+    return keyValue;
+  }
+  isOldItemTheSameAsNewOne(newItem, oldKey) {
+    const oldItem = this.get(oldKey, false);
+    return JSON.stringify(newItem) === JSON.stringify(oldItem);
+  }
+  async sqlCreate(item) {
+    const keyValue = this.getItemPrimaryKeyValue(item);
+    if (this.isOldItemTheSameAsNewOne(item, keyValue)) {
+      return;
+    }
+    await this.dbGate.gate.insertToTable(this.dbGate.schema, item);
+    this.set(keyValue, item);
+  }
+  async sqlUpdate(item) {
+    const keyValue = this.getItemPrimaryKeyValue(item);
+    if (this.isOldItemTheSameAsNewOne(item, keyValue)) {
+      return;
+    }
+    await this.dbGate.gate.updateToTable(this.dbGate.schema, item);
+    this.set(keyValue, item);
+  }
+  async sqlDelete(key) {
+    await this.dbGate.gate.deleteFromTable(this.dbGate.schema, key);
+    this.delete(key, { setNull: true });
   }
 };
 
@@ -734,7 +791,8 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     }
     return instance;
   }
-  async getAllFromTable(options) {
+  // CRUD OPERATIONS
+  async selectAllFromTable(options) {
     const results = await this.sql`SELECT * FROM ${this.sql(options.tableName)}`;
     const typedResults = [];
     for (const row of results) {
@@ -754,7 +812,7 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     }
     return typedResults;
   }
-  async getFromTableByPrimaryKey(options, primaryKeyValue) {
+  async selectFromTableByPrimaryKey(options, primaryKeyValue) {
     const results = await this.sql`
       SELECT * FROM ${this.sql(options.tableName)} 
       WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue}
@@ -772,7 +830,7 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     }
     return typedRow;
   }
-  async addToTable(options, data) {
+  async insertToTable(options, data) {
     let insertData = { ...data };
     if (options.insertSanitizationFn) {
       insertData = { ...insertData, ...options.insertSanitizationFn(insertData) };
@@ -817,6 +875,18 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
       WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue}
     `;
   }
+  // LISTENER MANAGEMENT
+  /**
+   * Retrieves the singleton listener database connection.
+   *
+   * If the listener connection does not already exist, this method initializes it
+   * using the provided connection string and specific connection options:
+   * - `max`: Limits the pool to a single connection.
+   * - `idle_timeout`: Disables idle timeout for the connection.
+   * - `max_lifetime`: Disables maximum lifetime for the connection.
+   *
+   * @returns The singleton listener database connection instance.
+   */
   getListenerConnection() {
     if (!this.listenerConnection) {
       this.listenerConnection = _postgres2.default.call(void 0, this.listenerConnectionString, {
@@ -827,6 +897,17 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     }
     return this.listenerConnection;
   }
+  /**
+   * Initializes a listener for the specified channel.
+   *
+   * This method sets up a new listener entry in the `listeners` map for the given channel,
+   * associates a callback map and a database connection, and starts listening for events
+   * on the specified channel. When an event is received, all registered listener callbacks
+   * for that channel are executed.
+   *
+   * @param channel - The name of the channel to listen on.
+   * @returns A promise that resolves when the listener has been successfully initialized.
+   */
   async initializeListener(channel) {
     var _a;
     (_a = this.logger) == null ? void 0 : _a.debug(`Initializing listener for channel "${channel}".`);
@@ -839,6 +920,15 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
       this.executeAllListenerCallbacks.bind(this, channel)
     );
   }
+  /**
+   * Executes all registered listener callbacks for a given channel, passing the provided payload to each callback.
+   *
+   * Iterates through all callbacks associated with the specified channel and invokes them with the given payload.
+   * If any callback throws an error, it is caught and logged using the logger (if available).
+   *
+   * @param channel - The name of the channel whose listener callbacks should be executed.
+   * @param payload - The data to pass to each listener callback.
+   */
   executeAllListenerCallbacks(channel, payload) {
     var _a;
     const listener = this.listeners.get(channel);
@@ -852,6 +942,20 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
       }
     }
   }
+  /**
+   * Adds a listener callback for a specified channel.
+   *
+   * If the channel does not already have a listener, it initializes one.
+   * The callback is associated with the provided `callbackId` and stored for the channel.
+   * Logs debug information about the addition and the current number of callbacks for the channel.
+   *
+   * @param params - An object containing:
+   *   @param params.channel - The name of the channel to listen to.
+   *   @param params.callbackId - A unique identifier for the callback.
+   *   @param params.callback - The callback function to be invoked for the channel.
+   *
+   * @returns A promise that resolves when the listener has been added.
+   */
   async addListener({ channel, callbackId, callback }) {
     var _a, _b;
     (_a = this.logger) == null ? void 0 : _a.debug(
