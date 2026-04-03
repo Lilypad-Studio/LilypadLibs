@@ -768,7 +768,7 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     this.logger = options.logger;
     this.connectionString = options.connectionString;
     this.listenerConnectionString = options.listenerConnectionString || options.connectionString;
-    this.sql = _postgres2.default.call(void 0, this.connectionString);
+    this.sql = _postgres2.default.call(void 0, this.connectionString, { prepare: false });
   }
   static async create(options) {
     if (options.singleton) {

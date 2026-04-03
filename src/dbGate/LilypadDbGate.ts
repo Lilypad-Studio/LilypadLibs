@@ -76,7 +76,7 @@ export class LilypadDbGate {
     this.logger = options.logger;
     this.connectionString = options.connectionString;
     this.listenerConnectionString = options.listenerConnectionString || options.connectionString;
-    this.sql = postgres(this.connectionString);
+    this.sql = postgres(this.connectionString, { prepare: false });
   }
 
   static async create(options: LilypadDbGateOptionsWithSingleton): Promise<LilypadDbGate> {
