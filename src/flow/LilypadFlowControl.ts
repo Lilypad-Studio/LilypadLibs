@@ -1,10 +1,14 @@
-import { LilypadLoggerType } from '@/logger/LilypadLogger';
+import type { LilypadLibLogger } from '@/logger/LilypadLogger';
 
 export interface FlowControlOptions {
   rate?: number;
+  /**
+   * Maximum duration of each attempt, in milliseconds. With retries, the total duration can be up to
+   * `(retries + 1) * timeout` plus the backoff times.
+   */
   timeout?: number;
   retries?: number;
-  logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
+  logger?: LilypadLibLogger;
 }
 
 export interface ExecuteFnOptions<T> {
@@ -57,10 +61,11 @@ const RATE_MAP_PRUNE_THRESHOLD = 1000;
  * - **Single-Flight**: Deduplicates concurrent requests for the same function identifier. Callers that
  *   join an in-flight execution share its result, including the outcome of the first caller's `errorFn`.
  * - **Retries**: Automatically retries failed operations with configurable backoff strategies
- * - **Timeout**: Fails operations that exceed the specified timeout duration and aborts their signal
+ * - **Timeout**: Fails an attempt that exceeds the specified timeout duration and aborts its signal.
+ *   The timeout applies to each attempt, not to the whole execution.
  *
  * @property rate - Minimum milliseconds between executions for rate limiting
- * @property timeout - Maximum milliseconds to wait for operation completion
+ * @property timeout - Maximum milliseconds to wait for each attempt
  * @property retries - Maximum number of retry attempts for failed operations
  * @property logger - Optional logger instance for error, warning, info, and debug messages
  */
@@ -68,7 +73,7 @@ export class LilypadFlowControl<T> {
   private rate?: number;
   private timeout?: number;
   private retries?: number;
-  private logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
+  private logger?: LilypadLibLogger;
 
   private singleFlightMap: Map<string, Promise<T>> = new Map();
   private rateMap: Map<string, number> = new Map();
@@ -161,20 +166,14 @@ export class LilypadFlowControl<T> {
    * rate limit is exceeded, an error is thrown. Otherwise, the invocation time
    * is recorded.
    *
+   * It must stay synchronous: `executeFn` relies on no await happening between the single-flight
+   * lookup and the registration of the new execution.
+   *
    * @param consumerIdentifier - A unique identifier for the consumer (e.g., user or service).
    * @param functionIdentifier - A unique identifier for the function being rate-limited.
    * @throws {Error} If the rate limit is exceeded for the given consumer and function.
-   * @returns A promise that resolves when the rate limit check passes.
    */
-  async rateLimit(consumerIdentifier: string, functionIdentifier: string): Promise<void> {
-    this.checkRateLimit(consumerIdentifier, functionIdentifier);
-  }
-
-  /**
-   * Synchronous implementation of {@link rateLimit}. It must stay synchronous: `executeFn` relies on
-   * no await happening between the single-flight lookup and the registration of the new execution.
-   */
-  private checkRateLimit(consumerIdentifier: string, functionIdentifier: string): void {
+  rateLimit(consumerIdentifier: string, functionIdentifier: string): void {
     if (this.rate !== undefined) {
       const rateKey = consumerIdentifier + '#' + functionIdentifier;
       const now = Date.now();
@@ -201,6 +200,13 @@ export class LilypadFlowControl<T> {
   }
 
   /**
+   * @returns `true` if an execution for the function identifier is currently in flight.
+   */
+  isInFlight(functionIdentifier: string): boolean {
+    return this.singleFlightMap.has(functionIdentifier);
+  }
+
+  /**
    * Executes a provided function with optional rate limiting, single-flight deduplication,
    * retries, and timeout handling. Ensures that only one execution per function identifier
    * is in-flight at a time, and subsequent calls return the same promise until completion.
@@ -221,8 +227,8 @@ export class LilypadFlowControl<T> {
       return inFlight;
     }
 
-    // Rate Limiting (synchronous, see checkRateLimit)
-    this.checkRateLimit(options.consumerIdentifier, options.functionIdentifier);
+    // Rate Limiting (synchronous, see rateLimit)
+    this.rateLimit(options.consumerIdentifier, options.functionIdentifier);
 
     // Execution Pipeline (Retries and Timeout)
     const executionPromise = this.executeWithRetries({

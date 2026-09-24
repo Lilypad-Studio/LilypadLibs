@@ -1,4 +1,7 @@
-"use strict";Object.defineProperty(exports, "__esModule", {value: true}); function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; } function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } async function _asyncNullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return await rhsFn(); } } var _class; var _class2; var _class3; var _class4;// src/flow/LilypadFlowControl.ts
+"use strict";Object.defineProperty(exports, "__esModule", {value: true}); function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; } function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } async function _asyncNullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return await rhsFn(); } } var _class; var _class2; var _class3; var _class4; var _class5;// src/cache/LilypadCache.ts
+var _crypto = require('crypto');
+
+// src/flow/LilypadFlowControl.ts
 var RATE_MAP_PRUNE_THRESHOLD = 1e3;
 var LilypadFlowControl = (_class = class {
   
@@ -85,19 +88,14 @@ var LilypadFlowControl = (_class = class {
    * rate limit is exceeded, an error is thrown. Otherwise, the invocation time
    * is recorded.
    *
+   * It must stay synchronous: `executeFn` relies on no await happening between the single-flight
+   * lookup and the registration of the new execution.
+   *
    * @param consumerIdentifier - A unique identifier for the consumer (e.g., user or service).
    * @param functionIdentifier - A unique identifier for the function being rate-limited.
    * @throws {Error} If the rate limit is exceeded for the given consumer and function.
-   * @returns A promise that resolves when the rate limit check passes.
    */
-  async rateLimit(consumerIdentifier, functionIdentifier) {
-    this.checkRateLimit(consumerIdentifier, functionIdentifier);
-  }
-  /**
-   * Synchronous implementation of {@link rateLimit}. It must stay synchronous: `executeFn` relies on
-   * no await happening between the single-flight lookup and the registration of the new execution.
-   */
-  checkRateLimit(consumerIdentifier, functionIdentifier) {
+  rateLimit(consumerIdentifier, functionIdentifier) {
     if (this.rate !== void 0) {
       const rateKey = consumerIdentifier + "#" + functionIdentifier;
       const now = Date.now();
@@ -122,6 +120,12 @@ var LilypadFlowControl = (_class = class {
     }
   }
   /**
+   * @returns `true` if an execution for the function identifier is currently in flight.
+   */
+  isInFlight(functionIdentifier) {
+    return this.singleFlightMap.has(functionIdentifier);
+  }
+  /**
    * Executes a provided function with optional rate limiting, single-flight deduplication,
    * retries, and timeout handling. Ensures that only one execution per function identifier
    * is in-flight at a time, and subsequent calls return the same promise until completion.
@@ -141,7 +145,7 @@ var LilypadFlowControl = (_class = class {
     if (inFlight) {
       return inFlight;
     }
-    this.checkRateLimit(options.consumerIdentifier, options.functionIdentifier);
+    this.rateLimit(options.consumerIdentifier, options.functionIdentifier);
     const executionPromise = this.executeWithRetries({
       executionFn: () => this.executeWithTimeout(options.fn),
       retries: _nullishCoalesce(_nullishCoalesce(options.retries, () => ( this.retries)), () => ( 0)),
@@ -156,11 +160,12 @@ var LilypadFlowControl = (_class = class {
 }, _class);
 
 // src/cache/LilypadCache.ts
-function isStale(retrieval) {
-  return Date.now() >= retrieval.expirationTime;
+function isStale(entry) {
+  return Date.now() >= entry.expirationTime;
 }
+var DEFAULT_ERROR_TTL = 5 * 60 * 1e3;
 var LilypadCache = (_class2 = class {
-  __init3() {this.id = `LilypadCache-${Math.random().toString(36).substring(2, 15)}`}
+  __init3() {this.id = `LilypadCache-${_crypto.randomUUID.call(void 0, )}`}
   
   
   // time to live in milliseconds
@@ -181,13 +186,23 @@ var LilypadCache = (_class2 = class {
    */
   __init5() {this.bulkSyncExpirationTime = 0}
   
-  constructor(ttl = 6e4, options = {}) {;_class2.prototype.__init3.call(this);_class2.prototype.__init4.call(this);_class2.prototype.__init5.call(this);
+  /** Source of the write tickets: see {@link setIfNewer}. */
+  __init6() {this.lastTicket = 0}
+  /**
+   * Writes of missing keys with a ticket below this one are discarded: a completed bulk sync
+   * already holds data newer than theirs.
+   */
+  __init7() {this.ticketFloor = 0}
+  /** Ticket of the last bulk sync invalidation, which a bulk sync started earlier must not undo. */
+  __init8() {this.bulkSyncInvalidationTicket = 0}
+  __init9() {this.disposed = false}
+  constructor(ttl = 6e4, options = {}) {;_class2.prototype.__init3.call(this);_class2.prototype.__init4.call(this);_class2.prototype.__init5.call(this);_class2.prototype.__init6.call(this);_class2.prototype.__init7.call(this);_class2.prototype.__init8.call(this);_class2.prototype.__init9.call(this);
     var _a;
     this.store = /* @__PURE__ */ new Map();
     this.defaultTtl = ttl;
     this.defaultBulkSyncTtl = _nullishCoalesce(options.defaultBulkSyncTtl, () => ( ttl));
     this.bulkSyncFn = options.bulkSyncFn;
-    this.defaultErrorTtl = _nullishCoalesce(options.defaultErrorTtl, () => ( 5 * 60 * 1e3));
+    this.defaultErrorTtl = _nullishCoalesce(options.defaultErrorTtl, () => ( Math.min(ttl, DEFAULT_ERROR_TTL)));
     this.logger = options.logger;
     this.flowControl = new LilypadFlowControl({
       logger: this.logger,
@@ -195,7 +210,7 @@ var LilypadCache = (_class2 = class {
     });
     this.bulkSyncFlowControl = new LilypadFlowControl({
       logger: this.logger,
-      timeout: _nullishCoalesce(options.flowControlTimeout, () => ( 3e4))
+      timeout: _nullishCoalesce(options.bulkSyncTimeout, () => ( 3e4))
     });
     if (options.autoCleanupInterval) {
       if (!Number.isFinite(options.autoCleanupInterval) || options.autoCleanupInterval <= 0) {
@@ -218,12 +233,28 @@ var LilypadCache = (_class2 = class {
     return Date.now() + (_nullishCoalesce(ttl, () => ( this.defaultTtl)));
   }
   /**
-   * Normalizes a key to the string form used by the store.
-   * Keys can be non-strings at runtime (e.g. numeric primary keys cast to `K`), so every access
-   * to the store or to the protected keys must go through this method.
+   * Normalizes a key to the string form used by the store and by the protected keys.
    */
   normalizeKey(key) {
     return String(key);
+  }
+  /**
+   * Takes a write ticket. An asynchronous write takes it when it starts, and passes it to
+   * {@link setIfNewer} when its value is ready.
+   */
+  nextTicket() {
+    return ++this.lastTicket;
+  }
+  write(key, value, ttl, ticket) {
+    if (this.disposed) {
+      return;
+    }
+    this.store.set(this.normalizeKey(key), {
+      key,
+      value,
+      expirationTime: this.createExpirationTime(ttl),
+      ticket
+    });
   }
   /**
    * Stores a value in the cache associated with the specified key, optionally setting a time-to-live (TTL) for expiration.
@@ -233,10 +264,22 @@ var LilypadCache = (_class2 = class {
    * @param ttl - Optional. The time-to-live in milliseconds. If not provided, the cache's default TTL is used.
    */
   set(key, value, ttl) {
-    this.store.set(this.normalizeKey(key), {
-      value,
-      expirationTime: this.createExpirationTime(ttl)
-    });
+    this.write(key, value, ttl, this.nextTicket());
+  }
+  /**
+   * Stores the result of an asynchronous read, unless a write that started later has already
+   * stored a value for the key.
+   *
+   * @param ticket - The ticket taken with {@link nextTicket} when the read started.
+   * @returns `true` if the value was stored.
+   */
+  setIfNewer(key, value, ttl, ticket) {
+    const entry = this.store.get(this.normalizeKey(key));
+    if (ticket <= (_nullishCoalesce((entry == null ? void 0 : entry.ticket), () => ( this.ticketFloor)))) {
+      return false;
+    }
+    this.write(key, value, ttl, ticket);
+    return true;
   }
   /**
    * Retrieves a value from the cache associated with the specified key.
@@ -249,9 +292,9 @@ var LilypadCache = (_class2 = class {
    * @returns The cached value if it exists and is not expired; otherwise, `undefined`.
    */
   get(key, removeOld = false) {
-    const cacheValue = this.store.get(this.normalizeKey(key));
-    if (cacheValue && !isStale(cacheValue)) {
-      return cacheValue.value;
+    const entry = this.store.get(this.normalizeKey(key));
+    if (entry && !isStale(entry)) {
+      return entry.value;
     } else {
       if (removeOld) {
         this.delete(key);
@@ -269,22 +312,23 @@ var LilypadCache = (_class2 = class {
    * - If the value does not exist, returns an object with `type: 'miss'`.
    */
   getComprehensive(key) {
-    const cacheValue = this.store.get(this.normalizeKey(key));
-    if (cacheValue && !isStale(cacheValue)) {
-      return { ...cacheValue, type: "hit" };
-    } else {
-      if (cacheValue) {
-        return { ...cacheValue, type: "expired" };
-      }
+    const entry = this.store.get(this.normalizeKey(key));
+    if (!entry) {
       return { type: "miss" };
     }
+    return {
+      type: isStale(entry) ? "expired" : "hit",
+      value: entry.value,
+      expirationTime: entry.expirationTime
+    };
   }
   /**
    * Handles error scenarios during cache retrieval by determining an appropriate value to return.
+   * It runs for each caller, so every caller gets the fallback its own options ask for.
    *
    * The method follows this order:
    * 1. If `options.errorFn` is provided and returns a value, that value is used and cached.
-   * 2. If `options.returnOldOnError` is true and a previous value exists (`fetched.type !== 'miss'`), the old value is used.
+   * 2. If `options.returnOldOnError` is true and a previous value exists, the old value is used.
    * 3. If no fallback value is determined, the original error is rethrown.
    *
    * The chosen value (from errorFn or old value) is cached with a TTL specified by `options.errorTtl` or the default error TTL.
@@ -292,20 +336,19 @@ var LilypadCache = (_class2 = class {
    * @param error - The error encountered during cache retrieval.
    * @param options - The cache get options, including error handling strategies.
    * @param key - The cache key associated with the retrieval.
-   * @param fetched - The result of the cache value retrieval, including type and value.
    * @returns The determined fallback value to return.
    * @throws Rethrows the original error if no fallback value is determined.
    */
-  errorReturn(error, options, key, fetched) {
-    var _a, _b;
-    void ((_a = this.logger) == null ? void 0 : _a.error(this.id, `Error fetching cache key "${String(key)}": `, error));
-    let valueToReturn = void 0;
-    const errorFnRes = (_b = options.errorFn) == null ? void 0 : _b.call(options, { key, error, options });
-    if (errorFnRes !== void 0) {
-      valueToReturn = errorFnRes;
-    }
-    if (fetched.type !== "miss" && options.returnOldOnError && valueToReturn === void 0) {
-      valueToReturn = fetched.value;
+  errorReturn(error, options, key) {
+    var _a;
+    let valueToReturn = (_a = options.errorFn) == null ? void 0 : _a.call(options, {
+      key,
+      error,
+      options
+    });
+    const current = this.getComprehensive(key);
+    if (valueToReturn === void 0 && options.returnOldOnError && current.type !== "miss") {
+      valueToReturn = current.value;
     }
     if (valueToReturn === void 0) {
       throw error;
@@ -313,80 +356,136 @@ var LilypadCache = (_class2 = class {
     this.set(key, valueToReturn, _nullishCoalesce(options.errorTtl, () => ( this.defaultErrorTtl)));
     return valueToReturn;
   }
+  getOrSetFlightId(key) {
+    return `LilypadCache-getOrSet-${this.normalizeKey(key)}`;
+  }
+  /**
+   * @returns `true` if a `getOrSet` fetch for the key is in flight.
+   */
+  isFetchInFlight(key) {
+    return this.flowControl.isInFlight(this.getOrSetFlightId(key));
+  }
   /**
    * Gets a value from the cache, or sets it using the provided function if not found.
    *
    * Implements a cache-aside pattern with support for concurrent request deduplication.
    * If the key exists in the cache and skipCache is not enabled, the cached value is returned immediately.
-   * If another request for the same key is already pending, that promise is reused instead of creating a duplicate.
+   * If another request for the same key is already pending, its fetch is shared; the error handling
+   * options are still applied separately to each caller.
    *
    * @template K - The type of the cache key
    * @template V - The type of the cached value
    * @param key - The cache key
-   * @param valueFn - An async function that produces the value to cache if it doesn't exist or is expired
+   * @param valueFn - An async function that produces the value to cache if it doesn't exist or is expired.
+   * It receives a signal that is aborted when the fetch times out.
    * @param options - Optional configuration for cache behavior and error handling
    * @returns A promise that resolves to the cached value or the value produced by valueFn
-   * @throws Will not throw, but will return a handled error value if valueFn rejects and error handling is configured
+   * @throws The error of `valueFn` (or the timeout error) when the options give no fallback value
    */
   async getOrSet(key, valueFn, options = {}) {
-    const fetched = this.getComprehensive(key);
-    if (!options.skipCache && fetched.type === "hit") {
-      return fetched.value;
-    }
-    return this.flowControl.executeFn({
-      functionIdentifier: `LilypadCache-getOrSet-${String(key)}`,
-      consumerIdentifier: "",
-      errorFn: (error) => this.errorReturn(error, options, key, fetched),
-      fn: async (signal) => {
-        const value = await valueFn();
-        if (!signal.aborted) {
-          this.set(key, value, options.ttl);
-        }
-        return value;
+    if (!options.skipCache) {
+      const cached = this.getComprehensive(key);
+      if (cached.type === "hit") {
+        return cached.value;
       }
-    });
+    }
+    try {
+      return await this.flowControl.executeFn({
+        functionIdentifier: this.getOrSetFlightId(key),
+        consumerIdentifier: "",
+        // Runs once per fetch, while the fallback is chosen per caller in errorReturn
+        errorFn: (error) => {
+          var _a;
+          void ((_a = this.logger) == null ? void 0 : _a.error(this.id, `Error fetching cache key "${String(key)}": `, error));
+          throw error;
+        },
+        fn: async (signal) => {
+          const ticket = this.nextTicket();
+          const value = await valueFn(signal);
+          if (!signal.aborted) {
+            this.setIfNewer(key, value, options.ttl, ticket);
+          }
+          return value;
+        }
+      });
+    } catch (error) {
+      return this.errorReturn(error, options, key);
+    }
   }
   /**
    * Synchronizes the cache in bulk by executing the provided sync function.
    *
    * This method uses flow control to manage the execution of the bulk sync operation.
    * If a `syncFn` is provided, it will be used to fetch key-value pairs to synchronize.
-   * Errors encountered during the sync process are logged and not rethrown: the cache keeps its
+   * Errors are logged; unless `throwOnError` is set they are not rethrown: the cache keeps its
    * current content, and the next call retries the sync.
    *
    * @param syncFn - An optional asynchronous function that returns an array of key-value pairs to be synchronized.
-   * @returns A promise that resolves when the bulk sync operation is complete (or has failed).
+   * It receives a signal that is aborted when the sync times out.
+   * @param options.throwOnError - If true, a failed sync rejects instead of resolving to `false`.
+   * @returns A promise that resolves to `true` if the cache is synced (now or by a recent sync),
+   * `false` if the sync failed or returned no data.
    */
-  async bulkSync(syncFn) {
-    await this.bulkSyncFlowControl.executeFn({
-      functionIdentifier: `LilypadCache-bulkSync`,
-      consumerIdentifier: "",
-      errorFn: (error) => {
-        var _a;
-        void ((_a = this.logger) == null ? void 0 : _a.error(this.id, "Error during bulk sync: ", error));
-      },
-      fn: async () => this._bulkSync(syncFn)
-    });
+  async bulkSync(syncFn, options = {}) {
+    try {
+      return await this.bulkSyncFlowControl.executeFn({
+        functionIdentifier: `LilypadCache-bulkSync`,
+        consumerIdentifier: "",
+        errorFn: (error) => {
+          var _a;
+          void ((_a = this.logger) == null ? void 0 : _a.error(this.id, "Error during bulk sync: ", error));
+          throw error;
+        },
+        fn: async (signal) => this._bulkSync(syncFn, signal)
+      });
+    } catch (error) {
+      if (options.throwOnError) {
+        throw error;
+      }
+      return false;
+    }
   }
-  async _bulkSync(syncFn) {
+  async _bulkSync(syncFn, signal) {
     var _a, _b;
     if (Date.now() < this.bulkSyncExpirationTime) {
-      return;
+      return true;
     }
-    const data = await _asyncNullishCoalesce(await (syncFn == null ? void 0 : syncFn()), async () => ( await ((_a = this.bulkSyncFn) == null ? void 0 : _a.call(this))));
+    const ticket = this.nextTicket();
+    const data = await _asyncNullishCoalesce(await (syncFn == null ? void 0 : syncFn(signal)), async () => ( await ((_a = this.bulkSyncFn) == null ? void 0 : _a.call(this, signal))));
+    if (signal.aborted) {
+      return false;
+    }
     if (!data) {
       void ((_b = this.logger) == null ? void 0 : _b.warn(this.id, "Bulk sync function returned no data"));
-      return;
+      return false;
     }
-    for (const key of this.store.keys()) {
-      if (!this.delete(key)) {
-        this.expire(key);
+    const incoming = /* @__PURE__ */ new Map();
+    for (const [key, value] of data) {
+      incoming.set(this.normalizeKey(key), [key, value]);
+    }
+    for (const [normalizedKey, entry] of this.store) {
+      if (entry.ticket > ticket || incoming.has(normalizedKey)) {
+        continue;
+      }
+      if (!this.deleteNormalized(normalizedKey)) {
+        this.expireNormalized(normalizedKey);
       }
     }
-    for (const [key, value] of data) {
-      this.set(key, value);
+    for (const [key, value] of incoming.values()) {
+      this.setIfNewer(key, value, void 0, ticket);
     }
-    this.bulkSyncExpirationTime = this.createExpirationTime(this.defaultBulkSyncTtl);
+    this.ticketFloor = Math.max(this.ticketFloor, ticket);
+    if (this.bulkSyncInvalidationTicket < ticket) {
+      this.bulkSyncExpirationTime = this.createExpirationTime(this.defaultBulkSyncTtl);
+    }
+    return true;
+  }
+  /**
+   * Forces the next `bulkSync` call to fetch fresh data, even if a sync is currently running.
+   */
+  invalidateBulkSync() {
+    this.bulkSyncExpirationTime = 0;
+    this.bulkSyncInvalidationTicket = this.nextTicket();
   }
   /**
    * Retrieves multiple values from the cache for the specified keys.
@@ -394,15 +493,23 @@ var LilypadCache = (_class2 = class {
    * If some keys are not found in the cache or they have expired, they are simply omitted from the result.
    *
    * @param options - An object containing an optional array of keys to retrieve.
-   * @returns A `Map` containing the key-value pairs found in the cache.
+   * @returns A `Map` containing the key-value pairs found in the cache. Without `keys`, each entry
+   * is keyed by the key it was stored with (e.g. a number stays a number).
    */
   bulkGet(options) {
     const result = /* @__PURE__ */ new Map();
-    const keysToGet = _nullishCoalesce(options.keys, () => ( Array.from(this.store.keys())));
-    for (const key of keysToGet) {
-      const value = this.get(key);
-      if (value !== void 0) {
-        result.set(key, value);
+    if (options.keys) {
+      for (const key of options.keys) {
+        const value = this.get(key);
+        if (value !== void 0) {
+          result.set(key, value);
+        }
+      }
+      return result;
+    }
+    for (const entry of this.store.values()) {
+      if (!isStale(entry)) {
+        result.set(entry.key, entry.value);
       }
     }
     return result;
@@ -480,7 +587,7 @@ var LilypadCache = (_class2 = class {
   invalidate(key, { invalidateBulkSync = true } = {}) {
     this.expire(key);
     if (invalidateBulkSync) {
-      this.bulkSyncExpirationTime = 0;
+      this.invalidateBulkSync();
     }
   }
   /**
@@ -490,9 +597,12 @@ var LilypadCache = (_class2 = class {
    * @param key - The key of the cache entry to expire.
    */
   expire(key) {
-    const comprehensive = this.getComprehensive(key);
-    if (comprehensive.type === "hit") {
-      this.set(key, comprehensive.value, -1);
+    this.expireNormalized(this.normalizeKey(key));
+  }
+  expireNormalized(normalizedKey) {
+    const entry = this.store.get(normalizedKey);
+    if (entry && !isStale(entry)) {
+      this.set(entry.key, entry.value, -1);
     }
   }
   /**
@@ -504,14 +614,22 @@ var LilypadCache = (_class2 = class {
    * @param options - Optional settings for deletion.
    * @param options.force - If true, forces deletion even if the key is protected.
    * @param options.setNull - If true, sets the value to null instead of deleting the entry.
+   * @returns `false` if the key is protected and was left untouched.
    */
   delete(key, options = {}) {
-    const normalizedKey = this.normalizeKey(key);
+    return this.deleteNormalized(this.normalizeKey(key), options);
+  }
+  deleteNormalized(normalizedKey, options = {}) {
     if (this.protectedKeys.has(normalizedKey) && !options.force) {
       return false;
     }
+    const entry = this.store.get(normalizedKey);
     if (options.setNull) {
-      this.set(normalizedKey, null);
+      if (entry) {
+        this.set(entry.key, null);
+      } else {
+        this.set(normalizedKey, null);
+      }
       return true;
     }
     this.store.delete(normalizedKey);
@@ -528,8 +646,8 @@ var LilypadCache = (_class2 = class {
    * @param options.setNull - If `true`, sets the value to null instead of deleting the entry.
    */
   clear(options = {}) {
-    for (const key of this.store.keys()) {
-      this.delete(key, options);
+    for (const normalizedKey of this.store.keys()) {
+      this.deleteNormalized(normalizedKey, options);
     }
   }
   /**
@@ -542,10 +660,9 @@ var LilypadCache = (_class2 = class {
    * @param options.force - If true, forces deletion of expired entries regardless of other conditions.
    */
   purgeExpired(options = {}) {
-    const now = Date.now();
-    for (const [key, cacheValue] of this.store.entries()) {
-      if (now >= cacheValue.expirationTime) {
-        this.delete(key, options);
+    for (const [normalizedKey, entry] of this.store.entries()) {
+      if (isStale(entry)) {
+        this.deleteNormalized(normalizedKey, options);
       }
     }
   }
@@ -563,289 +680,152 @@ var LilypadCache = (_class2 = class {
   /**
    * Disposes of the cache by stopping the cleanup interval and clearing all cached items.
    * This method should be called when the cache is no longer needed to free up resources.
+   * A disposed cache ignores every later write, including the ones of fetches still in flight.
    */
   dispose() {
     this.logger = void 0;
     this.stopCleanupInterval();
     this.clear({ force: true });
+    this.disposed = true;
   }
 }, _class2);
 var LilypadCache_default = LilypadCache;
 
+// src/dbGate/LilypadDbGate.ts
+
+
 // src/singleton/LilypadSingleton.ts
+
 var singletonMap = globalThis.__lilypadSingletonMap ??= /* @__PURE__ */ new Map();
-function getLilypadSingletonInstance(identifier, createInstanceFn) {
+var signatureMap = globalThis.__lilypadSingletonSignatureMap ??= /* @__PURE__ */ new Map();
+function createLilypadSingletonSignatureValue(parts) {
+  return _crypto.createHash.call(void 0, "sha256").update(JSON.stringify(parts)).digest("hex");
+}
+function checkSignature(identifier, signature) {
+  if (!signature) {
+    return;
+  }
+  const stored = signatureMap.get(identifier);
+  if (stored === void 0) {
+    signatureMap.set(identifier, signature.value);
+  } else if (stored !== signature.value) {
+    signature.onMismatch();
+  }
+}
+function getLilypadSingletonInstance(identifier, createInstanceFn, signature) {
   if (singletonMap.has(identifier)) {
-    return singletonMap.get(identifier);
+    const existing = singletonMap.get(identifier);
+    if (existing instanceof Promise) {
+      throw new Error(
+        `Singleton "${identifier}" is being created asynchronously: use getLilypadSingletonInstanceAsync.`
+      );
+    }
+    checkSignature(identifier, signature);
+    return existing;
   }
   const instance = createInstanceFn();
   singletonMap.set(identifier, instance);
+  signatureMap.delete(identifier);
+  checkSignature(identifier, signature);
   return instance;
 }
 function removeLilypadSingletonInstance(identifier) {
+  signatureMap.delete(identifier);
   return singletonMap.delete(identifier);
 }
-async function getLilypadSingletonInstanceAsync(identifier, createInstanceFn) {
+async function getLilypadSingletonInstanceAsync(identifier, createInstanceFn, signature) {
   if (singletonMap.has(identifier)) {
+    checkSignature(identifier, signature);
     return singletonMap.get(identifier);
   }
   const instancePromise = createInstanceFn();
   singletonMap.set(identifier, instancePromise);
+  signatureMap.delete(identifier);
+  checkSignature(identifier, signature);
   try {
     const instance = await instancePromise;
-    singletonMap.set(identifier, instance);
+    if (singletonMap.get(identifier) === instancePromise) {
+      singletonMap.set(identifier, instance);
+    }
     return instance;
   } catch (error) {
-    singletonMap.delete(identifier);
+    if (singletonMap.get(identifier) === instancePromise) {
+      removeLilypadSingletonInstance(identifier);
+    }
     throw error;
   }
 }
-
-// src/cache/LilypadDbCache.ts
-var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
-  
-  
-  
-  /**
-   * Creates a cache and, unless disabled, registers its default database listener.
-   *
-   * @throws If the default database listener cannot be registered (e.g. the database is unreachable).
-   */
-  static async create(ttl = 6e4, options) {
-    if (options.singleton) {
-      const identifier = options.singletonIdentifier;
-      return getLilypadSingletonInstanceAsync(identifier, async () => {
-        const cache = await _LilypadDbCache.initializeNew(ttl, options);
-        cache.singletonIdentifier = identifier;
-        return cache;
-      });
-    }
-    return _LilypadDbCache.initializeNew(ttl, options);
+function createLilypadSingletonAbleAsync(namespace, options, createInstanceFn, signature) {
+  if (!options.singleton) {
+    return createInstanceFn(void 0);
   }
-  static async initializeNew(ttl, options) {
-    const cache = new _LilypadDbCache(ttl, options);
-    if (cache.defaultDbListener) {
-      try {
-        await cache.dbGate.gate.addListener(cache.defaultDbListener);
-      } catch (error) {
-        await cache.dispose();
-        throw error;
-      }
-    }
-    return cache;
-  }
-  constructor(ttl, options) {
-    var _a;
-    super(ttl, options);
-    this.dbGate = options.dbGate;
-    this.bulkSyncFn = async () => (await this.dbGate.gate.selectAllFromTable(this.dbGate.schema)).map((item) => [
-      item[options.dbGate.schema.primaryKey],
-      item
-    ]);
-    if (_nullishCoalesce(options.useDefaultDbListener, () => ( true))) {
-      this.defaultDbListener = this.getDefaultDbListener(
-        options.useDefaultDbListener ? options.defaultListenerOptions : void 0
-      );
-    }
-    void ((_a = this.logger) == null ? void 0 : _a.debug(
-      this.id,
-      `LilypadDbCache initialized for table "${this.dbGate.schema.tableName}"`
-    ));
-  }
-  /**
-   * Retrieves a cached value by key, or fetches it from the database if not found in cache.
-   * Concurrent calls for the same key share a single database query.
-   *
-   * @param key - The cache key to retrieve or fetch.
-   * @returns A promise that resolves to the cached value (`null` if the row does not exist),
-   * or undefined if an error occurs during fetching.
-   * @throws Does not throw; errors are logged internally.
-   */
-  async getOrFetch(key) {
-    try {
-      return await this.getOrSet(
-        key,
-        () => this.dbGate.gate.selectFromTableByPrimaryKey(this.dbGate.schema, key)
-      );
-    } catch (e2) {
-      return void 0;
-    }
-  }
-  /**
-   * Invalidates the cache entry for the specified key.
-   *
-   * Attempts to update the cache for the given key. If the update fails,
-   * logs the error and falls back to the base class's invalidate method.
-   *
-   * @param key - The cache key to invalidate.
-   * @param options - Optional settings for invalidation.
-   * @param options.invalidateBulkSync - Whether to invalidate bulk sync when the update fails (default: true).
-   * @returns A promise that resolves when the invalidation process is complete.
-   */
-  async invalidate(key, options = {}) {
-    var _a;
-    try {
-      await this.update(key);
-    } catch (error) {
-      void ((_a = this.logger) == null ? void 0 : _a.error(
-        this.id,
-        `Error updating cache key "${String(key)}" after invalidation: `,
-        error
-      ));
-      super.invalidate(key, options);
-    }
-  }
-  /**
-   * Updates the cache entry for the specified key by fetching the latest value from the database.
-   * A row that does not exist is cached as `null`.
-   *
-   * @param key - The primary key of the cache entry to update.
-   * @returns A promise that resolves to the updated value from the database.
-   * @throws Rethrows any error encountered during the database fetch.
-   */
-  async update(key) {
-    const value = await this.dbGate.gate.selectFromTableByPrimaryKey(this.dbGate.schema, key);
-    this.set(key, value);
-    return value;
-  }
-  async getAll(keys) {
-    const values = await super.bulkAsyncGet({ doSync: true, keys });
-    return Array.from(values.values()).filter((item) => item !== null);
-  }
-  getDefaultDbListener(options) {
-    return {
-      channel: "cache_events",
-      // The instance id keeps the callbacks of different caches on the same table apart
-      callbackId: `lilypad_dbcache_${this.dbGate.schema.tableName}_${this.id}`,
-      callback: async (payload) => {
-        var _a, _b, _c, _d;
-        void ((_a = this.logger) == null ? void 0 : _a.debug(
-          this.id,
-          this.dbGate.schema.tableName,
-          "LilypadDbCache handler has received payload on cache_events channel:",
-          payload
-        ));
-        if (typeof payload !== "string") {
-          return;
-        }
-        let parsedPayload;
-        try {
-          parsedPayload = JSON.parse(payload);
-        } catch (e) {
-          void ((_b = this.logger) == null ? void 0 : _b.error(this.id, "Error parsing cache_events payload:", e));
-          return;
-        }
-        if (!parsedPayload.id || !parsedPayload.table) {
-          return;
-        }
-        if (parsedPayload.table === this.dbGate.schema.tableName) {
-          void ((_c = this.logger) == null ? void 0 : _c.debug(
-            this.id,
-            this.dbGate.schema.tableName,
-            "LilypadDbCache handler is processing payload:",
-            parsedPayload
-          ));
-          if (!(options == null ? void 0 : options.callback) || options.automaticallyInvalidateDataBeforeCallback) {
-            if (parsedPayload.op === "DELETE") {
-              this.delete(String(parsedPayload.id), { setNull: true });
-            } else {
-              await this.invalidate(String(parsedPayload.id), { invalidateBulkSync: false });
-            }
-          }
-          await ((_d = options == null ? void 0 : options.callback) == null ? void 0 : _d.call(options, parsedPayload));
-          return;
-        }
-      }
-    };
-  }
-  /**
-   * Disposes of the cache: stops its default database listener, removes it from the singleton
-   * registry (if it was created as a singleton) and clears it.
-   */
-  async dispose() {
-    if (this.singletonIdentifier !== void 0) {
-      removeLilypadSingletonInstance(this.singletonIdentifier);
-      this.singletonIdentifier = void 0;
-    }
-    const listenerRemoval = this.defaultDbListener ? this.dbGate.gate.removeListener(
-      this.defaultDbListener.channel,
-      this.defaultDbListener.callbackId
-    ) : void 0;
-    super.dispose();
-    await listenerRemoval;
-  }
-  getItemPrimaryKeyValue(item) {
-    const keyValue = item[this.dbGate.schema.primaryKey];
-    if (keyValue === void 0) {
-      throw new Error(
-        `Primary key "${String(
-          this.dbGate.schema.primaryKey
-        )}" is missing in the item data for table "${this.dbGate.schema.tableName}".`
-      );
-    }
-    return keyValue;
-  }
-  /**
-   * Inserts the item in the database and caches the row returned by the database.
-   * With `primaryKeyShouldAutoDetermine`, the primary key of `item` can be omitted: the cached row
-   * holds the one generated by the database.
-   *
-   * @returns The created row, or `null` if the schema's `selectSanitizationFn` discards it.
-   */
-  async sqlCreate(item) {
-    const row = await this.dbGate.gate.insertToTable(this.dbGate.schema, item);
-    if (row !== null) {
-      this.set(this.getItemPrimaryKeyValue(row), row);
-    }
-    return row;
-  }
-  /**
-   * Updates the item in the database and caches the row returned by the database.
-   *
-   * @returns The updated row, or `null` if the schema's `selectSanitizationFn` discards it.
-   * @throws If no row with the item's primary key exists.
-   */
-  async sqlUpdate(item) {
-    const keyValue = this.getItemPrimaryKeyValue(item);
-    const row = await this.dbGate.gate.updateToTable(this.dbGate.schema, item);
-    this.set(keyValue, row);
-    return row;
-  }
-  async sqlDelete(key) {
-    await this.dbGate.gate.deleteFromTable(this.dbGate.schema, key);
-    this.delete(key, { setNull: true });
-  }
-};
+  const registryKey = `${namespace}:${options.singletonIdentifier}`;
+  return getLilypadSingletonInstanceAsync(
+    registryKey,
+    () => createInstanceFn(registryKey),
+    signature
+  );
+}
 
 // src/dbGate/LilypadDbGate.ts
 var _postgres = require('postgres'); var _postgres2 = _interopRequireDefault(_postgres);
+var SELECT_ALL_BATCH_SIZE = 1e3;
+function lilypadMissingPrimaryKeyError(schema, context) {
+  return new Error(
+    `Primary key "${String(schema.primaryKey)}" is missing in the ${context} data for table "${schema.tableName}".`
+  );
+}
 var LilypadDbGate = (_class3 = class _LilypadDbGate {
+  __init10() {this.id = `LilypadDbGate-${_crypto.randomUUID.call(void 0, )}`}
   
   
   
   
-  __init6() {this.listeners = /* @__PURE__ */ new Map()}
+  __init11() {this.listeners = /* @__PURE__ */ new Map()}
   
-  constructor(options) {;_class3.prototype.__init6.call(this);
+  constructor(options) {;_class3.prototype.__init10.call(this);_class3.prototype.__init11.call(this);
     this.logger = options.logger;
     this.listenerConnectionString = options.listenerConnectionString || options.connectionString;
-    this.sql = _postgres2.default.call(void 0, options.connectionString, { prepare: false });
+    this.sql = _postgres2.default.call(void 0, options.connectionString, {
+      prepare: false,
+      ...options.statementTimeout !== void 0 && {
+        connection: { statement_timeout: options.statementTimeout }
+      }
+    });
   }
+  /**
+   * Creates a gate and registers the listeners of `options.listen`.
+   * With `singleton: true`, a later call with the same identifier returns the existing gate and
+   * ignores its own options (a warning is logged if they differ).
+   */
   static async create(options) {
-    if (options.singleton) {
-      const identifier = options.singletonIdentifier;
-      return await getLilypadSingletonInstanceAsync(identifier, async () => {
+    return createLilypadSingletonAbleAsync(
+      "LilypadDbGate",
+      options,
+      async (registryKey) => {
         const instance = await _LilypadDbGate.initializeNew(options);
-        instance.singletonIdentifier = identifier;
+        instance.singletonIdentifier = registryKey;
         return instance;
-      });
-    }
-    return await _LilypadDbGate.initializeNew(options);
+      },
+      {
+        value: createLilypadSingletonSignatureValue([
+          options.connectionString,
+          options.listenerConnectionString,
+          options.statementTimeout
+        ]),
+        onMismatch: () => {
+          var _a;
+          return void ((_a = options.logger) == null ? void 0 : _a.warn(
+            `LilypadDbGate singleton "${options.singleton ? options.singletonIdentifier : ""}" already exists with different connection options: the new options are ignored.`
+          ));
+        }
+      }
+    );
   }
   static async initializeNew(options) {
     const instance = new _LilypadDbGate(options);
     try {
-      for (const listenOption of options.listen) {
+      for (const listenOption of _nullishCoalesce(options.listen, () => ( []))) {
         await instance.addListener(listenOption);
       }
     } catch (error) {
@@ -878,43 +858,45 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
   }
   /**
    * Prepares the data of an insert/update:
-   * - applies the schema's `insertSanitizationFn`;
+   * - applies the schema's `insertSanitizationFn`, whose result replaces the data;
    * - validates the primary key, which an update always needs to find the row;
    * - restricts the written columns to the schema columns, so that extra properties of `data`
-   *   (e.g. coming from a request body) are never written to the table.
+   *   (e.g. coming from a request body) are never written to the table;
+   * - skips `undefined` values, which postgres.js rejects.
    */
   prepareWrite(schema, data, operation) {
-    let writeData = { ...data };
-    if (schema.insertSanitizationFn) {
-      writeData = { ...writeData, ...schema.insertSanitizationFn(writeData) };
-    }
+    const writeData = schema.insertSanitizationFn ? { ...schema.insertSanitizationFn({ ...data }) } : { ...data };
     const primaryKeyValue = writeData[schema.primaryKey];
     const primaryKeyRequired = operation === "update" || !schema.primaryKeyShouldAutoDetermine;
     if (primaryKeyRequired && (primaryKeyValue === void 0 || primaryKeyValue === null)) {
-      throw new Error(
-        `Primary key "${String(
-          schema.primaryKey
-        )}" is missing in the ${operation} data for table "${schema.tableName}".`
-      );
+      throw lilypadMissingPrimaryKeyError(schema, operation);
     }
     if (schema.primaryKeyShouldAutoDetermine) {
       delete writeData[schema.primaryKey];
     }
-    const columns = Object.keys(schema.cols).filter((column) => column in writeData);
+    const columns = Object.keys(schema.cols).filter(
+      (column) => writeData[column] !== void 0
+    );
     if (columns.length === 0) {
       throw new Error(`No columns to ${operation} for table "${schema.tableName}".`);
     }
     return { data: writeData, columns, primaryKeyValue };
   }
+  /**
+   * Selects every row of the table. Rows are read in batches through a cursor, so the raw result
+   * of the whole table is never held in memory at once.
+   */
   async selectAllFromTable(options) {
-    const results = await this.sql`
-      SELECT ${this.selectedColumns(options)} FROM ${this.sql(options.tableName)}
-    `;
     const typedResults = [];
-    for (const row of results) {
-      const typedRow = this.mapRow(options, row);
-      if (typedRow !== null) {
-        typedResults.push(typedRow);
+    const cursor = this.sql`
+      SELECT ${this.selectedColumns(options)} FROM ${this.sql(options.tableName)}
+    `.cursor(SELECT_ALL_BATCH_SIZE);
+    for await (const rows of cursor) {
+      for (const row of rows) {
+        const typedRow = this.mapRow(options, row);
+        if (typedRow !== null) {
+          typedResults.push(typedRow);
+        }
       }
     }
     return typedResults;
@@ -944,7 +926,8 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     return this.mapRow(options, results[0]);
   }
   /**
-   * Updates the row identified by the primary key contained in `data`.
+   * Updates the row identified by the primary key contained in `data`. Only the columns present
+   * in `data` are written.
    *
    * @returns The row as stored by the database, or `null` if the `selectSanitizationFn` discards it.
    * @throws If no row with that primary key exists.
@@ -1008,10 +991,21 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
    */
   initializeListener(channel) {
     var _a;
-    void ((_a = this.logger) == null ? void 0 : _a.debug(`Initializing listener for channel "${channel}".`));
+    void ((_a = this.logger) == null ? void 0 : _a.debug(this.id, `Initializing listener for channel "${channel}".`));
     const listener = {
       callbacks: /* @__PURE__ */ new Map(),
-      ready: this.getListenerConnection().listen(channel, (payload) => this.executeAllListenerCallbacks(channel, payload)).then(({ unlisten }) => unlisten).catch((error) => {
+      listening: false,
+      ready: this.getListenerConnection().listen(
+        channel,
+        (payload) => this.executeAllListenerCallbacks(channel, payload),
+        // postgres.js calls it on the first LISTEN and again after every reconnection
+        () => {
+          if (listener.listening) {
+            this.executeReconnectCallbacks(channel, listener);
+          }
+          listener.listening = true;
+        }
+      ).then(({ unlisten }) => unlisten).catch((error) => {
         if (this.listeners.get(channel) === listener) {
           this.listeners.delete(channel);
         }
@@ -1022,10 +1016,21 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     return listener;
   }
   /**
-   * Executes all registered listener callbacks for a given channel, passing the provided payload to each callback.
-   *
-   * Both synchronous throws and rejected promises of async callbacks are caught and logged,
+   * Runs a listener callback, catching both synchronous throws and rejected promises,
    * so a failing callback can neither affect the others nor cause an unhandled rejection.
+   */
+  runCallbackSafely(channel, callbackId, callback) {
+    Promise.resolve().then(callback).catch((error) => {
+      var _a;
+      void ((_a = this.logger) == null ? void 0 : _a.error(
+        this.id,
+        `Error in listener callback "${callbackId}" for channel "${channel}":`,
+        error
+      ));
+    });
+  }
+  /**
+   * Executes all registered listener callbacks for a given channel, passing the provided payload to each callback.
    *
    * @param channel - The name of the channel whose listener callbacks should be executed.
    * @param payload - The data to pass to each listener callback.
@@ -1035,14 +1040,20 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     if (!listener) {
       return;
     }
-    for (const [callbackId, callback] of listener.callbacks) {
-      Promise.resolve().then(() => callback(payload)).catch((error) => {
-        var _a;
-        void ((_a = this.logger) == null ? void 0 : _a.error(
-          `Error in listener callback "${callbackId}" for channel "${channel}":`,
-          error
-        ));
-      });
+    for (const [callbackId, { callback }] of listener.callbacks) {
+      this.runCallbackSafely(channel, callbackId, () => callback(payload));
+    }
+  }
+  executeReconnectCallbacks(channel, listener) {
+    var _a;
+    void ((_a = this.logger) == null ? void 0 : _a.warn(
+      this.id,
+      `LISTEN on channel "${channel}" was re-established: notifications sent meanwhile are lost.`
+    ));
+    for (const [callbackId, { onReconnect }] of listener.callbacks) {
+      if (onReconnect) {
+        this.runCallbackSafely(channel, callbackId, onReconnect);
+      }
     }
   }
   /**
@@ -1056,19 +1067,23 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
    *   @param params.channel - The name of the channel to listen to.
    *   @param params.callbackId - A unique identifier for the callback.
    *   @param params.callback - The callback function to be invoked for the channel.
+   *   @param params.onReconnect - Optional function called when LISTEN is re-established after a reconnection.
    *
    * @returns A promise that resolves once LISTEN is active on the channel.
    * @throws If LISTEN fails; in that case the callback is not registered.
    */
-  async addListener({ channel, callbackId, callback }) {
+  async addListener(identifier) {
     var _a, _b;
+    const { channel, callbackId } = identifier;
     void ((_a = this.logger) == null ? void 0 : _a.debug(
+      this.id,
       `Adding listener for channel "${channel}" with callback ID "${callbackId}".`
     ));
     const listener = _nullishCoalesce(this.listeners.get(channel), () => ( this.initializeListener(channel)));
-    listener.callbacks.set(callbackId, callback);
+    listener.callbacks.set(callbackId, identifier);
     await listener.ready;
     void ((_b = this.logger) == null ? void 0 : _b.debug(
+      this.id,
       `Listener for channel "${channel}" has ${listener.callbacks.size} callbacks.`
     ));
   }
@@ -1101,10 +1116,283 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
   }
 }, _class3);
 
+// src/cache/LilypadDbCache.ts
+var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
+  
+  
+  
+  /**
+   * Creates a cache and, unless disabled, registers its default database listener.
+   * With `singleton: true`, a later call with the same identifier returns the existing cache and
+   * ignores its own options (a warning is logged if the table or the TTL differ).
+   *
+   * @throws If the default database listener cannot be registered (e.g. the database is unreachable).
+   */
+  static async create(ttl = 6e4, options) {
+    return createLilypadSingletonAbleAsync(
+      "LilypadDbCache",
+      options,
+      async (registryKey) => {
+        const cache = await _LilypadDbCache.initializeNew(ttl, options);
+        cache.singletonIdentifier = registryKey;
+        return cache;
+      },
+      {
+        value: createLilypadSingletonSignatureValue([options.dbGate.schema.tableName, ttl]),
+        onMismatch: () => {
+          var _a;
+          return void ((_a = options.logger) == null ? void 0 : _a.warn(
+            `LilypadDbCache singleton "${options.singleton ? options.singletonIdentifier : ""}" already exists with a different table or TTL: the new options are ignored.`
+          ));
+        }
+      }
+    );
+  }
+  static async initializeNew(ttl, options) {
+    const cache = new _LilypadDbCache(ttl, options);
+    if (cache.defaultDbListener) {
+      try {
+        await cache.dbGate.gate.addListener(cache.defaultDbListener);
+      } catch (error) {
+        await cache.dispose();
+        throw error;
+      }
+    }
+    return cache;
+  }
+  constructor(ttl, options) {
+    var _a;
+    super(ttl, options);
+    this.dbGate = options.dbGate;
+    this.bulkSyncFn = async () => (await this.dbGate.gate.selectAllFromTable(this.dbGate.schema)).map((item) => [
+      item[this.dbGate.schema.primaryKey],
+      item
+    ]);
+    if (_nullishCoalesce(options.useDefaultDbListener, () => ( true))) {
+      this.defaultDbListener = this.getDefaultDbListener(
+        options.useDefaultDbListener ? options.defaultListenerOptions : void 0
+      );
+    }
+    void ((_a = this.logger) == null ? void 0 : _a.debug(
+      this.id,
+      `LilypadDbCache initialized for table "${this.dbGate.schema.tableName}"`
+    ));
+  }
+  /**
+   * Retrieves a cached value by key, or fetches it from the database if not found in cache.
+   * Concurrent calls for the same key share a single database query.
+   *
+   * @param key - The cache key to retrieve or fetch.
+   * @returns A promise that resolves to the cached value (`null` if the row does not exist),
+   * or undefined if an error occurs during fetching.
+   * @throws Does not throw; errors are logged internally.
+   */
+  async getOrFetch(key) {
+    try {
+      return await this.getOrSet(
+        key,
+        () => this.dbGate.gate.selectFromTableByPrimaryKey(this.dbGate.schema, key)
+      );
+    } catch (e2) {
+      return void 0;
+    }
+  }
+  /**
+   * Invalidates the cache entry for the specified key.
+   *
+   * Attempts to update the cache for the given key. If the update fails,
+   * logs the error and falls back to the base class's invalidate method.
+   *
+   * @param key - The cache key to invalidate.
+   * @param options - Optional settings for invalidation.
+   * @param options.invalidateBulkSync - Whether to invalidate bulk sync when the update fails (default: true).
+   * @returns A promise that resolves when the invalidation process is complete.
+   */
+  async invalidate(key, options = {}) {
+    var _a;
+    try {
+      await this.update(key);
+    } catch (error) {
+      void ((_a = this.logger) == null ? void 0 : _a.error(
+        this.id,
+        `Error updating cache key "${String(key)}" after invalidation: `,
+        error
+      ));
+      super.invalidate(key, options);
+    }
+  }
+  /**
+   * Updates the cache entry for the specified key by fetching the latest value from the database.
+   * A row that does not exist is cached as `null`.
+   * If a write that started later completes first, the fetched value is returned but not cached.
+   *
+   * @param key - The primary key of the cache entry to update.
+   * @returns A promise that resolves to the updated value from the database.
+   * @throws Rethrows any error encountered during the database fetch.
+   */
+  async update(key) {
+    const ticket = this.nextTicket();
+    const value = await this.dbGate.gate.selectFromTableByPrimaryKey(
+      this.dbGate.schema,
+      key
+    );
+    this.setIfNewer(key, value, void 0, ticket);
+    return value;
+  }
+  /**
+   * Returns every row of the table, loading it if the bulk sync has expired.
+   *
+   * @throws If the table cannot be loaded.
+   */
+  async getAll(keys) {
+    await this.bulkSync(void 0, { throwOnError: true });
+    const values = this.bulkGet({ keys });
+    return Array.from(values.values()).filter((item) => item !== null);
+  }
+  /**
+   * The key of the cached entry for a notified id, so that the entry keeps its original key type
+   * (a notification may carry a numeric key as a string, or the other way around).
+   */
+  resolveNotifiedKey(id) {
+    var _a;
+    const normalizedKey = this.normalizeKey(id);
+    return _nullishCoalesce(((_a = this.store.get(normalizedKey)) == null ? void 0 : _a.key), () => ( id));
+  }
+  /**
+   * Caches the key as "does not exist". Unlike `delete(key, { setNull: true })`, it also applies
+   * to protected keys: they are protected from removal, not from reflecting a deleted row.
+   */
+  markDeleted(key) {
+    this.set(key, null);
+  }
+  getDefaultDbListener(options) {
+    return {
+      channel: "cache_events",
+      // The instance id keeps the callbacks of different caches on the same table apart
+      callbackId: `lilypad_dbcache_${this.dbGate.schema.tableName}_${this.id}`,
+      // Notifications sent while the connection was down are lost: every entry may be stale
+      onReconnect: () => this.expireAll(),
+      callback: async (payload) => {
+        var _a, _b, _c, _d;
+        void ((_a = this.logger) == null ? void 0 : _a.debug(
+          this.id,
+          this.dbGate.schema.tableName,
+          "LilypadDbCache handler has received payload on cache_events channel:",
+          payload
+        ));
+        if (typeof payload !== "string") {
+          return;
+        }
+        let parsedPayload;
+        try {
+          parsedPayload = JSON.parse(payload);
+        } catch (e) {
+          void ((_b = this.logger) == null ? void 0 : _b.error(this.id, "Error parsing cache_events payload:", e));
+          return;
+        }
+        if (typeof parsedPayload !== "object" || parsedPayload === null) {
+          return;
+        }
+        if (typeof parsedPayload.id !== "string" && typeof parsedPayload.id !== "number" || parsedPayload.id === "" || !parsedPayload.table) {
+          return;
+        }
+        if (parsedPayload.table === this.dbGate.schema.tableName) {
+          void ((_c = this.logger) == null ? void 0 : _c.debug(
+            this.id,
+            this.dbGate.schema.tableName,
+            "LilypadDbCache handler is processing payload:",
+            parsedPayload
+          ));
+          if (!(options == null ? void 0 : options.callback) || options.automaticallyInvalidateDataBeforeCallback) {
+            await this.applyNotification(parsedPayload.op, parsedPayload.id);
+          }
+          await ((_d = options == null ? void 0 : options.callback) == null ? void 0 : _d.call(options, parsedPayload));
+          return;
+        }
+      }
+    };
+  }
+  async applyNotification(op, id) {
+    const key = this.resolveNotifiedKey(id);
+    if (op === "DELETE") {
+      this.markDeleted(key);
+      return;
+    }
+    if (this.getComprehensive(key).type !== "miss" || this.isFetchInFlight(key)) {
+      await this.invalidate(key, { invalidateBulkSync: false });
+    } else {
+      this.invalidateBulkSync();
+    }
+  }
+  /**
+   * Marks every entry as expired (keeping the values as fallback) and forces the next bulk sync.
+   */
+  expireAll() {
+    for (const entry of [...this.store.values()]) {
+      this.expire(entry.key);
+    }
+    this.invalidateBulkSync();
+  }
+  /**
+   * Disposes of the cache: stops its default database listener, removes it from the singleton
+   * registry (if it was created as a singleton) and clears it.
+   */
+  async dispose() {
+    if (this.singletonIdentifier !== void 0) {
+      removeLilypadSingletonInstance(this.singletonIdentifier);
+      this.singletonIdentifier = void 0;
+    }
+    const listenerRemoval = this.defaultDbListener ? this.dbGate.gate.removeListener(
+      this.defaultDbListener.channel,
+      this.defaultDbListener.callbackId
+    ) : void 0;
+    super.dispose();
+    await listenerRemoval;
+  }
+  getItemPrimaryKeyValue(item) {
+    const keyValue = item[this.dbGate.schema.primaryKey];
+    if (keyValue === void 0) {
+      throw lilypadMissingPrimaryKeyError(this.dbGate.schema, "item");
+    }
+    return keyValue;
+  }
+  /**
+   * Inserts the item in the database and caches the row returned by the database.
+   * With `primaryKeyShouldAutoDetermine`, the primary key of `item` can be omitted: the cached row
+   * holds the one generated by the database.
+   *
+   * @returns The created row, or `null` if the schema's `selectSanitizationFn` discards it.
+   */
+  async sqlCreate(item) {
+    const row = await this.dbGate.gate.insertToTable(this.dbGate.schema, item);
+    if (row !== null) {
+      this.set(this.getItemPrimaryKeyValue(row), row);
+    }
+    return row;
+  }
+  /**
+   * Updates the item in the database and caches the row returned by the database.
+   * Only the columns present in `item` are written.
+   *
+   * @returns The updated row, or `null` if the schema's `selectSanitizationFn` discards it.
+   * @throws If no row with the item's primary key exists.
+   */
+  async sqlUpdate(item) {
+    const keyValue = this.getItemPrimaryKeyValue(item);
+    const row = await this.dbGate.gate.updateToTable(this.dbGate.schema, item);
+    this.set(keyValue, row);
+    return row;
+  }
+  async sqlDelete(key) {
+    await this.dbGate.gate.deleteFromTable(this.dbGate.schema, key);
+    this.markDeleted(key);
+  }
+};
+
 // src/logger/LilypadLogger.ts
 var _util = require('util');
 var LilypadLogger = (_class4 = class _LilypadLogger {
-  __init7() {this.components = {}}
+  __init12() {this.components = {}}
   // Optional logger name
   
   get __name() {
@@ -1135,15 +1423,21 @@ var LilypadLogger = (_class4 = class _LilypadLogger {
    */
   static create(options) {
     if (options.singleton) {
-      return getLilypadSingletonInstance(
-        options.singletonIdentifier,
-        () => new _LilypadLogger(options)
-      );
+      const registryKey = `LilypadLogger:${options.singletonIdentifier}`;
+      return getLilypadSingletonInstance(registryKey, () => new _LilypadLogger(options), {
+        value: createLilypadSingletonSignatureValue([
+          options.name,
+          Object.keys(options.components).sort()
+        ]),
+        onMismatch: () => console.warn(
+          `LilypadLogger singleton "${options.singletonIdentifier}" already exists with different options: the new options are ignored.`
+        )
+      });
     }
     return new _LilypadLogger(options);
   }
-  constructor(options) {;_class4.prototype.__init7.call(this);
-    const reservedKeys = /* @__PURE__ */ new Set(["components", "register", "__name", "_name"]);
+  constructor(options) {;_class4.prototype.__init12.call(this);
+    const reservedKeys = /* @__PURE__ */ new Set(["components", "register", "__name", "_name", "then"]);
     for (const key of Object.keys(options.components)) {
       if (reservedKeys.has(key) || key in this) {
         throw new Error(`Logger type "${key}" is reserved and cannot be used as a log channel.`);
@@ -1155,21 +1449,20 @@ var LilypadLogger = (_class4 = class _LilypadLogger {
     }
     for (const type of Object.keys(this.components)) {
       const logFn = async (...message) => {
+        let errors;
         try {
           const stringMessage = message.map(formatMessagePart).join(" ");
-          const promises = [];
-          for (const component of this.components[type]) {
-            promises.push(
-              component.output(type, stringMessage, { logger: this })
-            );
-          }
-          await Promise.all(promises);
+          const results = await Promise.allSettled(
+            this.components[type].map(
+              async (component) => component.output(type, stringMessage, { logger: this })
+            )
+          );
+          errors = results.filter((result) => result.status === "rejected").map((result) => result.reason);
         } catch (error) {
-          if (options.errorLogging) {
-            await options.errorLogging(error);
-          } else {
-            console.error(`Error in logger component for type "${type}":`, error);
-          }
+          errors = [error];
+        }
+        for (const error of errors) {
+          await reportComponentError(type, error, options.errorLogging);
         }
       };
       this[type] = logFn;
@@ -1192,6 +1485,17 @@ var LilypadLogger = (_class4 = class _LilypadLogger {
     return this;
   }
 }, _class4);
+async function reportComponentError(type, error, errorLogging) {
+  if (errorLogging) {
+    try {
+      await errorLogging(error);
+      return;
+    } catch (loggingError) {
+      console.error(`Error in errorLogging callback for type "${type}":`, loggingError);
+    }
+  }
+  console.error(`Error in logger component for type "${type}":`, error);
+}
 function formatMessagePart(part) {
   return typeof part === "string" ? part : _util.inspect.call(void 0, part, { depth: 4, breakLength: Infinity });
 }
@@ -1238,42 +1542,110 @@ var LilypadConsoleLogger = class extends LilypadLoggerComponent {
 // src/logger/components/DiscordLogger.ts
 var DISCORD_MAX_CONTENT_LENGTH = 2e3;
 var DISCORD_REQUEST_TIMEOUT = 5e3;
-var LilypadDiscordLogger = class extends LilypadLoggerComponent {
+var DEFAULT_RETRY_AFTER = 1e3;
+var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+var LilypadDiscordLogger = (_class5 = class extends LilypadLoggerComponent {
   
-  constructor(webhookUrl) {
-    super();
+  
+  
+  __init13() {this.queue = []}
+  __init14() {this.flushing = false}
+  __init15() {this.nextRequestAt = 0}
+  constructor(webhookUrl, options = {}) {
+    super();_class5.prototype.__init13.call(this);_class5.prototype.__init14.call(this);_class5.prototype.__init15.call(this);;
     this.webhookUrl = webhookUrl;
+    this.minRequestInterval = _nullishCoalesce(options.minRequestInterval, () => ( 1e3));
+    this.rateLimitRetries = _nullishCoalesce(options.rateLimitRetries, () => ( 1));
   }
-  async send(message) {
-    const payload = {
-      content: message.slice(0, DISCORD_MAX_CONTENT_LENGTH),
-      allowed_mentions: { parse: [] }
-    };
-    const response = await fetch(this.webhookUrl, {
+  send(message) {
+    return new Promise((resolve, reject) => {
+      this.queue.push({ content: message.slice(0, DISCORD_MAX_CONTENT_LENGTH), resolve, reject });
+      void this.flush();
+    });
+  }
+  /**
+   * Sends the queued messages, one batch at a time. It never rejects: the outcome of each batch
+   * settles the promises of its messages.
+   */
+  async flush() {
+    if (this.flushing) {
+      return;
+    }
+    this.flushing = true;
+    try {
+      while (this.queue.length > 0) {
+        const wait = this.nextRequestAt - Date.now();
+        if (wait > 0) {
+          await sleep(wait);
+        }
+        await this.sendBatch(this.takeBatch());
+      }
+    } finally {
+      this.flushing = false;
+    }
+  }
+  /** Takes the queued messages that fit in one Discord message, always at least one. */
+  takeBatch() {
+    let length = this.queue[0].content.length;
+    let count = 1;
+    while (count < this.queue.length && length + 1 + this.queue[count].content.length <= DISCORD_MAX_CONTENT_LENGTH) {
+      length += 1 + this.queue[count].content.length;
+      count++;
+    }
+    return this.queue.splice(0, count);
+  }
+  async sendBatch(batch) {
+    const content = batch.map((message) => message.content).join("\n");
+    try {
+      for (let attempt = 0; ; attempt++) {
+        const response = await this.post(content);
+        this.nextRequestAt = Date.now() + this.minRequestInterval;
+        if (response.status === 429 && attempt < this.rateLimitRetries) {
+          this.nextRequestAt = Date.now() + retryAfterMs(response);
+          await sleep(this.nextRequestAt - Date.now());
+          continue;
+        }
+        if (!response.ok) {
+          throw new Error(
+            `Discord webhook request failed with status ${response.status} ${response.statusText}`
+          );
+        }
+        batch.forEach((message) => message.resolve());
+        return;
+      }
+    } catch (error) {
+      this.nextRequestAt = Math.max(this.nextRequestAt, Date.now() + this.minRequestInterval);
+      batch.forEach((message) => message.reject(error));
+    }
+  }
+  post(content) {
+    return fetch(this.webhookUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ content, allowed_mentions: { parse: [] } }),
       signal: AbortSignal.timeout(DISCORD_REQUEST_TIMEOUT)
     });
-    if (!response.ok) {
-      throw new Error(
-        `Discord webhook request failed with status ${response.status} ${response.statusText}`
-      );
-    }
   }
-};
+}, _class5);
+function retryAfterMs(response) {
+  var _a;
+  const seconds = Number((_a = response.headers) == null ? void 0 : _a.get("retry-after"));
+  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1e3 : DEFAULT_RETRY_AFTER;
+}
 
 // src/serializer/LilypadSerializer.ts
 var LilypadSerializer = class {
   constructor(options) {
     this.options = options;
+    this.fromKeys = Object.keys(options.serialization);
   }
+  
   serialize(input) {
     return input.map((item) => {
       const packedItem = {};
-      Object.keys(this.options.serialization).forEach((fromKey) => {
+      this.fromKeys.forEach((fromKey) => {
         const isEqual = _nullishCoalesce(this.options.serialization[fromKey].equality, () => ( ((v, d) => v === d)));
         if (isEqual(item[fromKey], this.options.serialization[fromKey].default)) {
           return;
@@ -1291,7 +1663,7 @@ var LilypadSerializer = class {
   deserialize(input) {
     return input.map((item) => {
       const unpackedItem = {};
-      Object.keys(this.options.serialization).forEach((fromKey) => {
+      this.fromKeys.forEach((fromKey) => {
         unpackedItem[fromKey] = _nullishCoalesce(this.options.serialization[fromKey].deserialize(item), () => ( cloneDefault(this.options.serialization[fromKey].default)));
       });
       return unpackedItem;

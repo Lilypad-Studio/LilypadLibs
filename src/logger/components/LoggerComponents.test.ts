@@ -34,6 +34,7 @@ describe('LilypadDiscordLogger', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
   function stubFetch(response: Partial<Response> = { ok: true, status: 204 }) {
@@ -70,10 +71,81 @@ describe('LilypadDiscordLogger', () => {
   });
 
   it('should reject when Discord answers with an error status', async () => {
-    stubFetch({ ok: false, status: 429, statusText: 'Too Many Requests' });
+    stubFetch({ ok: false, status: 500, statusText: 'Internal Server Error' });
 
     await expect(
       new LilypadDiscordLogger<'info'>(webhookUrl).output('info', 'message')
-    ).rejects.toThrow('Discord webhook request failed with status 429 Too Many Requests');
+    ).rejects.toThrow('Discord webhook request failed with status 500 Internal Server Error');
+  });
+
+  it('should batch the messages logged while the next request is throttled', async () => {
+    vi.useFakeTimers();
+    const fetchMock = stubFetch();
+    const logger = new LilypadDiscordLogger<'info'>(webhookUrl);
+
+    const sent = [
+      logger.output('info', 'first'),
+      logger.output('info', 'second'),
+      logger.output('info', 'third'),
+    ];
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledOnce();
+
+    await vi.advanceTimersByTimeAsync(1000);
+    await Promise.all(sent);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [, init] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
+    const content: string = JSON.parse(init.body as string).content;
+    expect(content.split('\n')).toEqual([
+      expect.stringContaining('[INFO]: second'),
+      expect.stringContaining('[INFO]: third'),
+    ]);
+  });
+
+  it('should retry a rate limited request after the retry-after time', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        statusText: 'Too Many Requests',
+        headers: new Headers({ 'retry-after': '2' }),
+      })
+      .mockResolvedValueOnce({ ok: true, status: 204 });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const sent = new LilypadDiscordLogger<'info'>(webhookUrl).output('info', 'message');
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+
+    await expect(sent).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('should reject when Discord keeps rate limiting the request', async () => {
+    vi.useFakeTimers();
+    stubFetch({ ok: false, status: 429, statusText: 'Too Many Requests' });
+
+    const sent = new LilypadDiscordLogger<'info'>(webhookUrl).output('info', 'message');
+    const assertion = expect(sent).rejects.toThrow('status 429');
+    await vi.advanceTimersByTimeAsync(1000);
+
+    await assertion;
+  });
+
+  it('should reject when the request times out', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+      })
+    );
+
+    await expect(
+      new LilypadDiscordLogger<'info'>(webhookUrl).output('info', 'message')
+    ).rejects.toThrow('timeout');
   });
 });

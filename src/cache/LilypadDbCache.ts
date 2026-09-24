@@ -1,18 +1,23 @@
-import type {
-  LilypadDbGate,
-  LilypadDbSchema,
-  ListenerCallbackIdentifier,
-} from '@/dbGate/LilypadDbGate';
-import LilypadCache, { LilypadCachedValueType } from './LilypadCache';
 import {
-  getLilypadSingletonInstanceAsync,
+  lilypadMissingPrimaryKeyError,
+  type LilypadDbGate,
+  type LilypadDbInsertData,
+  type LilypadDbSchema,
+  type LilypadDbUpdateData,
+  type ListenerCallbackIdentifier,
+} from '@/dbGate/LilypadDbGate';
+import LilypadCache, { LilypadCachedValueType, LilypadCacheKey } from './LilypadCache';
+import {
+  createLilypadSingletonAbleAsync,
+  createLilypadSingletonSignatureValue,
   LilypadSingletonAble,
   removeLilypadSingletonInstance,
 } from '@/singleton/LilypadSingleton';
 
 export type LilypadDbCacheDefaultNotificationPayload = {
   table?: string;
-  id?: string;
+  /** A number when the trigger serializes a numeric primary key as such (e.g. `json_build_object`). */
+  id?: string | number;
   op: 'UPDATE' | 'DELETE' | 'INSERT';
 };
 
@@ -28,10 +33,12 @@ export type LilypadDbCacheDefaultListenerOptions = {
   callback?: (payload: LilypadDbCacheDefaultNotificationPayload) => Promise<void> | void;
 };
 
-type LilypadDbCacheConstructorOptions<K extends string, V> = ConstructorParameters<
-  typeof LilypadCache<K, V>
->[1] & {
-  dbGate: { gate: LilypadDbGate; schema: LilypadDbSchema<V> };
+type LilypadDbCacheConstructorOptions<
+  K extends LilypadCacheKey,
+  V,
+  PK extends keyof V,
+> = ConstructorParameters<typeof LilypadCache<K, V>>[1] & {
+  dbGate: { gate: LilypadDbGate; schema: LilypadDbSchema<V, PK> };
 } & (
     | {
         useDefaultDbListener?: false;
@@ -48,16 +55,17 @@ type LilypadDbCacheConstructorOptions<K extends string, V> = ConstructorParamete
  * `LilypadDbCache` extends `LilypadCache` to provide automatic cache population and invalidation
  * by fetching data from a database. It supports bulk synchronization and per-key updates from the database.
  *
- * @typeParam K - The type of the cache key, constrained to string and a key of V.
+ * @typeParam K - The type of the cache key: the type of the primary key column.
  * @typeParam V - The type of the cached value, constrained to object.
+ * @typeParam PK - The primary key column of `V` (see {@link LilypadDbSchema}).
  *
  * @example
  * ```typescript
- * const users = await LilypadDbCache.create<string, User>(60_000, {
+ * const users = await LilypadDbCache.create<number, User, 'id'>(60_000, {
  *   dbGate: { gate, schema: usersSchema },
  *   logger,
  * });
- * const user = await users.getOrFetch('42'); // User | null (no such row) | undefined (query failed)
+ * const user = await users.getOrFetch(42); // User | null (no such row) | undefined (query failed)
  * await users.dispose();
  * ```
  *
@@ -68,45 +76,59 @@ type LilypadDbCacheConstructorOptions<K extends string, V> = ConstructorParamete
  * - The `bulkAsyncGet` method fetches all items from the database and updates the cache.
  * - Unless disabled, the cache listens on the `cache_events` channel for JSON payloads shaped as
  *   {@link LilypadDbCacheDefaultNotificationPayload}. The database trigger sending them is not part of this library.
- *
- * @see LilypadCache
- * @see LilypadDbGate
- * @see LilypadDbSchema
+ *   Only keys the cache holds (or is fetching) are re-fetched; other changes just force the next bulk sync.
  */
 export default class LilypadDbCache<
-  K extends string & V[keyof V],
+  K extends LilypadCacheKey & V[PK],
   V extends object,
+  PK extends keyof V = keyof V,
 > extends LilypadCache<K, V> {
-  private readonly dbGate: { gate: LilypadDbGate; schema: LilypadDbSchema<V> };
+  private readonly dbGate: { gate: LilypadDbGate; schema: LilypadDbSchema<V, PK> };
   private readonly defaultDbListener?: ListenerCallbackIdentifier;
   private singletonIdentifier?: string;
 
   /**
    * Creates a cache and, unless disabled, registers its default database listener.
+   * With `singleton: true`, a later call with the same identifier returns the existing cache and
+   * ignores its own options (a warning is logged if the table or the TTL differ).
    *
    * @throws If the default database listener cannot be registered (e.g. the database is unreachable).
    */
-  public static async create<K extends string & V[keyof V], V extends object>(
+  public static async create<
+    K extends LilypadCacheKey & V[PK],
+    V extends object,
+    PK extends keyof V = keyof V,
+  >(
     ttl: number = 60000,
-    options: LilypadDbCacheConstructorOptions<K, V> & LilypadSingletonAble
-  ): Promise<LilypadDbCache<K, V>> {
-    if (options.singleton) {
-      const identifier = options.singletonIdentifier;
-      return getLilypadSingletonInstanceAsync(identifier, async () => {
-        const cache = await LilypadDbCache.initializeNew<K, V>(ttl, options);
-        cache.singletonIdentifier = identifier;
+    options: LilypadDbCacheConstructorOptions<K, V, PK> & LilypadSingletonAble
+  ): Promise<LilypadDbCache<K, V, PK>> {
+    return createLilypadSingletonAbleAsync(
+      'LilypadDbCache',
+      options,
+      async (registryKey) => {
+        const cache = await LilypadDbCache.initializeNew<K, V, PK>(ttl, options);
+        cache.singletonIdentifier = registryKey;
         return cache;
-      });
-    }
-
-    return LilypadDbCache.initializeNew<K, V>(ttl, options);
+      },
+      {
+        value: createLilypadSingletonSignatureValue([options.dbGate.schema.tableName, ttl]),
+        onMismatch: () =>
+          void options.logger?.warn(
+            `LilypadDbCache singleton "${options.singleton ? options.singletonIdentifier : ''}" already exists with a different table or TTL: the new options are ignored.`
+          ),
+      }
+    );
   }
 
-  private static async initializeNew<K extends string & V[keyof V], V extends object>(
+  private static async initializeNew<
+    K extends LilypadCacheKey & V[PK],
+    V extends object,
+    PK extends keyof V,
+  >(
     ttl: number,
-    options: LilypadDbCacheConstructorOptions<K, V>
-  ): Promise<LilypadDbCache<K, V>> {
-    const cache = new LilypadDbCache<K, V>(ttl, options);
+    options: LilypadDbCacheConstructorOptions<K, V, PK>
+  ): Promise<LilypadDbCache<K, V, PK>> {
+    const cache = new LilypadDbCache<K, V, PK>(ttl, options);
     if (cache.defaultDbListener) {
       try {
         await cache.dbGate.gate.addListener(cache.defaultDbListener);
@@ -118,12 +140,12 @@ export default class LilypadDbCache<
     return cache;
   }
 
-  private constructor(ttl: number, options: LilypadDbCacheConstructorOptions<K, V>) {
+  private constructor(ttl: number, options: LilypadDbCacheConstructorOptions<K, V, PK>) {
     super(ttl, options);
     this.dbGate = options.dbGate;
     this.bulkSyncFn = async () =>
-      (await this.dbGate.gate.selectAllFromTable<V>(this.dbGate.schema)).map((item) => [
-        item[options.dbGate.schema.primaryKey] as K,
+      (await this.dbGate.gate.selectAllFromTable<V, PK>(this.dbGate.schema)).map((item) => [
+        item[this.dbGate.schema.primaryKey] as K,
         item,
       ]);
 
@@ -151,7 +173,7 @@ export default class LilypadDbCache<
   async getOrFetch(key: K): Promise<LilypadCachedValueType<V> | undefined> {
     try {
       return await this.getOrSet(key, () =>
-        this.dbGate.gate.selectFromTableByPrimaryKey<V>(this.dbGate.schema, key)
+        this.dbGate.gate.selectFromTableByPrimaryKey<V, PK>(this.dbGate.schema, key)
       );
     } catch {
       // Already logged by getOrSet
@@ -186,20 +208,48 @@ export default class LilypadDbCache<
   /**
    * Updates the cache entry for the specified key by fetching the latest value from the database.
    * A row that does not exist is cached as `null`.
+   * If a write that started later completes first, the fetched value is returned but not cached.
    *
    * @param key - The primary key of the cache entry to update.
    * @returns A promise that resolves to the updated value from the database.
    * @throws Rethrows any error encountered during the database fetch.
    */
   async update(key: K): Promise<LilypadCachedValueType<V>> {
-    const value = await this.dbGate.gate.selectFromTableByPrimaryKey<V>(this.dbGate.schema, key);
-    this.set(key, value);
+    const ticket = this.nextTicket();
+    const value = await this.dbGate.gate.selectFromTableByPrimaryKey<V, PK>(
+      this.dbGate.schema,
+      key
+    );
+    this.setIfNewer(key, value, undefined, ticket);
     return value;
   }
 
+  /**
+   * Returns every row of the table, loading it if the bulk sync has expired.
+   *
+   * @throws If the table cannot be loaded.
+   */
   async getAll(keys?: K[]): Promise<V[]> {
-    const values = await super.bulkAsyncGet({ doSync: true, keys });
+    await this.bulkSync(undefined, { throwOnError: true });
+    const values = this.bulkGet({ keys });
     return Array.from(values.values()).filter((item): item is V => item !== null);
+  }
+
+  /**
+   * The key of the cached entry for a notified id, so that the entry keeps its original key type
+   * (a notification may carry a numeric key as a string, or the other way around).
+   */
+  private resolveNotifiedKey(id: string | number): K {
+    const normalizedKey = this.normalizeKey(id as K);
+    return this.store.get(normalizedKey)?.key ?? (id as K);
+  }
+
+  /**
+   * Caches the key as "does not exist". Unlike `delete(key, { setNull: true })`, it also applies
+   * to protected keys: they are protected from removal, not from reflecting a deleted row.
+   */
+  private markDeleted(key: K) {
+    this.set(key, null);
   }
 
   protected getDefaultDbListener(
@@ -209,6 +259,8 @@ export default class LilypadDbCache<
       channel: 'cache_events',
       // The instance id keeps the callbacks of different caches on the same table apart
       callbackId: `lilypad_dbcache_${this.dbGate.schema.tableName}_${this.id}`,
+      // Notifications sent while the connection was down are lost: every entry may be stale
+      onReconnect: () => this.expireAll(),
       callback: async (payload: unknown) => {
         void this.logger?.debug(
           this.id,
@@ -226,7 +278,14 @@ export default class LilypadDbCache<
           void this.logger?.error(this.id, 'Error parsing cache_events payload:', e);
           return;
         }
-        if (!parsedPayload.id || !parsedPayload.table) {
+        if (typeof parsedPayload !== 'object' || parsedPayload === null) {
+          return;
+        }
+        if (
+          (typeof parsedPayload.id !== 'string' && typeof parsedPayload.id !== 'number') ||
+          parsedPayload.id === '' ||
+          !parsedPayload.table
+        ) {
           return;
         }
         if (parsedPayload.table === this.dbGate.schema.tableName) {
@@ -237,17 +296,41 @@ export default class LilypadDbCache<
             parsedPayload
           );
           if (!options?.callback || options.automaticallyInvalidateDataBeforeCallback) {
-            if (parsedPayload.op === 'DELETE') {
-              this.delete(String(parsedPayload.id) as K, { setNull: true });
-            } else {
-              await this.invalidate(String(parsedPayload.id) as K, { invalidateBulkSync: false });
-            }
+            await this.applyNotification(parsedPayload.op, parsedPayload.id);
           }
           await options?.callback?.(parsedPayload);
           return;
         }
       },
     };
+  }
+
+  private async applyNotification(
+    op: LilypadDbCacheDefaultNotificationPayload['op'],
+    id: string | number
+  ) {
+    const key = this.resolveNotifiedKey(id);
+    if (op === 'DELETE') {
+      // Also for keys not in cache: the null entry keeps an older, in-flight fetch from caching the row
+      this.markDeleted(key);
+      return;
+    }
+    if (this.getComprehensive(key).type !== 'miss' || this.isFetchInFlight(key)) {
+      await this.invalidate(key, { invalidateBulkSync: false });
+    } else {
+      // Nobody asked for this row: no query, but the next getAll must see it
+      this.invalidateBulkSync();
+    }
+  }
+
+  /**
+   * Marks every entry as expired (keeping the values as fallback) and forces the next bulk sync.
+   */
+  private expireAll() {
+    for (const entry of [...this.store.values()]) {
+      this.expire(entry.key);
+    }
+    this.invalidateBulkSync();
   }
 
   /**
@@ -270,16 +353,12 @@ export default class LilypadDbCache<
     await listenerRemoval;
   }
 
-  private getItemPrimaryKeyValue(item: V): V[keyof V] {
+  private getItemPrimaryKeyValue(item: Partial<V>): V[PK] {
     const keyValue = item[this.dbGate.schema.primaryKey];
     if (keyValue === undefined) {
-      throw new Error(
-        `Primary key "${String(
-          this.dbGate.schema.primaryKey
-        )}" is missing in the item data for table "${this.dbGate.schema.tableName}".`
-      );
+      throw lilypadMissingPrimaryKeyError(this.dbGate.schema, 'item');
     }
-    return keyValue;
+    return keyValue as V[PK];
   }
 
   /**
@@ -289,8 +368,8 @@ export default class LilypadDbCache<
    *
    * @returns The created row, or `null` if the schema's `selectSanitizationFn` discards it.
    */
-  async sqlCreate(item: V): Promise<V | null> {
-    const row = await this.dbGate.gate.insertToTable<V>(this.dbGate.schema, item);
+  async sqlCreate(item: LilypadDbInsertData<V, PK>): Promise<V | null> {
+    const row = await this.dbGate.gate.insertToTable<V, PK>(this.dbGate.schema, item);
     if (row !== null) {
       this.set(this.getItemPrimaryKeyValue(row) as K, row);
     }
@@ -299,19 +378,20 @@ export default class LilypadDbCache<
 
   /**
    * Updates the item in the database and caches the row returned by the database.
+   * Only the columns present in `item` are written.
    *
    * @returns The updated row, or `null` if the schema's `selectSanitizationFn` discards it.
    * @throws If no row with the item's primary key exists.
    */
-  async sqlUpdate(item: V): Promise<V | null> {
+  async sqlUpdate(item: LilypadDbUpdateData<V, PK>): Promise<V | null> {
     const keyValue = this.getItemPrimaryKeyValue(item);
-    const row = await this.dbGate.gate.updateToTable<V>(this.dbGate.schema, item);
+    const row = await this.dbGate.gate.updateToTable<V, PK>(this.dbGate.schema, item);
     this.set(keyValue as K, row);
     return row;
   }
 
   async sqlDelete(key: K): Promise<void> {
-    await this.dbGate.gate.deleteFromTable<V>(this.dbGate.schema, key);
-    this.delete(key, { setNull: true });
+    await this.dbGate.gate.deleteFromTable<V, PK>(this.dbGate.schema, key);
+    this.markDeleted(key);
   }
 }

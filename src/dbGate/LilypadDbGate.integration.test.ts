@@ -7,7 +7,7 @@ import type { LilypadLoggerType } from '@/logger/LilypadLogger';
 
 type User = { id: number; name: string; role: string };
 
-const usersSchema: LilypadDbSchema<User> = {
+const usersSchema: LilypadDbSchema<User, 'id'> = {
   tableName: 'users',
   primaryKey: 'id',
   primaryKeyShouldAutoDetermine: true,
@@ -155,6 +155,50 @@ describe('LilypadDbGate (integration)', () => {
       expect(await gate.selectAllFromTable(usersSchema)).toEqual([]);
     });
 
+    it('should write the result of the insertSanitizationFn, which can remove properties', async () => {
+      const schema: LilypadDbSchema<User, 'id'> = {
+        ...usersSchema,
+        insertSanitizationFn: ({ role: _role, ...rest }) => rest,
+      };
+
+      const created = await gate.insertToTable(schema, { name: 'Mallory', role: 'admin' });
+
+      expect(created?.role).toBe('user');
+    });
+
+    it('should skip undefined values instead of failing', async () => {
+      // e.g. an optional field of a request body that was not sent
+      const data = { name: 'Ada', role: undefined as unknown as string };
+
+      const created = await gate.insertToTable(usersSchema, data);
+
+      expect(created).toEqual({ id: 1, name: 'Ada', role: 'user' });
+    });
+
+    it('should update only the columns present in the data', async () => {
+      await gate.insertToTable(usersSchema, { name: 'Ada', role: 'dev' });
+
+      const updated = await gate.updateToTable(usersSchema, { id: 1, role: 'admin' });
+
+      expect(updated).toEqual({ id: 1, name: 'Ada', role: 'admin' });
+    });
+
+    it('should select tables larger than one cursor batch', async () => {
+      await admin`INSERT INTO users (name) SELECT 'user' || i FROM generate_series(1, 2500) AS i`;
+
+      expect(await gate.selectAllFromTable(usersSchema)).toHaveLength(2500);
+    });
+
+    it('should cancel queries longer than statementTimeout on the server', async () => {
+      const limitedGate = await LilypadDbGate.create({
+        connectionString: container.getConnectionUri(),
+        statementTimeout: 100,
+      });
+
+      await expect(limitedGate.sql`SELECT pg_sleep(1)`).rejects.toThrow('statement timeout');
+      await limitedGate.close();
+    });
+
     it('should escape table names', async () => {
       const schema = { ...usersSchema, tableName: 'users; DROP TABLE users; --' };
 
@@ -208,6 +252,7 @@ describe('LilypadDbGate (integration)', () => {
       await vi.waitFor(() => {
         expect(healthy).toHaveBeenCalledWith('payload');
         expect(logger.error).toHaveBeenCalledWith(
+          loggedGate.id,
           expect.stringContaining('"failing"'),
           expect.any(Error)
         );
@@ -252,6 +297,49 @@ describe('LilypadDbGate (integration)', () => {
     });
   });
 
+  describe('listener lifecycle', () => {
+    it('should call onReconnect once the listener connection is re-established', async () => {
+      const callback = vi.fn();
+      const onReconnect = vi.fn();
+      const reconnectingGate = await LilypadDbGate.create({
+        connectionString: container.getConnectionUri(),
+        listen: [{ channel: 'reconnect_channel', callbackId: 'cb', callback, onReconnect }],
+      });
+      expect(onReconnect).not.toHaveBeenCalled();
+
+      await admin`
+        SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+        WHERE query ILIKE 'listen%reconnect_channel%'
+      `;
+
+      await vi.waitFor(() => expect(onReconnect).toHaveBeenCalledOnce(), { timeout: 10000 });
+      await admin.notify('reconnect_channel', 'after');
+      await vi.waitFor(() => expect(callback).toHaveBeenCalledWith('after'));
+      await reconnectingGate.close();
+    });
+
+    it('should remove a callback whose LISTEN is still pending', async () => {
+      const callback = vi.fn();
+      const adding = gate.addListener({ channel: 'pending_channel', callbackId: 'cb', callback });
+
+      expect(await gate.removeListener('pending_channel', 'cb')).toBe(true);
+      await adding;
+      await admin.notify('pending_channel', 'payload');
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      expect(callback).not.toHaveBeenCalled();
+    });
+
+    it('should close a gate that still has active listeners', async () => {
+      const closingGate = await LilypadDbGate.create({
+        connectionString: container.getConnectionUri(),
+        listen: [{ channel: 'closing_channel', callbackId: 'cb', callback: vi.fn() }],
+      });
+
+      await expect(closingGate.close()).resolves.toBeUndefined();
+    });
+  });
+
   describe('singleton', () => {
     it('should create a new instance after the singleton is closed', async () => {
       const options = {
@@ -274,17 +362,18 @@ describe('LilypadDbGate (integration)', () => {
 
   describe('with LilypadDbCache', () => {
     it('should keep the cache in sync through cache_events notifications', async () => {
-      const cache = await LilypadDbCache.create<string, User>(60000, {
+      const cache = await LilypadDbCache.create<number, User, 'id'>(60000, {
         dbGate: { gate, schema: usersSchema },
       });
-      const created = await cache.sqlCreate({ name: 'Ada', role: 'dev' } as User);
+      const created = await cache.sqlCreate({ name: 'Ada', role: 'dev' });
       expect(created?.id).toBe(1);
 
       await admin`UPDATE users SET role = 'admin' WHERE id = 1`;
-      await vi.waitFor(() => expect(cache.get('1')).toEqual({ id: 1, name: 'Ada', role: 'admin' }));
+      await vi.waitFor(() => expect(cache.get(1)).toEqual({ id: 1, name: 'Ada', role: 'admin' }));
+      expect([...cache.bulkGet({}).keys()]).toEqual([1]);
 
       await admin`DELETE FROM users WHERE id = 1`;
-      await vi.waitFor(() => expect(cache.get('1')).toBeNull());
+      await vi.waitFor(() => expect(cache.get(1)).toBeNull());
 
       await cache.dispose();
     });

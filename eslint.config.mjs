@@ -34,7 +34,7 @@ const eslintConfig = defineConfig([
           format: ['camelCase', 'PascalCase'],
         },
       ],
-      '@typescript-eslint/no-var-requires': 'error',
+      '@typescript-eslint/no-require-imports': 'error',
       // Unhandled rejections terminate the Node.js process: every promise must be awaited,
       // returned, or explicitly marked as fire-and-forget with `void`.
       '@typescript-eslint/no-floating-promises': 'error',
@@ -52,11 +52,8 @@ const eslintConfig = defineConfig([
       semi: ['warn', 'always'], // Enforce semicolons
     },
   },
-  // Override default ignores of eslint-config-next.
-  globalIgnores([
-    // Default ignores of eslint-config-next:
-    'dist/**',
-  ]),
+  // The build output is generated
+  globalIgnores(['dist/**']),
 ]);
 
 export default eslintConfig;

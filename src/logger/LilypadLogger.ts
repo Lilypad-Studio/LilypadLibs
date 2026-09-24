@@ -1,5 +1,9 @@
 import { inspect } from 'node:util';
-import { getLilypadSingletonInstance, LilypadSingletonAble } from '@/singleton/LilypadSingleton';
+import {
+  createLilypadSingletonSignatureValue,
+  getLilypadSingletonInstance,
+  LilypadSingletonAble,
+} from '@/singleton/LilypadSingleton';
 import LilypadLoggerComponent from '@/logger/LilypadLoggerComponent';
 
 /**
@@ -9,6 +13,7 @@ import LilypadLoggerComponent from '@/logger/LilypadLoggerComponent';
  *
  * @property {Record<T, LilypadLoggerComponent<T>[]>} components - A record mapping component names to arrays of logger components.
  * @property {(error: unknown) => Promise<void>} [errorLogging] - Optional callback function to handle logging errors.
+ * It is called once for each failing component. If it fails as well, both errors are written to `console.error`.
  */
 export type LilypadLoggerConstructorOptions<T extends string> = {
   components: Record<T, LilypadLoggerComponent<T>[]>;
@@ -86,10 +91,17 @@ export class LilypadLogger<T extends string> {
     options: LilypadLoggerConstructorOptions<T>
   ): LilypadLoggerType<T> {
     if (options.singleton) {
-      return getLilypadSingletonInstance(
-        options.singletonIdentifier,
-        () => new LilypadLogger<T>(options)
-      ) as LilypadLoggerType<T>;
+      const registryKey = `LilypadLogger:${options.singletonIdentifier}`;
+      return getLilypadSingletonInstance(registryKey, () => new LilypadLogger<T>(options), {
+        value: createLilypadSingletonSignatureValue([
+          options.name,
+          Object.keys(options.components).sort(),
+        ]),
+        onMismatch: () =>
+          console.warn(
+            `LilypadLogger singleton "${options.singletonIdentifier}" already exists with different options: the new options are ignored.`
+          ),
+      }) as LilypadLoggerType<T>;
     }
 
     return new LilypadLogger<T>(options) as LilypadLoggerType<T>;
@@ -98,8 +110,9 @@ export class LilypadLogger<T extends string> {
   private constructor(options: LilypadLoggerConstructorOptions<T>) {
     // Check that no T can override existing properties. `key in this` also covers inherited ones
     // (e.g. `constructor`, `toString`); fields are listed explicitly because, depending on the
-    // compilation target, they may not be defined on the instance yet.
-    const reservedKeys = new Set(['components', 'register', '__name', '_name']);
+    // compilation target, they may not be defined on the instance yet. `then` would make the logger
+    // a thenable: returning it from an async function would call it instead of resolving to it.
+    const reservedKeys = new Set(['components', 'register', '__name', '_name', 'then']);
     for (const key of Object.keys(options.components)) {
       if (reservedKeys.has(key) || key in this) {
         throw new Error(`Logger type "${key}" is reserved and cannot be used as a log channel.`);
@@ -121,22 +134,24 @@ export class LilypadLogger<T extends string> {
     for (const type of Object.keys(this.components) as T[]) {
       // Create the function that logs to components
       const logFn = async (...message: unknown[]) => {
+        let errors: unknown[];
         try {
           // Formatting stays inside the try: it must never make the returned promise reject
           const stringMessage = message.map(formatMessagePart).join(' ');
-          const promises: Promise<void>[] = [];
-          for (const component of this.components[type]) {
-            promises.push(
+          // allSettled: a failing component must neither stop nor hide the errors of the others
+          const results = await Promise.allSettled(
+            this.components[type].map(async (component) =>
               component.output(type, stringMessage, { logger: this as LilypadLoggerType<T> })
-            );
-          }
-          await Promise.all(promises);
+            )
+          );
+          errors = results
+            .filter((result) => result.status === 'rejected')
+            .map((result) => result.reason);
         } catch (error) {
-          if (options.errorLogging) {
-            await options.errorLogging(error);
-          } else {
-            console.error(`Error in logger component for type "${type}":`, error);
-          }
+          errors = [error];
+        }
+        for (const error of errors) {
+          await reportComponentError(type, error, options.errorLogging);
         }
       };
 
@@ -164,6 +179,26 @@ export class LilypadLogger<T extends string> {
 }
 
 /**
+ * Reports the error of a logger component. It never rejects: channel methods are called
+ * fire-and-forget, so a rejection would be unhandled and terminate the Node.js process.
+ */
+async function reportComponentError(
+  type: string,
+  error: unknown,
+  errorLogging?: (error: unknown) => Promise<void>
+): Promise<void> {
+  if (errorLogging) {
+    try {
+      await errorLogging(error);
+      return;
+    } catch (loggingError) {
+      console.error(`Error in errorLogging callback for type "${type}":`, loggingError);
+    }
+  }
+  console.error(`Error in logger component for type "${type}":`, error);
+}
+
+/**
  * Formats a part of a log message. Unlike `JSON.stringify`, `inspect` keeps the message and stack
  * of errors and never throws on circular references or BigInts.
  */
@@ -172,6 +207,9 @@ function formatMessagePart(part: unknown): string {
 }
 
 export type LilypadLoggerType<T extends string> = LilypadLogger<T> & ChannelMethods<T>;
+
+/** The logger accepted by the other Lilypad modules. */
+export type LilypadLibLogger = LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
 
 /**
  * Creates a new Lilypad logger instance with the specified options.

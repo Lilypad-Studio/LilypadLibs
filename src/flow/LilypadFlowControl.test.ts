@@ -165,56 +165,56 @@ describe('LilypadFlowControl', () => {
   });
 
   describe('rateLimit', () => {
-    it('should allow execution when rate limit is not set', async () => {
+    it('should allow execution when rate limit is not set', () => {
       flowControl = new LilypadFlowControl<string>();
-      await expect(flowControl.rateLimit('user1', 'func1')).resolves.toBeUndefined();
+      expect(() => flowControl.rateLimit('user1', 'func1')).not.toThrow();
     });
 
-    it('should allow first execution when rate limit is set', async () => {
+    it('should allow first execution when rate limit is set', () => {
       flowControl = new LilypadFlowControl<string>({ rate: 1000 });
-      await expect(flowControl.rateLimit('user1', 'func1')).resolves.toBeUndefined();
+      expect(() => flowControl.rateLimit('user1', 'func1')).not.toThrow();
     });
 
-    it('should reject execution when rate limit is exceeded', async () => {
+    it('should reject execution when rate limit is exceeded', () => {
       flowControl = new LilypadFlowControl<string>({ rate: 1000 });
-      await flowControl.rateLimit('user1', 'func1');
-      await expect(flowControl.rateLimit('user1', 'func1')).rejects.toThrow(
+      flowControl.rateLimit('user1', 'func1');
+      expect(() => flowControl.rateLimit('user1', 'func1')).toThrow(
         'Rate limit exceeded for user1#func1'
       );
     });
 
-    it('should allow execution after rate limit expires', async () => {
+    it('should allow execution after rate limit expires', () => {
       vi.useFakeTimers();
       flowControl = new LilypadFlowControl<string>({ rate: 100 });
-      await flowControl.rateLimit('user1', 'func1');
+      flowControl.rateLimit('user1', 'func1');
       vi.advanceTimersByTime(150);
-      await expect(flowControl.rateLimit('user1', 'func1')).resolves.toBeUndefined();
+      expect(() => flowControl.rateLimit('user1', 'func1')).not.toThrow();
     });
 
-    it('should track rate limits per consumer/function pair', async () => {
+    it('should track rate limits per consumer/function pair', () => {
       flowControl = new LilypadFlowControl<string>({ rate: 1000 });
-      await flowControl.rateLimit('user1', 'func1');
-      await expect(flowControl.rateLimit('user2', 'func1')).resolves.toBeUndefined();
+      flowControl.rateLimit('user1', 'func1');
+      expect(() => flowControl.rateLimit('user2', 'func1')).not.toThrow();
     });
 
-    it('should prune expired rate limit entries once the map grows large', async () => {
+    it('should prune expired rate limit entries once the map grows large', () => {
       vi.useFakeTimers();
       flowControl = new LilypadFlowControl<string>({ rate: 100 });
       for (let i = 0; i < 1000; i++) {
-        await flowControl.rateLimit(`user${i}`, 'func1');
+        flowControl.rateLimit(`user${i}`, 'func1');
       }
       vi.advanceTimersByTime(150);
-      await flowControl.rateLimit('newUser', 'func1');
+      flowControl.rateLimit('newUser', 'func1');
       expect(flowControl['rateMap'].size).toBe(1);
     });
 
-    it('should not prune entries that are still limiting', async () => {
+    it('should not prune entries that are still limiting', () => {
       flowControl = new LilypadFlowControl<string>({ rate: 60000 });
       for (let i = 0; i <= 1000; i++) {
-        await flowControl.rateLimit(`user${i}`, 'func1');
+        flowControl.rateLimit(`user${i}`, 'func1');
       }
       expect(flowControl['rateMap'].size).toBe(1001);
-      await expect(flowControl.rateLimit('user0', 'func1')).rejects.toThrow('Rate limit exceeded');
+      expect(() => flowControl.rateLimit('user0', 'func1')).toThrow('Rate limit exceeded');
     });
   });
 

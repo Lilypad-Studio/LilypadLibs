@@ -75,16 +75,20 @@ export interface LilypadSerializerConstructorOptions<
  * ```
  */
 export class LilypadSerializer<
-  FROM extends {},
-  TO extends {},
+  FROM extends object,
+  TO extends object,
   KeyMap extends Record<keyof FROM, keyof TO>,
 > {
-  constructor(private options: LilypadSerializerConstructorOptions<FROM, TO, KeyMap>) {}
+  private readonly fromKeys: (keyof FROM)[];
+
+  constructor(private options: LilypadSerializerConstructorOptions<FROM, TO, KeyMap>) {
+    this.fromKeys = Object.keys(options.serialization) as (keyof FROM)[];
+  }
 
   serialize(input: FROM[]): TO[] {
     return input.map((item) => {
       const packedItem = {} as TO;
-      (Object.keys(this.options.serialization) as (keyof FROM)[]).forEach((fromKey) => {
+      this.fromKeys.forEach((fromKey) => {
         const isEqual = this.options.serialization[fromKey].equality ?? ((v, d) => v === d); // Fallback to strict equality
         if (isEqual(item[fromKey], this.options.serialization[fromKey].default)) {
           return; // Skip default values
@@ -105,7 +109,7 @@ export class LilypadSerializer<
   deserialize(input: TO[]): FROM[] {
     return input.map((item) => {
       const unpackedItem = {} as FROM;
-      (Object.keys(this.options.serialization) as (keyof FROM)[]).forEach((fromKey) => {
+      this.fromKeys.forEach((fromKey) => {
         unpackedItem[fromKey] =
           this.options.serialization[fromKey].deserialize(item) ??
           cloneDefault(this.options.serialization[fromKey].default);

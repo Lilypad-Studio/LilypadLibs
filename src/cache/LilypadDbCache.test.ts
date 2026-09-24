@@ -5,6 +5,7 @@ import type {
   LilypadDbSchema,
   ListenerCallbackIdentifier,
 } from '@/dbGate/LilypadDbGate';
+import type { LilypadLibLogger } from '@/logger/LilypadLogger';
 
 type Item = { id: string; name: string };
 
@@ -128,8 +129,9 @@ describe('LilypadDbCache', () => {
   });
 
   describe('default listener', () => {
-    it('should update the entry on INSERT and UPDATE notifications', async () => {
+    it('should refresh cached entries on INSERT and UPDATE notifications', async () => {
       const cache = await createCache();
+      await cache.getOrFetch('3'); // cached as null: the row does not exist yet
       fake.rows.set('3', { id: '3', name: 'three' });
 
       await fake.notify({ table: 'items', id: '3', op: 'INSERT' });
@@ -185,10 +187,12 @@ describe('LilypadDbCache', () => {
           },
         },
       });
+      await cache.getOrFetch('1');
+      fake.rows.set('1', { id: '1', name: 'ONE' });
 
       await fake.notify({ table: 'items', id: '1', op: 'UPDATE' });
 
-      expect(valueSeenByCallback).toEqual({ id: '1', name: 'one' });
+      expect(valueSeenByCallback).toEqual({ id: '1', name: 'ONE' });
     });
   });
 
@@ -275,6 +279,142 @@ describe('LilypadDbCache', () => {
 
       expect(fake.mocks.deleteFromTable).toHaveBeenCalledWith(schema, '1');
       expect(cache.get('1')).toBeNull();
+    });
+  });
+
+  describe('consistency with the database', () => {
+    /** A query result whose resolution the test controls. */
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      const promise = new Promise<T>((r) => (resolve = r));
+      return { promise, resolve };
+    }
+
+    it('should not query rows that are not cached, but include them in the next getAll', async () => {
+      const cache = await createCache();
+      await cache.getAll();
+      fake.rows.set('3', { id: '3', name: 'three' });
+
+      await fake.notify({ table: 'items', id: '3', op: 'INSERT' });
+
+      expect(fake.mocks.selectFromTableByPrimaryKey).not.toHaveBeenCalled();
+      expect(await cache.getAll()).toContainEqual({ id: '3', name: 'three' });
+      expect(fake.mocks.selectAllFromTable).toHaveBeenCalledTimes(2);
+    });
+
+    it('should refresh a key whose fetch is in flight', async () => {
+      const cache = await createCache();
+      const staleRead = deferred<Item | null>();
+      fake.mocks.selectFromTableByPrimaryKey.mockReturnValueOnce(staleRead.promise);
+      const fetching = cache.getOrFetch('1');
+
+      fake.rows.set('1', { id: '1', name: 'ONE' });
+      await fake.notify({ table: 'items', id: '1', op: 'UPDATE' });
+      staleRead.resolve({ id: '1', name: 'one' }); // read before the update
+      await fetching;
+
+      expect(cache.get('1')).toEqual({ id: '1', name: 'ONE' });
+    });
+
+    it('should keep the newest row when refreshes complete out of order', async () => {
+      const cache = await createCache();
+      await cache.getOrFetch('1');
+      const firstRead = deferred<Item | null>();
+      const secondRead = deferred<Item | null>();
+      fake.mocks.selectFromTableByPrimaryKey
+        .mockReturnValueOnce(firstRead.promise)
+        .mockReturnValueOnce(secondRead.promise);
+
+      const firstRefresh = fake.notify({ table: 'items', id: '1', op: 'UPDATE' });
+      const secondRefresh = fake.notify({ table: 'items', id: '1', op: 'UPDATE' });
+      secondRead.resolve({ id: '1', name: 'second' });
+      await secondRefresh;
+      firstRead.resolve({ id: '1', name: 'first' });
+      await firstRefresh;
+
+      expect(cache.get('1')).toEqual({ id: '1', name: 'second' });
+    });
+
+    it('should reflect a deleted row even for a protected key', async () => {
+      const cache = await createCache();
+      await cache.getOrFetch('1');
+      await cache.getOrFetch('2');
+      cache.addProtectedKeys(['1', '2']);
+
+      await fake.notify({ table: 'items', id: '1', op: 'DELETE' });
+      await cache.sqlDelete('2');
+
+      expect(cache.get('1')).toBeNull();
+      expect(cache.get('2')).toBeNull();
+    });
+
+    it('should expire every entry and force a bulk sync when LISTEN reconnects', async () => {
+      const cache = await createCache();
+      await cache.getAll();
+      const listener = [...fake.listeners.values()][0];
+
+      await listener.onReconnect?.();
+
+      expect(cache.getComprehensive('1').type).toBe('expired');
+      await cache.getAll();
+      expect(fake.mocks.selectAllFromTable).toHaveBeenCalledTimes(2);
+    });
+
+    it('should keep the key type of cached entries for numeric ids', async () => {
+      const cache = await createCache();
+      await cache.getOrFetch('1');
+      fake.rows.set('1', { id: '1', name: 'ONE' });
+
+      await fake.notify({ table: 'items', id: 1, op: 'UPDATE' });
+
+      expect(cache.get('1')).toEqual({ id: '1', name: 'ONE' });
+      expect([...cache.bulkGet({}).keys()]).toEqual(['1']);
+    });
+
+    it('should ignore payloads that are not objects', async () => {
+      await createCache();
+
+      await expect(fake.notify('null')).resolves.toBeUndefined();
+      await expect(fake.notify('42')).resolves.toBeUndefined();
+      expect(fake.mocks.selectFromTableByPrimaryKey).not.toHaveBeenCalled();
+    });
+
+    it('should reject getAll when the table cannot be loaded', async () => {
+      const cache = await createCache();
+      fake.mocks.selectAllFromTable.mockRejectedValueOnce(new Error('database unreachable'));
+
+      await expect(cache.getAll()).rejects.toThrow('database unreachable');
+    });
+  });
+
+  describe('typing and singletons', () => {
+    it('should require the primary key to update, with a declared primary key', async () => {
+      const typedSchema: LilypadDbSchema<Item, 'id'> = { ...schema, primaryKey: 'id' };
+      const cache = await LilypadDbCache.create<string, Item, 'id'>(60000, {
+        dbGate: { gate: fake.gate, schema: typedSchema },
+      });
+
+      await cache.sqlUpdate({ id: '1', name: 'renamed' }); // partial update: no full item needed
+      // @ts-expect-error: an update needs the primary key
+      await expect(cache.sqlUpdate({ name: 'no id' })).rejects.toThrow(
+        'Primary key "id" is missing in the item data for table "items".'
+      );
+    });
+
+    it('should warn when a singleton is requested with a different TTL', async () => {
+      const logger = { warn: vi.fn(), debug: vi.fn(), error: vi.fn(), info: vi.fn() };
+      const options = { singleton: true, singletonIdentifier: 'LilypadDbCache.test-mismatch' };
+      const first = await createCache(options);
+
+      const second = await LilypadDbCache.create<string, Item>(30000, {
+        dbGate: { gate: fake.gate, schema },
+        logger: logger as unknown as LilypadLibLogger,
+        ...(options as { singleton: true; singletonIdentifier: string }),
+      });
+
+      expect(second).toBe(first);
+      expect(logger.warn).toHaveBeenCalledOnce();
+      await first.dispose();
     });
   });
 });

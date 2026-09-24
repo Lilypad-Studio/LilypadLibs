@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import LilypadLoggerComponent from './LilypadLoggerComponent';
 import { LilypadLogger } from './LilypadLogger';
+import {
+  getLilypadSingletonInstanceAsync,
+  removeLilypadSingletonInstance,
+} from '@/singleton/LilypadSingleton';
 
 type mockType = 'info' | 'error';
 
@@ -91,7 +95,7 @@ describe('LilypadLogger', () => {
     expect(message).toContain('10n');
   });
 
-  it.each(['components', 'register', '__name', '_name', 'constructor', 'toString'])(
+  it.each(['components', 'register', '__name', '_name', 'then', 'constructor', 'toString'])(
     'should reject the reserved log channel "%s"',
     (channel) => {
       expect(() =>
@@ -242,5 +246,64 @@ describe('LilypadLogger', () => {
 
     await logger.info('test message'); // Should not throw
     expect(true).toBe(true); // Just to ensure the test passes
+  });
+
+  it('should never reject, even when errorLogging fails', async () => {
+    mockComponent.output = vi.fn(async () => {
+      throw new Error('Component error');
+    });
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const logger = LilypadLogger.create<mockType>({
+      components: { info: [mockComponent], error: [] },
+      errorLogging: async () => {
+        throw new Error('errorLogging failed');
+      },
+    });
+
+    await expect(logger.info('test')).resolves.toBeUndefined();
+
+    expect(consoleSpy).toHaveBeenCalledWith(expect.any(String), expect.any(Error));
+    expect(consoleSpy).toHaveBeenCalledTimes(2); // the errorLogging failure and the original error
+    consoleSpy.mockRestore();
+  });
+
+  it('should report the error of every failing component', async () => {
+    mockComponent.output = vi.fn(async () => {
+      throw new Error('first');
+    });
+    mockComponent2.output = vi.fn(async () => {
+      throw new Error('second');
+    });
+    const errorLogging = vi.fn(async () => {});
+    const logger = LilypadLogger.create<mockType>({
+      components: { info: [mockComponent, mockComponent2], error: [] },
+      errorLogging,
+    });
+
+    await logger.info('test');
+
+    expect(errorLogging).toHaveBeenCalledTimes(2);
+    expect(errorLogging).toHaveBeenCalledWith(expect.objectContaining({ message: 'first' }));
+    expect(errorLogging).toHaveBeenCalledWith(expect.objectContaining({ message: 'second' }));
+  });
+
+  it('should keep singletons apart from other classes using the same identifier', async () => {
+    const identifier = 'LilypadLogger.test-namespace';
+    const logger = LilypadLogger.create<mockType>({
+      singleton: true,
+      singletonIdentifier: identifier,
+      components: { info: [], error: [] },
+    });
+    const other = await getLilypadSingletonInstanceAsync(identifier, async () => ({ other: true }));
+
+    expect(other).toEqual({ other: true });
+    expect(
+      LilypadLogger.create<mockType>({
+        singleton: true,
+        singletonIdentifier: identifier,
+        components: { info: [], error: [] },
+      })
+    ).toBe(logger);
+    removeLilypadSingletonInstance(identifier);
   });
 });

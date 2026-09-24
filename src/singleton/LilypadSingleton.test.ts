@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
+  createLilypadSingletonAbleAsync,
+  createLilypadSingletonSignatureValue,
   getLilypadSingletonInstance,
   getLilypadSingletonInstanceAsync,
   removeLilypadSingletonInstance,
@@ -63,5 +65,73 @@ describe('LilypadSingleton', () => {
 
   it('should return false when removing an unknown identifier', () => {
     expect(removeLilypadSingletonInstance(uniqueId())).toBe(false);
+  });
+
+  it('should keep singletons of different namespaces apart', async () => {
+    const options = { singleton: true as const, singletonIdentifier: uniqueId() };
+
+    const a = await createLilypadSingletonAbleAsync('A', options, async () => ({ kind: 'a' }));
+    const b = await createLilypadSingletonAbleAsync('B', options, async () => ({ kind: 'b' }));
+
+    expect(a).toEqual({ kind: 'a' });
+    expect(b).toEqual({ kind: 'b' });
+  });
+
+  it('should pass the registry key to the factory, or undefined without singleton', async () => {
+    const identifier = uniqueId();
+    const factory = vi.fn(async (registryKey: string | undefined) => ({ registryKey }));
+
+    await createLilypadSingletonAbleAsync('A', {}, factory);
+    await createLilypadSingletonAbleAsync(
+      'A',
+      { singleton: true, singletonIdentifier: identifier },
+      factory
+    );
+
+    expect(factory.mock.calls).toEqual([[undefined], [`A:${identifier}`]]);
+  });
+
+  it('should report later calls with a different signature', () => {
+    const id = uniqueId();
+    const onMismatch = vi.fn();
+
+    const first = getLilypadSingletonInstance(id, () => ({}), { value: 'a', onMismatch });
+    getLilypadSingletonInstance(id, () => ({}), { value: 'a', onMismatch });
+    expect(onMismatch).not.toHaveBeenCalled();
+
+    const second = getLilypadSingletonInstance(id, () => ({}), { value: 'b', onMismatch });
+    expect(onMismatch).toHaveBeenCalledOnce();
+    expect(second).toBe(first);
+  });
+
+  it('should refuse a synchronous lookup of a singleton being created asynchronously', async () => {
+    const id = uniqueId();
+    const pending = getLilypadSingletonInstanceAsync(id, async () => ({}));
+
+    expect(() => getLilypadSingletonInstance(id, () => ({}))).toThrow('asynchronously');
+    await pending;
+  });
+
+  it('should not remove an entry registered while a failed creation was pending', async () => {
+    const id = uniqueId();
+    let rejectCreation!: (error: Error) => void;
+    const failing = getLilypadSingletonInstanceAsync(
+      id,
+      () => new Promise<object>((_, reject) => (rejectCreation = reject))
+    );
+
+    removeLilypadSingletonInstance(id);
+    const replacement = getLilypadSingletonInstance(id, () => ({ value: 2 }));
+    rejectCreation(new Error('creation failed'));
+    await expect(failing).rejects.toThrow('creation failed');
+
+    expect(getLilypadSingletonInstance(id, () => ({ value: 3 }))).toBe(replacement);
+  });
+
+  it('should hash signature values', () => {
+    const value = createLilypadSingletonSignatureValue(['postgres://user:secret@host/db']);
+
+    expect(value).toMatch(/^[0-9a-f]{64}$/);
+    expect(value).not.toContain('secret');
   });
 });

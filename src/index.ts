@@ -10,7 +10,11 @@
  * Cache Module
  */
 export { default as LilypadCache } from './cache/LilypadCache';
-export type { LilypadCacheGetOptions, LilypadCachedValueType } from './cache/LilypadCache';
+export type {
+  LilypadCacheGetOptions,
+  LilypadCachedValueType,
+  LilypadCacheKey,
+} from './cache/LilypadCache';
 
 export { default as LilypadDbCache } from './cache/LilypadDbCache';
 export type {
@@ -26,6 +30,8 @@ export type {
   LilypadDbGateOptions,
   LilypadDbSchema,
   LilypadDbColumnType,
+  LilypadDbInsertData,
+  LilypadDbUpdateData,
   ListenerCallbackIdentifier,
 } from './dbGate/LilypadDbGate';
 
@@ -33,7 +39,11 @@ export type {
  * Logger Module
  */
 export { default as createLogger, LilypadLogger } from './logger/LilypadLogger';
-export type { LilypadLoggerConstructorOptions, LilypadLoggerType } from './logger/LilypadLogger';
+export type {
+  LilypadLibLogger,
+  LilypadLoggerConstructorOptions,
+  LilypadLoggerType,
+} from './logger/LilypadLogger';
 
 /**
  * Logger Components: base class for custom components, and default components
@@ -41,6 +51,7 @@ export type { LilypadLoggerConstructorOptions, LilypadLoggerType } from './logge
 export { default as LilypadLoggerComponent } from './logger/LilypadLoggerComponent';
 export { default as LilypadConsoleLogger } from './logger/components/ConsoleLogger';
 export { default as LilypadDiscordLogger } from './logger/components/DiscordLogger';
+export type { LilypadDiscordLoggerOptions } from './logger/components/DiscordLogger';
 
 /**
  * Flow Control Module
