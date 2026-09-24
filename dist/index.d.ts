@@ -109,13 +109,16 @@ declare class LilypadLogger<T extends string> {
      *
      * @example
      * // Create a new logger instance
-     * const logger = LilypadLogger.create({ singleton: false });
+     * const logger = LilypadLogger.create<'info' | 'error'>({
+     *   components: { info: [new LilypadConsoleLogger()], error: [new LilypadConsoleLogger()] },
+     * });
      *
      * @example
-     * // Create or retrieve a singleton logger
-     * const singletonLogger = LilypadLogger.create({
+     * // Create or retrieve a singleton logger (later calls ignore their options)
+     * const singletonLogger = LilypadLogger.create<'info' | 'error'>({
      *   singleton: true,
-     *   singletonIdentifier: 'app-logger'
+     *   singletonIdentifier: 'app-logger',
+     *   components: { info: [new LilypadConsoleLogger()], error: [new LilypadConsoleLogger()] },
      * });
      */
     static create<T extends string = 'log' | 'error' | 'warn'>(options: LilypadLoggerConstructorOptions<T>): LilypadLoggerType<T>;
@@ -837,16 +840,18 @@ type LilypadDbCacheConstructorOptions<K extends string, V> = ConstructorParamete
  *
  * @example
  * ```typescript
- * const dbCache = await LilypadDbCache.create<string, MyType>(ttl, {
- *   dbGate: { gate: myDbGate, schema: mySchema },
- *   // ...other options
+ * const users = await LilypadDbCache.create<string, User>(60_000, {
+ *   dbGate: { gate, schema: usersSchema },
+ *   logger,
  * });
+ * const user = await users.getOrFetch('42'); // User | null (no such row) | undefined (query failed)
+ * await users.dispose();
  * ```
  *
  * @remarks
- * - The cache is automatically synchronized with the database using the provided `dbGate`.
- *   - The synchonization does not happen on cache misses, but only when directly invoked via `update` (or when specified otherwise).
- * - The `invalidate` method triggers an update from the database for the given key.
+ * - `get` reads memory only. `getOrFetch` queries the database on a miss; `update` and
+ *   `invalidate` always re-fetch the key; `getAll` loads the whole table (at most once per bulk sync TTL).
+ * - `sqlCreate`/`sqlUpdate`/`sqlDelete` write through to the database, then cache the result.
  * - The `bulkAsyncGet` method fetches all items from the database and updates the cache.
  * - Unless disabled, the cache listens on the `cache_events` channel for JSON payloads shaped as
  *   {@link LilypadDbCacheDefaultNotificationPayload}. The database trigger sending them is not part of this library.

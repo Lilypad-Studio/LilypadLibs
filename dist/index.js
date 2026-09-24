@@ -1121,13 +1121,16 @@ var LilypadLogger = (_class4 = class _LilypadLogger {
    *
    * @example
    * // Create a new logger instance
-   * const logger = LilypadLogger.create({ singleton: false });
+   * const logger = LilypadLogger.create<'info' | 'error'>({
+   *   components: { info: [new LilypadConsoleLogger()], error: [new LilypadConsoleLogger()] },
+   * });
    *
    * @example
-   * // Create or retrieve a singleton logger
-   * const singletonLogger = LilypadLogger.create({
+   * // Create or retrieve a singleton logger (later calls ignore their options)
+   * const singletonLogger = LilypadLogger.create<'info' | 'error'>({
    *   singleton: true,
-   *   singletonIdentifier: 'app-logger'
+   *   singletonIdentifier: 'app-logger',
+   *   components: { info: [new LilypadConsoleLogger()], error: [new LilypadConsoleLogger()] },
    * });
    */
   static create(options) {
