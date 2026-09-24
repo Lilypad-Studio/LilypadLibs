@@ -1,5 +1,6 @@
+import { inspect } from 'node:util';
 import { getLilypadSingletonInstance, LilypadSingletonAble } from '@/singleton/LilypadSingleton';
-import LilypadLoggerComponent from 'logger/LilypadLoggerComponent';
+import LilypadLoggerComponent from '@/logger/LilypadLoggerComponent';
 
 /**
  * Options for constructing a {@link LilypadLogger} instance.
@@ -7,7 +8,7 @@ import LilypadLoggerComponent from 'logger/LilypadLoggerComponent';
  * @template T - A string literal type representing component names.
  *
  * @property {Record<T, LilypadLoggerComponent<T>[]>} components - A record mapping component names to arrays of logger components.
- * @property {(error: unknown) => void} [errorLogging] - Optional callback function to handle logging errors.
+ * @property {(error: unknown) => Promise<void>} [errorLogging] - Optional callback function to handle logging errors.
  */
 export type LilypadLoggerConstructorOptions<T extends string> = {
   components: Record<T, LilypadLoggerComponent<T>[]>;
@@ -28,7 +29,7 @@ type ChannelMethods<T extends string> = {
  *
  * @example
  * ```typescript
- * const logger = new LilypadLogger<'info' | 'error' | 'warn'>({
+ * const logger = LilypadLogger.create<'info' | 'error' | 'warn'>({
  *   components: {
  *     info: [consoleComponent],
  *     error: [consoleComponent, fileComponent],
@@ -92,10 +93,12 @@ export class LilypadLogger<T extends string> {
   }
 
   private constructor(options: LilypadLoggerConstructorOptions<T>) {
-    // Check that no T can override existing properties
-    const reservedKeys = new Set(['components', 'register', '__name']);
+    // Check that no T can override existing properties. `key in this` also covers inherited ones
+    // (e.g. `constructor`, `toString`); fields are listed explicitly because, depending on the
+    // compilation target, they may not be defined on the instance yet.
+    const reservedKeys = new Set(['components', 'register', '__name', '_name']);
     for (const key of Object.keys(options.components)) {
-      if (reservedKeys.has(key)) {
+      if (reservedKeys.has(key) || key in this) {
         throw new Error(`Logger type "${key}" is reserved and cannot be used as a log channel.`);
       }
     }
@@ -115,20 +118,9 @@ export class LilypadLogger<T extends string> {
     for (const type of Object.keys(this.components) as T[]) {
       // Create the function that logs to components
       const logFn = async (...message: unknown[]) => {
-        let stringMessage: string = '';
-        for (let i = 0; i < message.length; i++) {
-          if (i > 0) {
-            stringMessage += ' ';
-          }
-          const msgPart = message[i];
-          if (typeof msgPart === 'string') {
-            stringMessage += msgPart;
-          } else {
-            stringMessage += JSON.stringify(msgPart);
-          }
-        }
-
         try {
+          // Formatting stays inside the try: it must never make the returned promise reject
+          const stringMessage = message.map(formatMessagePart).join(' ');
           const promises: Promise<void>[] = [];
           for (const component of this.components[type]) {
             promises.push(
@@ -157,10 +149,23 @@ export class LilypadLogger<T extends string> {
    */
   register(newComponents: Partial<Record<T, LilypadLoggerComponent<T>[]>>): this {
     for (const type of Object.keys(newComponents) as T[]) {
+      if (!this.components[type]) {
+        throw new Error(
+          `Logger type "${type}" was not defined when the logger was created and cannot be registered.`
+        );
+      }
       this.components[type].push(...(newComponents[type] ?? []));
     }
     return this;
   }
+}
+
+/**
+ * Formats a part of a log message. Unlike `JSON.stringify`, `inspect` keeps the message and stack
+ * of errors and never throws on circular references or BigInts.
+ */
+function formatMessagePart(part: unknown): string {
+  return typeof part === 'string' ? part : inspect(part, { depth: 4, breakLength: Infinity });
 }
 
 export type LilypadLoggerType<T extends string> = LilypadLogger<T> & ChannelMethods<T>;

@@ -3,6 +3,18 @@
   "version": "0.0.1",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "author": {
     "name": "Lilypad Studio"
   },
@@ -11,15 +23,17 @@
   ],
   "scripts": {
     "build": "tsup --dts",
+    "typecheck": "tsc --noEmit",
     "lint": "eslint --fix",
-    "test": "vitest",
+    "test": "vitest --project unit",
+    "test:integration": "vitest run --project integration",
     "prepare": "husky"
   },
   "dependencies": {
-    "postgres": "^3.4.7",
-    "typescript": "^5.9.3"
+    "postgres": "^3.4.7"
   },
   "devDependencies": {
+    "@testcontainers/postgresql": "^12.1.0",
     "@types/node": "^24.10.1",
     "@typescript-eslint/eslint-plugin": "^8.48.1",
     "@typescript-eslint/parser": "^8.48.1",
@@ -31,6 +45,7 @@
     "husky": "^9.1.7",
     "prettier": "^3.4.2",
     "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
     "vitest": "^4.0.15"
   }
 }

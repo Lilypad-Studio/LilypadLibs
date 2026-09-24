@@ -10,11 +10,17 @@ type LilypadSingletonAble = {
     singleton?: false;
 };
 declare function getLilypadSingletonInstance<T>(identifier: string, createInstanceFn: () => T): T;
+/**
+ * Removes a singleton instance from the registry, so that the next `create` call with the same
+ * identifier builds a fresh instance. Meant to be called when the instance is closed/disposed.
+ *
+ * @returns `true` if an instance was registered under the identifier.
+ */
+declare function removeLilypadSingletonInstance(identifier: string): boolean;
 declare function getLilypadSingletonInstanceAsync<T>(identifier: string, createInstanceFn: () => Promise<T>): Promise<T>;
 
 interface LilypadLoggerComponentOptions<T extends string> {
     logger: ReturnType<typeof LilypadLogger.create<T>>;
-    name?: string;
 }
 /**
  * Abstract base class for logging components in the Lilypad library.
@@ -37,7 +43,13 @@ declare abstract class LilypadLoggerComponent<T extends string> {
     private getTimestamp;
     private formatMessage;
     output(type: T, message: string, options?: LilypadLoggerComponentOptions<T>): Promise<void>;
-    protected abstract send(message: string): Promise<void>;
+    /**
+     * Sends an already formatted message to the specific output channel.
+     *
+     * @param message - The formatted message.
+     * @param type - The log type of the message, for outputs that route messages by severity.
+     */
+    protected abstract send(message: string, type: T): Promise<void>;
 }
 
 /**
@@ -46,7 +58,7 @@ declare abstract class LilypadLoggerComponent<T extends string> {
  * @template T - A string literal type representing component names.
  *
  * @property {Record<T, LilypadLoggerComponent<T>[]>} components - A record mapping component names to arrays of logger components.
- * @property {(error: unknown) => void} [errorLogging] - Optional callback function to handle logging errors.
+ * @property {(error: unknown) => Promise<void>} [errorLogging] - Optional callback function to handle logging errors.
  */
 type LilypadLoggerConstructorOptions<T extends string> = {
     components: Record<T, LilypadLoggerComponent<T>[]>;
@@ -64,7 +76,7 @@ type ChannelMethods<T extends string> = {
  *
  * @example
  * ```typescript
- * const logger = new LilypadLogger<'info' | 'error' | 'warn'>({
+ * const logger = LilypadLogger.create<'info' | 'error' | 'warn'>({
  *   components: {
  *     info: [consoleComponent],
  *     error: [consoleComponent, fileComponent],
@@ -140,10 +152,18 @@ interface FlowControlOptions {
     logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
 }
 interface ExecuteFnOptions<T> {
-    errorFn?: (error: unknown) => T | void;
+    /**
+     * Called once the execution has definitively failed (after all retries).
+     * Its return value becomes the result of the execution; to propagate the error, throw from it.
+     */
+    errorFn?: (error: unknown) => T;
     functionIdentifier: string;
     consumerIdentifier: string;
-    fn: () => Promise<T>;
+    /**
+     * The operation to execute. The received signal is aborted when the operation times out,
+     * so the function can stop its work and avoid side effects after the timeout.
+     */
+    fn: (signal: AbortSignal) => Promise<T>;
     retries?: number;
     backOffTime?: (attempt: number) => number;
 }
@@ -165,16 +185,17 @@ interface ExecuteFnOptions<T> {
  * const result = await flowControl.executeFn({
  *   functionIdentifier: 'myFunction',
  *   consumerIdentifier: 'user123',
- *   fn: () => fetchData(),
+ *   fn: (signal) => fetchData({ signal }),
  *   backOffTime: (attempt) => Math.pow(2, attempt) * 100
  * });
  * ```
  *
  * @remarks
  * - **Rate Limiting**: Enforces a minimum interval between executions per consumer/function pair
- * - **Single-Flight**: Deduplicates concurrent requests for the same function identifier
+ * - **Single-Flight**: Deduplicates concurrent requests for the same function identifier. Callers that
+ *   join an in-flight execution share its result, including the outcome of the first caller's `errorFn`.
  * - **Retries**: Automatically retries failed operations with configurable backoff strategies
- * - **Timeout**: Fails operations that exceed the specified timeout duration
+ * - **Timeout**: Fails operations that exceed the specified timeout duration and aborts their signal
  *
  * @property rate - Minimum milliseconds between executions for rate limiting
  * @property timeout - Maximum milliseconds to wait for operation completion
@@ -193,7 +214,7 @@ declare class LilypadFlowControl<T> {
      * Executes an asynchronous function with a timeout constraint.
      *
      * @template T The type of value returned by the execution function.
-     * @param executionFn An asynchronous function to execute.
+     * @param executionFn An asynchronous function to execute. It receives a signal that is aborted on timeout.
      * @returns A promise that resolves with the result of `executionFn` if it completes before the timeout,
      *          or rejects with an error if the timeout is exceeded.
      * @throws {Error} Throws an error with message 'Operation timed out' if the execution exceeds the configured timeout duration.
@@ -201,15 +222,16 @@ declare class LilypadFlowControl<T> {
      * @remarks
      * This method uses `Promise.race()` to implement the timeout mechanism. The timeout is cleared in the finally block
      * to ensure no memory leaks occur regardless of whether the operation succeeds or times out.
+     * JavaScript cannot forcibly stop a running promise: `executionFn` should observe the signal to stop its work.
      */
-    executeWithTimeout(executionFn: () => Promise<T>): Promise<T>;
+    executeWithTimeout(executionFn: (signal: AbortSignal) => Promise<T>): Promise<T>;
     /**
      * Executes a given asynchronous function with retry logic and optional exponential backoff.
      *
      * @template T The return type of the execution function.
      * @param options - The options for executing with retries, including:
      * @param options.executionFn - The asynchronous function to execute.
-     * @param options.errorFn - Optional function to handle errors after all retries have been exhausted. If provided, its return value will be returned instead of throwing the error.
+     * @param options.errorFn - Optional function to handle errors after all retries have been exhausted. If provided, its return value is returned instead of throwing the error; it can throw to propagate it.
      * @param options.retries - The maximum number of retry attempts. If not provided, the instance's configured retries will be used.
      * @param options.backOffTime - Optional function to calculate the backoff time (in milliseconds) before each retry attempt. Receives the current attempt number as an argument. Defaults to exponential backoff if not provided.
      * @returns A promise that resolves with the result of `executionFn`, or with the result of `errorFn` if retries are exhausted.
@@ -218,7 +240,7 @@ declare class LilypadFlowControl<T> {
     executeWithRetries(options: {
         executionFn: () => Promise<T>;
         retries?: number;
-        errorFn?: (error: unknown) => T | void;
+        errorFn?: (error: unknown) => T;
         backOffTime?: (attempt: number) => number;
     }): Promise<T>;
     /**
@@ -236,16 +258,26 @@ declare class LilypadFlowControl<T> {
      */
     rateLimit(consumerIdentifier: string, functionIdentifier: string): Promise<void>;
     /**
+     * Synchronous implementation of {@link rateLimit}. It must stay synchronous: `executeFn` relies on
+     * no await happening between the single-flight lookup and the registration of the new execution.
+     */
+    private checkRateLimit;
+    /**
+     * Removes the rate limit entries whose interval has already elapsed, as they no longer limit anything.
+     */
+    private pruneRateMap;
+    /**
      * Executes a provided function with optional rate limiting, single-flight deduplication,
      * retries, and timeout handling. Ensures that only one execution per function identifier
      * is in-flight at a time, and subsequent calls return the same promise until completion.
+     * Calls that join an in-flight execution are not rate limited, since they do not start a new one.
      *
      * @template T - The return type of the function to execute.
      * @param options - The execution options, including:
      *   - consumerIdentifier: Unique identifier for the consumer (used for rate limiting).
      *   - functionIdentifier: Unique identifier for the function (used for single-flight).
      *   - fn: The function to execute.
-     *   - errorFn: Optional error handler for retries.
+     *   - errorFn: Optional error handler, called once all retries are exhausted.
      *   - backOffTime: Optional backoff time between retries.
      * @returns A promise that resolves with the result of the executed function.
      */
@@ -403,19 +435,27 @@ declare class LilypadCache<K extends string, V> {
      */
     private createExpirationTime;
     /**
+     * Normalizes a key to the string form used by the store.
+     * Keys can be non-strings at runtime (e.g. numeric primary keys cast to `K`), so every access
+     * to the store or to the protected keys must go through this method.
+     */
+    protected normalizeKey(key: K): K;
+    /**
      * Stores a value in the cache associated with the specified key, optionally setting a time-to-live (TTL) for expiration.
      *
      * @param key - The key to associate with the cached value.
      * @param value - The value to store in the cache.
-     * @param ttl - Optional. The time-to-live in milliseconds. If not provided, the value will not expire.
+     * @param ttl - Optional. The time-to-live in milliseconds. If not provided, the cache's default TTL is used.
      */
     set(key: K, value: LilypadCachedValueType<V>, ttl?: number): void;
     /**
      * Retrieves a value from the cache associated with the specified key.
      * If the cached value has expired or does not exist, it returns `undefined`.
-     * If the value is expired, it is also removed from the cache, as a side effect.
      *
      * @param key - The key associated with the cached value.
+     * @param removeOld - If true, an expired value is also removed from the cache, as a side effect.
+     * Defaults to false, so that the old value stays available as a fallback for `getOrSet` with
+     * `returnOldOnError`; expired entries are removed by `purgeExpired` / `autoCleanupInterval`.
      * @returns The cached value if it exists and is not expired; otherwise, `undefined`.
      */
     get(key: K, removeOld?: boolean): LilypadCachedValueType<V> | undefined;
@@ -468,10 +508,11 @@ declare class LilypadCache<K extends string, V> {
      *
      * This method uses flow control to manage the execution of the bulk sync operation.
      * If a `syncFn` is provided, it will be used to fetch key-value pairs to synchronize.
-     * Any errors encountered during the sync process are logged.
+     * Errors encountered during the sync process are logged and not rethrown: the cache keeps its
+     * current content, and the next call retries the sync.
      *
      * @param syncFn - An optional asynchronous function that returns an array of key-value pairs to be synchronized.
-     * @returns A promise that resolves when the bulk sync operation is complete.
+     * @returns A promise that resolves when the bulk sync operation is complete (or has failed).
      */
     bulkSync(syncFn?: () => Promise<[K, LilypadCachedValueType<V>][]>): Promise<void>;
     private _bulkSync;
@@ -496,7 +537,7 @@ declare class LilypadCache<K extends string, V> {
      * @param options.syncFn - An asynchronous function that returns an array of key-value pairs to sync the cache.
      * @returns A promise that resolves to a map of keys to their corresponding values.
      */
-    bulkAsyncGet(options?: {
+    bulkAsyncGet({ keys, doSync, syncFn, }?: {
         keys?: K[];
         doSync?: boolean;
         syncFn?: () => Promise<[K, LilypadCachedValueType<V>][]>;
@@ -534,12 +575,18 @@ declare class LilypadCache<K extends string, V> {
      *
      * @param key - The key of the cache entry to invalidate.
      * @param options - Optional settings for invalidation.
-     * @param options.invalidateBulkSync - If true, forces a bulk sync on the next bulkSync call.
+     * @param options.invalidateBulkSync - If true (default), forces a bulk sync on the next bulkSync call.
      */
-    invalidate(key: K, options?: {
+    invalidate(key: K, { invalidateBulkSync }?: {
         invalidateBulkSync?: boolean;
-        tryToUpdate?: boolean;
     }): void;
+    /**
+     * Marks a valid cache entry as expired, keeping its value as a fallback for `returnOldOnError`.
+     * Unlike `invalidate`, it is never overridden by subclasses, so it is always synchronous.
+     *
+     * @param key - The key of the cache entry to expire.
+     */
+    protected expire(key: K): void;
     /**
      * Deletes the specified key from the cache.
      *
@@ -590,7 +637,7 @@ declare class LilypadCache<K extends string, V> {
     dispose(): void;
 }
 
-type ListenerCallback = (payload: unknown) => void;
+type ListenerCallback = (payload: unknown) => void | Promise<void>;
 type ListenerCallbackIdentifier = {
     channel: string;
     callbackId: string;
@@ -610,11 +657,18 @@ type LilypadDbSchema<T> = {
     primaryKeyShouldAutoDetermine?: boolean;
     insertSanitizationFn?: (data: Partial<T>) => Partial<T>;
     selectSanitizationFn?: (row: unknown) => T | null;
+    /**
+     * The columns of the table.
+     * - Without a `selectSanitizationFn`, only these columns are selected.
+     * - Only these columns are written by inserts and updates: any other property of the data is ignored.
+     *
+     * The column metadata (`type`, `nullable`, `default`) is descriptive and is not used by the gate.
+     */
     cols: {
         [K in keyof T]: {
             type: LilypadDbColumnType;
         } & ({
-            nullable: false | undefined;
+            nullable?: false;
         } | {
             nullable: true;
             default: T[K] | null;
@@ -632,32 +686,60 @@ type LilypadDbSchema<T> = {
  *
  * @example
  * ```typescript
- * const dbGate = new LilypadDbGate({
+ * const dbGate = await LilypadDbGate.create({
  *   connectionString: 'postgres://user:pass@host:port/db',
  *   listen: [
- *     { channel: 'my_channel', callback: (payload) => console.log(payload) }
+ *     { channel: 'my_channel', callbackId: 'my_callback', callback: (payload) => console.log(payload) }
  *   ]
  * });
  * ```
  *
- * @typeParam T - The type representing the table schema.
- *
  * @public
  */
 declare class LilypadDbGate {
-    private connectionString;
     private listenerConnectionString;
     sql: postgres.Sql;
     private listenerConnection;
     protected logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
     private listeners;
+    private singletonIdentifier?;
     private constructor();
     static create(options: LilypadDbGateOptionsWithSingleton): Promise<LilypadDbGate>;
     private static initializeNew;
+    /**
+     * Maps a database row to `T`, using the schema's `selectSanitizationFn` if provided,
+     * otherwise by copying the schema columns.
+     */
+    private mapRow;
+    /**
+     * The columns to select. The `selectSanitizationFn` receives the whole row, since it may read
+     * columns that are not in the schema; otherwise only the schema columns are needed.
+     */
+    private selectedColumns;
+    /**
+     * Prepares the data of an insert/update:
+     * - applies the schema's `insertSanitizationFn`;
+     * - validates the primary key, which an update always needs to find the row;
+     * - restricts the written columns to the schema columns, so that extra properties of `data`
+     *   (e.g. coming from a request body) are never written to the table.
+     */
+    private prepareWrite;
     selectAllFromTable<T>(options: LilypadDbSchema<T>): Promise<T[]>;
     selectFromTableByPrimaryKey<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<T | null>;
-    insertToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
-    updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void>;
+    /**
+     * Inserts a row.
+     *
+     * @returns The row as stored by the database, including generated columns such as an
+     * auto-determined primary key, or `null` if the `selectSanitizationFn` discards it.
+     */
+    insertToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<T | null>;
+    /**
+     * Updates the row identified by the primary key contained in `data`.
+     *
+     * @returns The row as stored by the database, or `null` if the `selectSanitizationFn` discards it.
+     * @throws If no row with that primary key exists.
+     */
+    updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<T | null>;
     deleteFromTable<T>(options: LilypadDbSchema<T>, primaryKeyValue: T[keyof T]): Promise<void>;
     /**
      * Retrieves the singleton listener database connection.
@@ -672,45 +754,67 @@ declare class LilypadDbGate {
      */
     private getListenerConnection;
     /**
-     * Initializes a listener for the specified channel.
+     * Starts listening on the specified channel.
      *
-     * This method sets up a new listener entry in the `listeners` map for the given channel,
-     * associates a callback map and a database connection, and starts listening for events
-     * on the specified channel. When an event is received, all registered listener callbacks
-     * for that channel are executed.
+     * The listener entry is registered immediately, before LISTEN is active, so that concurrent
+     * `addListener` calls for the same channel share it and await the same `ready` promise.
+     * If LISTEN fails, the entry is removed, so that a later `addListener` call retries it.
      *
      * @param channel - The name of the channel to listen on.
-     * @returns A promise that resolves when the listener has been successfully initialized.
+     * @returns The listener entry of the channel.
      */
     private initializeListener;
     /**
      * Executes all registered listener callbacks for a given channel, passing the provided payload to each callback.
      *
-     * Iterates through all callbacks associated with the specified channel and invokes them with the given payload.
-     * If any callback throws an error, it is caught and logged using the logger (if available).
+     * Both synchronous throws and rejected promises of async callbacks are caught and logged,
+     * so a failing callback can neither affect the others nor cause an unhandled rejection.
      *
      * @param channel - The name of the channel whose listener callbacks should be executed.
      * @param payload - The data to pass to each listener callback.
      */
-    executeAllListenerCallbacks(channel: string, payload: unknown): void;
+    private executeAllListenerCallbacks;
     /**
      * Adds a listener callback for a specified channel.
      *
      * If the channel does not already have a listener, it initializes one.
-     * The callback is associated with the provided `callbackId` and stored for the channel.
-     * Logs debug information about the addition and the current number of callbacks for the channel.
+     * The callback is associated with the provided `callbackId`: adding a callback with an existing
+     * `callbackId` on the same channel replaces the previous one.
      *
      * @param params - An object containing:
      *   @param params.channel - The name of the channel to listen to.
      *   @param params.callbackId - A unique identifier for the callback.
      *   @param params.callback - The callback function to be invoked for the channel.
      *
-     * @returns A promise that resolves when the listener has been added.
+     * @returns A promise that resolves once LISTEN is active on the channel.
+     * @throws If LISTEN fails; in that case the callback is not registered.
      */
     addListener({ channel, callbackId, callback }: ListenerCallbackIdentifier): Promise<void>;
+    /**
+     * Removes a listener callback. When the channel has no callbacks left, it stops listening to it.
+     *
+     * @returns `true` if the callback was registered.
+     */
+    removeListener(channel: string, callbackId: string): Promise<boolean>;
     close(): Promise<void>;
 }
 
+type LilypadDbCacheDefaultNotificationPayload = {
+    table?: string;
+    id?: string;
+    op: 'UPDATE' | 'DELETE' | 'INSERT';
+};
+type LilypadDbCacheDefaultListenerOptions = {
+    /**
+     * If true, the cache entry is updated from the database (or set to null, for a DELETE)
+     * before `callback` is called.
+     *
+     * Without a `callback` the entry is always updated. With a `callback` this defaults to false:
+     * keeping the cache up to date is then the callback's responsibility.
+     */
+    automaticallyInvalidateDataBeforeCallback?: boolean;
+    callback?: (payload: LilypadDbCacheDefaultNotificationPayload) => Promise<void> | void;
+};
 type LilypadDbCacheConstructorOptions<K extends string, V> = ConstructorParameters<typeof LilypadCache<K, V>>[1] & {
     dbGate: {
         gate: LilypadDbGate;
@@ -720,16 +824,8 @@ type LilypadDbCacheConstructorOptions<K extends string, V> = ConstructorParamete
     useDefaultDbListener?: false;
 } | {
     useDefaultDbListener: true;
-    defaultListenerOptions: {
-        automaticallyInvalidateDataBeforeCallback?: boolean;
-        callback?: (payload: LilypadDbCacheDefaultNotificationPayload) => Promise<void> | void;
-    };
+    defaultListenerOptions: LilypadDbCacheDefaultListenerOptions;
 });
-type LilypadDbCacheDefaultNotificationPayload = {
-    table?: string;
-    id?: string;
-    op: 'UPDATE' | 'DELETE' | 'INSERT';
-};
 /**
  * A cache class that synchronizes with a database table using a provided database gateway and schema.
  *
@@ -741,7 +837,7 @@ type LilypadDbCacheDefaultNotificationPayload = {
  *
  * @example
  * ```typescript
- * const dbCache = new LilypadDbCache<string, MyType>(ttl, {
+ * const dbCache = await LilypadDbCache.create<string, MyType>(ttl, {
  *   dbGate: { gate: myDbGate, schema: mySchema },
  *   // ...other options
  * });
@@ -752,6 +848,8 @@ type LilypadDbCacheDefaultNotificationPayload = {
  *   - The synchonization does not happen on cache misses, but only when directly invoked via `update` (or when specified otherwise).
  * - The `invalidate` method triggers an update from the database for the given key.
  * - The `bulkAsyncGet` method fetches all items from the database and updates the cache.
+ * - Unless disabled, the cache listens on the `cache_events` channel for JSON payloads shaped as
+ *   {@link LilypadDbCacheDefaultNotificationPayload}. The database trigger sending them is not part of this library.
  *
  * @see LilypadCache
  * @see LilypadDbGate
@@ -759,15 +857,24 @@ type LilypadDbCacheDefaultNotificationPayload = {
  */
 declare class LilypadDbCache<K extends string & V[keyof V], V extends object> extends LilypadCache<K, V> {
     private readonly dbGate;
-    static create<K extends string & V[keyof V], V extends object>(ttl: number | undefined, options: LilypadDbCacheConstructorOptions<K, V> & LilypadSingletonAble): LilypadDbCache<K, V>;
+    private readonly defaultDbListener?;
+    private singletonIdentifier?;
+    /**
+     * Creates a cache and, unless disabled, registers its default database listener.
+     *
+     * @throws If the default database listener cannot be registered (e.g. the database is unreachable).
+     */
+    static create<K extends string & V[keyof V], V extends object>(ttl: number | undefined, options: LilypadDbCacheConstructorOptions<K, V> & LilypadSingletonAble): Promise<LilypadDbCache<K, V>>;
+    private static initializeNew;
     private constructor();
     /**
-     * Retrieves a cached value by key, or fetches and updates it if not found in cache.
-     * @template K - The type of the cache key.
-     * @template V - The type of the cached value.
+     * Retrieves a cached value by key, or fetches it from the database if not found in cache.
+     * Concurrent calls for the same key share a single database query.
+     *
      * @param key - The cache key to retrieve or fetch.
-     * @returns A promise that resolves to the cached value, or undefined if the key doesn't exist or an error occurs during fetching.
-     * @throws Does not throw; errors are caught and logged internally.
+     * @returns A promise that resolves to the cached value (`null` if the row does not exist),
+     * or undefined if an error occurs during fetching.
+     * @throws Does not throw; errors are logged internally.
      */
     getOrFetch(key: K): Promise<LilypadCachedValueType<V> | undefined>;
     /**
@@ -778,7 +885,7 @@ declare class LilypadDbCache<K extends string & V[keyof V], V extends object> ex
      *
      * @param key - The cache key to invalidate.
      * @param options - Optional settings for invalidation.
-     * @param options.invalidateBulkSync - Whether to invalidate bulk sync (default: true).
+     * @param options.invalidateBulkSync - Whether to invalidate bulk sync when the update fails (default: true).
      * @returns A promise that resolves when the invalidation process is complete.
      */
     invalidate(key: K, options?: {
@@ -786,25 +893,36 @@ declare class LilypadDbCache<K extends string & V[keyof V], V extends object> ex
     }): Promise<void>;
     /**
      * Updates the cache entry for the specified key by fetching the latest value from the database.
-     *
-     * If the database gateway is available, retrieves the value associated with the given key from the database,
-     * updates the cache with this value, and returns it. If an error occurs during the process, logs the error
-     * and rethrows it. Returns `undefined` if the database gateway is not available.
+     * A row that does not exist is cached as `null`.
      *
      * @param key - The primary key of the cache entry to update.
-     * @returns A promise that resolves to the updated value from the database, or `undefined` if the update could not be performed.
-     * @throws Rethrows any error encountered during the database fetch or cache update process.
+     * @returns A promise that resolves to the updated value from the database.
+     * @throws Rethrows any error encountered during the database fetch.
      */
-    update(key: K): Promise<V | null | undefined>;
+    update(key: K): Promise<LilypadCachedValueType<V>>;
     getAll(keys?: K[]): Promise<V[]>;
-    protected getDefaultDbListener(options?: {
-        callback?: (payload: LilypadDbCacheDefaultNotificationPayload) => Promise<void> | void;
-        automaticallyInvalidateDataBeforeCallback?: boolean;
-    }): ListenerCallbackIdentifier;
+    protected getDefaultDbListener(options?: LilypadDbCacheDefaultListenerOptions): ListenerCallbackIdentifier;
+    /**
+     * Disposes of the cache: stops its default database listener, removes it from the singleton
+     * registry (if it was created as a singleton) and clears it.
+     */
+    dispose(): Promise<void>;
     private getItemPrimaryKeyValue;
-    private isOldItemTheSameAsNewOne;
-    sqlCreate(item: V): Promise<void>;
-    sqlUpdate(item: V): Promise<void>;
+    /**
+     * Inserts the item in the database and caches the row returned by the database.
+     * With `primaryKeyShouldAutoDetermine`, the primary key of `item` can be omitted: the cached row
+     * holds the one generated by the database.
+     *
+     * @returns The created row, or `null` if the schema's `selectSanitizationFn` discards it.
+     */
+    sqlCreate(item: V): Promise<V | null>;
+    /**
+     * Updates the item in the database and caches the row returned by the database.
+     *
+     * @returns The updated row, or `null` if the schema's `selectSanitizationFn` discards it.
+     * @throws If no row with the item's primary key exists.
+     */
+    sqlUpdate(item: V): Promise<V | null>;
     sqlDelete(key: K): Promise<void>;
 }
 
@@ -820,10 +938,11 @@ declare class LilypadDbCache<K extends string & V[keyof V], V extends object> ex
  *
  * @remarks
  * This logger extends {@link LilypadLoggerComponent} and implements basic console logging functionality.
- * Messages are sent to the standard output using `console.log()`.
+ * Messages of type `error` are sent to `console.error`, messages of type `warn` to `console.warn`
+ * (case-insensitive), and every other message to `console.log`.
  */
 declare class LilypadConsoleLogger<T extends string> extends LilypadLoggerComponent<T> {
-    protected send(message: string): Promise<void>;
+    protected send(message: string, type: T): Promise<void>;
 }
 
 /**
@@ -834,13 +953,20 @@ declare class LilypadConsoleLogger<T extends string> extends LilypadLoggerCompon
  *
  * @example
  * ```typescript
- * const logger = new LilypadDiscordLogger<'info' | 'error' | 'warn'>('https://discordapp.com/api/webhooks/...');
- * await logger.send('An important log message');
+ * const discordLogger = new LilypadDiscordLogger<'info' | 'error' | 'warn'>('https://discordapp.com/api/webhooks/...');
+ * const logger = LilypadLogger.create({ components: { error: [discordLogger] } });
+ * await logger.error('An important log message');
  * ```
  *
  * @remarks
  * This class uses Discord's webhook API to send messages. Ensure the webhook URL is kept secure
  * and not exposed in version control or client-side code.
+ * - Log messages are sent to a third-party service: anything they contain (including data logged
+ *   together with errors) becomes visible to the members of the Discord channel.
+ * - Mentions are disabled, so a message containing `@everyone` or a user/role mention notifies no one.
+ * - Messages longer than 2000 characters are truncated.
+ * - A failed request (e.g. rate limited by Discord) makes `output` reject, so the logger reports it
+ *   through its `errorLogging` callback.
  */
 declare class LilypadDiscordLogger<T extends string> extends LilypadLoggerComponent<T> {
     private webhookUrl;
@@ -851,7 +977,17 @@ declare class LilypadDiscordLogger<T extends string> extends LilypadLoggerCompon
 type InvertRecord<R extends Record<PropertyKey, PropertyKey>> = {
     [K in keyof R as R[K]]: K;
 };
-type IsBijective<A extends object, B extends object, M extends Record<keyof A, keyof B>> = keyof A extends keyof M ? keyof B extends M[keyof A] ? InvertRecord<M> extends Record<keyof B, keyof A> ? true : false : false : false;
+/** True if every key of B is the target of at least one key of the mapping. */
+type IsSurjective<B extends object, M extends Record<PropertyKey, PropertyKey>> = keyof B extends M[keyof M] ? true : false;
+/** True if no two keys of the mapping have the same target. */
+type IsInjective<M extends Record<PropertyKey, PropertyKey>> = {
+    [K in keyof M]: M[K] extends keyof InvertRecord<M> ? [InvertRecord<M>[M[K]]] extends [K] ? true : false : false;
+}[keyof M] extends true ? true : false;
+/**
+ * True if the mapping M pairs every key of A with exactly one key of B, and vice versa.
+ * Every key of A being mapped is already guaranteed by the `Record<keyof A, keyof B>` constraint.
+ */
+type IsBijective<A extends object, B extends object, M extends Record<keyof A, keyof B>> = IsSurjective<B, M> extends true ? IsInjective<M> : false;
 interface LilypadSerializerConstructorOptions<FROM extends object, TO extends object, KeyMap extends Record<keyof FROM, keyof TO>> {
     serialization: {
         [K in keyof FROM]: {
@@ -872,20 +1008,23 @@ interface LilypadSerializerConstructorOptions<FROM extends object, TO extends ob
  * @typeParam KeyMap - A mapping from keys in `FROM` to keys in `TO`.
  *
  * @remarks
- * - The serializer uses a `keyMapping` to map keys from the source to the target object.
+ * - Each key of the source is mapped to its `target` key in the target object; the mapping must be
+ *   bijective, otherwise `target` is typed as `never`.
  * - Custom serialization and deserialization functions can be provided for each key.
  * - Default values and equality checks can be specified to skip serialization of default values.
  * - When a function in the serialization map returns `undefined`, that key is omitted from the serialized output.
+ * - When deserialization returns `null` or `undefined`, the key gets a copy of its default value
+ *   (object defaults are cloned, so deserialized items never share them).
  *
  * @example
  * ```typescript
  * interface Source { a: number; b: string; }
  * interface Target { x: number; y: string; }
  * const serializer = new LilypadSerializer<Source, Target, { a: 'x'; b: 'y' }>({
- *   keyMapping: { a: 'x', b: 'y' },
- *   serializationMap: { a: item => item.a, b: item => item.b },
- *   deserializationMap: { x: item => item.x, y: item => item.y },
- *   fromDefaultValues: { a: 0, b: '' }
+ *   serialization: {
+ *     a: { target: 'x', serialize: (item) => item.a, deserialize: (item) => item.x, default: 0 },
+ *     b: { target: 'y', serialize: (item) => item.b, deserialize: (item) => item.y, default: '' },
+ *   },
  * });
  * const packed = serializer.serialize([{ a: 1, b: 'foo' }]);
  * const unpacked = serializer.deserialize(packed);
@@ -898,4 +1037,4 @@ declare class LilypadSerializer<FROM extends {}, TO extends {}, KeyMap extends R
     deserialize(input: TO[]): FROM[];
 }
 
-export { type ExecuteFnOptions, type FlowControlOptions, LilypadCache, type LilypadCacheGetOptions, LilypadConsoleLogger, LilypadDbCache, type LilypadDbCacheDefaultNotificationPayload, LilypadDbGate, type LilypadDbGateOptions, type LilypadDbSchema, LilypadDiscordLogger, LilypadFlowControl, LilypadLogger, type LilypadLoggerConstructorOptions, type LilypadLoggerType, LilypadSerializer, type LilypadSerializerConstructorOptions, type LilypadSingletonAble, createLogger, getLilypadSingletonInstance, getLilypadSingletonInstanceAsync };
+export { type ExecuteFnOptions, type FlowControlOptions, LilypadCache, type LilypadCacheGetOptions, type LilypadCachedValueType, LilypadConsoleLogger, LilypadDbCache, type LilypadDbCacheDefaultListenerOptions, type LilypadDbCacheDefaultNotificationPayload, type LilypadDbColumnType, LilypadDbGate, type LilypadDbGateOptions, type LilypadDbSchema, LilypadDiscordLogger, LilypadFlowControl, LilypadLogger, LilypadLoggerComponent, type LilypadLoggerConstructorOptions, type LilypadLoggerType, LilypadSerializer, type LilypadSerializerConstructorOptions, type LilypadSingletonAble, type ListenerCallbackIdentifier, createLogger, getLilypadSingletonInstance, getLilypadSingletonInstanceAsync, removeLilypadSingletonInstance };

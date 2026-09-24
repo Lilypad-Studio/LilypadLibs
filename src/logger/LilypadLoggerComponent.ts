@@ -2,7 +2,6 @@ import type { LilypadLogger } from './LilypadLogger';
 
 interface LilypadLoggerComponentOptions<T extends string> {
   logger: ReturnType<typeof LilypadLogger.create<T>>;
-  name?: string;
 }
 
 /**
@@ -35,8 +34,6 @@ export default abstract class LilypadLoggerComponent<T extends string> {
 
     if (options?.logger?.__name) {
       formatted += `[${options.logger.__name}] `;
-    } else if (options?.name) {
-      formatted += `[${options.name}] `;
     }
 
     formatted += `[${type.toUpperCase()}]: ${message}`;
@@ -49,9 +46,14 @@ export default abstract class LilypadLoggerComponent<T extends string> {
     options?: LilypadLoggerComponentOptions<T>
   ): Promise<void> {
     const formattedMessage = this.formatMessage(type, message, options);
-    await this.send(formattedMessage);
+    await this.send(formattedMessage, type);
   }
 
-  // Sends an already formatted message to the specific output channel
-  protected abstract send(message: string): Promise<void>;
+  /**
+   * Sends an already formatted message to the specific output channel.
+   *
+   * @param message - The formatted message.
+   * @param type - The log type of the message, for outputs that route messages by severity.
+   */
+  protected abstract send(message: string, type: T): Promise<void>;
 }

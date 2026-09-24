@@ -35,6 +35,15 @@ const eslintConfig = defineConfig([
         },
       ],
       '@typescript-eslint/no-var-requires': 'error',
+      // Unhandled rejections terminate the Node.js process: every promise must be awaited,
+      // returned, or explicitly marked as fire-and-forget with `void`.
+      '@typescript-eslint/no-floating-promises': 'error',
+      '@typescript-eslint/no-misused-promises': [
+        'error',
+        // Async overrides of sync methods (e.g. LilypadDbCache.invalidate/dispose) are intended:
+        // the base classes never call them without awaiting the result.
+        { checksVoidReturn: { inheritedMethods: false } },
+      ],
 
       // General Best Practices
       curly: ['warn', 'all'], // Always use braces for clarity

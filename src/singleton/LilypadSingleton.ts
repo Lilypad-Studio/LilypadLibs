@@ -22,6 +22,16 @@ export function getLilypadSingletonInstance<T>(identifier: string, createInstanc
   return instance;
 }
 
+/**
+ * Removes a singleton instance from the registry, so that the next `create` call with the same
+ * identifier builds a fresh instance. Meant to be called when the instance is closed/disposed.
+ *
+ * @returns `true` if an instance was registered under the identifier.
+ */
+export function removeLilypadSingletonInstance(identifier: string): boolean {
+  return singletonMap.delete(identifier);
+}
+
 export async function getLilypadSingletonInstanceAsync<T>(
   identifier: string,
   createInstanceFn: () => Promise<T>

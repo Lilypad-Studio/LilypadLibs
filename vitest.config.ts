@@ -5,15 +5,31 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, 'src'),
-      logger: path.resolve(__dirname, 'src/logger'),
-      cache: path.resolve(__dirname, 'src/cache'),
-      flow: path.resolve(__dirname, 'src/flow'),
     },
   },
   test: {
-    include: ['src/**/*.test.ts'],
     coverage: {
       reporter: ['text', 'json', 'html'],
     },
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: 'unit',
+          include: ['src/**/*.test.ts'],
+          exclude: ['src/**/*.integration.test.ts'],
+        },
+      },
+      {
+        // Requires Docker: each suite starts its own PostgreSQL container
+        extends: true,
+        test: {
+          name: 'integration',
+          include: ['src/**/*.integration.test.ts'],
+          testTimeout: 30000,
+          hookTimeout: 120000,
+        },
+      },
+    ],
   },
 });

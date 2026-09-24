@@ -1,4 +1,5 @@
 "use strict";Object.defineProperty(exports, "__esModule", {value: true}); function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; } function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } async function _asyncNullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return await rhsFn(); } } var _class; var _class2; var _class3; var _class4;// src/flow/LilypadFlowControl.ts
+var RATE_MAP_PRUNE_THRESHOLD = 1e3;
 var LilypadFlowControl = (_class = class {
   
   
@@ -16,7 +17,7 @@ var LilypadFlowControl = (_class = class {
    * Executes an asynchronous function with a timeout constraint.
    *
    * @template T The type of value returned by the execution function.
-   * @param executionFn An asynchronous function to execute.
+   * @param executionFn An asynchronous function to execute. It receives a signal that is aborted on timeout.
    * @returns A promise that resolves with the result of `executionFn` if it completes before the timeout,
    *          or rejects with an error if the timeout is exceeded.
    * @throws {Error} Throws an error with message 'Operation timed out' if the execution exceeds the configured timeout duration.
@@ -24,17 +25,23 @@ var LilypadFlowControl = (_class = class {
    * @remarks
    * This method uses `Promise.race()` to implement the timeout mechanism. The timeout is cleared in the finally block
    * to ensure no memory leaks occur regardless of whether the operation succeeds or times out.
+   * JavaScript cannot forcibly stop a running promise: `executionFn` should observe the signal to stop its work.
    */
   async executeWithTimeout(executionFn) {
+    const controller = new AbortController();
     if (this.timeout === void 0) {
-      return executionFn();
+      return executionFn(controller.signal);
     }
     let timeoutId;
     const timeoutPromise = new Promise((_, reject) => {
-      timeoutId = setTimeout(() => reject(new Error("Operation timed out")), this.timeout);
+      timeoutId = setTimeout(() => {
+        const error = new Error("Operation timed out");
+        controller.abort(error);
+        reject(error);
+      }, this.timeout);
     });
     try {
-      return await Promise.race([executionFn(), timeoutPromise]);
+      return await Promise.race([executionFn(controller.signal), timeoutPromise]);
     } finally {
       clearTimeout(timeoutId);
     }
@@ -45,7 +52,7 @@ var LilypadFlowControl = (_class = class {
    * @template T The return type of the execution function.
    * @param options - The options for executing with retries, including:
    * @param options.executionFn - The asynchronous function to execute.
-   * @param options.errorFn - Optional function to handle errors after all retries have been exhausted. If provided, its return value will be returned instead of throwing the error.
+   * @param options.errorFn - Optional function to handle errors after all retries have been exhausted. If provided, its return value is returned instead of throwing the error; it can throw to propagate it.
    * @param options.retries - The maximum number of retry attempts. If not provided, the instance's configured retries will be used.
    * @param options.backOffTime - Optional function to calculate the backoff time (in milliseconds) before each retry attempt. Receives the current attempt number as an argument. Defaults to exponential backoff if not provided.
    * @returns A promise that resolves with the result of `executionFn`, or with the result of `errorFn` if retries are exhausted.
@@ -60,10 +67,7 @@ var LilypadFlowControl = (_class = class {
       } catch (error) {
         if (attempts >= (_nullishCoalesce(_nullishCoalesce(options.retries, () => ( this.retries)), () => ( 0)))) {
           if (options.errorFn) {
-            const result = options.errorFn(error);
-            if (result !== void 0) {
-              return result;
-            }
+            return options.errorFn(error);
           }
           throw error;
         }
@@ -87,6 +91,13 @@ var LilypadFlowControl = (_class = class {
    * @returns A promise that resolves when the rate limit check passes.
    */
   async rateLimit(consumerIdentifier, functionIdentifier) {
+    this.checkRateLimit(consumerIdentifier, functionIdentifier);
+  }
+  /**
+   * Synchronous implementation of {@link rateLimit}. It must stay synchronous: `executeFn` relies on
+   * no await happening between the single-flight lookup and the registration of the new execution.
+   */
+  checkRateLimit(consumerIdentifier, functionIdentifier) {
     if (this.rate !== void 0) {
       const rateKey = consumerIdentifier + "#" + functionIdentifier;
       const now = Date.now();
@@ -95,52 +106,48 @@ var LilypadFlowControl = (_class = class {
         throw new Error(`Rate limit exceeded for ${rateKey}`);
       }
       this.rateMap.set(rateKey, now);
+      if (this.rateMap.size > RATE_MAP_PRUNE_THRESHOLD) {
+        this.pruneRateMap(now);
+      }
     }
-    return;
+  }
+  /**
+   * Removes the rate limit entries whose interval has already elapsed, as they no longer limit anything.
+   */
+  pruneRateMap(now) {
+    for (const [rateKey, lastExecution] of this.rateMap) {
+      if (now - lastExecution >= this.rate) {
+        this.rateMap.delete(rateKey);
+      }
+    }
   }
   /**
    * Executes a provided function with optional rate limiting, single-flight deduplication,
    * retries, and timeout handling. Ensures that only one execution per function identifier
    * is in-flight at a time, and subsequent calls return the same promise until completion.
+   * Calls that join an in-flight execution are not rate limited, since they do not start a new one.
    *
    * @template T - The return type of the function to execute.
    * @param options - The execution options, including:
    *   - consumerIdentifier: Unique identifier for the consumer (used for rate limiting).
    *   - functionIdentifier: Unique identifier for the function (used for single-flight).
    *   - fn: The function to execute.
-   *   - errorFn: Optional error handler for retries.
+   *   - errorFn: Optional error handler, called once all retries are exhausted.
    *   - backOffTime: Optional backoff time between retries.
    * @returns A promise that resolves with the result of the executed function.
    */
   async executeFn(options) {
-    await this.rateLimit(options.consumerIdentifier, options.functionIdentifier);
-    if (this.singleFlightMap.has(options.functionIdentifier)) {
-      return this.singleFlightMap.get(options.functionIdentifier);
+    const inFlight = this.singleFlightMap.get(options.functionIdentifier);
+    if (inFlight) {
+      return inFlight;
     }
-    const pipeline = async () => {
-      const executionFn = () => this.timeout !== void 0 ? this.executeWithTimeout(options.fn) : options.fn();
-      const effectiveRetries = _nullishCoalesce(_nullishCoalesce(options.retries, () => ( this.retries)), () => ( 0));
-      if (effectiveRetries > 0) {
-        return this.executeWithRetries({
-          executionFn,
-          retries: effectiveRetries,
-          errorFn: options.errorFn,
-          backOffTime: options.backOffTime
-        });
-      }
-      try {
-        return await executionFn();
-      } catch (error) {
-        if (options.errorFn) {
-          const result = options.errorFn(error);
-          if (result !== void 0) {
-            return result;
-          }
-        }
-        throw error;
-      }
-    };
-    const executionPromise = pipeline().finally(() => {
+    this.checkRateLimit(options.consumerIdentifier, options.functionIdentifier);
+    const executionPromise = this.executeWithRetries({
+      executionFn: () => this.executeWithTimeout(options.fn),
+      retries: _nullishCoalesce(_nullishCoalesce(options.retries, () => ( this.retries)), () => ( 0)),
+      errorFn: options.errorFn,
+      backOffTime: options.backOffTime
+    }).finally(() => {
       this.singleFlightMap.delete(options.functionIdentifier);
     });
     this.singleFlightMap.set(options.functionIdentifier, executionPromise);
@@ -180,15 +187,15 @@ var LilypadCache = (_class2 = class {
     this.defaultTtl = ttl;
     this.defaultBulkSyncTtl = _nullishCoalesce(options.defaultBulkSyncTtl, () => ( ttl));
     this.bulkSyncFn = options.bulkSyncFn;
-    this.defaultErrorTtl = options.defaultErrorTtl ? options.defaultErrorTtl : 5 * 60 * 1e3;
+    this.defaultErrorTtl = _nullishCoalesce(options.defaultErrorTtl, () => ( 5 * 60 * 1e3));
     this.logger = options.logger;
     this.flowControl = new LilypadFlowControl({
       logger: this.logger,
-      timeout: options.flowControlTimeout || 5e3
+      timeout: _nullishCoalesce(options.flowControlTimeout, () => ( 5e3))
     });
     this.bulkSyncFlowControl = new LilypadFlowControl({
       logger: this.logger,
-      timeout: options.flowControlTimeout || 3e4
+      timeout: _nullishCoalesce(options.flowControlTimeout, () => ( 3e4))
     });
     if (options.autoCleanupInterval) {
       if (!Number.isFinite(options.autoCleanupInterval) || options.autoCleanupInterval <= 0) {
@@ -199,7 +206,7 @@ var LilypadCache = (_class2 = class {
         this.cleanupIntervalId.unref();
       }
     }
-    (_a = this.logger) == null ? void 0 : _a.debug(this.id, `LilypadCache initialized`);
+    void ((_a = this.logger) == null ? void 0 : _a.debug(this.id, `LilypadCache initialized`));
   }
   /**
    * Calculates the expiration timestamp based on the provided TTL (time-to-live) value.
@@ -211,25 +218,38 @@ var LilypadCache = (_class2 = class {
     return Date.now() + (_nullishCoalesce(ttl, () => ( this.defaultTtl)));
   }
   /**
+   * Normalizes a key to the string form used by the store.
+   * Keys can be non-strings at runtime (e.g. numeric primary keys cast to `K`), so every access
+   * to the store or to the protected keys must go through this method.
+   */
+  normalizeKey(key) {
+    return String(key);
+  }
+  /**
    * Stores a value in the cache associated with the specified key, optionally setting a time-to-live (TTL) for expiration.
    *
    * @param key - The key to associate with the cached value.
    * @param value - The value to store in the cache.
-   * @param ttl - Optional. The time-to-live in milliseconds. If not provided, the value will not expire.
+   * @param ttl - Optional. The time-to-live in milliseconds. If not provided, the cache's default TTL is used.
    */
   set(key, value, ttl) {
-    this.store.set(String(key), { value, expirationTime: this.createExpirationTime(ttl) });
+    this.store.set(this.normalizeKey(key), {
+      value,
+      expirationTime: this.createExpirationTime(ttl)
+    });
   }
   /**
    * Retrieves a value from the cache associated with the specified key.
    * If the cached value has expired or does not exist, it returns `undefined`.
-   * If the value is expired, it is also removed from the cache, as a side effect.
    *
    * @param key - The key associated with the cached value.
+   * @param removeOld - If true, an expired value is also removed from the cache, as a side effect.
+   * Defaults to false, so that the old value stays available as a fallback for `getOrSet` with
+   * `returnOldOnError`; expired entries are removed by `purgeExpired` / `autoCleanupInterval`.
    * @returns The cached value if it exists and is not expired; otherwise, `undefined`.
    */
-  get(key, removeOld = true) {
-    const cacheValue = this.store.get(String(key));
+  get(key, removeOld = false) {
+    const cacheValue = this.store.get(this.normalizeKey(key));
     if (cacheValue && !isStale(cacheValue)) {
       return cacheValue.value;
     } else {
@@ -249,7 +269,7 @@ var LilypadCache = (_class2 = class {
    * - If the value does not exist, returns an object with `type: 'miss'`.
    */
   getComprehensive(key) {
-    const cacheValue = this.store.get(String(key));
+    const cacheValue = this.store.get(this.normalizeKey(key));
     if (cacheValue && !isStale(cacheValue)) {
       return { ...cacheValue, type: "hit" };
     } else {
@@ -278,7 +298,7 @@ var LilypadCache = (_class2 = class {
    */
   errorReturn(error, options, key, fetched) {
     var _a, _b;
-    (_a = this.logger) == null ? void 0 : _a.error(this.id, `Error fetching cache key "${String(key)}": `, error);
+    void ((_a = this.logger) == null ? void 0 : _a.error(this.id, `Error fetching cache key "${String(key)}": `, error));
     let valueToReturn = void 0;
     const errorFnRes = (_b = options.errorFn) == null ? void 0 : _b.call(options, { key, error, options });
     if (errorFnRes !== void 0) {
@@ -317,9 +337,11 @@ var LilypadCache = (_class2 = class {
       functionIdentifier: `LilypadCache-getOrSet-${String(key)}`,
       consumerIdentifier: "",
       errorFn: (error) => this.errorReturn(error, options, key, fetched),
-      fn: async () => {
+      fn: async (signal) => {
         const value = await valueFn();
-        this.set(key, value, options.ttl);
+        if (!signal.aborted) {
+          this.set(key, value, options.ttl);
+        }
         return value;
       }
     });
@@ -329,10 +351,11 @@ var LilypadCache = (_class2 = class {
    *
    * This method uses flow control to manage the execution of the bulk sync operation.
    * If a `syncFn` is provided, it will be used to fetch key-value pairs to synchronize.
-   * Any errors encountered during the sync process are logged.
+   * Errors encountered during the sync process are logged and not rethrown: the cache keeps its
+   * current content, and the next call retries the sync.
    *
    * @param syncFn - An optional asynchronous function that returns an array of key-value pairs to be synchronized.
-   * @returns A promise that resolves when the bulk sync operation is complete.
+   * @returns A promise that resolves when the bulk sync operation is complete (or has failed).
    */
   async bulkSync(syncFn) {
     await this.bulkSyncFlowControl.executeFn({
@@ -340,7 +363,7 @@ var LilypadCache = (_class2 = class {
       consumerIdentifier: "",
       errorFn: (error) => {
         var _a;
-        (_a = this.logger) == null ? void 0 : _a.error(this.id, "Error during bulk sync: ", error);
+        void ((_a = this.logger) == null ? void 0 : _a.error(this.id, "Error during bulk sync: ", error));
       },
       fn: async () => this._bulkSync(syncFn)
     });
@@ -352,15 +375,16 @@ var LilypadCache = (_class2 = class {
     }
     const data = await _asyncNullishCoalesce(await (syncFn == null ? void 0 : syncFn()), async () => ( await ((_a = this.bulkSyncFn) == null ? void 0 : _a.call(this))));
     if (!data) {
-      (_b = this.logger) == null ? void 0 : _b.warn(this.id, "Bulk sync function returned no data");
+      void ((_b = this.logger) == null ? void 0 : _b.warn(this.id, "Bulk sync function returned no data"));
       return;
     }
-    const expirationTime = this.createExpirationTime();
     for (const key of this.store.keys()) {
-      this.delete(key) || this.invalidate(key, { invalidateBulkSync: false });
+      if (!this.delete(key)) {
+        this.expire(key);
+      }
     }
-    for (const [key, value] of _nullishCoalesce(data, () => ( []))) {
-      this.set(key, value, expirationTime);
+    for (const [key, value] of data) {
+      this.set(key, value);
     }
     this.bulkSyncExpirationTime = this.createExpirationTime(this.defaultBulkSyncTtl);
   }
@@ -393,11 +417,15 @@ var LilypadCache = (_class2 = class {
    * @param options.syncFn - An asynchronous function that returns an array of key-value pairs to sync the cache.
    * @returns A promise that resolves to a map of keys to their corresponding values.
    */
-  async bulkAsyncGet(options = { keys: void 0, doSync: true, syncFn: void 0 }) {
-    if (options.doSync) {
-      await this.bulkSync(options.syncFn);
+  async bulkAsyncGet({
+    keys,
+    doSync = true,
+    syncFn
+  } = {}) {
+    if (doSync) {
+      await this.bulkSync(syncFn);
     }
-    return this.bulkGet({ keys: options.keys });
+    return this.bulkGet({ keys });
   }
   /**
    * Sets multiple key-value pairs in the cache at once.
@@ -423,7 +451,7 @@ var LilypadCache = (_class2 = class {
    */
   addProtectedKeys(keys) {
     for (const key of keys) {
-      this.protectedKeys.add(key);
+      this.protectedKeys.add(this.normalizeKey(key));
     }
     return this;
   }
@@ -435,7 +463,7 @@ var LilypadCache = (_class2 = class {
    */
   removeProtectedKeys(keys) {
     for (const key of keys) {
-      this.protectedKeys.delete(key);
+      this.protectedKeys.delete(this.normalizeKey(key));
     }
     return this;
   }
@@ -447,18 +475,24 @@ var LilypadCache = (_class2 = class {
    *
    * @param key - The key of the cache entry to invalidate.
    * @param options - Optional settings for invalidation.
-   * @param options.invalidateBulkSync - If true, forces a bulk sync on the next bulkSync call.
+   * @param options.invalidateBulkSync - If true (default), forces a bulk sync on the next bulkSync call.
    */
-  invalidate(key, options = {
-    invalidateBulkSync: true,
-    tryToUpdate: false
-  }) {
+  invalidate(key, { invalidateBulkSync = true } = {}) {
+    this.expire(key);
+    if (invalidateBulkSync) {
+      this.bulkSyncExpirationTime = 0;
+    }
+  }
+  /**
+   * Marks a valid cache entry as expired, keeping its value as a fallback for `returnOldOnError`.
+   * Unlike `invalidate`, it is never overridden by subclasses, so it is always synchronous.
+   *
+   * @param key - The key of the cache entry to expire.
+   */
+  expire(key) {
     const comprehensive = this.getComprehensive(key);
     if (comprehensive.type === "hit") {
       this.set(key, comprehensive.value, -1);
-    }
-    if (options.invalidateBulkSync) {
-      this.bulkSyncExpirationTime = 0;
     }
   }
   /**
@@ -472,14 +506,15 @@ var LilypadCache = (_class2 = class {
    * @param options.setNull - If true, sets the value to null instead of deleting the entry.
    */
   delete(key, options = {}) {
-    if (this.protectedKeys.has(key) && !options.force) {
+    const normalizedKey = this.normalizeKey(key);
+    if (this.protectedKeys.has(normalizedKey) && !options.force) {
       return false;
     }
     if (options.setNull) {
-      this.set(key, null);
+      this.set(normalizedKey, null);
       return true;
     }
-    this.store.delete(String(key));
+    this.store.delete(normalizedKey);
     return true;
   }
   /**
@@ -547,6 +582,9 @@ function getLilypadSingletonInstance(identifier, createInstanceFn) {
   singletonMap.set(identifier, instance);
   return instance;
 }
+function removeLilypadSingletonInstance(identifier) {
+  return singletonMap.delete(identifier);
+}
 async function getLilypadSingletonInstanceAsync(identifier, createInstanceFn) {
   if (singletonMap.has(identifier)) {
     return singletonMap.get(identifier);
@@ -566,12 +604,35 @@ async function getLilypadSingletonInstanceAsync(identifier, createInstanceFn) {
 // src/cache/LilypadDbCache.ts
 var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
   
-  static create(ttl = 6e4, options) {
+  
+  
+  /**
+   * Creates a cache and, unless disabled, registers its default database listener.
+   *
+   * @throws If the default database listener cannot be registered (e.g. the database is unreachable).
+   */
+  static async create(ttl = 6e4, options) {
     if (options.singleton) {
-      const cacheKey = _nullishCoalesce(options.singletonIdentifier, () => ( `LilypadDbCache-${options.dbGate.schema.tableName}`));
-      return getLilypadSingletonInstance(cacheKey, () => new _LilypadDbCache(ttl, options));
+      const identifier = options.singletonIdentifier;
+      return getLilypadSingletonInstanceAsync(identifier, async () => {
+        const cache = await _LilypadDbCache.initializeNew(ttl, options);
+        cache.singletonIdentifier = identifier;
+        return cache;
+      });
     }
-    return new _LilypadDbCache(ttl, options);
+    return _LilypadDbCache.initializeNew(ttl, options);
+  }
+  static async initializeNew(ttl, options) {
+    const cache = new _LilypadDbCache(ttl, options);
+    if (cache.defaultDbListener) {
+      try {
+        await cache.dbGate.gate.addListener(cache.defaultDbListener);
+      } catch (error) {
+        await cache.dispose();
+        throw error;
+      }
+    }
+    return cache;
   }
   constructor(ttl, options) {
     var _a;
@@ -582,36 +643,31 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
       item
     ]);
     if (_nullishCoalesce(options.useDefaultDbListener, () => ( true))) {
-      this.dbGate.gate.addListener(
-        this.getDefaultDbListener(
-          options.useDefaultDbListener ? options.defaultListenerOptions : void 0
-        )
+      this.defaultDbListener = this.getDefaultDbListener(
+        options.useDefaultDbListener ? options.defaultListenerOptions : void 0
       );
     }
-    (_a = this.logger) == null ? void 0 : _a.debug(
+    void ((_a = this.logger) == null ? void 0 : _a.debug(
       this.id,
       `LilypadDbCache initialized for table "${this.dbGate.schema.tableName}"`
-    );
+    ));
   }
   /**
-   * Retrieves a cached value by key, or fetches and updates it if not found in cache.
-   * @template K - The type of the cache key.
-   * @template V - The type of the cached value.
+   * Retrieves a cached value by key, or fetches it from the database if not found in cache.
+   * Concurrent calls for the same key share a single database query.
+   *
    * @param key - The cache key to retrieve or fetch.
-   * @returns A promise that resolves to the cached value, or undefined if the key doesn't exist or an error occurs during fetching.
-   * @throws Does not throw; errors are caught and logged internally.
+   * @returns A promise that resolves to the cached value (`null` if the row does not exist),
+   * or undefined if an error occurs during fetching.
+   * @throws Does not throw; errors are logged internally.
    */
   async getOrFetch(key) {
-    var _a;
-    const cachedValue = super.get(key, false);
-    if (cachedValue !== void 0) {
-      return cachedValue;
-    }
     try {
-      const value = await this.update(key);
-      return value;
-    } catch (error) {
-      (_a = this.logger) == null ? void 0 : _a.error(`Error fetching and updating cache key "${String(key)}": `, error);
+      return await this.getOrSet(
+        key,
+        () => this.dbGate.gate.selectFromTableByPrimaryKey(this.dbGate.schema, key)
+      );
+    } catch (e2) {
       return void 0;
     }
   }
@@ -623,68 +679,52 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
    *
    * @param key - The cache key to invalidate.
    * @param options - Optional settings for invalidation.
-   * @param options.invalidateBulkSync - Whether to invalidate bulk sync (default: true).
+   * @param options.invalidateBulkSync - Whether to invalidate bulk sync when the update fails (default: true).
    * @returns A promise that resolves when the invalidation process is complete.
    */
-  async invalidate(key, options = {
-    invalidateBulkSync: true
-  }) {
+  async invalidate(key, options = {}) {
     var _a;
     try {
       await this.update(key);
     } catch (error) {
-      (_a = this.logger) == null ? void 0 : _a.error(`Error updating cache key "${String(key)}" after invalidation: `, error);
+      void ((_a = this.logger) == null ? void 0 : _a.error(
+        this.id,
+        `Error updating cache key "${String(key)}" after invalidation: `,
+        error
+      ));
       super.invalidate(key, options);
     }
   }
   /**
    * Updates the cache entry for the specified key by fetching the latest value from the database.
-   *
-   * If the database gateway is available, retrieves the value associated with the given key from the database,
-   * updates the cache with this value, and returns it. If an error occurs during the process, logs the error
-   * and rethrows it. Returns `undefined` if the database gateway is not available.
+   * A row that does not exist is cached as `null`.
    *
    * @param key - The primary key of the cache entry to update.
-   * @returns A promise that resolves to the updated value from the database, or `undefined` if the update could not be performed.
-   * @throws Rethrows any error encountered during the database fetch or cache update process.
+   * @returns A promise that resolves to the updated value from the database.
+   * @throws Rethrows any error encountered during the database fetch.
    */
   async update(key) {
-    var _a;
-    try {
-      if (this.dbGate && this.dbGate.gate) {
-        const value = await this.dbGate.gate.selectFromTableByPrimaryKey(
-          this.dbGate.schema,
-          key
-        );
-        this.set(key, value);
-        return value;
-      }
-    } catch (error) {
-      (_a = this.logger) == null ? void 0 : _a.error(`Error updating cache key "${String(key)}": `, error);
-      throw error;
-    }
-    return void 0;
+    const value = await this.dbGate.gate.selectFromTableByPrimaryKey(this.dbGate.schema, key);
+    this.set(key, value);
+    return value;
   }
   async getAll(keys) {
-    return Array.from(
-      (await super.bulkAsyncGet({
-        doSync: true,
-        keys
-      })).values().filter((item) => item !== void 0 && item !== null)
-    );
+    const values = await super.bulkAsyncGet({ doSync: true, keys });
+    return Array.from(values.values()).filter((item) => item !== null);
   }
   getDefaultDbListener(options) {
     return {
       channel: "cache_events",
-      callbackId: "lilypad_dbcache_" + this.dbGate.schema.tableName,
+      // The instance id keeps the callbacks of different caches on the same table apart
+      callbackId: `lilypad_dbcache_${this.dbGate.schema.tableName}_${this.id}`,
       callback: async (payload) => {
         var _a, _b, _c, _d;
-        (_a = this.logger) == null ? void 0 : _a.debug(
+        void ((_a = this.logger) == null ? void 0 : _a.debug(
           this.id,
           this.dbGate.schema.tableName,
           "LilypadDbCache handler has received payload on cache_events channel:",
           payload
-        );
+        ));
         if (typeof payload !== "string") {
           return;
         }
@@ -692,19 +732,19 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
         try {
           parsedPayload = JSON.parse(payload);
         } catch (e) {
-          (_b = this.logger) == null ? void 0 : _b.error("Error parsing cache_events payload:", e);
+          void ((_b = this.logger) == null ? void 0 : _b.error(this.id, "Error parsing cache_events payload:", e));
           return;
         }
         if (!parsedPayload.id || !parsedPayload.table) {
           return;
         }
         if (parsedPayload.table === this.dbGate.schema.tableName) {
-          (_c = this.logger) == null ? void 0 : _c.debug(
+          void ((_c = this.logger) == null ? void 0 : _c.debug(
             this.id,
             this.dbGate.schema.tableName,
             "LilypadDbCache handler is processing payload:",
             parsedPayload
-          );
+          ));
           if (!(options == null ? void 0 : options.callback) || options.automaticallyInvalidateDataBeforeCallback) {
             if (parsedPayload.op === "DELETE") {
               this.delete(String(parsedPayload.id), { setNull: true });
@@ -718,6 +758,22 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
       }
     };
   }
+  /**
+   * Disposes of the cache: stops its default database listener, removes it from the singleton
+   * registry (if it was created as a singleton) and clears it.
+   */
+  async dispose() {
+    if (this.singletonIdentifier !== void 0) {
+      removeLilypadSingletonInstance(this.singletonIdentifier);
+      this.singletonIdentifier = void 0;
+    }
+    const listenerRemoval = this.defaultDbListener ? this.dbGate.gate.removeListener(
+      this.defaultDbListener.channel,
+      this.defaultDbListener.callbackId
+    ) : void 0;
+    super.dispose();
+    await listenerRemoval;
+  }
   getItemPrimaryKeyValue(item) {
     const keyValue = item[this.dbGate.schema.primaryKey];
     if (keyValue === void 0) {
@@ -729,25 +785,31 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
     }
     return keyValue;
   }
-  isOldItemTheSameAsNewOne(newItem, oldKey) {
-    const oldItem = this.get(oldKey, false);
-    return JSON.stringify(newItem) === JSON.stringify(oldItem);
-  }
+  /**
+   * Inserts the item in the database and caches the row returned by the database.
+   * With `primaryKeyShouldAutoDetermine`, the primary key of `item` can be omitted: the cached row
+   * holds the one generated by the database.
+   *
+   * @returns The created row, or `null` if the schema's `selectSanitizationFn` discards it.
+   */
   async sqlCreate(item) {
-    const keyValue = this.getItemPrimaryKeyValue(item);
-    if (this.isOldItemTheSameAsNewOne(item, keyValue)) {
-      return;
+    const row = await this.dbGate.gate.insertToTable(this.dbGate.schema, item);
+    if (row !== null) {
+      this.set(this.getItemPrimaryKeyValue(row), row);
     }
-    await this.dbGate.gate.insertToTable(this.dbGate.schema, item);
-    this.set(keyValue, item);
+    return row;
   }
+  /**
+   * Updates the item in the database and caches the row returned by the database.
+   *
+   * @returns The updated row, or `null` if the schema's `selectSanitizationFn` discards it.
+   * @throws If no row with the item's primary key exists.
+   */
   async sqlUpdate(item) {
     const keyValue = this.getItemPrimaryKeyValue(item);
-    if (this.isOldItemTheSameAsNewOne(item, keyValue)) {
-      return;
-    }
-    await this.dbGate.gate.updateToTable(this.dbGate.schema, item);
-    this.set(keyValue, item);
+    const row = await this.dbGate.gate.updateToTable(this.dbGate.schema, item);
+    this.set(keyValue, row);
+    return row;
   }
   async sqlDelete(key) {
     await this.dbGate.gate.deleteFromTable(this.dbGate.schema, key);
@@ -762,116 +824,153 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
   
   
   
-  
   __init6() {this.listeners = /* @__PURE__ */ new Map()}
+  
   constructor(options) {;_class3.prototype.__init6.call(this);
     this.logger = options.logger;
-    this.connectionString = options.connectionString;
     this.listenerConnectionString = options.listenerConnectionString || options.connectionString;
-    this.sql = _postgres2.default.call(void 0, this.connectionString, { prepare: false });
+    this.sql = _postgres2.default.call(void 0, options.connectionString, { prepare: false });
   }
   static async create(options) {
     if (options.singleton) {
-      const cacheKey = options.singletonIdentifier;
-      return await getLilypadSingletonInstanceAsync(
-        cacheKey,
-        () => _LilypadDbGate.initializeNew(options)
-      );
+      const identifier = options.singletonIdentifier;
+      return await getLilypadSingletonInstanceAsync(identifier, async () => {
+        const instance = await _LilypadDbGate.initializeNew(options);
+        instance.singletonIdentifier = identifier;
+        return instance;
+      });
     }
     return await _LilypadDbGate.initializeNew(options);
   }
   static async initializeNew(options) {
     const instance = new _LilypadDbGate(options);
-    for (const listenOption of options.listen) {
-      await instance.addListener({
-        channel: listenOption.channel,
-        callbackId: listenOption.callbackId,
-        callback: listenOption.callback
-      });
+    try {
+      for (const listenOption of options.listen) {
+        await instance.addListener(listenOption);
+      }
+    } catch (error) {
+      await instance.close();
+      throw error;
     }
     return instance;
   }
   // CRUD OPERATIONS
+  /**
+   * Maps a database row to `T`, using the schema's `selectSanitizationFn` if provided,
+   * otherwise by copying the schema columns.
+   */
+  mapRow(schema, row) {
+    if (schema.selectSanitizationFn) {
+      return schema.selectSanitizationFn(row);
+    }
+    const typedRow = {};
+    for (const key in schema.cols) {
+      typedRow[key] = row[key];
+    }
+    return typedRow;
+  }
+  /**
+   * The columns to select. The `selectSanitizationFn` receives the whole row, since it may read
+   * columns that are not in the schema; otherwise only the schema columns are needed.
+   */
+  selectedColumns(schema) {
+    return schema.selectSanitizationFn ? this.sql`*` : this.sql(Object.keys(schema.cols));
+  }
+  /**
+   * Prepares the data of an insert/update:
+   * - applies the schema's `insertSanitizationFn`;
+   * - validates the primary key, which an update always needs to find the row;
+   * - restricts the written columns to the schema columns, so that extra properties of `data`
+   *   (e.g. coming from a request body) are never written to the table.
+   */
+  prepareWrite(schema, data, operation) {
+    let writeData = { ...data };
+    if (schema.insertSanitizationFn) {
+      writeData = { ...writeData, ...schema.insertSanitizationFn(writeData) };
+    }
+    const primaryKeyValue = writeData[schema.primaryKey];
+    const primaryKeyRequired = operation === "update" || !schema.primaryKeyShouldAutoDetermine;
+    if (primaryKeyRequired && (primaryKeyValue === void 0 || primaryKeyValue === null)) {
+      throw new Error(
+        `Primary key "${String(
+          schema.primaryKey
+        )}" is missing in the ${operation} data for table "${schema.tableName}".`
+      );
+    }
+    if (schema.primaryKeyShouldAutoDetermine) {
+      delete writeData[schema.primaryKey];
+    }
+    const columns = Object.keys(schema.cols).filter((column) => column in writeData);
+    if (columns.length === 0) {
+      throw new Error(`No columns to ${operation} for table "${schema.tableName}".`);
+    }
+    return { data: writeData, columns, primaryKeyValue };
+  }
   async selectAllFromTable(options) {
-    const results = await this.sql`SELECT * FROM ${this.sql(options.tableName)}`;
+    const results = await this.sql`
+      SELECT ${this.selectedColumns(options)} FROM ${this.sql(options.tableName)}
+    `;
     const typedResults = [];
     for (const row of results) {
-      if (options.selectSanitizationFn) {
-        const res = options.selectSanitizationFn(row);
-        if (res === null) {
-          continue;
-        }
-        typedResults.push(res);
-        continue;
+      const typedRow = this.mapRow(options, row);
+      if (typedRow !== null) {
+        typedResults.push(typedRow);
       }
-      const typedRow = {};
-      for (const key in options.cols) {
-        typedRow[key] = row[key];
-      }
-      typedResults.push(typedRow);
     }
     return typedResults;
   }
   async selectFromTableByPrimaryKey(options, primaryKeyValue) {
     const results = await this.sql`
-      SELECT * FROM ${this.sql(options.tableName)} 
+      SELECT ${this.selectedColumns(options)} FROM ${this.sql(options.tableName)}
       WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue}
     `;
     if (results.length === 0) {
       return null;
     }
-    const row = results[0];
-    if (options.selectSanitizationFn) {
-      return options.selectSanitizationFn(row);
-    }
-    const typedRow = {};
-    for (const key in options.cols) {
-      typedRow[key] = row[key];
-    }
-    return typedRow;
+    return this.mapRow(options, results[0]);
   }
+  /**
+   * Inserts a row.
+   *
+   * @returns The row as stored by the database, including generated columns such as an
+   * auto-determined primary key, or `null` if the `selectSanitizationFn` discards it.
+   */
   async insertToTable(options, data) {
-    let insertData = { ...data };
-    if (options.insertSanitizationFn) {
-      insertData = { ...insertData, ...options.insertSanitizationFn(insertData) };
-    }
-    if (options.primaryKeyShouldAutoDetermine) {
-      delete insertData[options.primaryKey];
-    } else if (insertData[options.primaryKey] === void 0 || insertData[options.primaryKey] === null) {
-      throw new Error(
-        `Primary key "${String(
-          options.primaryKey
-        )}" is missing in the insert data for table "${options.tableName}".`
-      );
-    }
-    await this.sql`
-      INSERT INTO ${this.sql(options.tableName)} ${this.sql(insertData)}
+    const { data: insertData, columns } = this.prepareWrite(options, data, "insert");
+    const results = await this.sql`
+      INSERT INTO ${this.sql(options.tableName)} ${this.sql(insertData, columns)}
+      RETURNING *
     `;
+    return this.mapRow(options, results[0]);
   }
+  /**
+   * Updates the row identified by the primary key contained in `data`.
+   *
+   * @returns The row as stored by the database, or `null` if the `selectSanitizationFn` discards it.
+   * @throws If no row with that primary key exists.
+   */
   async updateToTable(options, data) {
-    let updateData = { ...data };
-    if (options.insertSanitizationFn) {
-      updateData = { ...updateData, ...options.insertSanitizationFn(updateData) };
-    }
-    const primaryKeyValue = updateData[options.primaryKey];
-    if (options.primaryKeyShouldAutoDetermine) {
-      delete updateData[options.primaryKey];
-    } else if (updateData[options.primaryKey] === void 0 || updateData[options.primaryKey] === null) {
+    const {
+      data: updateData,
+      columns,
+      primaryKeyValue
+    } = this.prepareWrite(options, data, "update");
+    const results = await this.sql`
+      UPDATE ${this.sql(options.tableName)}
+      SET ${this.sql(updateData, columns)}
+      WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue}
+      RETURNING *
+    `;
+    if (results.count === 0) {
       throw new Error(
-        `Primary key "${String(
-          options.primaryKey
-        )}" is missing in the update data for table "${options.tableName}".`
+        `No row with primary key "${String(primaryKeyValue)}" found in table "${options.tableName}".`
       );
     }
-    await this.sql`
-      UPDATE ${this.sql(options.tableName)} 
-      SET ${this.sql(updateData)} 
-      WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue}
-    `;
+    return this.mapRow(options, results[0]);
   }
   async deleteFromTable(options, primaryKeyValue) {
     await this.sql`
-      DELETE FROM ${this.sql(options.tableName)} 
+      DELETE FROM ${this.sql(options.tableName)}
       WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue}
     `;
   }
@@ -898,84 +997,104 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
     return this.listenerConnection;
   }
   /**
-   * Initializes a listener for the specified channel.
+   * Starts listening on the specified channel.
    *
-   * This method sets up a new listener entry in the `listeners` map for the given channel,
-   * associates a callback map and a database connection, and starts listening for events
-   * on the specified channel. When an event is received, all registered listener callbacks
-   * for that channel are executed.
+   * The listener entry is registered immediately, before LISTEN is active, so that concurrent
+   * `addListener` calls for the same channel share it and await the same `ready` promise.
+   * If LISTEN fails, the entry is removed, so that a later `addListener` call retries it.
    *
    * @param channel - The name of the channel to listen on.
-   * @returns A promise that resolves when the listener has been successfully initialized.
+   * @returns The listener entry of the channel.
    */
-  async initializeListener(channel) {
+  initializeListener(channel) {
     var _a;
-    (_a = this.logger) == null ? void 0 : _a.debug(`Initializing listener for channel "${channel}".`);
-    this.listeners.set(channel, {
-      listenerCallback: /* @__PURE__ */ new Map(),
-      connection: this.getListenerConnection()
-    });
-    await this.getListenerConnection().listen(
-      channel,
-      this.executeAllListenerCallbacks.bind(this, channel)
-    );
+    void ((_a = this.logger) == null ? void 0 : _a.debug(`Initializing listener for channel "${channel}".`));
+    const listener = {
+      callbacks: /* @__PURE__ */ new Map(),
+      ready: this.getListenerConnection().listen(channel, (payload) => this.executeAllListenerCallbacks(channel, payload)).then(({ unlisten }) => unlisten).catch((error) => {
+        if (this.listeners.get(channel) === listener) {
+          this.listeners.delete(channel);
+        }
+        throw error;
+      })
+    };
+    this.listeners.set(channel, listener);
+    return listener;
   }
   /**
    * Executes all registered listener callbacks for a given channel, passing the provided payload to each callback.
    *
-   * Iterates through all callbacks associated with the specified channel and invokes them with the given payload.
-   * If any callback throws an error, it is caught and logged using the logger (if available).
+   * Both synchronous throws and rejected promises of async callbacks are caught and logged,
+   * so a failing callback can neither affect the others nor cause an unhandled rejection.
    *
    * @param channel - The name of the channel whose listener callbacks should be executed.
    * @param payload - The data to pass to each listener callback.
    */
   executeAllListenerCallbacks(channel, payload) {
-    var _a;
     const listener = this.listeners.get(channel);
-    if (listener) {
-      for (const cb of listener.listenerCallback.values()) {
-        try {
-          cb(payload);
-        } catch (error) {
-          (_a = this.logger) == null ? void 0 : _a.error(`Error in listener callback for channel "${channel}":`, error);
-        }
-      }
+    if (!listener) {
+      return;
+    }
+    for (const [callbackId, callback] of listener.callbacks) {
+      Promise.resolve().then(() => callback(payload)).catch((error) => {
+        var _a;
+        void ((_a = this.logger) == null ? void 0 : _a.error(
+          `Error in listener callback "${callbackId}" for channel "${channel}":`,
+          error
+        ));
+      });
     }
   }
   /**
    * Adds a listener callback for a specified channel.
    *
    * If the channel does not already have a listener, it initializes one.
-   * The callback is associated with the provided `callbackId` and stored for the channel.
-   * Logs debug information about the addition and the current number of callbacks for the channel.
+   * The callback is associated with the provided `callbackId`: adding a callback with an existing
+   * `callbackId` on the same channel replaces the previous one.
    *
    * @param params - An object containing:
    *   @param params.channel - The name of the channel to listen to.
    *   @param params.callbackId - A unique identifier for the callback.
    *   @param params.callback - The callback function to be invoked for the channel.
    *
-   * @returns A promise that resolves when the listener has been added.
+   * @returns A promise that resolves once LISTEN is active on the channel.
+   * @throws If LISTEN fails; in that case the callback is not registered.
    */
   async addListener({ channel, callbackId, callback }) {
     var _a, _b;
-    (_a = this.logger) == null ? void 0 : _a.debug(
+    void ((_a = this.logger) == null ? void 0 : _a.debug(
       `Adding listener for channel "${channel}" with callback ID "${callbackId}".`
-    );
-    if (!this.listeners.has(channel)) {
-      await this.initializeListener(channel);
-    }
+    ));
+    const listener = _nullishCoalesce(this.listeners.get(channel), () => ( this.initializeListener(channel)));
+    listener.callbacks.set(callbackId, callback);
+    await listener.ready;
+    void ((_b = this.logger) == null ? void 0 : _b.debug(
+      `Listener for channel "${channel}" has ${listener.callbacks.size} callbacks.`
+    ));
+  }
+  /**
+   * Removes a listener callback. When the channel has no callbacks left, it stops listening to it.
+   *
+   * @returns `true` if the callback was registered.
+   */
+  async removeListener(channel, callbackId) {
     const listener = this.listeners.get(channel);
-    if (listener) {
-      listener.listenerCallback.set(callbackId, callback);
+    if (!listener || !listener.callbacks.delete(callbackId)) {
+      return false;
     }
-    (_b = this.logger) == null ? void 0 : _b.debug(
-      `Listener for channel "${channel}" has ${listener ? listener.listenerCallback.size : -1} callbacks.`
-    );
+    if (listener.callbacks.size === 0) {
+      this.listeners.delete(channel);
+      const unlisten = await listener.ready;
+      await unlisten();
+    }
+    return true;
   }
   async close() {
     var _a;
-    for (const [channel] of this.listeners) {
-      this.listeners.delete(channel);
+    this.listeners.clear();
+    if (this.singletonIdentifier !== void 0) {
+      removeLilypadSingletonInstance(this.singletonIdentifier);
+      this.singletonIdentifier = void 0;
     }
     await ((_a = this.listenerConnection) == null ? void 0 : _a.end());
     await this.sql.end();
@@ -983,6 +1102,7 @@ var LilypadDbGate = (_class3 = class _LilypadDbGate {
 }, _class3);
 
 // src/logger/LilypadLogger.ts
+var _util = require('util');
 var LilypadLogger = (_class4 = class _LilypadLogger {
   __init7() {this.components = {}}
   // Optional logger name
@@ -1020,9 +1140,9 @@ var LilypadLogger = (_class4 = class _LilypadLogger {
     return new _LilypadLogger(options);
   }
   constructor(options) {;_class4.prototype.__init7.call(this);
-    const reservedKeys = /* @__PURE__ */ new Set(["components", "register", "__name"]);
+    const reservedKeys = /* @__PURE__ */ new Set(["components", "register", "__name", "_name"]);
     for (const key of Object.keys(options.components)) {
-      if (reservedKeys.has(key)) {
+      if (reservedKeys.has(key) || key in this) {
         throw new Error(`Logger type "${key}" is reserved and cannot be used as a log channel.`);
       }
     }
@@ -1032,19 +1152,8 @@ var LilypadLogger = (_class4 = class _LilypadLogger {
     }
     for (const type of Object.keys(this.components)) {
       const logFn = async (...message) => {
-        let stringMessage = "";
-        for (let i = 0; i < message.length; i++) {
-          if (i > 0) {
-            stringMessage += " ";
-          }
-          const msgPart = message[i];
-          if (typeof msgPart === "string") {
-            stringMessage += msgPart;
-          } else {
-            stringMessage += JSON.stringify(msgPart);
-          }
-        }
         try {
+          const stringMessage = message.map(formatMessagePart).join(" ");
           const promises = [];
           for (const component of this.components[type]) {
             promises.push(
@@ -1070,11 +1179,19 @@ var LilypadLogger = (_class4 = class _LilypadLogger {
    */
   register(newComponents) {
     for (const type of Object.keys(newComponents)) {
+      if (!this.components[type]) {
+        throw new Error(
+          `Logger type "${type}" was not defined when the logger was created and cannot be registered.`
+        );
+      }
       this.components[type].push(..._nullishCoalesce(newComponents[type], () => ( [])));
     }
     return this;
   }
 }, _class4);
+function formatMessagePart(part) {
+  return typeof part === "string" ? part : _util.inspect.call(void 0, part, { depth: 4, breakLength: Infinity });
+}
 function createLogger(options) {
   return LilypadLogger.create(options);
 }
@@ -1089,26 +1206,35 @@ var LilypadLoggerComponent = class {
     let formatted = `${this.getTimestamp()} - `;
     if ((_a = options == null ? void 0 : options.logger) == null ? void 0 : _a.__name) {
       formatted += `[${options.logger.__name}] `;
-    } else if (options == null ? void 0 : options.name) {
-      formatted += `[${options.name}] `;
     }
     formatted += `[${type.toUpperCase()}]: ${message}`;
     return formatted;
   }
   async output(type, message, options) {
     const formattedMessage = this.formatMessage(type, message, options);
-    await this.send(formattedMessage);
+    await this.send(formattedMessage, type);
   }
 };
 
 // src/logger/components/ConsoleLogger.ts
 var LilypadConsoleLogger = class extends LilypadLoggerComponent {
-  async send(message) {
-    console.log(message);
+  async send(message, type) {
+    switch (type.toLowerCase()) {
+      case "error":
+        console.error(message);
+        break;
+      case "warn":
+        console.warn(message);
+        break;
+      default:
+        console.log(message);
+    }
   }
 };
 
 // src/logger/components/DiscordLogger.ts
+var DISCORD_MAX_CONTENT_LENGTH = 2e3;
+var DISCORD_REQUEST_TIMEOUT = 5e3;
 var LilypadDiscordLogger = class extends LilypadLoggerComponent {
   
   constructor(webhookUrl) {
@@ -1117,15 +1243,22 @@ var LilypadDiscordLogger = class extends LilypadLoggerComponent {
   }
   async send(message) {
     const payload = {
-      content: message
+      content: message.slice(0, DISCORD_MAX_CONTENT_LENGTH),
+      allowed_mentions: { parse: [] }
     };
-    await fetch(this.webhookUrl, {
+    const response = await fetch(this.webhookUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(DISCORD_REQUEST_TIMEOUT)
     });
+    if (!response.ok) {
+      throw new Error(
+        `Discord webhook request failed with status ${response.status} ${response.statusText}`
+      );
+    }
   }
 };
 
@@ -1138,9 +1271,6 @@ var LilypadSerializer = class {
     return input.map((item) => {
       const packedItem = {};
       Object.keys(this.options.serialization).forEach((fromKey) => {
-        if (!this.options.serialization[fromKey]) {
-          return;
-        }
         const isEqual = _nullishCoalesce(this.options.serialization[fromKey].equality, () => ( ((v, d) => v === d)));
         if (isEqual(item[fromKey], this.options.serialization[fromKey].default)) {
           return;
@@ -1159,12 +1289,15 @@ var LilypadSerializer = class {
     return input.map((item) => {
       const unpackedItem = {};
       Object.keys(this.options.serialization).forEach((fromKey) => {
-        unpackedItem[fromKey] = _nullishCoalesce(this.options.serialization[fromKey].deserialize(item), () => ( this.options.serialization[fromKey].default));
+        unpackedItem[fromKey] = _nullishCoalesce(this.options.serialization[fromKey].deserialize(item), () => ( cloneDefault(this.options.serialization[fromKey].default)));
       });
       return unpackedItem;
     });
   }
 };
+function cloneDefault(value) {
+  return typeof value === "object" && value !== null ? structuredClone(value) : value;
+}
 
 
 
@@ -1177,5 +1310,7 @@ var LilypadSerializer = class {
 
 
 
-exports.LilypadCache = LilypadCache_default; exports.LilypadConsoleLogger = LilypadConsoleLogger; exports.LilypadDbCache = LilypadDbCache; exports.LilypadDbGate = LilypadDbGate; exports.LilypadDiscordLogger = LilypadDiscordLogger; exports.LilypadFlowControl = LilypadFlowControl; exports.LilypadLogger = LilypadLogger; exports.LilypadSerializer = LilypadSerializer; exports.createLogger = createLogger; exports.getLilypadSingletonInstance = getLilypadSingletonInstance; exports.getLilypadSingletonInstanceAsync = getLilypadSingletonInstanceAsync;
+
+
+exports.LilypadCache = LilypadCache_default; exports.LilypadConsoleLogger = LilypadConsoleLogger; exports.LilypadDbCache = LilypadDbCache; exports.LilypadDbGate = LilypadDbGate; exports.LilypadDiscordLogger = LilypadDiscordLogger; exports.LilypadFlowControl = LilypadFlowControl; exports.LilypadLogger = LilypadLogger; exports.LilypadLoggerComponent = LilypadLoggerComponent; exports.LilypadSerializer = LilypadSerializer; exports.createLogger = createLogger; exports.getLilypadSingletonInstance = getLilypadSingletonInstance; exports.getLilypadSingletonInstanceAsync = getLilypadSingletonInstanceAsync; exports.removeLilypadSingletonInstance = removeLilypadSingletonInstance;
 //# sourceMappingURL=index.js.map

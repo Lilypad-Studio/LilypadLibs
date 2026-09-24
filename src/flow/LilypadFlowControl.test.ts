@@ -1,11 +1,28 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { LilypadFlowControl } from './LilypadFlowControl';
+
+/**
+ * Runs `run` with fake timers, advancing them until every pending timer (timeouts, backoffs) has fired.
+ * Returns the settled promise, so the caller can assert on its result or rejection.
+ */
+async function withFakeTimers<T>(run: () => Promise<T>): Promise<T> {
+  vi.useFakeTimers();
+  const promise = run();
+  // Avoid an unhandled rejection while the timers are advanced; the caller still gets the rejection
+  promise.catch(() => {});
+  await vi.runAllTimersAsync();
+  return promise;
+}
 
 describe('LilypadFlowControl', () => {
   let flowControl: LilypadFlowControl<string>;
 
   beforeEach(() => {
     flowControl = new LilypadFlowControl<string>();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   describe('constructor', () => {
@@ -34,10 +51,36 @@ describe('LilypadFlowControl', () => {
     it('should throw timeout error when execution exceeds timeout', async () => {
       flowControl = new LilypadFlowControl<string>({ timeout: 100 });
       await expect(
-        flowControl.executeWithTimeout(
-          () => new Promise((resolve) => setTimeout(() => resolve('delayed'), 500))
+        withFakeTimers(() =>
+          flowControl.executeWithTimeout(
+            () => new Promise((resolve) => setTimeout(() => resolve('delayed'), 500))
+          )
         )
       ).rejects.toThrow('Operation timed out');
+    });
+
+    it('should abort the signal passed to the function on timeout', async () => {
+      flowControl = new LilypadFlowControl<string>({ timeout: 100 });
+      let receivedSignal: AbortSignal | undefined;
+      await expect(
+        withFakeTimers(() =>
+          flowControl.executeWithTimeout((signal) => {
+            receivedSignal = signal;
+            return new Promise((resolve) => setTimeout(() => resolve('delayed'), 500));
+          })
+        )
+      ).rejects.toThrow('Operation timed out');
+      expect(receivedSignal?.aborted).toBe(true);
+    });
+
+    it('should not abort the signal when execution completes in time', async () => {
+      flowControl = new LilypadFlowControl<string>({ timeout: 1000 });
+      let receivedSignal: AbortSignal | undefined;
+      await flowControl.executeWithTimeout((signal) => {
+        receivedSignal = signal;
+        return Promise.resolve('success');
+      });
+      expect(receivedSignal?.aborted).toBe(false);
     });
 
     it('should not timeout when no timeout is configured', async () => {
@@ -59,15 +102,17 @@ describe('LilypadFlowControl', () => {
     it('should retry on failure and return result', async () => {
       flowControl = new LilypadFlowControl<string>({ retries: 3 });
       let attempts = 0;
-      const result = await flowControl.executeWithRetries({
-        executionFn: () => {
-          attempts++;
-          if (attempts < 2) {
-            return Promise.reject(new Error('fail'));
-          }
-          return Promise.resolve('success');
-        },
-      });
+      const result = await withFakeTimers(() =>
+        flowControl.executeWithRetries({
+          executionFn: () => {
+            attempts++;
+            if (attempts < 2) {
+              return Promise.reject(new Error('fail'));
+            }
+            return Promise.resolve('success');
+          },
+        })
+      );
       expect(result).toBe('success');
       expect(attempts).toBe(2);
     });
@@ -75,20 +120,24 @@ describe('LilypadFlowControl', () => {
     it('should throw error after exhausting retries', async () => {
       flowControl = new LilypadFlowControl<string>({ retries: 2 });
       await expect(
-        flowControl.executeWithRetries({
-          executionFn: () => Promise.reject(new Error('fail')),
-          errorFn: undefined,
-          backOffTime: () => 20,
-        })
+        withFakeTimers(() =>
+          flowControl.executeWithRetries({
+            executionFn: () => Promise.reject(new Error('fail')),
+            errorFn: undefined,
+            backOffTime: () => 20,
+          })
+        )
       ).rejects.toThrow('fail');
     });
 
     it('should use errorFn when provided and retries exhausted', async () => {
       flowControl = new LilypadFlowControl<string>({ retries: 1 });
-      const result = await flowControl.executeWithRetries({
-        executionFn: () => Promise.reject(new Error('fail')),
-        errorFn: () => 'fallback',
-      });
+      const result = await withFakeTimers(() =>
+        flowControl.executeWithRetries({
+          executionFn: () => Promise.reject(new Error('fail')),
+          errorFn: () => 'fallback',
+        })
+      );
       expect(result).toBe('fallback');
     });
 
@@ -97,17 +146,19 @@ describe('LilypadFlowControl', () => {
       const backoffSpy = vi.fn((attempt) => attempt * 10);
       let attempts = 0;
 
-      await flowControl.executeWithRetries({
-        executionFn: () => {
-          attempts++;
-          if (attempts < 3) {
-            return Promise.reject(new Error('fail'));
-          }
-          return Promise.resolve('success');
-        },
-        errorFn: undefined,
-        backOffTime: backoffSpy,
-      });
+      await withFakeTimers(() =>
+        flowControl.executeWithRetries({
+          executionFn: () => {
+            attempts++;
+            if (attempts < 3) {
+              return Promise.reject(new Error('fail'));
+            }
+            return Promise.resolve('success');
+          },
+          errorFn: undefined,
+          backOffTime: backoffSpy,
+        })
+      );
 
       expect(backoffSpy).toHaveBeenCalled();
     });
@@ -133,9 +184,10 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should allow execution after rate limit expires', async () => {
+      vi.useFakeTimers();
       flowControl = new LilypadFlowControl<string>({ rate: 100 });
       await flowControl.rateLimit('user1', 'func1');
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      vi.advanceTimersByTime(150);
       await expect(flowControl.rateLimit('user1', 'func1')).resolves.toBeUndefined();
     });
 
@@ -143,6 +195,26 @@ describe('LilypadFlowControl', () => {
       flowControl = new LilypadFlowControl<string>({ rate: 1000 });
       await flowControl.rateLimit('user1', 'func1');
       await expect(flowControl.rateLimit('user2', 'func1')).resolves.toBeUndefined();
+    });
+
+    it('should prune expired rate limit entries once the map grows large', async () => {
+      vi.useFakeTimers();
+      flowControl = new LilypadFlowControl<string>({ rate: 100 });
+      for (let i = 0; i < 1000; i++) {
+        await flowControl.rateLimit(`user${i}`, 'func1');
+      }
+      vi.advanceTimersByTime(150);
+      await flowControl.rateLimit('newUser', 'func1');
+      expect(flowControl['rateMap'].size).toBe(1);
+    });
+
+    it('should not prune entries that are still limiting', async () => {
+      flowControl = new LilypadFlowControl<string>({ rate: 60000 });
+      for (let i = 0; i <= 1000; i++) {
+        await flowControl.rateLimit(`user${i}`, 'func1');
+      }
+      expect(flowControl['rateMap'].size).toBe(1001);
+      await expect(flowControl.rateLimit('user0', 'func1')).rejects.toThrow('Rate limit exceeded');
     });
   });
 
@@ -172,6 +244,28 @@ describe('LilypadFlowControl', () => {
       ).rejects.toThrow('Rate limit exceeded');
     });
 
+    it('should not rate limit calls that join an in-flight execution', async () => {
+      flowControl = new LilypadFlowControl<string>({ rate: 1000 });
+      const fnSpy = vi.fn(() => Promise.resolve('success'));
+
+      const [result1, result2] = await Promise.all([
+        flowControl.executeFn({
+          functionIdentifier: 'func1',
+          consumerIdentifier: 'user1',
+          fn: fnSpy,
+        }),
+        flowControl.executeFn({
+          functionIdentifier: 'func1',
+          consumerIdentifier: 'user1',
+          fn: fnSpy,
+        }),
+      ]);
+
+      expect(result1).toBe('success');
+      expect(result2).toBe('success');
+      expect(fnSpy).toHaveBeenCalledOnce();
+    });
+
     it('should implement single-flight deduplication', async () => {
       const fnSpy = vi.fn(() => Promise.resolve('success'));
       flowControl = new LilypadFlowControl<string>();
@@ -198,11 +292,13 @@ describe('LilypadFlowControl', () => {
     it('should apply timeout', async () => {
       flowControl = new LilypadFlowControl<string>({ timeout: 100 });
       await expect(
-        flowControl.executeFn({
-          functionIdentifier: 'func1',
-          consumerIdentifier: 'user1',
-          fn: () => new Promise((resolve) => setTimeout(() => resolve('delayed'), 500)),
-        })
+        withFakeTimers(() =>
+          flowControl.executeFn({
+            functionIdentifier: 'func1',
+            consumerIdentifier: 'user1',
+            fn: () => new Promise((resolve) => setTimeout(() => resolve('delayed'), 500)),
+          })
+        )
       ).rejects.toThrow('Operation timed out');
     });
 
@@ -210,17 +306,19 @@ describe('LilypadFlowControl', () => {
       flowControl = new LilypadFlowControl<string>({ retries: 3 });
       let attempts = 0;
 
-      const result = await flowControl.executeFn({
-        functionIdentifier: 'func1',
-        consumerIdentifier: 'user1',
-        fn: () => {
-          attempts++;
-          if (attempts < 2) {
-            return Promise.reject(new Error('fail'));
-          }
-          return Promise.resolve('success');
-        },
-      });
+      const result = await withFakeTimers(() =>
+        flowControl.executeFn({
+          functionIdentifier: 'func1',
+          consumerIdentifier: 'user1',
+          fn: () => {
+            attempts++;
+            if (attempts < 2) {
+              return Promise.reject(new Error('fail'));
+            }
+            return Promise.resolve('success');
+          },
+        })
+      );
 
       expect(result).toBe('success');
       expect(attempts).toBe(2);
@@ -228,6 +326,19 @@ describe('LilypadFlowControl', () => {
 
     it('should use errorFn when provided', async () => {
       flowControl = new LilypadFlowControl<string>({ retries: 1 });
+      const result = await withFakeTimers(() =>
+        flowControl.executeFn({
+          functionIdentifier: 'func1',
+          consumerIdentifier: 'user1',
+          fn: () => Promise.reject(new Error('fail')),
+          errorFn: () => 'fallback',
+        })
+      );
+
+      expect(result).toBe('fallback');
+    });
+
+    it('should use errorFn without retries', async () => {
       const result = await flowControl.executeFn({
         functionIdentifier: 'func1',
         consumerIdentifier: 'user1',
@@ -330,17 +441,19 @@ describe('LilypadFlowControl', () => {
       flowControl = new LilypadFlowControl<string>({ timeout: 200, retries: 2 });
       let attempts = 0;
 
-      const result = await flowControl.executeFn({
-        functionIdentifier: 'func1',
-        consumerIdentifier: 'user1',
-        fn: () => {
-          attempts++;
-          if (attempts < 2) {
-            return Promise.reject(new Error('fail'));
-          }
-          return Promise.resolve('success');
-        },
-      });
+      const result = await withFakeTimers(() =>
+        flowControl.executeFn({
+          functionIdentifier: 'func1',
+          consumerIdentifier: 'user1',
+          fn: () => {
+            attempts++;
+            if (attempts < 2) {
+              return Promise.reject(new Error('fail'));
+            }
+            return Promise.resolve('success');
+          },
+        })
+      );
 
       expect(result).toBe('success');
       expect(attempts).toBe(2);
@@ -350,25 +463,46 @@ describe('LilypadFlowControl', () => {
       flowControl = new LilypadFlowControl<string>({ timeout: 100, retries: 3 });
 
       await expect(
-        flowControl.executeFn({
-          functionIdentifier: 'func1',
-          consumerIdentifier: 'user1',
-          fn: () => new Promise((resolve) => setTimeout(() => resolve('delayed'), 500)),
-        })
+        withFakeTimers(() =>
+          flowControl.executeFn({
+            functionIdentifier: 'func1',
+            consumerIdentifier: 'user1',
+            fn: () => new Promise((resolve) => setTimeout(() => resolve('delayed'), 500)),
+          })
+        )
       ).rejects.toThrow('Operation timed out');
     });
 
-    it('should handle errorFn returning undefined by throwing', async () => {
+    it('should propagate the error when errorFn rethrows it', async () => {
       flowControl = new LilypadFlowControl<string>({ retries: 1 });
 
       await expect(
-        flowControl.executeFn({
+        withFakeTimers(() =>
+          flowControl.executeFn({
+            functionIdentifier: 'func1',
+            consumerIdentifier: 'user1',
+            fn: () => Promise.reject(new Error('fail')),
+            errorFn: (error) => {
+              throw error;
+            },
+          })
+        )
+      ).rejects.toThrow('fail');
+    });
+
+    it('should resolve with undefined when errorFn handles the error of a void execution', async () => {
+      const voidFlowControl = new LilypadFlowControl<void>();
+      const errorFn = vi.fn();
+
+      await expect(
+        voidFlowControl.executeFn({
           functionIdentifier: 'func1',
           consumerIdentifier: 'user1',
           fn: () => Promise.reject(new Error('fail')),
-          errorFn: () => undefined,
+          errorFn,
         })
-      ).rejects.toThrow('fail');
+      ).resolves.toBeUndefined();
+      expect(errorFn).toHaveBeenCalledWith(expect.any(Error));
     });
 
     it('should allow different consumers for different function identifier', async () => {
@@ -397,15 +531,17 @@ describe('LilypadFlowControl', () => {
       flowControl = new LilypadFlowControl<string>({ retries: 2 });
       let attempts = 0;
 
-      const result = await flowControl.executeWithRetries({
-        executionFn: () => {
-          attempts++;
-          if (attempts < 2) {
-            return Promise.reject(new Error('fail'));
-          }
-          return Promise.resolve('success');
-        },
-      });
+      const result = await withFakeTimers(() =>
+        flowControl.executeWithRetries({
+          executionFn: () => {
+            attempts++;
+            if (attempts < 2) {
+              return Promise.reject(new Error('fail'));
+            }
+            return Promise.resolve('success');
+          },
+        })
+      );
 
       expect(result).toBe('success');
       expect(attempts).toBe(2);
@@ -415,16 +551,18 @@ describe('LilypadFlowControl', () => {
       flowControl = new LilypadFlowControl<string>({ retries: 5 });
       let attempts = 0;
 
-      const result = await flowControl.executeWithRetries({
-        executionFn: () => {
-          attempts++;
-          if (attempts < 2) {
-            return Promise.reject(new Error('fail'));
-          }
-          return Promise.resolve('success');
-        },
-        retries: 1,
-      });
+      const result = await withFakeTimers(() =>
+        flowControl.executeWithRetries({
+          executionFn: () => {
+            attempts++;
+            if (attempts < 2) {
+              return Promise.reject(new Error('fail'));
+            }
+            return Promise.resolve('success');
+          },
+          retries: 1,
+        })
+      );
 
       expect(result).toBe('success');
       expect(attempts).toBe(2);
@@ -459,18 +597,20 @@ describe('LilypadFlowControl', () => {
       const backoffSpy = vi.fn((_attempt) => 50);
       let attempts = 0;
 
-      const result = await flowControl.executeFn({
-        functionIdentifier: 'func1',
-        consumerIdentifier: 'user1',
-        fn: () => {
-          attempts++;
-          if (attempts < 2) {
-            return Promise.reject(new Error('fail'));
-          }
-          return Promise.resolve('success');
-        },
-        backOffTime: backoffSpy,
-      });
+      const result = await withFakeTimers(() =>
+        flowControl.executeFn({
+          functionIdentifier: 'func1',
+          consumerIdentifier: 'user1',
+          fn: () => {
+            attempts++;
+            if (attempts < 2) {
+              return Promise.reject(new Error('fail'));
+            }
+            return Promise.resolve('success');
+          },
+          backOffTime: backoffSpy,
+        })
+      );
 
       expect(result).toBe('success');
       expect(backoffSpy).toHaveBeenCalled();

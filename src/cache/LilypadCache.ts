@@ -170,17 +170,17 @@ class LilypadCache<K extends string, V> {
     this.defaultTtl = ttl;
     this.defaultBulkSyncTtl = options.defaultBulkSyncTtl ?? ttl;
     this.bulkSyncFn = options.bulkSyncFn;
-    this.defaultErrorTtl = options.defaultErrorTtl ? options.defaultErrorTtl : 5 * 60 * 1000; // 5 minutes;
+    this.defaultErrorTtl = options.defaultErrorTtl ?? 5 * 60 * 1000; // 5 minutes;
     this.logger = options.logger;
 
     this.flowControl = new LilypadFlowControl<LilypadCachedValueType<V>>({
       logger: this.logger,
-      timeout: options.flowControlTimeout || 5000,
+      timeout: options.flowControlTimeout ?? 5000,
     });
 
     this.bulkSyncFlowControl = new LilypadFlowControl<void>({
       logger: this.logger,
-      timeout: options.flowControlTimeout || 30000,
+      timeout: options.flowControlTimeout ?? 30000,
     });
 
     if (options.autoCleanupInterval) {
@@ -194,7 +194,7 @@ class LilypadCache<K extends string, V> {
       }
     }
 
-    this.logger?.debug(this.id, `LilypadCache initialized`);
+    void this.logger?.debug(this.id, `LilypadCache initialized`);
   }
 
   /**
@@ -206,27 +206,42 @@ class LilypadCache<K extends string, V> {
   private createExpirationTime(ttl?: number): number {
     return Date.now() + (ttl ?? this.defaultTtl);
   }
+
+  /**
+   * Normalizes a key to the string form used by the store.
+   * Keys can be non-strings at runtime (e.g. numeric primary keys cast to `K`), so every access
+   * to the store or to the protected keys must go through this method.
+   */
+  protected normalizeKey(key: K): K {
+    return String(key) as K;
+  }
+
   /**
    * Stores a value in the cache associated with the specified key, optionally setting a time-to-live (TTL) for expiration.
    *
    * @param key - The key to associate with the cached value.
    * @param value - The value to store in the cache.
-   * @param ttl - Optional. The time-to-live in milliseconds. If not provided, the value will not expire.
+   * @param ttl - Optional. The time-to-live in milliseconds. If not provided, the cache's default TTL is used.
    */
   set(key: K, value: LilypadCachedValueType<V>, ttl?: number) {
-    this.store.set(String(key) as K, { value, expirationTime: this.createExpirationTime(ttl) });
+    this.store.set(this.normalizeKey(key), {
+      value,
+      expirationTime: this.createExpirationTime(ttl),
+    });
   }
 
   /**
    * Retrieves a value from the cache associated with the specified key.
    * If the cached value has expired or does not exist, it returns `undefined`.
-   * If the value is expired, it is also removed from the cache, as a side effect.
    *
    * @param key - The key associated with the cached value.
+   * @param removeOld - If true, an expired value is also removed from the cache, as a side effect.
+   * Defaults to false, so that the old value stays available as a fallback for `getOrSet` with
+   * `returnOldOnError`; expired entries are removed by `purgeExpired` / `autoCleanupInterval`.
    * @returns The cached value if it exists and is not expired; otherwise, `undefined`.
    */
-  get(key: K, removeOld: boolean = true): LilypadCachedValueType<V> | undefined {
-    const cacheValue = this.store.get(String(key) as K);
+  get(key: K, removeOld: boolean = false): LilypadCachedValueType<V> | undefined {
+    const cacheValue = this.store.get(this.normalizeKey(key));
     if (cacheValue && !isStale(cacheValue)) {
       return cacheValue.value;
     } else {
@@ -247,7 +262,7 @@ class LilypadCache<K extends string, V> {
    * - If the value does not exist, returns an object with `type: 'miss'`.
    */
   getComprehensive(key: K): LilypadCacheValueRetrieval<V> {
-    const cacheValue = this.store.get(String(key) as K);
+    const cacheValue = this.store.get(this.normalizeKey(key));
     if (cacheValue && !isStale(cacheValue)) {
       return { ...cacheValue, type: 'hit' };
     } else {
@@ -281,7 +296,7 @@ class LilypadCache<K extends string, V> {
     key: K,
     fetched: LilypadCacheValueRetrieval<V>
   ): LilypadCachedValueType<V> {
-    this.logger?.error(this.id, `Error fetching cache key "${String(key)}": `, error);
+    void this.logger?.error(this.id, `Error fetching cache key "${String(key)}": `, error);
 
     let valueToReturn: LilypadCachedValueType<V> | undefined = undefined;
     const errorFnRes = options.errorFn?.({ key, error, options });
@@ -333,9 +348,13 @@ class LilypadCache<K extends string, V> {
       functionIdentifier: `LilypadCache-getOrSet-${String(key)}`,
       consumerIdentifier: '',
       errorFn: (error) => this.errorReturn(error, options, key, fetched),
-      fn: async () => {
+      fn: async (signal) => {
         const value = await valueFn();
-        this.set(key, value, options.ttl);
+        // After a timeout the caller already got an error/fallback, and a newer value may have
+        // been cached in the meantime: a late result must not overwrite it.
+        if (!signal.aborted) {
+          this.set(key, value, options.ttl);
+        }
         return value;
       },
     });
@@ -346,17 +365,18 @@ class LilypadCache<K extends string, V> {
    *
    * This method uses flow control to manage the execution of the bulk sync operation.
    * If a `syncFn` is provided, it will be used to fetch key-value pairs to synchronize.
-   * Any errors encountered during the sync process are logged.
+   * Errors encountered during the sync process are logged and not rethrown: the cache keeps its
+   * current content, and the next call retries the sync.
    *
    * @param syncFn - An optional asynchronous function that returns an array of key-value pairs to be synchronized.
-   * @returns A promise that resolves when the bulk sync operation is complete.
+   * @returns A promise that resolves when the bulk sync operation is complete (or has failed).
    */
   async bulkSync(syncFn?: () => Promise<[K, LilypadCachedValueType<V>][]>): Promise<void> {
     await this.bulkSyncFlowControl.executeFn({
       functionIdentifier: `LilypadCache-bulkSync`,
       consumerIdentifier: '',
       errorFn: (error) => {
-        this.logger?.error(this.id, 'Error during bulk sync: ', error);
+        void this.logger?.error(this.id, 'Error during bulk sync: ', error);
       },
       fn: async () => this._bulkSync(syncFn),
     });
@@ -367,15 +387,16 @@ class LilypadCache<K extends string, V> {
     }
     const data = (await syncFn?.()) ?? (await this.bulkSyncFn?.());
     if (!data) {
-      this.logger?.warn(this.id, 'Bulk sync function returned no data');
+      void this.logger?.warn(this.id, 'Bulk sync function returned no data');
       return;
     }
-    const expirationTime = this.createExpirationTime();
     for (const key of this.store.keys()) {
-      this.delete(key) || this.invalidate(key, { invalidateBulkSync: false });
+      if (!this.delete(key)) {
+        this.expire(key); // protected keys are kept, but marked as stale
+      }
     }
-    for (const [key, value] of data ?? []) {
-      this.set(key, value, expirationTime);
+    for (const [key, value] of data) {
+      this.set(key, value);
     }
     this.bulkSyncExpirationTime = this.createExpirationTime(this.defaultBulkSyncTtl);
   }
@@ -410,17 +431,19 @@ class LilypadCache<K extends string, V> {
    * @param options.syncFn - An asynchronous function that returns an array of key-value pairs to sync the cache.
    * @returns A promise that resolves to a map of keys to their corresponding values.
    */
-  async bulkAsyncGet(
-    options: {
-      keys?: K[];
-      doSync?: boolean;
-      syncFn?: () => Promise<[K, LilypadCachedValueType<V>][]>;
-    } = { keys: undefined, doSync: true, syncFn: undefined }
-  ): Promise<Map<K, LilypadCachedValueType<V>>> {
-    if (options.doSync) {
-      await this.bulkSync(options.syncFn);
+  async bulkAsyncGet({
+    keys,
+    doSync = true,
+    syncFn,
+  }: {
+    keys?: K[];
+    doSync?: boolean;
+    syncFn?: () => Promise<[K, LilypadCachedValueType<V>][]>;
+  } = {}): Promise<Map<K, LilypadCachedValueType<V>>> {
+    if (doSync) {
+      await this.bulkSync(syncFn);
     }
-    return this.bulkGet({ keys: options.keys });
+    return this.bulkGet({ keys });
   }
 
   /**
@@ -448,7 +471,7 @@ class LilypadCache<K extends string, V> {
    */
   addProtectedKeys(keys: K[]) {
     for (const key of keys) {
-      this.protectedKeys.add(key);
+      this.protectedKeys.add(this.normalizeKey(key));
     }
     return this;
   }
@@ -460,7 +483,7 @@ class LilypadCache<K extends string, V> {
    */
   removeProtectedKeys(keys: K[]) {
     for (const key of keys) {
-      this.protectedKeys.delete(key);
+      this.protectedKeys.delete(this.normalizeKey(key));
     }
     return this;
   }
@@ -473,21 +496,25 @@ class LilypadCache<K extends string, V> {
    *
    * @param key - The key of the cache entry to invalidate.
    * @param options - Optional settings for invalidation.
-   * @param options.invalidateBulkSync - If true, forces a bulk sync on the next bulkSync call.
+   * @param options.invalidateBulkSync - If true (default), forces a bulk sync on the next bulkSync call.
    */
-  invalidate(
-    key: K,
-    options: { invalidateBulkSync?: boolean; tryToUpdate?: boolean } = {
-      invalidateBulkSync: true,
-      tryToUpdate: false,
+  invalidate(key: K, { invalidateBulkSync = true }: { invalidateBulkSync?: boolean } = {}) {
+    this.expire(key);
+    if (invalidateBulkSync) {
+      this.bulkSyncExpirationTime = 0; // force bulk sync on next bulkSync call
     }
-  ) {
+  }
+
+  /**
+   * Marks a valid cache entry as expired, keeping its value as a fallback for `returnOldOnError`.
+   * Unlike `invalidate`, it is never overridden by subclasses, so it is always synchronous.
+   *
+   * @param key - The key of the cache entry to expire.
+   */
+  protected expire(key: K) {
     const comprehensive = this.getComprehensive(key);
     if (comprehensive.type === 'hit') {
       this.set(key, comprehensive.value, -1); // sets to expired
-    }
-    if (options.invalidateBulkSync) {
-      this.bulkSyncExpirationTime = 0; // force bulk sync on next bulkSync call
     }
   }
 
@@ -502,14 +529,15 @@ class LilypadCache<K extends string, V> {
    * @param options.setNull - If true, sets the value to null instead of deleting the entry.
    */
   delete(key: K, options: { force?: boolean; setNull?: boolean } = {}) {
-    if (this.protectedKeys.has(key) && !options.force) {
+    const normalizedKey = this.normalizeKey(key);
+    if (this.protectedKeys.has(normalizedKey) && !options.force) {
       return false;
     }
     if (options.setNull) {
-      this.set(key, null);
+      this.set(normalizedKey, null);
       return true;
     }
-    this.store.delete(String(key) as K);
+    this.store.delete(normalizedKey);
     return true;
   }
 

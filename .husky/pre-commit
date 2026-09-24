@@ -1,4 +1,7 @@
-npm test
-npm run lint
+npm test -- --run
+npm run typecheck
+npx eslint . --max-warnings 0
 npm run build
-git add .
+# Only the rebuilt bundle is staged: never `git add .`, which would also commit unrelated
+# (possibly secret) files of the working tree
+git add dist

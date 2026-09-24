@@ -1,2 +1,11 @@
 # dependencies
 /node_modules
+
+# secrets (connection strings, webhook URLs, ...)
+.env
+.env.*
+!.env.example
+
+# test and debug output
+/coverage
+*.log

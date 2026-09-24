@@ -2,10 +2,11 @@ import { LilypadLoggerType } from '@/logger/LilypadLogger';
 import {
   getLilypadSingletonInstanceAsync,
   LilypadSingletonAble,
+  removeLilypadSingletonInstance,
 } from '@/singleton/LilypadSingleton';
 import postgres from 'postgres';
 
-type ListenerCallback = (payload: unknown) => void;
+type ListenerCallback = (payload: unknown) => void | Promise<void>;
 export type ListenerCallbackIdentifier = {
   channel: string;
   callbackId: string;
@@ -28,11 +29,24 @@ export type LilypadDbSchema<T> = {
   primaryKeyShouldAutoDetermine?: boolean;
   insertSanitizationFn?: (data: Partial<T>) => Partial<T>;
   selectSanitizationFn?: (row: unknown) => T | null;
+  /**
+   * The columns of the table.
+   * - Without a `selectSanitizationFn`, only these columns are selected.
+   * - Only these columns are written by inserts and updates: any other property of the data is ignored.
+   *
+   * The column metadata (`type`, `nullable`, `default`) is descriptive and is not used by the gate.
+   */
   cols: {
     [K in keyof T]: {
       type: LilypadDbColumnType;
-    } & ({ nullable: false | undefined } | { nullable: true; default: T[K] | null });
+    } & ({ nullable?: false } | { nullable: true; default: T[K] | null });
   };
+};
+
+type ChannelListener = {
+  callbacks: Map<string, ListenerCallback>;
+  /** Resolves, once LISTEN is active on the channel, with the function that stops listening. */
+  ready: Promise<() => Promise<void>>;
 };
 
 /**
@@ -46,45 +60,38 @@ export type LilypadDbSchema<T> = {
  *
  * @example
  * ```typescript
- * const dbGate = new LilypadDbGate({
+ * const dbGate = await LilypadDbGate.create({
  *   connectionString: 'postgres://user:pass@host:port/db',
  *   listen: [
- *     { channel: 'my_channel', callback: (payload) => console.log(payload) }
+ *     { channel: 'my_channel', callbackId: 'my_callback', callback: (payload) => console.log(payload) }
  *   ]
  * });
  * ```
  *
- * @typeParam T - The type representing the table schema.
- *
  * @public
  */
 export class LilypadDbGate {
-  private connectionString!: string;
-  private listenerConnectionString!: string;
+  private listenerConnectionString: string;
   public sql: postgres.Sql;
   private listenerConnection: postgres.Sql | undefined;
   protected logger?: LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
-  private listeners: Map<
-    string,
-    {
-      listenerCallback: Map<string, ListenerCallback>;
-      connection: postgres.Sql;
-    }
-  > = new Map();
+  private listeners: Map<string, ChannelListener> = new Map();
+  private singletonIdentifier?: string;
 
   private constructor(options: LilypadDbGateOptions) {
     this.logger = options.logger;
-    this.connectionString = options.connectionString;
     this.listenerConnectionString = options.listenerConnectionString || options.connectionString;
-    this.sql = postgres(this.connectionString, { prepare: false });
+    this.sql = postgres(options.connectionString, { prepare: false });
   }
 
   static async create(options: LilypadDbGateOptionsWithSingleton): Promise<LilypadDbGate> {
     if (options.singleton) {
-      const cacheKey = options.singletonIdentifier;
-      return await getLilypadSingletonInstanceAsync<LilypadDbGate>(cacheKey, () =>
-        LilypadDbGate.initializeNew(options)
-      );
+      const identifier = options.singletonIdentifier;
+      return await getLilypadSingletonInstanceAsync<LilypadDbGate>(identifier, async () => {
+        const instance = await LilypadDbGate.initializeNew(options);
+        instance.singletonIdentifier = identifier;
+        return instance;
+      });
     }
 
     return await LilypadDbGate.initializeNew(options);
@@ -92,36 +99,88 @@ export class LilypadDbGate {
 
   private static async initializeNew(options: LilypadDbGateOptions): Promise<LilypadDbGate> {
     const instance = new LilypadDbGate(options);
-    for (const listenOption of options.listen) {
-      await instance.addListener({
-        channel: listenOption.channel,
-        callbackId: listenOption.callbackId,
-        callback: listenOption.callback,
-      });
+    try {
+      for (const listenOption of options.listen) {
+        await instance.addListener(listenOption);
+      }
+    } catch (error) {
+      // Do not leak the connection pools of an instance that is never returned
+      await instance.close();
+      throw error;
     }
     return instance;
   }
 
   // CRUD OPERATIONS
 
+  /**
+   * Maps a database row to `T`, using the schema's `selectSanitizationFn` if provided,
+   * otherwise by copying the schema columns.
+   */
+  private mapRow<T>(schema: LilypadDbSchema<T>, row: postgres.Row): T | null {
+    if (schema.selectSanitizationFn) {
+      return schema.selectSanitizationFn(row);
+    }
+    const typedRow: Partial<T> = {};
+    for (const key in schema.cols) {
+      typedRow[key] = row[key];
+    }
+    return typedRow as T;
+  }
+
+  /**
+   * The columns to select. The `selectSanitizationFn` receives the whole row, since it may read
+   * columns that are not in the schema; otherwise only the schema columns are needed.
+   */
+  private selectedColumns<T>(schema: LilypadDbSchema<T>) {
+    return schema.selectSanitizationFn ? this.sql`*` : this.sql(Object.keys(schema.cols));
+  }
+
+  /**
+   * Prepares the data of an insert/update:
+   * - applies the schema's `insertSanitizationFn`;
+   * - validates the primary key, which an update always needs to find the row;
+   * - restricts the written columns to the schema columns, so that extra properties of `data`
+   *   (e.g. coming from a request body) are never written to the table.
+   */
+  private prepareWrite<T>(schema: LilypadDbSchema<T>, data: T, operation: 'insert' | 'update') {
+    let writeData: Partial<T> = { ...data };
+    if (schema.insertSanitizationFn) {
+      writeData = { ...writeData, ...schema.insertSanitizationFn(writeData) };
+    }
+
+    const primaryKeyValue = writeData[schema.primaryKey];
+    const primaryKeyRequired = operation === 'update' || !schema.primaryKeyShouldAutoDetermine;
+    if (primaryKeyRequired && (primaryKeyValue === undefined || primaryKeyValue === null)) {
+      throw new Error(
+        `Primary key "${String(
+          schema.primaryKey
+        )}" is missing in the ${operation} data for table "${schema.tableName}".`
+      );
+    }
+    if (schema.primaryKeyShouldAutoDetermine) {
+      delete writeData[schema.primaryKey];
+    }
+
+    const columns = Object.keys(schema.cols).filter((column) => column in writeData);
+    if (columns.length === 0) {
+      throw new Error(`No columns to ${operation} for table "${schema.tableName}".`);
+    }
+
+    return { data: writeData as postgres.Row, columns, primaryKeyValue };
+  }
+
   async selectAllFromTable<T>(options: LilypadDbSchema<T>): Promise<T[]> {
-    const results = await this.sql`SELECT * FROM ${this.sql(options.tableName)}`;
+    const results = await this.sql`
+      SELECT ${this.selectedColumns(options)} FROM ${this.sql(options.tableName)}
+    `;
     const typedResults: T[] = [];
 
     for (const row of results) {
-      if (options.selectSanitizationFn) {
-        const res = options.selectSanitizationFn(row);
-        if (res === null) {
-          continue;
-        }
-        typedResults.push(res);
-        continue;
+      const typedRow = this.mapRow(options, row);
+      if (typedRow !== null) {
+        typedResults.push(typedRow);
       }
-      const typedRow: Partial<T> = {};
-      for (const key in options.cols) {
-        typedRow[key] = row[key];
-      }
-      typedResults.push(typedRow as T);
     }
     return typedResults;
   }
@@ -131,77 +190,57 @@ export class LilypadDbGate {
     primaryKeyValue: T[keyof T]
   ): Promise<T | null> {
     const results = await this.sql`
-      SELECT * FROM ${this.sql(options.tableName)} 
+      SELECT ${this.selectedColumns(options)} FROM ${this.sql(options.tableName)}
       WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue as string}
     `;
 
     if (results.length === 0) {
       return null;
     }
-
-    const row = results[0];
-
-    if (options.selectSanitizationFn) {
-      return options.selectSanitizationFn(row);
-    }
-
-    const typedRow: Partial<T> = {};
-    for (const key in options.cols) {
-      typedRow[key] = row[key];
-    }
-    return typedRow as T;
+    return this.mapRow(options, results[0]);
   }
 
-  async insertToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void> {
-    let insertData: Partial<T> = { ...data };
-    if (options.insertSanitizationFn) {
-      insertData = { ...insertData, ...options.insertSanitizationFn(insertData) };
-    }
+  /**
+   * Inserts a row.
+   *
+   * @returns The row as stored by the database, including generated columns such as an
+   * auto-determined primary key, or `null` if the `selectSanitizationFn` discards it.
+   */
+  async insertToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<T | null> {
+    const { data: insertData, columns } = this.prepareWrite(options, data, 'insert');
 
-    if (options.primaryKeyShouldAutoDetermine) {
-      delete insertData[options.primaryKey];
-    } else if (
-      insertData[options.primaryKey] === undefined ||
-      insertData[options.primaryKey] === null
-    ) {
-      throw new Error(
-        `Primary key "${String(
-          options.primaryKey
-        )}" is missing in the insert data for table "${options.tableName}".`
-      );
-    }
-
-    await this.sql`
-      INSERT INTO ${this.sql(options.tableName)} ${this.sql(insertData as Record<string, unknown>)}
+    const results = await this.sql`
+      INSERT INTO ${this.sql(options.tableName)} ${this.sql(insertData, columns)}
+      RETURNING *
     `;
+    return this.mapRow(options, results[0]);
   }
 
-  async updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<void> {
-    let updateData: Partial<T> = { ...data };
-    if (options.insertSanitizationFn) {
-      updateData = { ...updateData, ...options.insertSanitizationFn(updateData) };
-    }
+  /**
+   * Updates the row identified by the primary key contained in `data`.
+   *
+   * @returns The row as stored by the database, or `null` if the `selectSanitizationFn` discards it.
+   * @throws If no row with that primary key exists.
+   */
+  async updateToTable<T>(options: LilypadDbSchema<T>, data: T): Promise<T | null> {
+    const {
+      data: updateData,
+      columns,
+      primaryKeyValue,
+    } = this.prepareWrite(options, data, 'update');
 
-    const primaryKeyValue: string = updateData[options.primaryKey] as string;
-
-    if (options.primaryKeyShouldAutoDetermine) {
-      delete updateData[options.primaryKey];
-    } else if (
-      updateData[options.primaryKey] === undefined ||
-      updateData[options.primaryKey] === null
-    ) {
+    const results = await this.sql`
+      UPDATE ${this.sql(options.tableName)}
+      SET ${this.sql(updateData, columns)}
+      WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue as string}
+      RETURNING *
+    `;
+    if (results.count === 0) {
       throw new Error(
-        `Primary key "${String(
-          options.primaryKey
-        )}" is missing in the update data for table "${options.tableName}".`
+        `No row with primary key "${String(primaryKeyValue)}" found in table "${options.tableName}".`
       );
     }
-
-    await this.sql`
-      UPDATE ${this.sql(options.tableName)} 
-      SET ${this.sql(updateData as Record<string, unknown>)} 
-      WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue}
-    `;
+    return this.mapRow(options, results[0]);
   }
 
   async deleteFromTable<T>(
@@ -209,7 +248,7 @@ export class LilypadDbGate {
     primaryKeyValue: T[keyof T]
   ): Promise<void> {
     await this.sql`
-      DELETE FROM ${this.sql(options.tableName)} 
+      DELETE FROM ${this.sql(options.tableName)}
       WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue as string}
     `;
   }
@@ -239,47 +278,56 @@ export class LilypadDbGate {
   }
 
   /**
-   * Initializes a listener for the specified channel.
+   * Starts listening on the specified channel.
    *
-   * This method sets up a new listener entry in the `listeners` map for the given channel,
-   * associates a callback map and a database connection, and starts listening for events
-   * on the specified channel. When an event is received, all registered listener callbacks
-   * for that channel are executed.
+   * The listener entry is registered immediately, before LISTEN is active, so that concurrent
+   * `addListener` calls for the same channel share it and await the same `ready` promise.
+   * If LISTEN fails, the entry is removed, so that a later `addListener` call retries it.
    *
    * @param channel - The name of the channel to listen on.
-   * @returns A promise that resolves when the listener has been successfully initialized.
+   * @returns The listener entry of the channel.
    */
-  private async initializeListener(channel: string) {
-    this.logger?.debug(`Initializing listener for channel "${channel}".`);
-    this.listeners.set(channel, {
-      listenerCallback: new Map(),
-      connection: this.getListenerConnection(),
-    });
-    await this.getListenerConnection().listen(
-      channel,
-      this.executeAllListenerCallbacks.bind(this, channel)
-    );
+  private initializeListener(channel: string): ChannelListener {
+    void this.logger?.debug(`Initializing listener for channel "${channel}".`);
+    const listener: ChannelListener = {
+      callbacks: new Map(),
+      ready: this.getListenerConnection()
+        .listen(channel, (payload) => this.executeAllListenerCallbacks(channel, payload))
+        .then(({ unlisten }) => unlisten)
+        .catch((error: unknown) => {
+          if (this.listeners.get(channel) === listener) {
+            this.listeners.delete(channel);
+          }
+          throw error;
+        }),
+    };
+    this.listeners.set(channel, listener);
+    return listener;
   }
 
   /**
    * Executes all registered listener callbacks for a given channel, passing the provided payload to each callback.
    *
-   * Iterates through all callbacks associated with the specified channel and invokes them with the given payload.
-   * If any callback throws an error, it is caught and logged using the logger (if available).
+   * Both synchronous throws and rejected promises of async callbacks are caught and logged,
+   * so a failing callback can neither affect the others nor cause an unhandled rejection.
    *
    * @param channel - The name of the channel whose listener callbacks should be executed.
    * @param payload - The data to pass to each listener callback.
    */
-  public executeAllListenerCallbacks(channel: string, payload: unknown) {
+  private executeAllListenerCallbacks(channel: string, payload: unknown) {
     const listener = this.listeners.get(channel);
-    if (listener) {
-      for (const cb of listener.listenerCallback.values()) {
-        try {
-          cb(payload);
-        } catch (error) {
-          this.logger?.error(`Error in listener callback for channel "${channel}":`, error);
-        }
-      }
+    if (!listener) {
+      return;
+    }
+    for (const [callbackId, callback] of listener.callbacks) {
+      Promise.resolve()
+        .then(() => callback(payload))
+        .catch((error: unknown) => {
+          void this.logger?.error(
+            `Error in listener callback "${callbackId}" for channel "${channel}":`,
+            error
+          );
+        });
     }
   }
 
@@ -287,36 +335,53 @@ export class LilypadDbGate {
    * Adds a listener callback for a specified channel.
    *
    * If the channel does not already have a listener, it initializes one.
-   * The callback is associated with the provided `callbackId` and stored for the channel.
-   * Logs debug information about the addition and the current number of callbacks for the channel.
+   * The callback is associated with the provided `callbackId`: adding a callback with an existing
+   * `callbackId` on the same channel replaces the previous one.
    *
    * @param params - An object containing:
    *   @param params.channel - The name of the channel to listen to.
    *   @param params.callbackId - A unique identifier for the callback.
    *   @param params.callback - The callback function to be invoked for the channel.
    *
-   * @returns A promise that resolves when the listener has been added.
+   * @returns A promise that resolves once LISTEN is active on the channel.
+   * @throws If LISTEN fails; in that case the callback is not registered.
    */
   async addListener({ channel, callbackId, callback }: ListenerCallbackIdentifier) {
-    this.logger?.debug(
+    void this.logger?.debug(
       `Adding listener for channel "${channel}" with callback ID "${callbackId}".`
     );
-    if (!this.listeners.has(channel)) {
-      await this.initializeListener(channel);
-    }
+    const listener = this.listeners.get(channel) ?? this.initializeListener(channel);
+    listener.callbacks.set(callbackId, callback);
+    await listener.ready;
 
-    const listener = this.listeners.get(channel);
-    if (listener) {
-      listener.listenerCallback.set(callbackId, callback);
-    }
-    this.logger?.debug(
-      `Listener for channel "${channel}" has ${listener ? listener.listenerCallback.size : -1} callbacks.`
+    void this.logger?.debug(
+      `Listener for channel "${channel}" has ${listener.callbacks.size} callbacks.`
     );
   }
 
-  async close() {
-    for (const [channel] of this.listeners) {
+  /**
+   * Removes a listener callback. When the channel has no callbacks left, it stops listening to it.
+   *
+   * @returns `true` if the callback was registered.
+   */
+  async removeListener(channel: string, callbackId: string): Promise<boolean> {
+    const listener = this.listeners.get(channel);
+    if (!listener || !listener.callbacks.delete(callbackId)) {
+      return false;
+    }
+    if (listener.callbacks.size === 0) {
       this.listeners.delete(channel);
+      const unlisten = await listener.ready;
+      await unlisten();
+    }
+    return true;
+  }
+
+  async close() {
+    this.listeners.clear();
+    if (this.singletonIdentifier !== undefined) {
+      removeLilypadSingletonInstance(this.singletonIdentifier);
+      this.singletonIdentifier = undefined;
     }
 
     await this.listenerConnection?.end();

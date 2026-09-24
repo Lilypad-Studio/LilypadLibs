@@ -253,4 +253,86 @@ describe('LilypadSerializer', () => {
       ]);
     });
   });
+
+  describe('defaults', () => {
+    it('should not share object defaults between deserialized items', () => {
+      interface Tagged {
+        tags: string[];
+      }
+      interface PackedTagged {
+        t?: string[];
+      }
+      const serializer = new LilypadSerializer<Tagged, PackedTagged, { tags: 't' }>({
+        serialization: {
+          tags: {
+            target: 't',
+            serialize: (item) => item.tags,
+            deserialize: (item) => item.t as string[],
+            default: [],
+          },
+        },
+      });
+
+      const [first, second] = serializer.deserialize([{}, {}]);
+      first.tags.push('mutated');
+
+      expect(second.tags).toEqual([]);
+    });
+  });
+
+  // These cases are checked at compile time by `npm run typecheck`: an unused @ts-expect-error fails it
+  describe('key mapping type checks', () => {
+    it('should reject key mappings that are not injective', () => {
+      interface TwoKeys {
+        a: number;
+        b: number;
+      }
+      interface OneKey {
+        x: number;
+      }
+      const create = () =>
+        new LilypadSerializer<TwoKeys, OneKey, { a: 'x'; b: 'x' }>({
+          serialization: {
+            a: {
+              // @ts-expect-error 'a' and 'b' both map to 'x'
+              target: 'x',
+              serialize: (item) => item.a,
+              deserialize: (item) => item.x,
+              default: 0,
+            },
+            b: {
+              // @ts-expect-error 'a' and 'b' both map to 'x'
+              target: 'x',
+              serialize: (item) => item.b,
+              deserialize: (item) => item.x,
+              default: 0,
+            },
+          },
+        });
+      expect(create).toBeTypeOf('function');
+    });
+
+    it('should reject key mappings that are not surjective', () => {
+      interface OneKey {
+        a: number;
+      }
+      interface TwoKeys {
+        x: number;
+        y: number;
+      }
+      const create = () =>
+        new LilypadSerializer<OneKey, TwoKeys, { a: 'x' }>({
+          serialization: {
+            a: {
+              // @ts-expect-error 'y' is not the target of any key
+              target: 'x',
+              serialize: (item) => item.a,
+              deserialize: (item) => item.x,
+              default: 0,
+            },
+          },
+        });
+      expect(create).toBeTypeOf('function');
+    });
+  });
 });

@@ -36,7 +36,7 @@ describe('LilypadLogger', () => {
     expect(typeof logger.error).toBe('function');
   });
 
-  it('should call component.output with string message', () => {
+  it('should call component.output with string message', async () => {
     const logger = LilypadLogger.create<mockType>({
       components: {
         info: [mockComponent],
@@ -44,12 +44,12 @@ describe('LilypadLogger', () => {
       },
     });
 
-    logger.info('test message');
+    await logger.info('test message');
 
     expect(mockComponent.output).toHaveBeenCalledWith('info', 'test message', { logger: logger });
   });
 
-  it('should stringify non-string messages', () => {
+  it('should stringify non-string messages', async () => {
     const logger = LilypadLogger.create<mockType>({
       components: {
         info: [mockComponent],
@@ -58,11 +58,54 @@ describe('LilypadLogger', () => {
     });
 
     const obj = { key: 'value' };
-    logger.info(obj);
+    await logger.info(obj);
 
-    expect(mockComponent.output).toHaveBeenCalledWith('info', JSON.stringify(obj), {
+    expect(mockComponent.output).toHaveBeenCalledWith('info', "{ key: 'value' }", {
       logger: logger,
     });
+  });
+
+  it('should keep message and stack of errors', async () => {
+    const logger = LilypadLogger.create<mockType>({
+      components: { info: [], error: [mockComponent] },
+    });
+
+    await logger.error('Failure:', new Error('boom'));
+
+    const message = vi.mocked(mockComponent.output).mock.calls[0][1];
+    expect(message).toContain('Failure: Error: boom');
+    expect(message).toContain('LilypadLogger.test.ts');
+  });
+
+  it('should not throw on circular references and BigInts', async () => {
+    const logger = LilypadLogger.create<mockType>({
+      components: { info: [mockComponent], error: [] },
+    });
+    const circular: Record<string, unknown> = { name: 'circular' };
+    circular.self = circular;
+
+    await expect(logger.info(circular, 10n)).resolves.toBeUndefined();
+
+    const message = vi.mocked(mockComponent.output).mock.calls[0][1];
+    expect(message).toContain('[Circular *1]');
+    expect(message).toContain('10n');
+  });
+
+  it.each(['components', 'register', '__name', '_name', 'constructor', 'toString'])(
+    'should reject the reserved log channel "%s"',
+    (channel) => {
+      expect(() =>
+        LilypadLogger.create<string>({ components: { [channel]: [mockComponent] } })
+      ).toThrow(`Logger type "${channel}" is reserved`);
+    }
+  );
+
+  it('should throw a clear error when registering an unknown log type', () => {
+    const logger = LilypadLogger.create<string>({ components: { info: [] } });
+
+    expect(() => logger.register({ debug: [mockComponent] })).toThrow(
+      'Logger type "debug" was not defined'
+    );
   });
 
   it('should route messages to all registered components', async () => {
@@ -79,7 +122,7 @@ describe('LilypadLogger', () => {
     expect(mockComponent2.output).toHaveBeenCalled();
   });
 
-  it('should handle component errors with errorLogging callback', () => {
+  it('should handle component errors with errorLogging callback', async () => {
     mockComponent.output = vi.fn(() => {
       throw new Error('Component error');
     });
@@ -93,12 +136,12 @@ describe('LilypadLogger', () => {
       errorLogging,
     });
 
-    logger.info('test');
+    await logger.info('test');
 
     expect(errorLogging).toHaveBeenCalledWith(expect.any(Error));
   });
 
-  it('should use console.error as fallback for component errors', () => {
+  it('should use console.error as fallback for component errors', async () => {
     mockComponent.output = vi.fn(() => {
       throw new Error('Component error');
     });
@@ -111,7 +154,7 @@ describe('LilypadLogger', () => {
       },
     });
 
-    logger.info('test');
+    await logger.info('test');
 
     expect(consoleSpy).toHaveBeenCalled();
     consoleSpy.mockRestore();

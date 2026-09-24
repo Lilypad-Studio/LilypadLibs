@@ -3,18 +3,15 @@
     "module": "nodenext",
     "outDir": "dist",
     "moduleResolution": "nodenext",
-    "baseUrl": "./src",
     "declaration": true,
     "strict": true,
     "esModuleInterop": true,
     "noImplicitOverride": true,
     "noImplicitAny": true,
     "noImplicitReturns": true,
+    "skipLibCheck": true,
     "paths": {
-      "@/*": ["./*"],
-      "logger/*": ["./logger/*"],
-      "cache/*": ["./cache/*"],
-      "flow/*": ["./flow/*"]
+      "@/*": ["./src/*"]
     }
   },
   "include": ["src", "vitest.config.ts", "tsup.config.ts"],

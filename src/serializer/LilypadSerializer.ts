@@ -2,15 +2,30 @@ type InvertRecord<R extends Record<PropertyKey, PropertyKey>> = {
   [K in keyof R as R[K]]: K;
 };
 
-type IsBijective<A extends object, B extends object, M extends Record<keyof A, keyof B>> =
-  // Same number of keys
-  keyof A extends keyof M
-    ? keyof B extends M[keyof A]
-      ? InvertRecord<M> extends Record<keyof B, keyof A>
-        ? true
-        : false
+/** True if every key of B is the target of at least one key of the mapping. */
+type IsSurjective<
+  B extends object,
+  M extends Record<PropertyKey, PropertyKey>,
+> = keyof B extends M[keyof M] ? true : false;
+
+/** True if no two keys of the mapping have the same target. */
+type IsInjective<M extends Record<PropertyKey, PropertyKey>> = {
+  // InvertRecord<M>[M[K]] is the union of all the keys mapped to M[K]: it must be K alone
+  [K in keyof M]: M[K] extends keyof InvertRecord<M>
+    ? [InvertRecord<M>[M[K]]] extends [K]
+      ? true
       : false
     : false;
+}[keyof M] extends true
+  ? true
+  : false;
+
+/**
+ * True if the mapping M pairs every key of A with exactly one key of B, and vice versa.
+ * Every key of A being mapped is already guaranteed by the `Record<keyof A, keyof B>` constraint.
+ */
+type IsBijective<A extends object, B extends object, M extends Record<keyof A, keyof B>> =
+  IsSurjective<B, M> extends true ? IsInjective<M> : false;
 
 export interface LilypadSerializerConstructorOptions<
   FROM extends object,
@@ -37,20 +52,23 @@ export interface LilypadSerializerConstructorOptions<
  * @typeParam KeyMap - A mapping from keys in `FROM` to keys in `TO`.
  *
  * @remarks
- * - The serializer uses a `keyMapping` to map keys from the source to the target object.
+ * - Each key of the source is mapped to its `target` key in the target object; the mapping must be
+ *   bijective, otherwise `target` is typed as `never`.
  * - Custom serialization and deserialization functions can be provided for each key.
  * - Default values and equality checks can be specified to skip serialization of default values.
  * - When a function in the serialization map returns `undefined`, that key is omitted from the serialized output.
+ * - When deserialization returns `null` or `undefined`, the key gets a copy of its default value
+ *   (object defaults are cloned, so deserialized items never share them).
  *
  * @example
  * ```typescript
  * interface Source { a: number; b: string; }
  * interface Target { x: number; y: string; }
  * const serializer = new LilypadSerializer<Source, Target, { a: 'x'; b: 'y' }>({
- *   keyMapping: { a: 'x', b: 'y' },
- *   serializationMap: { a: item => item.a, b: item => item.b },
- *   deserializationMap: { x: item => item.x, y: item => item.y },
- *   fromDefaultValues: { a: 0, b: '' }
+ *   serialization: {
+ *     a: { target: 'x', serialize: (item) => item.a, deserialize: (item) => item.x, default: 0 },
+ *     b: { target: 'y', serialize: (item) => item.b, deserialize: (item) => item.y, default: '' },
+ *   },
  * });
  * const packed = serializer.serialize([{ a: 1, b: 'foo' }]);
  * const unpacked = serializer.deserialize(packed);
@@ -67,10 +85,6 @@ export class LilypadSerializer<
     return input.map((item) => {
       const packedItem = {} as TO;
       (Object.keys(this.options.serialization) as (keyof FROM)[]).forEach((fromKey) => {
-        if (!this.options.serialization[fromKey]) {
-          return; // Skip if no serialization function is provided
-        }
-
         const isEqual = this.options.serialization[fromKey].equality ?? ((v, d) => v === d); // Fallback to strict equality
         if (isEqual(item[fromKey], this.options.serialization[fromKey].default)) {
           return; // Skip default values
@@ -94,9 +108,17 @@ export class LilypadSerializer<
       (Object.keys(this.options.serialization) as (keyof FROM)[]).forEach((fromKey) => {
         unpackedItem[fromKey] =
           this.options.serialization[fromKey].deserialize(item) ??
-          this.options.serialization[fromKey].default;
+          cloneDefault(this.options.serialization[fromKey].default);
       });
       return unpackedItem;
     });
   }
+}
+
+/**
+ * Object defaults are cloned, otherwise every deserialized item would share (and could mutate)
+ * the same default instance.
+ */
+function cloneDefault<T>(value: T): T {
+  return typeof value === 'object' && value !== null ? structuredClone(value) : value;
 }
