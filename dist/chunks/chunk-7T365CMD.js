@@ -385,6 +385,8 @@ var LilypadDbGate = (_class = class _LilypadDbGate {
 // src/dbGate/LilypadChangelog.ts
 var LILYPAD_DEFAULT_CHANGELOG_TABLE = "lilypad_cache_changes";
 var LILYPAD_DEFAULT_NOTIFY_CHANNEL = "cache_events";
+var LILYPAD_CHANGELOG_VERSION = 2;
+var LILYPAD_CHANGELOG_VERSION_PREFIX = "lilypad-changelog:";
 function quoteIdentifier(identifier) {
   return identifier.split(".").map((part) => `"${part.replace(/"/g, '""')}"`).join(".");
 }
@@ -401,23 +403,27 @@ function lilypadChangelogSql(options = {}) {
   const indexPrefix = table.replace(/\W/g, "_");
   const notify = (idExpression, opExpression) => channel === false ? "" : `
     PERFORM pg_notify(${quoteLiteral(channel)}, json_build_object(
-      'table', TG_TABLE_NAME, 'id', ${idExpression}, 'op', ${opExpression}
+      'schema', TG_TABLE_SCHEMA, 'table', TG_TABLE_NAME, 'id', ${idExpression}, 'op', ${opExpression}
     )::text);`;
+  const functionName = quoteIdentifier(triggerFunctionName(table));
   return `CREATE TABLE IF NOT EXISTS ${quotedTable} (
-  id         bigserial   PRIMARY KEY,
-  xid        xid8        NOT NULL DEFAULT pg_current_xact_id(),
-  table_name text        NOT NULL,
-  row_id     text        NOT NULL,
-  op         text        NOT NULL,
-  changed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+  id           bigserial   PRIMARY KEY,
+  xid          xid8        NOT NULL DEFAULT pg_current_xact_id(),
+  table_schema text,
+  table_name   text        NOT NULL,
+  row_id       text        NOT NULL,
+  op           text        NOT NULL,
+  changed_at   timestamptz NOT NULL DEFAULT clock_timestamp()
 );
+-- Version 1 had no schema column: tables of the same name in different schemas were mixed up
+ALTER TABLE ${quotedTable} ADD COLUMN IF NOT EXISTS table_schema text;
 CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${indexPrefix}_table_xid_idx`)}
   ON ${quotedTable} (table_name, xid);
 CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${indexPrefix}_changed_at_idx`)}
   ON ${quotedTable} (changed_at);
 
 -- Records a change of a row; the trigger argument is the primary key column.
-CREATE OR REPLACE FUNCTION ${quoteIdentifier(triggerFunctionName(table))}() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION ${functionName}() RETURNS trigger AS $$
 DECLARE
   new_id text;
   old_id text;
@@ -431,14 +437,16 @@ BEGIN
 
   -- An update that changes the primary key also deletes the old key
   IF TG_OP = 'UPDATE' AND old_id IS DISTINCT FROM new_id THEN
-    INSERT INTO ${quotedTable} (table_name, row_id, op) VALUES (TG_TABLE_NAME, old_id, 'DELETE');${notify("old_id", `'DELETE'`)}
+    INSERT INTO ${quotedTable} (table_schema, table_name, row_id, op)
+      VALUES (TG_TABLE_SCHEMA, TG_TABLE_NAME, old_id, 'DELETE');${notify("old_id", `'DELETE'`)}
   END IF;
 
-  INSERT INTO ${quotedTable} (table_name, row_id, op)
-    VALUES (TG_TABLE_NAME, COALESCE(new_id, old_id), TG_OP);${notify("COALESCE(new_id, old_id)", "TG_OP")}
+  INSERT INTO ${quotedTable} (table_schema, table_name, row_id, op)
+    VALUES (TG_TABLE_SCHEMA, TG_TABLE_NAME, COALESCE(new_id, old_id), TG_OP);${notify("COALESCE(new_id, old_id)", "TG_OP")}
   RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
+COMMENT ON FUNCTION ${functionName}() IS ${quoteLiteral(`${LILYPAD_CHANGELOG_VERSION_PREFIX}${LILYPAD_CHANGELOG_VERSION}`)};
 `;
 }
 function lilypadChangelogTriggerSql(options) {
@@ -456,10 +464,19 @@ async function readLilypadChanges(gate, options) {
   const since = options.since;
   const condition = "cursor" in since ? sql`c.xid >= ${since.cursor.toString()}::xid8` : sql`c.changed_at >= clock_timestamp() - make_interval(secs => ${since.lookback / 1e3})`;
   const rows = await sql`
-    WITH snapshot AS (SELECT pg_snapshot_xmin(pg_current_snapshot())::text AS next_cursor)
+    WITH snapshot AS (SELECT pg_snapshot_xmin(pg_current_snapshot())::text AS next_cursor),
+    target AS (
+      SELECT n.nspname AS schema_name, t.relname AS rel_name
+      FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace
+      WHERE t.oid = to_regclass(${quoteIdentifier(options.tableName)}::text)
+    )
     SELECT snapshot.next_cursor, c.id::text AS id, c.xid::text AS xid, c.row_id, c.op
     FROM snapshot
-    LEFT JOIN ${sql(changelogTable)} c ON c.table_name = ${options.tableName} AND ${condition}
+    LEFT JOIN target ON true
+    LEFT JOIN ${sql(changelogTable)} c
+      ON c.table_name = target.rel_name
+      AND (c.table_schema = target.schema_name OR c.table_schema IS NULL)
+      AND ${condition}
     ORDER BY c.id
   `;
   const changes = [];
@@ -484,12 +501,171 @@ async function pruneLilypadChangelog(gate, options) {
   return result.count;
 }
 
+// src/dbGate/LilypadSchemaCheck.ts
+var LilypadSchemaCheckError = class extends Error {
+  
+  constructor(subject, problems) {
+    super(formatLilypadSchemaProblems(subject, problems));
+    this.name = "LilypadSchemaCheckError";
+    this.problems = problems;
+  }
+};
+function formatLilypadSchemaProblems(subject, problems) {
+  const lines = [`${subject}: the database is not set up.`];
+  for (const problem of problems) {
+    lines.push(`- ${problem.message}`);
+  }
+  const fixes = [...new Set(problems.flatMap((problem) => problem.fix ? [problem.fix] : []))];
+  if (fixes.length > 0) {
+    lines.push("Run this SQL in a migration to fix it:", ...fixes);
+  }
+  return lines.join("\n");
+}
+var TRIGGER_TYPE_ROW = 1;
+var TRIGGER_TYPE_INSERT = 4;
+var TRIGGER_TYPE_DELETE = 8;
+var TRIGGER_TYPE_UPDATE = 16;
+var CHANGELOG_TRIGGER_TYPE = TRIGGER_TYPE_ROW | TRIGGER_TYPE_INSERT | TRIGGER_TYPE_DELETE | TRIGGER_TYPE_UPDATE;
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+async function checkLilypadSchema(gate, options) {
+  var _a;
+  const sql = gate.sql;
+  const changelogTable = options.changelog === false ? void 0 : _nullishCoalesce(((_a = options.changelog) == null ? void 0 : _a.table), () => ( LILYPAD_DEFAULT_CHANGELOG_TABLE));
+  const notifyChannel = _nullishCoalesce(options.notifyChannel, () => ( false));
+  const customChangelogTable = changelogTable === LILYPAD_DEFAULT_CHANGELOG_TABLE ? void 0 : changelogTable;
+  const functionSignature = `${quoteIdentifier(
+    triggerFunctionName(_nullishCoalesce(changelogTable, () => ( LILYPAD_DEFAULT_CHANGELOG_TABLE)))
+  )}()`;
+  const problems = [];
+  const [database] = await sql`
+    SELECT
+      current_setting('server_version_num')::int AS version,
+      to_regclass(${quoteIdentifier(_nullishCoalesce(changelogTable, () => ( LILYPAD_DEFAULT_CHANGELOG_TABLE)))}::text)
+        IS NOT NULL AS has_changelog_table,
+      EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = to_regclass(${quoteIdentifier(_nullishCoalesce(changelogTable, () => ( LILYPAD_DEFAULT_CHANGELOG_TABLE)))}::text)
+          AND attname = 'table_schema' AND NOT attisdropped
+      ) AS has_schema_column,
+      to_regprocedure(${functionSignature}::text) IS NOT NULL AS has_function,
+      obj_description(to_regprocedure(${functionSignature}::text), 'pg_proc') AS function_comment
+  `;
+  if (database.version < 13e4) {
+    problems.push({
+      code: "unsupported-version",
+      message: `PostgreSQL ${database.version} is too old: the changelog needs PostgreSQL 13 or later.`
+    });
+  }
+  if (changelogTable !== void 0) {
+    const changelogSql = lilypadChangelogSql({ table: customChangelogTable });
+    if (!database.has_changelog_table || !database.has_function) {
+      problems.push({
+        code: "missing-changelog",
+        message: !database.has_changelog_table ? `The changelog table "${changelogTable}" does not exist.` : `The changelog trigger function ${functionSignature} does not exist.`,
+        fix: changelogSql
+      });
+    }
+    const comment = _nullishCoalesce(database.function_comment, () => ( ""));
+    const version = comment.startsWith(LILYPAD_CHANGELOG_VERSION_PREFIX) ? Number(comment.slice(LILYPAD_CHANGELOG_VERSION_PREFIX.length)) : 1;
+    if (database.has_changelog_table && !database.has_schema_column || database.has_function && version < LILYPAD_CHANGELOG_VERSION) {
+      problems.push({
+        code: "outdated-changelog",
+        message: `The changelog "${changelogTable}" was installed by an older version of the library (version ${version}, expected ${LILYPAD_CHANGELOG_VERSION}).`,
+        fix: changelogSql
+      });
+    }
+  }
+  const tables = [];
+  for (const { table, primaryKey } of options.tables) {
+    const [found] = await sql`
+      SELECT
+        n.nspname AS schema_name,
+        (
+          SELECT coalesce(json_agg(json_build_object(
+            'changelog', tr.tgfoid = to_regprocedure(${functionSignature}::text)::oid,
+            'args', encode(tr.tgargs, 'escape'),
+            'type', tr.tgtype,
+            'enabled', tr.tgenabled <> 'D',
+            'source', p.prosrc
+          )), '[]'::json)
+          FROM pg_trigger tr JOIN pg_proc p ON p.oid = tr.tgfoid
+          WHERE tr.tgrelid = t.oid AND NOT tr.tgisinternal
+        ) AS triggers
+      FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace
+      WHERE t.oid = to_regclass(${quoteIdentifier(table)}::text)
+    `;
+    if (!found) {
+      tables.push({ table, schema: null });
+      problems.push({
+        code: "missing-table",
+        table,
+        message: `The table "${table}" does not exist.`
+      });
+      continue;
+    }
+    tables.push({ table, schema: found.schema_name });
+    const triggers = typeof found.triggers === "string" ? JSON.parse(found.triggers) : found.triggers;
+    if (changelogTable !== void 0) {
+      const fix = lilypadChangelogTriggerSql({
+        table,
+        primaryKey,
+        changelogTable: customChangelogTable
+      });
+      const working = triggers.filter(
+        (trigger) => trigger.changelog && trigger.enabled && (trigger.type & CHANGELOG_TRIGGER_TYPE) === CHANGELOG_TRIGGER_TYPE
+      );
+      if (working.length === 0) {
+        problems.push({
+          code: "missing-changelog-trigger",
+          table,
+          message: triggers.some((trigger) => trigger.changelog) ? `The changelog trigger of "${table}" is disabled or does not fire on each INSERT, UPDATE and DELETE row.` : `The table "${table}" has no changelog trigger: its changes are not recorded.`,
+          fix
+        });
+      } else if (!working.some((trigger) => trigger.args.split("\\000")[0] === primaryKey)) {
+        problems.push({
+          code: "wrong-trigger-primary-key",
+          table,
+          message: `The changelog trigger of "${table}" records the column "${working[0].args.split("\\000")[0]}", not the primary key "${primaryKey}".`,
+          fix
+        });
+      }
+    }
+    if (notifyChannel !== false) {
+      const notifies = new RegExp(
+        `pg_notify\\s*\\(\\s*'${escapeRegExp(notifyChannel.replace(/'/g, "''"))}'`,
+        "i"
+      );
+      const notifying = triggers.some(
+        (trigger) => trigger.enabled && (trigger.type & TRIGGER_TYPE_ROW) !== 0 && notifies.test(trigger.source)
+      );
+      if (!notifying) {
+        problems.push({
+          code: "missing-notify-trigger",
+          table,
+          message: `No trigger of "${table}" sends notifications on the "${notifyChannel}" channel: the cache is not told about changes made elsewhere.`,
+          fix: lilypadChangelogSql({ table: customChangelogTable, notifyChannel }) + lilypadChangelogTriggerSql({ table, primaryKey, changelogTable: customChangelogTable })
+        });
+      }
+    }
+  }
+  return { ok: problems.length === 0, problems, tables };
+}
+
 // src/cache/LilypadDbCache.ts
 var DEFAULT_CHANGELOG_MAX_GAP = 60 * 60 * 1e3;
 var LilypadDbCache = (_class2 = class _LilypadDbCache extends _chunk7QJ33PAPjs.LilypadCache_default {
   
   
   
+  
+  
+  /**
+   * The schema of the table: from `tableName` when it is qualified, otherwise as resolved by the
+   * schema check. Notifications from another schema are ignored; while it is unknown, notifications
+   * of the table in any schema are applied.
+   */
   
   
   // Changelog strategy state
@@ -528,13 +704,16 @@ var LilypadDbCache = (_class2 = class _LilypadDbCache extends _chunk7QJ33PAPjs.L
   }
   static async initializeNew(ttl, options) {
     const cache = new _LilypadDbCache(ttl, options);
-    if (cache.sync.strategy === "listen" && cache.sync.connect !== "lazy") {
-      try {
-        await cache.startListening();
-      } catch (error) {
-        await cache.dispose();
-        throw error;
+    try {
+      if (cache.schemaVerification() === "throw") {
+        await cache.verifySchema();
       }
+      if (cache.sync.strategy === "listen" && cache.sync.connect !== "lazy") {
+        await cache.startListening();
+      }
+    } catch (error) {
+      await cache.dispose();
+      throw error;
     }
     return cache;
   }
@@ -547,6 +726,10 @@ var LilypadDbCache = (_class2 = class _LilypadDbCache extends _chunk7QJ33PAPjs.L
       item
     ]);
     this.sync = _nullishCoalesce(options.sync, () => ( _LilypadDbCache.syncFromLegacyOptions(options)));
+    const tableNameParts = this.dbGate.schema.tableName.split(".");
+    if (tableNameParts.length > 1) {
+      this.tableSchema = tableNameParts[tableNameParts.length - 2];
+    }
     if (this.sync.strategy === "listen") {
       this.defaultDbListener = this.getDefaultDbListener(this.sync.listenerOptions);
     }
@@ -564,11 +747,63 @@ var LilypadDbCache = (_class2 = class _LilypadDbCache extends _chunk7QJ33PAPjs.L
       listenerOptions: options.useDefaultDbListener ? options.defaultListenerOptions : void 0
     };
   }
+  // SCHEMA VERIFICATION
+  schemaVerification() {
+    return this.sync.strategy === "none" ? "off" : _nullishCoalesce(this.sync.verify, () => ( "warn"));
+  }
+  /**
+   * Checks once that the database has the triggers the sync strategy needs, and resolves the schema
+   * of the table. With `verify: 'warn'` it never rejects: problems and failures are logged.
+   *
+   * @throws A `LilypadSchemaCheckError` with `verify: 'throw'`, or the error of the check.
+   */
+  verifySchema() {
+    const mode = this.schemaVerification();
+    if (mode === "off") {
+      return Promise.resolve();
+    }
+    this.schemaCheck ??= this.runSchemaCheck(mode);
+    return this.schemaCheck;
+  }
+  async runSchemaCheck(mode) {
+    var _a, _b;
+    const { tableName, primaryKey } = this.dbGate.schema;
+    const subject = `LilypadDbCache "${tableName}" (sync: ${this.sync.strategy})`;
+    try {
+      const result = await checkLilypadSchema(this.dbGate.gate, {
+        tables: [{ table: tableName, primaryKey: String(primaryKey) }],
+        changelog: this.sync.strategy === "changelog" ? { table: this.sync.table } : false,
+        notifyChannel: this.sync.strategy === "listen" ? LILYPAD_DEFAULT_NOTIFY_CHANNEL : false
+      });
+      this.tableSchema = _nullishCoalesce(((_a = result.tables[0]) == null ? void 0 : _a.schema), () => ( this.tableSchema));
+      if (result.ok) {
+        return;
+      }
+      if (mode === "throw") {
+        throw new LilypadSchemaCheckError(subject, result.problems);
+      }
+      const message = formatLilypadSchemaProblems(subject, result.problems);
+      if (this.logger) {
+        void this.logger.warn(this.id, message);
+      } else {
+        console.warn(message);
+      }
+    } catch (error) {
+      if (mode === "throw") {
+        throw error;
+      }
+      void ((_b = this.logger) == null ? void 0 : _b.warn(this.id, `${subject}: could not check the database schema:`, error));
+    }
+  }
   // SYNCHRONIZATION
-  /** Registers the listener once; a failed registration is retried by the next call. */
+  /**
+   * Registers the listener once, after the schema check (which resolves the schema of the table,
+   * to ignore the notifications of other schemas); a failed registration is retried by the next call.
+   */
   startListening() {
     if (!this.listening && this.defaultDbListener) {
-      this.listening = this.dbGate.gate.addListener(this.defaultDbListener).catch((error) => {
+      const listener = this.defaultDbListener;
+      this.listening = this.verifySchema().then(() => this.dbGate.gate.addListener(listener)).catch((error) => {
         this.listening = void 0;
         throw error;
       });
@@ -599,6 +834,10 @@ var LilypadDbCache = (_class2 = class _LilypadDbCache extends _chunk7QJ33PAPjs.L
     if (Date.now() - this.lastChangelogRead < this.sync.pollInterval) {
       return void 0;
     }
+    if (!this.schemaCheck) {
+      _chunkLL3KVXOKjs.runInBackground.call(void 0, this.platform, this.verifySchema(), () => {
+      });
+    }
     const reading = this.readChangelog();
     if (this.sync.poll === "background") {
       _chunkLL3KVXOKjs.runInBackground.call(void 0, this.platform, reading, () => {
@@ -628,8 +867,7 @@ var LilypadDbCache = (_class2 = class _LilypadDbCache extends _chunk7QJ33PAPjs.L
     const trusted = this.changelogCursor !== void 0 && readAt - this.lastChangelogRead <= maxGap;
     const lookback = _nullishCoalesce(this.sync.lookback, () => ( this.defaultTtl + this.defaultStaleWhileRevalidate + 6e4));
     const { changes, cursor } = await readLilypadChanges(this.dbGate.gate, {
-      // The trigger records the table name without its schema
-      tableName: this.dbGate.schema.tableName.split(".").pop(),
+      tableName: this.dbGate.schema.tableName,
       since: trusted ? { cursor: this.changelogCursor } : { lookback },
       changelogTable: this.sync.table
     });
@@ -822,7 +1060,7 @@ var LilypadDbCache = (_class2 = class _LilypadDbCache extends _chunk7QJ33PAPjs.L
         if (typeof parsedPayload.id !== "string" && typeof parsedPayload.id !== "number" || parsedPayload.id === "" || !parsedPayload.table) {
           return;
         }
-        if (parsedPayload.table === this.dbGate.schema.tableName.split(".").pop()) {
+        if (this.isNotificationForTable(parsedPayload)) {
           void ((_c = this.logger) == null ? void 0 : _c.debug(
             this.id,
             this.dbGate.schema.tableName,
@@ -838,6 +1076,16 @@ var LilypadDbCache = (_class2 = class _LilypadDbCache extends _chunk7QJ33PAPjs.L
         }
       }
     };
+  }
+  /**
+   * Whether a notification is about the table of this cache. `table` is the name without its
+   * schema; `schema`, when the trigger sends it and the schema of the table is known, must match.
+   */
+  isNotificationForTable(payload) {
+    if (payload.table !== this.dbGate.schema.tableName.split(".").pop()) {
+      return false;
+    }
+    return typeof payload.schema !== "string" || this.tableSchema === void 0 || payload.schema === this.tableSchema;
   }
   /**
    * Marks every entry as expired (keeping the values as fallback) and forces the next bulk sync.
@@ -917,5 +1165,7 @@ var LilypadDbCache = (_class2 = class _LilypadDbCache extends _chunk7QJ33PAPjs.L
 
 
 
-exports.lilypadServerlessPool = lilypadServerlessPool; exports.LilypadDbGate = LilypadDbGate; exports.LILYPAD_DEFAULT_CHANGELOG_TABLE = LILYPAD_DEFAULT_CHANGELOG_TABLE; exports.lilypadChangelogSql = lilypadChangelogSql; exports.lilypadChangelogTriggerSql = lilypadChangelogTriggerSql; exports.readLilypadChanges = readLilypadChanges; exports.pruneLilypadChangelog = pruneLilypadChangelog; exports.LilypadDbCache = LilypadDbCache;
-//# sourceMappingURL=chunk-MJNO5GAA.js.map
+
+
+exports.lilypadServerlessPool = lilypadServerlessPool; exports.LilypadDbGate = LilypadDbGate; exports.LILYPAD_DEFAULT_CHANGELOG_TABLE = LILYPAD_DEFAULT_CHANGELOG_TABLE; exports.lilypadChangelogSql = lilypadChangelogSql; exports.lilypadChangelogTriggerSql = lilypadChangelogTriggerSql; exports.readLilypadChanges = readLilypadChanges; exports.pruneLilypadChangelog = pruneLilypadChangelog; exports.LilypadSchemaCheckError = LilypadSchemaCheckError; exports.checkLilypadSchema = checkLilypadSchema; exports.LilypadDbCache = LilypadDbCache;
+//# sourceMappingURL=chunk-7T365CMD.js.map

@@ -232,6 +232,11 @@ declare class LilypadDbGate {
 }
 
 type LilypadDbCacheDefaultNotificationPayload = {
+    /**
+     * The schema of the table. Notifications without it match the table in any schema (the triggers
+     * of version 1 of the changelog, and custom triggers that do not send it).
+     */
+    schema?: string;
     table?: string;
     /** A number when the trigger serializes a numeric primary key as such (e.g. `json_build_object`). */
     id?: string | number;
@@ -258,9 +263,20 @@ type LilypadDbCacheDefaultListenerOptions = {
  *   per `pollInterval`, when the cache is used. No long-lived connection: suited to serverless
  *   platforms. Changes are seen within `pollInterval`.
  * - `none`: only the writes of this instance and the TTL keep the cache up to date.
+ *
+ * `listen` and `changelog` rely on triggers that the library does not install (see
+ * `lilypadChangelogSql`). Their `verify` option checks that they exist (`checkLilypadSchema`):
+ * - `warn` (default): once, when the cache first uses the database (`LISTEN`, or the first read
+ *   of the changelog), without delaying changelog reads; problems are logged as a warning, with the
+ *   SQL that fixes them (on `console.warn` without a logger).
+ * - `throw`: in `create`, which rejects with a `LilypadSchemaCheckError`. `create` then queries
+ *   the database, whatever the strategy.
+ * - `off`: no check. With `listen`, notifications of a table of the same name in another schema
+ *   are then told apart only if `tableName` is qualified (`schema.table`).
  */
 type LilypadDbCacheSync = {
     strategy: 'listen';
+    verify?: LilypadDbCacheSchemaVerification;
     /**
      * `eager` (default): `create` resolves once `LISTEN` is active, and rejects if it fails.
      * `lazy`: `LISTEN` starts on the first read, so creating the cache opens no connection.
@@ -269,6 +285,7 @@ type LilypadDbCacheSync = {
     listenerOptions?: LilypadDbCacheDefaultListenerOptions;
 } | {
     strategy: 'changelog';
+    verify?: LilypadDbCacheSchemaVerification;
     /** Minimum time between two reads of the changelog, in ms. Changes are seen within it. */
     pollInterval: number;
     /**
@@ -294,6 +311,8 @@ type LilypadDbCacheSync = {
 } | {
     strategy: 'none';
 };
+/** How the cache checks that the database has the triggers it needs (see {@link LilypadDbCacheSync}). */
+type LilypadDbCacheSchemaVerification = 'warn' | 'throw' | 'off';
 type LilypadDbCacheConstructorOptions<K extends LilypadCacheKey, V, PK extends keyof V> = LilypadCacheOptions<K, V> & {
     dbGate: {
         gate: LilypadDbGate;
@@ -345,6 +364,13 @@ declare class LilypadDbCache<K extends LilypadCacheKey & V[PK], V extends object
     private readonly defaultDbListener?;
     private listening?;
     private singletonIdentifier?;
+    /**
+     * The schema of the table: from `tableName` when it is qualified, otherwise as resolved by the
+     * schema check. Notifications from another schema are ignored; while it is unknown, notifications
+     * of the table in any schema are applied.
+     */
+    private tableSchema?;
+    private schemaCheck?;
     private changelogCursor?;
     /** Changes already applied, by id, with their transaction id, until the cursor passes them. */
     private appliedChanges;
@@ -362,7 +388,19 @@ declare class LilypadDbCache<K extends LilypadCacheKey & V[PK], V extends object
     private static initializeNew;
     private constructor();
     private static syncFromLegacyOptions;
-    /** Registers the listener once; a failed registration is retried by the next call. */
+    private schemaVerification;
+    /**
+     * Checks once that the database has the triggers the sync strategy needs, and resolves the schema
+     * of the table. With `verify: 'warn'` it never rejects: problems and failures are logged.
+     *
+     * @throws A `LilypadSchemaCheckError` with `verify: 'throw'`, or the error of the check.
+     */
+    private verifySchema;
+    private runSchemaCheck;
+    /**
+     * Registers the listener once, after the schema check (which resolves the schema of the table,
+     * to ignore the notifications of other schemas); a failed registration is retried by the next call.
+     */
     private startListening;
     /**
      * Brings the cache up to date with the changes made elsewhere before a read: starts a lazy
@@ -447,6 +485,11 @@ declare class LilypadDbCache<K extends LilypadCacheKey & V[PK], V extends object
     private markDeleted;
     protected getDefaultDbListener(options?: LilypadDbCacheDefaultListenerOptions): ListenerCallbackIdentifier;
     /**
+     * Whether a notification is about the table of this cache. `table` is the name without its
+     * schema; `schema`, when the trigger sends it and the schema of the table is known, must match.
+     */
+    private isNotificationForTable;
+    /**
      * Marks every entry as expired (keeping the values as fallback) and forces the next bulk sync.
      */
     private expireAll;
@@ -529,6 +572,10 @@ type LilypadChange = {
  *
  * Without a cursor (first read, or a cursor no longer trusted), `since.lookback` returns the
  * changes recorded in the last `lookback` milliseconds instead.
+ *
+ * `tableName` is resolved as the gate's queries resolve it (with the `search_path` when it is not
+ * qualified), so a table of the same name in another schema is not mixed up with it. Rows recorded
+ * by a version 1 trigger, which had no schema, match any schema.
  */
 declare function readLilypadChanges(gate: LilypadDbGate, options: {
     tableName: string;
@@ -554,4 +601,73 @@ declare function pruneLilypadChangelog(gate: LilypadDbGate, options: {
     changelogTable?: string;
 }): Promise<number>;
 
-export { LILYPAD_DEFAULT_CHANGELOG_TABLE, type LilypadChange, type LilypadChangelogSqlOptions, LilypadDbCache, type LilypadDbCacheDefaultListenerOptions, type LilypadDbCacheDefaultNotificationPayload, type LilypadDbCacheSync, type LilypadDbColumnType, LilypadDbGate, type LilypadDbGateOptions, type LilypadDbInsertData, type LilypadDbPoolOptions, type LilypadDbSchema, type LilypadDbUpdateData, type ListenerCallbackIdentifier, lilypadChangelogSql, lilypadChangelogTriggerSql, lilypadServerlessPool, pruneLilypadChangelog, readLilypadChanges };
+type LilypadSchemaCheckOptions = {
+    /** The cached tables, as in their `LilypadDbSchema` (`tableName`, `primaryKey`). */
+    tables: {
+        table: string;
+        primaryKey: string;
+    }[];
+    /**
+     * Checks the changelog table, its trigger function, and that each table has the changelog
+     * trigger (the `changelog` strategy). `false` skips these checks. Defaults to `{}`: the default
+     * changelog table.
+     */
+    changelog?: {
+        table?: string;
+    } | false;
+    /**
+     * Checks that each table has a trigger that sends notifications on this channel (the `listen`
+     * strategy). The trigger may be the changelog trigger or one of your own: its function must call
+     * `pg_notify` with the channel name as a literal. Defaults to `false`: not checked.
+     */
+    notifyChannel?: string | false;
+};
+type LilypadSchemaProblemCode = 
+/** PostgreSQL is older than 13: the changelog needs `xid8`. */
+'unsupported-version'
+/** The cached table does not exist (as seen with the `search_path` of the gate). */
+ | 'missing-table'
+/** The changelog table or its trigger function does not exist. */
+ | 'missing-changelog'
+/** The changelog table or its trigger function was installed by an older version of the library. */
+ | 'outdated-changelog'
+/** The table has no enabled changelog trigger firing on each INSERT, UPDATE and DELETE row. */
+ | 'missing-changelog-trigger'
+/** The changelog trigger of the table records another column than the primary key. */
+ | 'wrong-trigger-primary-key'
+/** No trigger of the table sends notifications on the channel. */
+ | 'missing-notify-trigger';
+type LilypadSchemaProblem = {
+    code: LilypadSchemaProblemCode;
+    /** The cached table concerned, for the per-table problems. */
+    table?: string;
+    message: string;
+    /** SQL that fixes the problem, to run in a migration. */
+    fix?: string;
+};
+type LilypadSchemaCheckResult = {
+    ok: boolean;
+    problems: LilypadSchemaProblem[];
+    /** The schema each table resolves to (`null` if the table does not exist). */
+    tables: {
+        table: string;
+        schema: string | null;
+    }[];
+};
+/** Thrown by `LilypadDbCache.create` with `verify: 'throw'` when the database is not set up. */
+declare class LilypadSchemaCheckError extends Error {
+    readonly problems: LilypadSchemaProblem[];
+    constructor(subject: string, problems: LilypadSchemaProblem[]);
+}
+/**
+ * Checks that the database has what `LilypadDbCache` needs to learn about changes: the changelog
+ * table, its trigger function and a trigger on each cached table, or a trigger that sends
+ * notifications. It only reads the catalogs: it changes nothing.
+ *
+ * @returns The problems found, each with a message and, when the library can generate it, the SQL
+ * that fixes it (`ok` is true when there is none).
+ * @throws If the catalogs cannot be read (e.g. the database is unreachable).
+ */
+declare function checkLilypadSchema(gate: LilypadDbGate, options: LilypadSchemaCheckOptions): Promise<LilypadSchemaCheckResult>;
+
+export { LILYPAD_DEFAULT_CHANGELOG_TABLE, type LilypadChange, type LilypadChangelogSqlOptions, LilypadDbCache, type LilypadDbCacheDefaultListenerOptions, type LilypadDbCacheDefaultNotificationPayload, type LilypadDbCacheSchemaVerification, type LilypadDbCacheSync, type LilypadDbColumnType, LilypadDbGate, type LilypadDbGateOptions, type LilypadDbInsertData, type LilypadDbPoolOptions, type LilypadDbSchema, type LilypadDbUpdateData, LilypadSchemaCheckError, type LilypadSchemaCheckOptions, type LilypadSchemaCheckResult, type LilypadSchemaProblem, type LilypadSchemaProblemCode, type ListenerCallbackIdentifier, checkLilypadSchema, lilypadChangelogSql, lilypadChangelogTriggerSql, lilypadServerlessPool, pruneLilypadChangelog, readLilypadChanges };

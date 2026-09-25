@@ -18,6 +18,7 @@ export type {
   LilypadDbCacheDefaultNotificationPayload,
   LilypadDbCacheDefaultListenerOptions,
   LilypadDbCacheSync,
+  LilypadDbCacheSchemaVerification,
 } from '../cache/LilypadDbCache';
 
 export {
@@ -28,3 +29,11 @@ export {
   readLilypadChanges,
 } from '../dbGate/LilypadChangelog';
 export type { LilypadChange, LilypadChangelogSqlOptions } from '../dbGate/LilypadChangelog';
+
+export { checkLilypadSchema, LilypadSchemaCheckError } from '../dbGate/LilypadSchemaCheck';
+export type {
+  LilypadSchemaCheckOptions,
+  LilypadSchemaCheckResult,
+  LilypadSchemaProblem,
+  LilypadSchemaProblemCode,
+} from '../dbGate/LilypadSchemaCheck';

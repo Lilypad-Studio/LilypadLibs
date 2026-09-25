@@ -152,6 +152,8 @@ Or print the SQL and paste it into your migration tool: both functions return pl
 
 - The changelog table (`lilypad_cache_changes`) records the table, the primary key and the operation of every change. An update that changes the primary key is recorded as a delete of the old key and an update of the new one.
 - The trigger also sends a `NOTIFY` on `cache_events`, so `listen` and `changelog` can coexist (for example a long-running worker next to the Vercel app). Pass `{ notifyChannel: false }` to skip it.
+- If you installed the changelog with an earlier version of the library, run `lilypadChangelogSql()` again: it adds the schema column and updates the trigger function.
+- The cache checks the setup once, with its first read of the changelog, and logs a warning with the missing SQL (`verify: 'warn'`, the default). With `verify: 'throw'`, `create` rejects instead, but it then queries the database: keep the default for code that runs during `next build`. To check in a deployment script, call `checkLilypadSchema(gate, { tables: [{ table: 'users', primaryKey: 'id' }] })` (see the [README](../README.md#checking-the-database-setup)).
 
 ### Using it
 

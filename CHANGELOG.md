@@ -21,6 +21,8 @@ These changes can break existing code. Check each item that applies to you.
 | `LilypadDbCache` caches deleted rows as `null` even for protected keys. | None: protected keys were wrongly kept. |
 | Notification triggers that the library installs send `id` as a string. | None: the cache accepts numbers and strings. |
 | `useDefaultDbListener` and `defaultListenerOptions` are deprecated. | Use `sync: { strategy: 'none' }` or `sync: { strategy: 'listen', listenerOptions }`. They still work. |
+| The changelog records the schema of each table (version 2). The changelog of a development build of 0.2.0 must be upgraded. | Run `lilypadChangelogSql()` again (it adds the `table_schema` column). Until then, reads of the changelog fail. |
+| `LilypadDbCache` checks once that its triggers are installed (`verify: 'warn'`), and warns on `console.warn` when it has no logger. | Install what the warning lists, or set `sync.verify: 'off'` (for example if you send notifications in a way the check does not see). |
 
 ### Added
 
@@ -29,6 +31,7 @@ These changes can break existing code. Check each item that applies to you.
   - Subpath entries (`@lilypad/libs/logger`, `/cache`, `/flow`, `/serializer`, `/singleton`, `/platform`, `/db`), ESM builds, and edge-runtime compatibility for every module except `/db`.
 - **LilypadCache**: a shared level between instances (`shared`, `name`, `codec`, soft refresh lock), `staleWhileRevalidate`, `failureCooldown` (shared between instances), `getOrSetDetailed` with the status of the value, `maxEntries` (LRU), `cleanupOnAccessEvery`, a per-call `timeout`, invalidation events.
 - **LilypadDbCache**: the `sync` option, with the `changelog` strategy (a trigger writes every change to a table; each instance reads it at most once per `pollInterval`, missing no commit whatever its order), `listen` with `connect: 'lazy'`, and `none`. Helpers `lilypadChangelogSql`, `lilypadChangelogTriggerSql`, `pruneLilypadChangelog`, `readLilypadChanges`.
+- **Schema check**: `checkLilypadSchema` reports what the database misses for the `changelog` and `listen` strategies, with the SQL that fixes it. `LilypadDbCache` runs it once (`sync.verify`: `warn`, `throw` or `off`).
 - **LilypadDbGate**: `pool` options, the `lilypadServerlessPool` preset, `statementTimeout`, `onReconnect` on listeners, typed partial updates (`LilypadDbSchema<T, PK>`).
 - **Logger**: `platform`, `flush()`, `context`, structured records for components (`sendRecord`), `LilypadJsonConsoleLogger`. `LilypadDiscordLogger` batches messages and retries rate-limited requests.
 - **LilypadFlowControl**: per-execution `timeout`, `isInFlight`.
@@ -36,6 +39,7 @@ These changes can break existing code. Check each item that applies to you.
 
 ### Fixed
 
+- `LilypadDbCache` mixed up tables of the same name in different schemas: it applied the changes of `archive.users` to a cache of `users`, with both strategies.
 - `insertSanitizationFn` could not remove properties from the written data.
 - A failing `errorLogging` callback made the logger reject, which terminated the process.
 - Out-of-order refreshes could leave an old row in a `LilypadDbCache`; writes are now ordered by when they started.

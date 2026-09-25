@@ -9,6 +9,7 @@ import {
   pruneLilypadChangelog,
   readLilypadChanges,
 } from './LilypadChangelog';
+import { checkLilypadSchema } from './LilypadSchemaCheck';
 import type { LilypadLoggerType } from '@/logger/LilypadLogger';
 
 type User = { id: number; name: string; role: string };
@@ -425,6 +426,208 @@ describe('LilypadDbGate (integration)', () => {
       await vi.waitFor(() => expect(listened).toHaveBeenCalled());
       expect((await readAll()).changes).toHaveLength(1);
       await gate.removeListener('cache_events', 'both');
+    });
+  });
+
+  describe('schema check', () => {
+    const users = { table: 'users', primaryKey: 'id' };
+    const codes = (result: Awaited<ReturnType<typeof checkLilypadSchema>>) =>
+      result.problems.map((problem) => problem.code);
+
+    it('should find nothing to fix in a database set up with the library SQL', async () => {
+      const result = await checkLilypadSchema(gate, {
+        tables: [users],
+        notifyChannel: 'cache_events', // sent by the custom trigger of the test table
+      });
+
+      expect(result).toEqual({
+        ok: true,
+        problems: [],
+        tables: [{ table: 'users', schema: 'public' }],
+      });
+    });
+
+    it('should report a missing table', async () => {
+      const result = await checkLilypadSchema(gate, {
+        tables: [{ table: 'missing', primaryKey: 'id' }],
+      });
+
+      expect(codes(result)).toEqual(['missing-table']);
+      expect(result.tables).toEqual([{ table: 'missing', schema: null }]);
+    });
+
+    it('should report a table without the changelog trigger, with the SQL that fixes it', async () => {
+      await admin`CREATE TABLE unwatched (id int PRIMARY KEY)`;
+      try {
+        const options = { tables: [{ table: 'unwatched', primaryKey: 'id' }] };
+        const result = await checkLilypadSchema(gate, options);
+        expect(codes(result)).toEqual(['missing-changelog-trigger']);
+
+        await admin.unsafe(result.problems[0].fix!);
+
+        expect((await checkLilypadSchema(gate, options)).ok).toBe(true);
+      } finally {
+        await admin`DROP TABLE unwatched`;
+      }
+    });
+
+    it('should report a disabled changelog trigger', async () => {
+      await admin`ALTER TABLE users DISABLE TRIGGER users_lilypad_changes`;
+      try {
+        const result = await checkLilypadSchema(gate, { tables: [users] });
+
+        expect(codes(result)).toEqual(['missing-changelog-trigger']);
+        expect(result.problems[0].message).toContain('disabled');
+      } finally {
+        await admin`ALTER TABLE users ENABLE TRIGGER users_lilypad_changes`;
+      }
+    });
+
+    it('should report a trigger that records another column than the primary key', async () => {
+      const result = await checkLilypadSchema(gate, {
+        tables: [{ table: 'users', primaryKey: 'name' }],
+      });
+
+      expect(codes(result)).toEqual(['wrong-trigger-primary-key']);
+      expect(result.problems[0].message).toContain('"id"');
+    });
+
+    it('should report a table whose triggers send no notification on the channel', async () => {
+      // The changelog trigger function of this suite sends none (notifyChannel: false)
+      await admin`CREATE TABLE unwatched (id int PRIMARY KEY)`;
+      await admin.unsafe(lilypadChangelogTriggerSql({ table: 'unwatched', primaryKey: 'id' }));
+      try {
+        const result = await checkLilypadSchema(gate, {
+          tables: [{ table: 'unwatched', primaryKey: 'id' }],
+          changelog: false,
+          notifyChannel: 'cache_events',
+        });
+
+        expect(codes(result)).toEqual(['missing-notify-trigger']);
+      } finally {
+        await admin`DROP TABLE unwatched`;
+      }
+    });
+
+    it('should report a missing changelog', async () => {
+      const result = await checkLilypadSchema(gate, {
+        tables: [users],
+        changelog: { table: 'other_changes' },
+      });
+
+      expect(codes(result)).toEqual(['missing-changelog', 'missing-changelog-trigger']);
+      expect(result.problems[0].fix).toContain('CREATE TABLE IF NOT EXISTS "other_changes"');
+      expect(result.problems[1].fix).toContain('EXECUTE FUNCTION "other_changes_record"');
+    });
+
+    it('should report a changelog installed by version 1, and upgrade it', async () => {
+      await admin.unsafe(lilypadChangelogSql({ table: 'legacy_changes', notifyChannel: false }));
+      // What version 1 installed: no schema column, no version comment
+      await admin`ALTER TABLE legacy_changes DROP COLUMN table_schema`;
+      await admin`COMMENT ON FUNCTION legacy_changes_record() IS NULL`;
+      try {
+        const options = { tables: [], changelog: { table: 'legacy_changes' } };
+        const result = await checkLilypadSchema(gate, options);
+        expect(codes(result)).toEqual(['outdated-changelog']);
+        expect(result.problems[0].message).toContain('version 1');
+
+        await admin.unsafe(result.problems[0].fix!);
+
+        expect((await checkLilypadSchema(gate, options)).ok).toBe(true);
+      } finally {
+        await admin`DROP TABLE legacy_changes`;
+        await admin`DROP FUNCTION legacy_changes_record()`;
+      }
+    });
+  });
+
+  describe('tables of the same name in different schemas', () => {
+    beforeAll(async () => {
+      await admin`CREATE SCHEMA archive`;
+      await admin`CREATE TABLE archive.users (id int PRIMARY KEY, name text NOT NULL)`;
+      await admin.unsafe(lilypadChangelogTriggerSql({ table: 'archive.users', primaryKey: 'id' }));
+      // A second changelog, whose trigger function also sends notifications on cache_events. Its
+      // trigger is created by hand: the generated one has the same name as the trigger above.
+      await admin.unsafe(lilypadChangelogSql({ table: 'archive.changes' }));
+      await admin`
+        CREATE TRIGGER archive_users_notify AFTER INSERT OR UPDATE OR DELETE ON archive.users
+        FOR EACH ROW EXECUTE FUNCTION archive_changes_record('id')
+      `;
+    });
+
+    afterAll(async () => {
+      await admin`DROP SCHEMA archive CASCADE`;
+      await admin`DROP FUNCTION archive_changes_record()`;
+    });
+
+    beforeEach(async () => {
+      await admin`TRUNCATE archive.users, archive.changes`;
+    });
+
+    it('should read the changes of the table of the given schema only', async () => {
+      await admin`INSERT INTO users (name) VALUES ('Ada')`;
+      await admin`INSERT INTO archive.users (id, name) VALUES (7, 'old')`;
+      const read = (tableName: string) =>
+        readLilypadChanges(gate, { tableName, since: { lookback: 60_000 } });
+
+      expect((await read('users')).changes.map((change) => change.rowId)).toEqual(['1']);
+      expect((await read('public.users')).changes.map((change) => change.rowId)).toEqual(['1']);
+      expect((await read('archive.users')).changes.map((change) => change.rowId)).toEqual(['7']);
+    });
+
+    it('should still return the rows recorded without a schema by version 1', async () => {
+      await admin`
+        INSERT INTO lilypad_cache_changes (table_name, row_id, op) VALUES ('users', '9', 'UPDATE')
+      `;
+
+      const { changes } = await readLilypadChanges(gate, {
+        tableName: 'archive.users',
+        since: { lookback: 60_000 },
+      });
+
+      expect(changes.map((change) => change.rowId)).toEqual(['9']);
+    });
+
+    it('should resolve the schema of each table', async () => {
+      const result = await checkLilypadSchema(gate, {
+        tables: [
+          { table: 'users', primaryKey: 'id' },
+          { table: 'archive.users', primaryKey: 'id' },
+        ],
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.tables).toEqual([
+        { table: 'users', schema: 'public' },
+        { table: 'archive.users', schema: 'archive' },
+      ]);
+    });
+
+    it('should not apply to a LilypadDbCache the notifications of the other schema', async () => {
+      const cache = await LilypadDbCache.create<number, User, 'id'>(60_000, {
+        dbGate: { gate, schema: usersSchema },
+      });
+      // Registered after the cache: when it sees a notification, the cache has applied it
+      const seen: { schema?: string; op: string }[] = [];
+      await gate.addListener({
+        channel: 'cache_events',
+        callbackId: 'archive-spy',
+        callback: (payload) => void seen.push(JSON.parse(payload as string)),
+      });
+      try {
+        const created = await cache.sqlCreate({ name: 'Ada', role: 'dev' });
+
+        await admin`INSERT INTO archive.users (id, name) VALUES (1, 'old')`;
+        await admin`DELETE FROM archive.users WHERE id = 1`;
+        await vi.waitFor(() =>
+          expect(seen).toContainEqual(expect.objectContaining({ schema: 'archive', op: 'DELETE' }))
+        );
+
+        expect(cache.get(1)).toEqual(created);
+      } finally {
+        await gate.removeListener('cache_events', 'archive-spy');
+        await cache.dispose();
+      }
     });
   });
 

@@ -6,6 +6,7 @@ import type {
   ListenerCallbackIdentifier,
 } from '@/dbGate/LilypadDbGate';
 import type { LilypadLibLogger } from '@/logger/LilypadLogger';
+import { LilypadSchemaCheckError } from '@/dbGate/LilypadSchemaCheck';
 
 // The changelog is read through this mock: the queries themselves are covered by the integration tests
 const changelog = vi.hoisted(() => ({ read: vi.fn() }));
@@ -13,6 +14,19 @@ vi.mock('@/dbGate/LilypadChangelog', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/dbGate/LilypadChangelog')>()),
   readLilypadChanges: changelog.read,
 }));
+
+// The schema check is mocked too: its queries are covered by the integration tests
+const schemaCheck = vi.hoisted(() => ({ check: vi.fn() }));
+vi.mock('@/dbGate/LilypadSchemaCheck', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/dbGate/LilypadSchemaCheck')>()),
+  checkLilypadSchema: schemaCheck.check,
+}));
+
+const schemaOk = (schemaName: string | null = 'public') => ({
+  ok: true,
+  problems: [],
+  tables: [{ table: 'items', schema: schemaName }],
+});
 
 type Item = { id: string; name: string };
 
@@ -76,6 +90,8 @@ describe('LilypadDbCache', () => {
       { id: '1', name: 'one' },
       { id: '2', name: 'two' },
     ]);
+    schemaCheck.check.mockReset();
+    schemaCheck.check.mockResolvedValue(schemaOk());
   });
 
   const createCache = (options: Record<string, unknown> = {}) =>
@@ -573,6 +589,182 @@ describe('LilypadDbCache', () => {
         cache.id,
         'Error reading the changelog:',
         expect.any(Error)
+      );
+    });
+  });
+
+  describe('schema verification', () => {
+    const missingTrigger = {
+      ok: false,
+      problems: [
+        {
+          code: 'missing-changelog-trigger',
+          table: 'items',
+          message: 'The table "items" has no changelog trigger: its changes are not recorded.',
+          fix: 'CREATE TRIGGER items_lilypad_changes ...',
+        },
+      ],
+      tables: [{ table: 'items', schema: 'public' }],
+    };
+    const createLogger = () => ({ error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() });
+
+    beforeEach(() => {
+      changelog.read.mockReset();
+      changelog.read.mockResolvedValue({ changes: [], cursor: 100n });
+    });
+
+    it('should check the notification trigger before LISTEN with the listen strategy', async () => {
+      await createCache();
+
+      expect(schemaCheck.check).toHaveBeenCalledWith(fake.gate, {
+        tables: [{ table: 'items', primaryKey: 'id' }],
+        changelog: false,
+        notifyChannel: 'cache_events',
+      });
+      expect(schemaCheck.check.mock.invocationCallOrder[0]).toBeLessThan(
+        fake.mocks.addListener.mock.invocationCallOrder[0]
+      );
+    });
+
+    it('should check the changelog once, on the first read, with the changelog strategy', async () => {
+      const cache = await createCache({
+        sync: { strategy: 'changelog', pollInterval: 0, table: 'my_changes' },
+      });
+      expect(schemaCheck.check).not.toHaveBeenCalled();
+
+      await cache.getOrFetch('1');
+      await cache.getOrFetch('2');
+
+      expect(schemaCheck.check).toHaveBeenCalledOnce();
+      expect(schemaCheck.check).toHaveBeenCalledWith(fake.gate, {
+        tables: [{ table: 'items', primaryKey: 'id' }],
+        changelog: { table: 'my_changes' },
+        notifyChannel: false,
+      });
+    });
+
+    it('should not delay changelog reads for the check', async () => {
+      schemaCheck.check.mockReturnValue(new Promise(() => {}));
+      const cache = await createCache({ sync: { strategy: 'changelog', pollInterval: 0 } });
+
+      await expect(cache.getOrFetch('1')).resolves.toEqual({ id: '1', name: 'one' });
+    });
+
+    it('should warn once with the problems and the SQL that fixes them', async () => {
+      schemaCheck.check.mockResolvedValue(missingTrigger);
+      const logger = createLogger();
+      const cache = await createCache({
+        sync: { strategy: 'changelog', pollInterval: 0 },
+        logger,
+      });
+
+      await cache.getOrFetch('1');
+      await cache.getOrFetch('2');
+      await vi.waitFor(() => expect(logger.warn).toHaveBeenCalled());
+
+      expect(logger.warn).toHaveBeenCalledOnce();
+      const [id, message] = logger.warn.mock.calls[0];
+      expect(id).toBe(cache.id);
+      expect(message).toContain('LilypadDbCache "items" (sync: changelog)');
+      expect(message).toContain('has no changelog trigger');
+      expect(message).toContain('CREATE TRIGGER items_lilypad_changes ...');
+    });
+
+    it('should warn on the console without a logger', async () => {
+      schemaCheck.check.mockResolvedValue(missingTrigger);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        await createCache();
+
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('has no changelog trigger'));
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('should keep working when the check fails', async () => {
+      schemaCheck.check.mockRejectedValue(new Error('permission denied for pg_trigger'));
+      const logger = createLogger();
+      const cache = await createCache({ logger });
+
+      expect(fake.mocks.addListener).toHaveBeenCalledOnce();
+      expect(logger.warn).toHaveBeenCalledWith(
+        cache.id,
+        'LilypadDbCache "items" (sync: listen): could not check the database schema:',
+        expect.any(Error)
+      );
+    });
+
+    it('should reject create with verify: throw, before connecting', async () => {
+      schemaCheck.check.mockResolvedValue(missingTrigger);
+
+      const creating = createCache({ sync: { strategy: 'listen', verify: 'throw' } });
+
+      await expect(creating).rejects.toThrow(LilypadSchemaCheckError);
+      await expect(creating).rejects.toMatchObject({ problems: missingTrigger.problems });
+      expect(fake.mocks.addListener).not.toHaveBeenCalled();
+    });
+
+    it('should check in create with verify: throw, even with the changelog strategy', async () => {
+      await createCache({ sync: { strategy: 'changelog', pollInterval: 0, verify: 'throw' } });
+
+      expect(schemaCheck.check).toHaveBeenCalledOnce();
+    });
+
+    it('should not check with verify: off or the none strategy', async () => {
+      const cache = await createCache({ sync: { strategy: 'listen', verify: 'off' } });
+      const other = await createCache({ sync: { strategy: 'none' } });
+      await cache.getOrFetch('1');
+      await other.getOrFetch('1');
+
+      expect(schemaCheck.check).not.toHaveBeenCalled();
+    });
+
+    it('should ignore the notifications of a table of the same name in another schema', async () => {
+      const cache = await createCache();
+      await cache.getOrFetch('1');
+
+      await fake.notify({ schema: 'archive', table: 'items', id: '1', op: 'DELETE' });
+      expect(cache.get('1')).toEqual({ id: '1', name: 'one' });
+
+      await fake.notify({ schema: 'public', table: 'items', id: '1', op: 'DELETE' });
+      expect(cache.get('1')).toBeNull();
+    });
+
+    it('should apply notifications without a schema to the table in any schema', async () => {
+      const cache = await createCache();
+      await cache.getOrFetch('1');
+
+      await fake.notify({ table: 'items', id: '1', op: 'DELETE' });
+
+      expect(cache.get('1')).toBeNull();
+    });
+
+    it('should take the schema from a qualified table name, even without a check', async () => {
+      const cache = await LilypadDbCache.create<string, Item>(60000, {
+        dbGate: { gate: fake.gate, schema: { ...schema, tableName: 'app.items' } },
+        sync: { strategy: 'listen', verify: 'off' },
+      });
+      await cache.getOrFetch('1');
+
+      await fake.notify({ schema: 'public', table: 'items', id: '1', op: 'DELETE' });
+      expect(cache.get('1')).toEqual({ id: '1', name: 'one' });
+
+      await fake.notify({ schema: 'app', table: 'items', id: '1', op: 'DELETE' });
+      expect(cache.get('1')).toBeNull();
+    });
+
+    it('should read the changelog of the qualified table name', async () => {
+      const cache = await LilypadDbCache.create<string, Item>(60000, {
+        dbGate: { gate: fake.gate, schema: { ...schema, tableName: 'app.items' } },
+        sync: { strategy: 'changelog', pollInterval: 0 },
+      });
+
+      await cache.getOrFetch('1');
+
+      expect(changelog.read).toHaveBeenCalledWith(
+        fake.gate,
+        expect.objectContaining({ tableName: 'app.items' })
       );
     });
   });

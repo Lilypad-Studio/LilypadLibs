@@ -3,12 +3,14 @@ import {
   LILYPAD_DEFAULT_CHANGELOG_TABLE,
   LilypadDbCache,
   LilypadDbGate,
+  LilypadSchemaCheckError,
+  checkLilypadSchema,
   lilypadChangelogSql,
   lilypadChangelogTriggerSql,
   lilypadServerlessPool,
   pruneLilypadChangelog,
   readLilypadChanges
-} from "./chunks/chunk-QM2QYHEZ.mjs";
+} from "./chunks/chunk-3FQBS2R5.mjs";
 import {
   LilypadCacheCooldownError,
   LilypadCache_default
@@ -48,7 +50,9 @@ export {
   LilypadJsonConsoleLogger,
   LilypadLogger,
   LilypadLoggerComponent,
+  LilypadSchemaCheckError,
   LilypadSerializer,
+  checkLilypadSchema,
   createLogger,
   getLilypadSingletonInstance,
   getLilypadSingletonInstanceAsync,

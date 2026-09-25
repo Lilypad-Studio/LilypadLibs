@@ -7,6 +7,11 @@ import {
   type ListenerCallbackIdentifier,
 } from '@/dbGate/LilypadDbGate';
 import { LILYPAD_DEFAULT_NOTIFY_CHANNEL, readLilypadChanges } from '@/dbGate/LilypadChangelog';
+import {
+  checkLilypadSchema,
+  formatLilypadSchemaProblems,
+  LilypadSchemaCheckError,
+} from '@/dbGate/LilypadSchemaCheck';
 import LilypadCache, {
   type LilypadCachedValueType,
   type LilypadCacheGetOptions,
@@ -22,6 +27,11 @@ import {
 } from '@/singleton/LilypadSingleton';
 
 export type LilypadDbCacheDefaultNotificationPayload = {
+  /**
+   * The schema of the table. Notifications without it match the table in any schema (the triggers
+   * of version 1 of the changelog, and custom triggers that do not send it).
+   */
+  schema?: string;
   table?: string;
   /** A number when the trigger serializes a numeric primary key as such (e.g. `json_build_object`). */
   id?: string | number;
@@ -50,10 +60,21 @@ export type LilypadDbCacheDefaultListenerOptions = {
  *   per `pollInterval`, when the cache is used. No long-lived connection: suited to serverless
  *   platforms. Changes are seen within `pollInterval`.
  * - `none`: only the writes of this instance and the TTL keep the cache up to date.
+ *
+ * `listen` and `changelog` rely on triggers that the library does not install (see
+ * `lilypadChangelogSql`). Their `verify` option checks that they exist (`checkLilypadSchema`):
+ * - `warn` (default): once, when the cache first uses the database (`LISTEN`, or the first read
+ *   of the changelog), without delaying changelog reads; problems are logged as a warning, with the
+ *   SQL that fixes them (on `console.warn` without a logger).
+ * - `throw`: in `create`, which rejects with a `LilypadSchemaCheckError`. `create` then queries
+ *   the database, whatever the strategy.
+ * - `off`: no check. With `listen`, notifications of a table of the same name in another schema
+ *   are then told apart only if `tableName` is qualified (`schema.table`).
  */
 export type LilypadDbCacheSync =
   | {
       strategy: 'listen';
+      verify?: LilypadDbCacheSchemaVerification;
       /**
        * `eager` (default): `create` resolves once `LISTEN` is active, and rejects if it fails.
        * `lazy`: `LISTEN` starts on the first read, so creating the cache opens no connection.
@@ -63,6 +84,7 @@ export type LilypadDbCacheSync =
     }
   | {
       strategy: 'changelog';
+      verify?: LilypadDbCacheSchemaVerification;
       /** Minimum time between two reads of the changelog, in ms. Changes are seen within it. */
       pollInterval: number;
       /**
@@ -87,6 +109,9 @@ export type LilypadDbCacheSync =
       table?: string;
     }
   | { strategy: 'none' };
+
+/** How the cache checks that the database has the triggers it needs (see {@link LilypadDbCacheSync}). */
+export type LilypadDbCacheSchemaVerification = 'warn' | 'throw' | 'off';
 
 type LilypadDbCacheConstructorOptions<
   K extends LilypadCacheKey,
@@ -150,6 +175,13 @@ export default class LilypadDbCache<
   private readonly defaultDbListener?: ListenerCallbackIdentifier;
   private listening?: Promise<void>;
   private singletonIdentifier?: string;
+  /**
+   * The schema of the table: from `tableName` when it is qualified, otherwise as resolved by the
+   * schema check. Notifications from another schema are ignored; while it is unknown, notifications
+   * of the table in any schema are applied.
+   */
+  private tableSchema?: string;
+  private schemaCheck?: Promise<void>;
 
   // Changelog strategy state
   private changelogCursor?: bigint;
@@ -201,13 +233,16 @@ export default class LilypadDbCache<
     options: LilypadDbCacheConstructorOptions<K, V, PK>
   ): Promise<LilypadDbCache<K, V, PK>> {
     const cache = new LilypadDbCache<K, V, PK>(ttl, options);
-    if (cache.sync.strategy === 'listen' && cache.sync.connect !== 'lazy') {
-      try {
-        await cache.startListening();
-      } catch (error) {
-        await cache.dispose();
-        throw error;
+    try {
+      if (cache.schemaVerification() === 'throw') {
+        await cache.verifySchema();
       }
+      if (cache.sync.strategy === 'listen' && cache.sync.connect !== 'lazy') {
+        await cache.startListening();
+      }
+    } catch (error) {
+      await cache.dispose();
+      throw error;
     }
     return cache;
   }
@@ -222,6 +257,10 @@ export default class LilypadDbCache<
       ]);
 
     this.sync = options.sync ?? LilypadDbCache.syncFromLegacyOptions(options);
+    const tableNameParts = this.dbGate.schema.tableName.split('.');
+    if (tableNameParts.length > 1) {
+      this.tableSchema = tableNameParts[tableNameParts.length - 2];
+    }
     if (this.sync.strategy === 'listen') {
       this.defaultDbListener = this.getDefaultDbListener(this.sync.listenerOptions);
     }
@@ -245,15 +284,73 @@ export default class LilypadDbCache<
     };
   }
 
+  // SCHEMA VERIFICATION
+
+  private schemaVerification(): LilypadDbCacheSchemaVerification {
+    return this.sync.strategy === 'none' ? 'off' : (this.sync.verify ?? 'warn');
+  }
+
+  /**
+   * Checks once that the database has the triggers the sync strategy needs, and resolves the schema
+   * of the table. With `verify: 'warn'` it never rejects: problems and failures are logged.
+   *
+   * @throws A `LilypadSchemaCheckError` with `verify: 'throw'`, or the error of the check.
+   */
+  private verifySchema(): Promise<void> {
+    const mode = this.schemaVerification();
+    if (mode === 'off') {
+      return Promise.resolve();
+    }
+    this.schemaCheck ??= this.runSchemaCheck(mode);
+    return this.schemaCheck;
+  }
+
+  private async runSchemaCheck(mode: 'warn' | 'throw'): Promise<void> {
+    const { tableName, primaryKey } = this.dbGate.schema;
+    const subject = `LilypadDbCache "${tableName}" (sync: ${this.sync.strategy})`;
+    try {
+      const result = await checkLilypadSchema(this.dbGate.gate, {
+        tables: [{ table: tableName, primaryKey: String(primaryKey) }],
+        changelog: this.sync.strategy === 'changelog' ? { table: this.sync.table } : false,
+        notifyChannel: this.sync.strategy === 'listen' ? LILYPAD_DEFAULT_NOTIFY_CHANNEL : false,
+      });
+      this.tableSchema = result.tables[0]?.schema ?? this.tableSchema;
+      if (result.ok) {
+        return;
+      }
+      if (mode === 'throw') {
+        throw new LilypadSchemaCheckError(subject, result.problems);
+      }
+      const message = formatLilypadSchemaProblems(subject, result.problems);
+      if (this.logger) {
+        void this.logger.warn(this.id, message);
+      } else {
+        // A missing trigger would otherwise go unnoticed: the cache just stays stale
+        console.warn(message);
+      }
+    } catch (error) {
+      if (mode === 'throw') {
+        throw error;
+      }
+      void this.logger?.warn(this.id, `${subject}: could not check the database schema:`, error);
+    }
+  }
+
   // SYNCHRONIZATION
 
-  /** Registers the listener once; a failed registration is retried by the next call. */
+  /**
+   * Registers the listener once, after the schema check (which resolves the schema of the table,
+   * to ignore the notifications of other schemas); a failed registration is retried by the next call.
+   */
   private startListening(): Promise<void> {
     if (!this.listening && this.defaultDbListener) {
-      this.listening = this.dbGate.gate.addListener(this.defaultDbListener).catch((error) => {
-        this.listening = undefined;
-        throw error;
-      });
+      const listener = this.defaultDbListener;
+      this.listening = this.verifySchema()
+        .then(() => this.dbGate.gate.addListener(listener))
+        .catch((error) => {
+          this.listening = undefined;
+          throw error;
+        });
     }
     return this.listening ?? Promise.resolve();
   }
@@ -280,6 +377,10 @@ export default class LilypadDbCache<
     }
     if (Date.now() - this.lastChangelogRead < this.sync.pollInterval) {
       return undefined;
+    }
+    if (!this.schemaCheck) {
+      // Only diagnostics: reads do not wait for it
+      runInBackground(this.platform, this.verifySchema(), () => {});
     }
     const reading = this.readChangelog();
     if (this.sync.poll === 'background') {
@@ -313,8 +414,7 @@ export default class LilypadDbCache<
     const lookback =
       this.sync.lookback ?? this.defaultTtl + this.defaultStaleWhileRevalidate + 60_000;
     const { changes, cursor } = await readLilypadChanges(this.dbGate.gate, {
-      // The trigger records the table name without its schema
-      tableName: this.dbGate.schema.tableName.split('.').pop()!,
+      tableName: this.dbGate.schema.tableName,
       since: trusted ? { cursor: this.changelogCursor! } : { lookback },
       changelogTable: this.sync.table,
     });
@@ -538,8 +638,7 @@ export default class LilypadDbCache<
         ) {
           return;
         }
-        // The trigger sends the table name without its schema
-        if (parsedPayload.table === this.dbGate.schema.tableName.split('.').pop()) {
+        if (this.isNotificationForTable(parsedPayload)) {
           void this.logger?.debug(
             this.id,
             this.dbGate.schema.tableName,
@@ -555,6 +654,21 @@ export default class LilypadDbCache<
         }
       },
     };
+  }
+
+  /**
+   * Whether a notification is about the table of this cache. `table` is the name without its
+   * schema; `schema`, when the trigger sends it and the schema of the table is known, must match.
+   */
+  private isNotificationForTable(payload: LilypadDbCacheDefaultNotificationPayload): boolean {
+    if (payload.table !== this.dbGate.schema.tableName.split('.').pop()) {
+      return false;
+    }
+    return (
+      typeof payload.schema !== 'string' ||
+      this.tableSchema === undefined ||
+      payload.schema === this.tableSchema
+    );
   }
 
   /**
