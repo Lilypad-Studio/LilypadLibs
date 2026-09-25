@@ -1,10 +1,7 @@
-import { inspect } from 'node:util';
-import {
-  createLilypadSingletonSignatureValue,
-  getLilypadSingletonInstance,
-  LilypadSingletonAble,
-} from '@/singleton/LilypadSingleton';
-import LilypadLoggerComponent from '@/logger/LilypadLoggerComponent';
+import { getLilypadSingletonInstance, LilypadSingletonAble } from '@/singleton/LilypadSingleton';
+import LilypadLoggerComponent, { type LilypadLogRecord } from '@/logger/LilypadLoggerComponent';
+import { formatLogValue } from '@/logger/formatLogValue';
+import { runInBackground, type LilypadPlatform } from '@/platform/LilypadPlatform';
 
 /**
  * Options for constructing a {@link LilypadLogger} instance.
@@ -19,6 +16,16 @@ export type LilypadLoggerConstructorOptions<T extends string> = {
   components: Record<T, LilypadLoggerComponent<T>[]>;
   name?: string;
   errorLogging?: (error: unknown) => Promise<void>;
+  /**
+   * `platform.background` receives every message being sent, so that the instance stays alive
+   * until it is sent even after the response (serverless platforms).
+   */
+  platform?: Pick<LilypadPlatform, 'background'>;
+  /**
+   * Called synchronously for every message: its fields are added to the record (e.g. a request id
+   * read from `AsyncLocalStorage`). If it throws, the message is logged without context.
+   */
+  context?: () => Record<string, unknown> | undefined;
 } & LilypadSingletonAble;
 
 // Define a utility type to map channel keys to method signatures
@@ -64,6 +71,9 @@ export class LilypadLogger<T extends string> {
     return this._name;
   }
 
+  /** The messages still being sent, awaited by `flush`. */
+  private _pending: Set<Promise<void>> = new Set();
+
   /**
    * Creates a new LilypadLogger instance or retrieves a singleton instance.
    *
@@ -93,10 +103,8 @@ export class LilypadLogger<T extends string> {
     if (options.singleton) {
       const registryKey = `LilypadLogger:${options.singletonIdentifier}`;
       return getLilypadSingletonInstance(registryKey, () => new LilypadLogger<T>(options), {
-        value: createLilypadSingletonSignatureValue([
-          options.name,
-          Object.keys(options.components).sort(),
-        ]),
+        // No secrets in these options: the signature can stay in clear text
+        value: JSON.stringify([options.name, Object.keys(options.components).sort()]),
         onMismatch: () =>
           console.warn(
             `LilypadLogger singleton "${options.singletonIdentifier}" already exists with different options: the new options are ignored.`
@@ -112,7 +120,15 @@ export class LilypadLogger<T extends string> {
     // (e.g. `constructor`, `toString`); fields are listed explicitly because, depending on the
     // compilation target, they may not be defined on the instance yet. `then` would make the logger
     // a thenable: returning it from an async function would call it instead of resolving to it.
-    const reservedKeys = new Set(['components', 'register', '__name', '_name', 'then']);
+    const reservedKeys = new Set([
+      'components',
+      'register',
+      'flush',
+      '__name',
+      '_name',
+      '_pending',
+      'then',
+    ]);
     for (const key of Object.keys(options.components)) {
       if (reservedKeys.has(key) || key in this) {
         throw new Error(`Logger type "${key}" is reserved and cannot be used as a log channel.`);
@@ -133,15 +149,25 @@ export class LilypadLogger<T extends string> {
 
     for (const type of Object.keys(this.components) as T[]) {
       // Create the function that logs to components
-      const logFn = async (...message: unknown[]) => {
+      const send = async (message: unknown[], context: Record<string, unknown> | undefined) => {
         let errors: unknown[];
         try {
           // Formatting stays inside the try: it must never make the returned promise reject
-          const stringMessage = message.map(formatMessagePart).join(' ');
+          const record: LilypadLogRecord<T> = {
+            type,
+            message: message.map(formatLogValue).join(' '),
+            parts: message,
+            timestamp: new Date(),
+            loggerName: this._name,
+            context,
+          };
           // allSettled: a failing component must neither stop nor hide the errors of the others
           const results = await Promise.allSettled(
             this.components[type].map(async (component) =>
-              component.output(type, stringMessage, { logger: this as LilypadLoggerType<T> })
+              component.output(type, record.message, {
+                logger: this as LilypadLoggerType<T>,
+                record,
+              })
             )
           );
           errors = results
@@ -153,6 +179,16 @@ export class LilypadLogger<T extends string> {
         for (const error of errors) {
           await reportComponentError(type, error, options.errorLogging);
         }
+      };
+
+      const logFn = (...message: unknown[]): Promise<void> => {
+        // The context is read synchronously, while the caller's async context is still active
+        const task = send(message, readContext(options.context));
+        this._pending.add(task);
+        void task.finally(() => this._pending.delete(task));
+        // `task` never rejects: the error handler is only required by runInBackground
+        runInBackground(options.platform, task, () => {});
+        return task;
       };
 
       // Assign the function directly to the class instance (this)
@@ -176,6 +212,26 @@ export class LilypadLogger<T extends string> {
     }
     return this;
   }
+
+  /**
+   * Resolves once every message logged so far has been sent (or has failed and been reported).
+   * Useful before the process exits, or at the end of a serverless request without `platform`.
+   */
+  async flush(): Promise<void> {
+    while (this._pending.size > 0) {
+      await Promise.all(this._pending);
+    }
+  }
+}
+
+function readContext(
+  context: (() => Record<string, unknown> | undefined) | undefined
+): Record<string, unknown> | undefined {
+  try {
+    return context?.();
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -196,14 +252,6 @@ async function reportComponentError(
     }
   }
   console.error(`Error in logger component for type "${type}":`, error);
-}
-
-/**
- * Formats a part of a log message. Unlike `JSON.stringify`, `inspect` keeps the message and stack
- * of errors and never throws on circular references or BigInts.
- */
-function formatMessagePart(part: unknown): string {
-  return typeof part === 'string' ? part : inspect(part, { depth: 4, breakLength: Infinity });
 }
 
 export type LilypadLoggerType<T extends string> = LilypadLogger<T> & ChannelMethods<T>;

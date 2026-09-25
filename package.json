@@ -1,17 +1,95 @@
 {
   "name": "@lilypad/libs",
-  "version": "0.0.1",
+  "version": "0.2.0",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "module": "./dist/index.mjs",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    },
+    "./cache": {
+      "import": {
+        "types": "./dist/cache.d.mts",
+        "default": "./dist/cache.mjs"
+      },
+      "require": {
+        "types": "./dist/cache.d.ts",
+        "default": "./dist/cache.js"
+      }
+    },
+    "./db": {
+      "import": {
+        "types": "./dist/db.d.mts",
+        "default": "./dist/db.mjs"
+      },
+      "require": {
+        "types": "./dist/db.d.ts",
+        "default": "./dist/db.js"
+      }
+    },
+    "./flow": {
+      "import": {
+        "types": "./dist/flow.d.mts",
+        "default": "./dist/flow.mjs"
+      },
+      "require": {
+        "types": "./dist/flow.d.ts",
+        "default": "./dist/flow.js"
+      }
+    },
+    "./logger": {
+      "import": {
+        "types": "./dist/logger.d.mts",
+        "default": "./dist/logger.mjs"
+      },
+      "require": {
+        "types": "./dist/logger.d.ts",
+        "default": "./dist/logger.js"
+      }
+    },
+    "./platform": {
+      "import": {
+        "types": "./dist/platform.d.mts",
+        "default": "./dist/platform.mjs"
+      },
+      "require": {
+        "types": "./dist/platform.d.ts",
+        "default": "./dist/platform.js"
+      }
+    },
+    "./serializer": {
+      "import": {
+        "types": "./dist/serializer.d.mts",
+        "default": "./dist/serializer.mjs"
+      },
+      "require": {
+        "types": "./dist/serializer.d.ts",
+        "default": "./dist/serializer.js"
+      }
+    },
+    "./singleton": {
+      "import": {
+        "types": "./dist/singleton.d.mts",
+        "default": "./dist/singleton.mjs"
+      },
+      "require": {
+        "types": "./dist/singleton.d.ts",
+        "default": "./dist/singleton.js"
+      }
     }
   },
   "files": [
     "dist"
   ],
+  "sideEffects": false,
   "engines": {
     "node": ">=20"
   },
@@ -25,7 +103,7 @@
     "build": "tsup --dts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint --fix",
-    "test": "vitest --project unit",
+    "test": "vitest --project unit --project edge",
     "test:integration": "vitest run --project integration",
     "prepare": "husky"
   },
@@ -33,6 +111,7 @@
     "postgres": "^3.4.7"
   },
   "devDependencies": {
+    "@edge-runtime/vm": "^5.0.0",
     "@testcontainers/postgresql": "^12.1.0",
     "@types/node": "^20.19.43",
     "@typescript-eslint/eslint-plugin": "^8.48.1",

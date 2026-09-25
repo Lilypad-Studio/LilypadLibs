@@ -1,6 +1,14 @@
-import { randomUUID } from 'node:crypto';
 import { LilypadFlowControl } from '@/flow/LilypadFlowControl';
 import type { LilypadLibLogger } from '@/logger/LilypadLogger';
+import {
+  runAfterResponse,
+  runInBackground,
+  sharedStoreOperation,
+  toTtlSeconds,
+  type LilypadInvalidationEvent,
+  type LilypadPlatform,
+  type LilypadSharedStore,
+} from '@/platform/LilypadPlatform';
 
 /**
  * The keys accepted by the cache. Keys are compared by their string form, so `42` and `'42'`
@@ -20,6 +28,18 @@ export type LilypadCacheGetOptions<K extends LilypadCacheKey, V> = {
    * If true, bypasses the cache and always calls `valueFn` to get a fresh value.
    */
   skipCache?: boolean;
+
+  /**
+   * How long after its expiration a value is still returned at once, while it is refreshed in the
+   * background. Overrides the cache's `staleWhileRevalidate`.
+   */
+  staleWhileRevalidate?: number;
+
+  /**
+   * Timeout of the fetch, in milliseconds. Overrides the cache's `flowControlTimeout`. Concurrent
+   * calls share the timeout of the call that started the fetch.
+   */
+  timeout?: number;
 
   /**
    * If true, when the provided `valueFn` (or an in-flight promise) throws/rejects,
@@ -63,20 +83,87 @@ type LilypadCacheGetOptionsErrorFn<K extends LilypadCacheKey, V> = {
 export type LilypadCachedValueType<V> = V | null;
 
 /**
+ * Where the value returned by `getOrSetDetailed` comes from:
+ * - `L1-HIT`: a fresh value in the memory of this instance;
+ * - `L2-HIT`: a fresh value from the shared level;
+ * - `STALE`: an expired value within `staleWhileRevalidate`, being refreshed in the background;
+ * - `MISS`: fetched now (or a fallback, if the fetch failed).
+ */
+export type LilypadCacheStatus = 'L1-HIT' | 'L2-HIT' | 'STALE' | 'MISS';
+
+export type LilypadCacheResult<V> = {
+  value: LilypadCachedValueType<V>;
+  status: LilypadCacheStatus;
+  /** The last fetch of the key failed: the value is a stale copy or a fallback. */
+  refreshFailed: boolean;
+};
+
+/**
+ * Converts values to and from what the shared store can hold (usually JSON).
+ */
+export type LilypadSharedCodec<V> = {
+  encode(value: V): unknown;
+  /** Returns `null` when the stored value does not have the expected shape: it is then ignored. */
+  decode(raw: unknown): V | null;
+};
+
+export type LilypadCacheSharedOptions<V> = {
+  /** Defaults to the `shared` store of the cache's `platform`. */
+  store?: LilypadSharedStore;
+  /**
+   * Without a codec, values are stored as they are: this suits JSON-compatible values only
+   * (e.g. a `Date` comes back as a string). A codec also validates what comes back.
+   */
+  codec?: LilypadSharedCodec<V>;
+  /** Beyond this time (ms) a shared store operation counts as failed. Defaults to 300 ms. */
+  timeout?: number;
+  /**
+   * If set, a background refresh holds a lock in the shared store for this long (ms), so that the
+   * other instances do not refresh the same key at the same time. It is a soft lock (read and
+   * write are not atomic): rarely, two instances still refresh together. Set it to the maximum
+   * duration of a fetch.
+   */
+  refreshLockTtl?: number;
+};
+
+/**
+ * Thrown by `getOrSet` for a key whose last fetch failed less than `failureCooldown` ago, when no
+ * fallback value is available.
+ */
+export class LilypadCacheCooldownError extends Error {
+  constructor(key: string, cooldown: number) {
+    super(`Fetching "${key}" failed less than ${cooldown}ms ago: not retrying yet.`);
+    this.name = 'LilypadCacheCooldownError';
+  }
+}
+
+/**
  * Represents a cached value along with its expiration time.
  *
  * @template K The type of the cache key.
  * @template V The type of the value being cached.
  * @property key The key as passed by the caller: the store is keyed by its string form.
  * @property value The actual value stored in the cache. Will be NULL if the associated value does not exist at all, instead of simply not being cached yet.
- * @property expirationTime The UNIX timestamp (in milliseconds) indicating when the cached value expires.
+ * @property expirationTime The UNIX timestamp (in milliseconds) indicating when the cached value
+ * expires. `0` marks an invalidated entry, which is never served as a stale value.
+ * @property fetchedAt When the value was produced: the age of a value copied from the shared
+ * level is measured from here, not from when it entered this level.
  * @property ticket Orders the writes: see {@link LilypadCache.setIfNewer}.
  */
 type LilypadCacheEntry<K, V> = {
   key: K;
   value: LilypadCachedValueType<V>;
   expirationTime: number;
+  fetchedAt: number;
   ticket: number;
+};
+
+/** What the cache stores in the shared level. */
+type LilypadSharedEnvelope = {
+  lilypad: 1;
+  value: unknown;
+  fetchedAt: number;
+  expiresAt: number;
 };
 
 /**
@@ -105,8 +192,43 @@ function isStale(entry: { expirationTime: number }): boolean {
 }
 
 const DEFAULT_ERROR_TTL = 5 * 60 * 1000; // 5 minutes
+const DEFAULT_SHARED_TIMEOUT = 300;
+/**
+ * A background refresh scheduled longer ago than this no longer blocks new ones: it may never
+ * have started (e.g. the platform dropped the work scheduled after the response).
+ */
+const STUCK_REFRESH_AFTER = 60_000;
 
-type LilypadCacheConstructorOptions<K extends LilypadCacheKey, V> = {
+export type LilypadCacheOptions<K extends LilypadCacheKey, V> = {
+  /**
+   * Identifies the cache in the shared level, in invalidation events and in logs. Required with
+   * `shared`, and unique among the caches that use the same shared store.
+   */
+  name?: string;
+  /** Platform capabilities: background work, shared store, invalidation hook. */
+  platform?: LilypadPlatform;
+  /** Adds a level shared by every instance (e.g. the Vercel Runtime Cache). */
+  shared?: LilypadCacheSharedOptions<V>;
+  /**
+   * How long after its expiration a value is still returned at once by `getOrSet`, while it is
+   * refreshed in the background. Defaults to 0 (disabled).
+   */
+  staleWhileRevalidate?: number;
+  /**
+   * After a failed fetch, the key is not fetched again for this long (ms): the stale value or the
+   * fallback is used, or `LilypadCacheCooldownError` is thrown. Shared through the shared level.
+   * Defaults to 0 (disabled).
+   */
+  failureCooldown?: number;
+  /** Maximum number of entries in memory; the least recently used are removed first. */
+  maxEntries?: number;
+  /**
+   * Removes expired entries during cache accesses, at most once per this interval (ms). Unlike
+   * `autoCleanupInterval` it needs no timer, so it also works on instances that are suspended
+   * between requests.
+   */
+  cleanupOnAccessEvery?: number;
+  /** Removes expired entries with a timer. On serverless platforms prefer `cleanupOnAccessEvery`. */
   autoCleanupInterval?: number;
   /** Defaults to the smaller of `ttl` and 5 minutes. */
   defaultErrorTtl?: number;
@@ -117,6 +239,15 @@ type LilypadCacheConstructorOptions<K extends LilypadCacheKey, V> = {
   flowControlTimeout?: number;
   /** Timeout of `bulkSync`, in milliseconds. Defaults to 30 seconds. */
   bulkSyncTimeout?: number;
+  /** Prefix of the tags of the invalidation events. Defaults to `lilypad`. */
+  tagPrefix?: string;
+};
+
+type LilypadResolvedSharedOptions<V> = {
+  store: LilypadSharedStore;
+  codec?: LilypadSharedCodec<V>;
+  timeout: number;
+  refreshLockTtl?: number;
 };
 
 /**
@@ -126,10 +257,11 @@ type LilypadCacheConstructorOptions<K extends LilypadCacheKey, V> = {
  * - Automatic expiration of entries based on TTL.
  * - Prevention of duplicate concurrent fetches for the same key.
  * - Optional fallback to previous values on fetch errors.
+ * - Stale-while-revalidate and a cooldown after failed fetches.
+ * - An optional level shared by every instance of the application.
  * - Protection of specific keys from deletion or clearing.
- * - Automatic periodic cleanup of expired entries.
+ * - Automatic cleanup of expired entries.
  * - Optional bulk synchronization with an external data source.
- * - Integration with a database gateway for persistent and updated storage when an invalidation occurs.
  *
  * When a value is returned, as a general rule of thumb:
  * - `undefined` means "not in cache"
@@ -166,17 +298,27 @@ type LilypadCacheConstructorOptions<K extends LilypadCacheKey, V> = {
  * @see {@link dispose}
  */
 class LilypadCache<K extends LilypadCacheKey, V> {
-  public readonly id = `LilypadCache-${randomUUID()}`;
+  public readonly id = `LilypadCache-${globalThis.crypto.randomUUID()}`;
+  /** The name given in the options, or the id. */
+  public readonly name: string;
 
   protected store: Map<string, LilypadCacheEntry<K, V>>;
   protected defaultTtl: number; // time to live in milliseconds
   protected defaultErrorTtl: number; // default error TTL in milliseconds
   protected defaultBulkSyncTtl: number;
+  protected defaultStaleWhileRevalidate: number;
+  protected failureCooldown: number;
   protected cleanupIntervalId?: ReturnType<typeof setInterval> & { unref?: () => void };
 
   protected protectedKeys: Set<string> = new Set();
 
   protected logger?: LilypadLibLogger;
+  protected platform?: LilypadPlatform;
+  private shared?: LilypadResolvedSharedOptions<V>;
+  private maxEntries?: number;
+  private cleanupOnAccessEvery?: number;
+  private lastCleanup = Date.now();
+  private tagPrefix: string;
 
   protected flowControl: LilypadFlowControl<LilypadCachedValueType<V>>;
   protected bulkSyncFlowControl: LilypadFlowControl<boolean>;
@@ -202,14 +344,45 @@ class LilypadCache<K extends LilypadCacheKey, V> {
   private bulkSyncInvalidationTicket = 0;
   private disposed = false;
 
-  public constructor(ttl: number = 60000, options: LilypadCacheConstructorOptions<K, V> = {}) {
+  /** When the last fetch of each key failed (normalized keys), for `failureCooldown`. */
+  private failures = new Map<string, number>();
+  /** Keys whose background refresh is scheduled or running, with the time it was scheduled. */
+  private refreshing = new Map<string, number>();
+
+  public constructor(ttl: number = 60000, options: LilypadCacheOptions<K, V> = {}) {
     this.store = new Map();
     this.defaultTtl = ttl;
     this.defaultBulkSyncTtl = options.defaultBulkSyncTtl ?? ttl;
     this.bulkSyncFn = options.bulkSyncFn;
     // A transient error must not pin its fallback for longer than a regular value
     this.defaultErrorTtl = options.defaultErrorTtl ?? Math.min(ttl, DEFAULT_ERROR_TTL);
+    this.defaultStaleWhileRevalidate = options.staleWhileRevalidate ?? 0;
+    this.failureCooldown = options.failureCooldown ?? 0;
     this.logger = options.logger;
+    this.platform = options.platform;
+    this.name = options.name ?? this.id;
+    this.maxEntries = options.maxEntries;
+    this.cleanupOnAccessEvery = options.cleanupOnAccessEvery;
+    this.tagPrefix = options.tagPrefix ?? 'lilypad';
+
+    if (options.shared) {
+      const store = options.shared.store ?? options.platform?.shared;
+      if (!store) {
+        throw new Error('LilypadCache: `shared` needs a `store`, or a `platform.shared` store.');
+      }
+      if (options.name === undefined) {
+        throw new Error('LilypadCache: `name` is required with `shared`.');
+      }
+      this.shared = {
+        store,
+        codec: options.shared.codec,
+        timeout: options.shared.timeout ?? DEFAULT_SHARED_TIMEOUT,
+        refreshLockTtl: options.shared.refreshLockTtl,
+      };
+    }
+    if (options.maxEntries !== undefined && !(options.maxEntries > 0)) {
+      throw new Error('maxEntries must be a positive number');
+    }
 
     this.flowControl = new LilypadFlowControl<LilypadCachedValueType<V>>({
       logger: this.logger,
@@ -260,28 +433,72 @@ class LilypadCache<K extends LilypadCacheKey, V> {
     return ++this.lastTicket;
   }
 
-  private write(key: K, value: LilypadCachedValueType<V>, ttl: number | undefined, ticket: number) {
+  private writeEntry(entry: LilypadCacheEntry<K, V>) {
     // A disposed cache stays empty, even when in-flight fetches complete
     if (this.disposed) {
       return;
     }
-    this.store.set(this.normalizeKey(key), {
+    const normalizedKey = this.normalizeKey(entry.key);
+    if (this.maxEntries !== undefined) {
+      // Re-inserted at the end: the Map order is the order of use
+      this.store.delete(normalizedKey);
+    }
+    this.store.set(normalizedKey, entry);
+    this.evictOverflow();
+  }
+
+  /** Removes the least recently used entries beyond `maxEntries`, sparing protected keys. */
+  private evictOverflow() {
+    if (this.maxEntries === undefined || this.store.size <= this.maxEntries) {
+      return;
+    }
+    for (const normalizedKey of this.store.keys()) {
+      if (this.store.size <= this.maxEntries) {
+        return;
+      }
+      if (!this.protectedKeys.has(normalizedKey)) {
+        this.store.delete(normalizedKey);
+      }
+    }
+  }
+
+  /** Marks an entry as recently used, for `maxEntries`. */
+  private touch(normalizedKey: string, entry: LilypadCacheEntry<K, V>) {
+    if (this.maxEntries !== undefined) {
+      this.store.delete(normalizedKey);
+      this.store.set(normalizedKey, entry);
+    }
+  }
+
+  /** Writes to this instance only. */
+  private setLocal(
+    key: K,
+    value: LilypadCachedValueType<V>,
+    ttl?: number
+  ): LilypadCacheEntry<K, V> {
+    const entry = {
       key,
       value,
       expirationTime: this.createExpirationTime(ttl),
-      ticket,
-    });
+      fetchedAt: Date.now(),
+      ticket: this.nextTicket(),
+    };
+    this.writeEntry(entry);
+    return entry;
   }
 
   /**
    * Stores a value in the cache associated with the specified key, optionally setting a time-to-live (TTL) for expiration.
+   * With a shared level, the value is also written there (in the background).
    *
    * @param key - The key to associate with the cached value.
    * @param value - The value to store in the cache.
    * @param ttl - Optional. The time-to-live in milliseconds. If not provided, the cache's default TTL is used.
    */
   set(key: K, value: LilypadCachedValueType<V>, ttl?: number) {
-    this.write(key, value, ttl, this.nextTicket());
+    this.cleanupOnAccess();
+    const entry = this.setLocal(key, value, ttl);
+    this.writeShared(entry);
   }
 
   /**
@@ -289,25 +506,63 @@ class LilypadCache<K extends LilypadCacheKey, V> {
    * stored a value for the key.
    *
    * @param ticket - The ticket taken with {@link nextTicket} when the read started.
+   * @param fetchedAt - When the read started.
    * @returns `true` if the value was stored.
    */
   protected setIfNewer(
     key: K,
     value: LilypadCachedValueType<V>,
     ttl: number | undefined,
-    ticket: number
+    ticket: number,
+    fetchedAt: number = Date.now()
   ): boolean {
     const entry = this.store.get(this.normalizeKey(key));
     if (ticket <= (entry?.ticket ?? this.ticketFloor)) {
       return false;
     }
-    this.write(key, value, ttl, ticket);
+    this.writeEntry({
+      key,
+      value,
+      expirationTime: this.createExpirationTime(ttl),
+      fetchedAt,
+      ticket,
+    });
+    return true;
+  }
+
+  /**
+   * Stores a value just read from the source: in this instance (if no newer write happened, see
+   * {@link setIfNewer}) and in the shared level. It also ends the key's failure cooldown.
+   *
+   * @returns `true` if the value was stored.
+   */
+  protected storeFetched(
+    key: K,
+    value: LilypadCachedValueType<V>,
+    ttl: number | undefined,
+    ticket: number,
+    fetchedAt: number
+  ): boolean {
+    const normalizedKey = this.normalizeKey(key);
+    if (this.failures.delete(normalizedKey) && this.shared && this.failureCooldown > 0) {
+      this.sharedInBackground(`delete of the failure of "${normalizedKey}"`, (store) =>
+        store.delete(this.sharedFailureKey(normalizedKey))
+      );
+    }
+    if (!this.setIfNewer(key, value, ttl, ticket, fetchedAt)) {
+      return false;
+    }
+    const entry = this.store.get(normalizedKey);
+    if (entry) {
+      this.writeShared(entry);
+    }
     return true;
   }
 
   /**
    * Retrieves a value from the cache associated with the specified key.
    * If the cached value has expired or does not exist, it returns `undefined`.
+   * It reads the memory of this instance only: use `getOrSet` to also read the shared level.
    *
    * @param key - The key associated with the cached value.
    * @param removeOld - If true, an expired value is also removed from the cache, as a side effect.
@@ -316,12 +571,15 @@ class LilypadCache<K extends LilypadCacheKey, V> {
    * @returns The cached value if it exists and is not expired; otherwise, `undefined`.
    */
   get(key: K, removeOld: boolean = false): LilypadCachedValueType<V> | undefined {
-    const entry = this.store.get(this.normalizeKey(key));
+    this.cleanupOnAccess();
+    const normalizedKey = this.normalizeKey(key);
+    const entry = this.store.get(normalizedKey);
     if (entry && !isStale(entry)) {
+      this.touch(normalizedKey, entry);
       return entry.value;
     } else {
       if (removeOld) {
-        this.delete(key);
+        this.deleteNormalized(normalizedKey);
       }
       return undefined;
     }
@@ -357,7 +615,8 @@ class LilypadCache<K extends LilypadCacheKey, V> {
    * 2. If `options.returnOldOnError` is true and a previous value exists, the old value is used.
    * 3. If no fallback value is determined, the original error is rethrown.
    *
-   * The chosen value (from errorFn or old value) is cached with a TTL specified by `options.errorTtl` or the default error TTL.
+   * The chosen value (from errorFn or old value) is cached in this instance only, with a TTL
+   * specified by `options.errorTtl` or the default error TTL.
    *
    * @param error - The error encountered during cache retrieval.
    * @param options - The cache get options, including error handling strategies.
@@ -385,7 +644,7 @@ class LilypadCache<K extends LilypadCacheKey, V> {
     if (valueToReturn === undefined) {
       throw error; // rethrow if no fallback value determined
     }
-    this.set(key, valueToReturn, options.errorTtl ?? this.defaultErrorTtl);
+    this.setLocal(key, valueToReturn, options.errorTtl ?? this.defaultErrorTtl);
     return valueToReturn;
   }
 
@@ -398,6 +657,28 @@ class LilypadCache<K extends LilypadCacheKey, V> {
    */
   protected isFetchInFlight(key: K): boolean {
     return this.flowControl.isInFlight(this.getOrSetFlightId(key));
+  }
+
+  private inCooldown(normalizedKey: string): boolean {
+    const failedAt = this.failures.get(normalizedKey);
+    return (
+      this.failureCooldown > 0 &&
+      failedAt !== undefined &&
+      Date.now() - failedAt < this.failureCooldown
+    );
+  }
+
+  private recordFailure(normalizedKey: string) {
+    const failedAt = Date.now();
+    this.failures.set(normalizedKey, failedAt);
+    if (this.shared && this.failureCooldown > 0) {
+      this.sharedInBackground(`write of the failure of "${normalizedKey}"`, (store) =>
+        store.set(this.sharedFailureKey(normalizedKey), failedAt, {
+          ttl: toTtlSeconds(this.failureCooldown),
+          tags: [this.cacheTag()],
+        })
+      );
+    }
   }
 
   /**
@@ -416,41 +697,397 @@ class LilypadCache<K extends LilypadCacheKey, V> {
    * @param options - Optional configuration for cache behavior and error handling
    * @returns A promise that resolves to the cached value or the value produced by valueFn
    * @throws The error of `valueFn` (or the timeout error) when the options give no fallback value
+   * @see {@link getOrSetDetailed} to also know where the value comes from
    */
   async getOrSet(
     key: K,
     valueFn: (signal: AbortSignal) => Promise<LilypadCachedValueType<V>>,
     options: LilypadCacheGetOptions<K, V> = {}
   ): Promise<LilypadCachedValueType<V>> {
+    return (await this.getOrSetDetailed(key, valueFn, options)).value;
+  }
+
+  /**
+   * Like {@link getOrSet}, but also tells where the value comes from and whether the last fetch
+   * failed.
+   *
+   * The lookup order is: memory of this instance, shared level, stale value (returned at once and
+   * refreshed in the background, within `staleWhileRevalidate`), fetch.
+   */
+  async getOrSetDetailed(
+    key: K,
+    valueFn: (signal: AbortSignal) => Promise<LilypadCachedValueType<V>>,
+    options: LilypadCacheGetOptions<K, V> = {}
+  ): Promise<LilypadCacheResult<V>> {
+    this.cleanupOnAccess();
+    const normalizedKey = this.normalizeKey(key);
+
     if (!options.skipCache) {
-      const cached = this.getComprehensive(key);
-      if (cached.type === 'hit') {
-        return cached.value;
+      const local = this.store.get(normalizedKey);
+      if (local && !isStale(local)) {
+        this.touch(normalizedKey, local);
+        return { value: local.value, status: 'L1-HIT', refreshFailed: false };
+      }
+
+      let refreshLocked = false;
+      if (this.shared) {
+        const ticket = this.nextTicket();
+        const remote = await this.readShared(normalizedKey);
+        refreshLocked = remote.locked;
+        if (remote.failedAt !== undefined) {
+          this.failures.set(
+            normalizedKey,
+            Math.max(remote.failedAt, this.failures.get(normalizedKey) ?? 0)
+          );
+        }
+        const adopted = remote.entry && this.adoptShared(key, remote.entry, ticket);
+        const current = this.store.get(normalizedKey);
+        if (current && !isStale(current)) {
+          return {
+            value: current.value,
+            status: adopted ? 'L2-HIT' : 'L1-HIT',
+            refreshFailed: false,
+          };
+        }
+      }
+
+      const current = this.store.get(normalizedKey);
+      const staleWindow = options.staleWhileRevalidate ?? this.defaultStaleWhileRevalidate;
+      if (current && staleWindow > 0 && Date.now() < current.expirationTime + staleWindow) {
+        this.refreshInBackground(key, valueFn, options, refreshLocked);
+        const failedAt = this.failures.get(normalizedKey);
+        return {
+          value: current.value,
+          status: 'STALE',
+          refreshFailed: failedAt !== undefined && failedAt >= current.fetchedAt,
+        };
       }
     }
 
-    try {
-      return await this.flowControl.executeFn({
-        functionIdentifier: this.getOrSetFlightId(key),
-        consumerIdentifier: '',
-        // Runs once per fetch, while the fallback is chosen per caller in errorReturn
-        errorFn: (error) => {
-          void this.logger?.error(this.id, `Error fetching cache key "${String(key)}": `, error);
-          throw error;
-        },
-        fn: async (signal) => {
-          const ticket = this.nextTicket();
-          const value = await valueFn(signal);
-          // After a timeout the caller already got an error/fallback: a late result is not cached
-          if (!signal.aborted) {
-            this.setIfNewer(key, value, options.ttl, ticket);
-          }
-          return value;
-        },
-      });
-    } catch (error) {
-      return this.errorReturn(error, options, key);
+    if (this.inCooldown(normalizedKey) && !this.isFetchInFlight(key)) {
+      const error = new LilypadCacheCooldownError(normalizedKey, this.failureCooldown);
+      return { value: this.errorReturn(error, options, key), status: 'MISS', refreshFailed: true };
     }
+    try {
+      const value = await this.fetchAndStore(key, valueFn, options);
+      return { value, status: 'MISS', refreshFailed: false };
+    } catch (error) {
+      return { value: this.errorReturn(error, options, key), status: 'MISS', refreshFailed: true };
+    }
+  }
+
+  /** Fetches the value (one fetch per key at a time) and stores it. */
+  private fetchAndStore(
+    key: K,
+    valueFn: (signal: AbortSignal) => Promise<LilypadCachedValueType<V>>,
+    options: LilypadCacheGetOptions<K, V>
+  ): Promise<LilypadCachedValueType<V>> {
+    return this.flowControl.executeFn({
+      functionIdentifier: this.getOrSetFlightId(key),
+      consumerIdentifier: '',
+      timeout: options.timeout,
+      // Runs once per fetch, while the fallback is chosen per caller in errorReturn
+      errorFn: (error) => {
+        void this.logger?.error(this.id, `Error fetching cache key "${String(key)}": `, error);
+        this.recordFailure(this.normalizeKey(key));
+        throw error;
+      },
+      fn: async (signal) => {
+        const ticket = this.nextTicket();
+        const fetchedAt = Date.now();
+        const value = await valueFn(signal);
+        // After a timeout the caller already got an error/fallback: a late result is not cached
+        if (!signal.aborted) {
+          this.storeFetched(key, value, options.ttl, ticket, fetchedAt);
+        }
+        return value;
+      },
+    });
+  }
+
+  /**
+   * Refreshes a stale key after the response (or at once, without `platform.afterResponse`),
+   * unless it is already being refreshed, locked by another instance, or in its failure cooldown.
+   */
+  private refreshInBackground(
+    key: K,
+    valueFn: (signal: AbortSignal) => Promise<LilypadCachedValueType<V>>,
+    options: LilypadCacheGetOptions<K, V>,
+    lockedByOtherInstance: boolean
+  ) {
+    const normalizedKey = this.normalizeKey(key);
+    if (
+      lockedByOtherInstance ||
+      Date.now() - (this.refreshing.get(normalizedKey) ?? -Infinity) < STUCK_REFRESH_AFTER ||
+      this.isFetchInFlight(key) ||
+      this.inCooldown(normalizedKey)
+    ) {
+      return;
+    }
+    const scheduledAt = Date.now();
+    this.refreshing.set(normalizedKey, scheduledAt);
+    runAfterResponse(
+      this.platform,
+      async () => {
+        const owner = await this.acquireRefreshLock(normalizedKey);
+        try {
+          await this.fetchAndStore(key, valueFn, options);
+        } finally {
+          // A newer refresh may have replaced a stuck one meanwhile
+          if (this.refreshing.get(normalizedKey) === scheduledAt) {
+            this.refreshing.delete(normalizedKey);
+          }
+          if (owner) {
+            await this.releaseRefreshLock(normalizedKey, owner);
+          }
+        }
+      },
+      // The fetch error has already been logged by fetchAndStore
+      () => {}
+    );
+  }
+
+  // SHARED LEVEL
+
+  private sharedKey(normalizedKey: string): string {
+    return `lilypad:${this.name}:${normalizedKey}`;
+  }
+
+  private sharedFailureKey(normalizedKey: string): string {
+    return `${this.sharedKey(normalizedKey)}:failedAt`;
+  }
+
+  private sharedLockKey(normalizedKey: string): string {
+    return `${this.sharedKey(normalizedKey)}:lock`;
+  }
+
+  private cacheTag(): string {
+    return `${this.tagPrefix}:${this.name}`;
+  }
+
+  /** A shared store operation bounded by the timeout; a failure resolves to `fallback`. */
+  private sharedOperation<T>(
+    description: string,
+    operation: (store: LilypadSharedStore) => Promise<T>,
+    fallback: T
+  ): Promise<T> {
+    const shared = this.shared!;
+    return sharedStoreOperation(
+      () => operation(shared.store),
+      fallback,
+      shared.timeout,
+      (error) => {
+        void this.logger?.warn(this.id, `Shared cache ${description} failed:`, error);
+      }
+    );
+  }
+
+  private sharedInBackground(
+    description: string,
+    operation: (store: LilypadSharedStore) => Promise<unknown>
+  ) {
+    runInBackground(
+      this.platform,
+      this.sharedOperation(description, operation, undefined),
+      () => {}
+    );
+  }
+
+  /** Reads the entry, the failure time and the refresh lock of a key, in parallel. */
+  private async readShared(normalizedKey: string): Promise<{
+    entry?: LilypadSharedEnvelope & { decoded: LilypadCachedValueType<V> };
+    failedAt?: number;
+    locked: boolean;
+  }> {
+    const [raw, failedAt, lock] = await Promise.all([
+      this.sharedOperation(
+        `read of "${normalizedKey}"`,
+        (store) => store.get(this.sharedKey(normalizedKey)),
+        null
+      ),
+      this.failureCooldown > 0
+        ? this.sharedOperation(
+            `read of the failure of "${normalizedKey}"`,
+            (store) => store.get(this.sharedFailureKey(normalizedKey)),
+            null
+          )
+        : null,
+      this.shared!.refreshLockTtl !== undefined
+        ? this.sharedOperation(
+            `read of the lock of "${normalizedKey}"`,
+            (store) => store.get(this.sharedLockKey(normalizedKey)),
+            null
+          )
+        : null,
+    ]);
+    return {
+      entry: this.decodeEnvelope(normalizedKey, raw),
+      failedAt: typeof failedAt === 'number' ? failedAt : undefined,
+      locked: typeof lock === 'string',
+    };
+  }
+
+  private decodeEnvelope(
+    normalizedKey: string,
+    raw: unknown
+  ): (LilypadSharedEnvelope & { decoded: LilypadCachedValueType<V> }) | undefined {
+    if (raw === null || raw === undefined) {
+      return undefined;
+    }
+    const envelope = raw as Partial<LilypadSharedEnvelope>;
+    const valid =
+      typeof raw === 'object' &&
+      envelope.lilypad === 1 &&
+      typeof envelope.fetchedAt === 'number' &&
+      typeof envelope.expiresAt === 'number' &&
+      'value' in envelope;
+    if (!valid) {
+      void this.logger?.warn(this.id, `Ignoring a malformed shared entry for "${normalizedKey}"`);
+      return undefined;
+    }
+    if (envelope.value === null) {
+      return { ...(envelope as LilypadSharedEnvelope), decoded: null };
+    }
+    const codec = this.shared!.codec;
+    const decoded = codec ? codec.decode(envelope.value) : (envelope.value as V);
+    if (decoded === null) {
+      void this.logger?.warn(
+        this.id,
+        `Ignoring a shared entry rejected by the codec: "${normalizedKey}"`
+      );
+      return undefined;
+    }
+    return { ...(envelope as LilypadSharedEnvelope), decoded };
+  }
+
+  /**
+   * Copies an entry of the shared level into this instance, if it is newer than the local one
+   * and no local write started after the read of the shared level.
+   *
+   * @returns `true` if the entry was copied.
+   */
+  private adoptShared(
+    key: K,
+    remote: LilypadSharedEnvelope & { decoded: LilypadCachedValueType<V> },
+    ticket: number
+  ): boolean {
+    const current = this.store.get(this.normalizeKey(key));
+    if (current && current.fetchedAt >= remote.fetchedAt) {
+      return false;
+    }
+    if (ticket <= (current?.ticket ?? this.ticketFloor)) {
+      return false;
+    }
+    this.writeEntry({
+      key,
+      value: remote.decoded,
+      expirationTime: remote.expiresAt,
+      fetchedAt: remote.fetchedAt,
+      ticket,
+    });
+    return true;
+  }
+
+  /**
+   * Writes an entry to the shared level in the background, unless the shared level already holds a
+   * value fetched later (a soft check: read and write are not atomic).
+   */
+  private writeShared(entry: LilypadCacheEntry<K, V>) {
+    if (!this.shared) {
+      return;
+    }
+    const normalizedKey = this.normalizeKey(entry.key);
+    const lifetime = entry.expirationTime + this.defaultStaleWhileRevalidate - Date.now();
+    if (lifetime <= 0) {
+      return;
+    }
+    const codec = this.shared.codec;
+    const envelope: LilypadSharedEnvelope = {
+      lilypad: 1,
+      value: entry.value === null || !codec ? entry.value : codec.encode(entry.value),
+      fetchedAt: entry.fetchedAt,
+      expiresAt: entry.expirationTime,
+    };
+    this.sharedInBackground(`write of "${normalizedKey}"`, async (store) => {
+      const current = (await store.get(this.sharedKey(normalizedKey))) as
+        | Partial<LilypadSharedEnvelope>
+        | null
+        | undefined;
+      if (typeof current?.fetchedAt === 'number' && current.fetchedAt > envelope.fetchedAt) {
+        return;
+      }
+      await store.set(this.sharedKey(normalizedKey), envelope, {
+        ttl: toTtlSeconds(lifetime),
+        tags: [this.cacheTag()],
+      });
+    });
+  }
+
+  /** Removes a key from the shared level, in the background. */
+  protected deleteShared(key: K) {
+    if (!this.shared) {
+      return;
+    }
+    const normalizedKey = this.normalizeKey(key);
+    this.sharedInBackground(`delete of "${normalizedKey}"`, (store) =>
+      store.delete(this.sharedKey(normalizedKey))
+    );
+  }
+
+  /** @returns The lock owner id, or undefined when no lock is configured. */
+  private async acquireRefreshLock(normalizedKey: string): Promise<string | undefined> {
+    const lockTtl = this.shared?.refreshLockTtl;
+    if (lockTtl === undefined) {
+      return undefined;
+    }
+    const owner = globalThis.crypto.randomUUID();
+    await this.sharedOperation(
+      `write of the lock of "${normalizedKey}"`,
+      (store) =>
+        store.set(this.sharedLockKey(normalizedKey), owner, { ttl: toTtlSeconds(lockTtl) }),
+      undefined
+    );
+    return owner;
+  }
+
+  /** Releases the lock only if it still belongs to this refresh, not to another instance. */
+  private async releaseRefreshLock(normalizedKey: string, owner: string) {
+    const current = await this.sharedOperation(
+      `read of the lock of "${normalizedKey}"`,
+      (store) => store.get(this.sharedLockKey(normalizedKey)),
+      null
+    );
+    if (current === owner) {
+      await this.sharedOperation(
+        `delete of the lock of "${normalizedKey}"`,
+        (store) => store.delete(this.sharedLockKey(normalizedKey)),
+        undefined
+      );
+    }
+  }
+
+  // INVALIDATION EVENTS
+
+  /**
+   * Sends an invalidation event to `platform.onInvalidate`, in the background.
+   */
+  protected emitInvalidation(source: LilypadInvalidationEvent['source'], keys: K[]) {
+    const onInvalidate = this.platform?.onInvalidate;
+    if (!onInvalidate || keys.length === 0) {
+      return;
+    }
+    const normalizedKeys = keys.map((key) => this.normalizeKey(key));
+    const event: LilypadInvalidationEvent = {
+      source,
+      cache: this.name,
+      keys: normalizedKeys,
+      tags: [this.cacheTag(), ...normalizedKeys.map((key) => `${this.cacheTag()}:${key}`)],
+    };
+    runInBackground(
+      this.platform,
+      Promise.resolve().then(() => onInvalidate(event)),
+      (error) => void this.logger?.error(this.id, 'Error in onInvalidate:', error)
+    );
   }
 
   /**
@@ -460,6 +1097,7 @@ class LilypadCache<K extends LilypadCacheKey, V> {
    * If a `syncFn` is provided, it will be used to fetch key-value pairs to synchronize.
    * Errors are logged; unless `throwOnError` is set they are not rethrown: the cache keeps its
    * current content, and the next call retries the sync.
+   * Bulk syncs fill the memory of this instance only, not the shared level.
    *
    * @param syncFn - An optional asynchronous function that returns an array of key-value pairs to be synchronized.
    * It receives a signal that is aborted when the sync times out.
@@ -496,6 +1134,7 @@ class LilypadCache<K extends LilypadCacheKey, V> {
       return true;
     }
     const ticket = this.nextTicket();
+    const fetchedAt = Date.now();
     const data = (await syncFn?.(signal)) ?? (await this.bulkSyncFn?.(signal));
     if (signal.aborted) {
       // Timed out: the caller already got an error, and a newer sync may be running
@@ -520,7 +1159,7 @@ class LilypadCache<K extends LilypadCacheKey, V> {
       }
     }
     for (const [key, value] of incoming.values()) {
-      this.setIfNewer(key, value, undefined, ticket);
+      this.setIfNewer(key, value, undefined, ticket, fetchedAt);
     }
     this.ticketFloor = Math.max(this.ticketFloor, ticket);
 
@@ -596,7 +1235,7 @@ class LilypadCache<K extends LilypadCacheKey, V> {
    * Sets multiple key-value pairs in the cache at once.
    *
    * Accepts either a `Map<K, V>` or an array of `[K, V]` tuples.
-   * Each entry is added to the cache using the `set` method.
+   * Each entry is added to the cache using the `set` method (so also to the shared level).
    *
    * @param entries - The entries to set, as a `Map` or an array of key-value tuples.
    */
@@ -637,22 +1276,37 @@ class LilypadCache<K extends LilypadCacheKey, V> {
   /**
    * Invalidates the cache entry for the specified key.
    *
-   * If the cache contains a valid entry for the given key, this method marks it as expired
-   * by setting its value with a negative expiration time.
+   * The entry is marked as expired: it is no longer returned, not even as a stale value, but it
+   * stays available as a fallback for `returnOldOnError`. It is also removed from the shared level,
+   * and `platform.onInvalidate` receives a `manual` event.
    *
    * @param key - The key of the cache entry to invalidate.
    * @param options - Optional settings for invalidation.
    * @param options.invalidateBulkSync - If true (default), forces a bulk sync on the next bulkSync call.
    */
   invalidate(key: K, { invalidateBulkSync = true }: { invalidateBulkSync?: boolean } = {}) {
+    this.markInvalid(key, { invalidateBulkSync });
+    this.emitInvalidation('manual', [key]);
+  }
+
+  /**
+   * The effect of `invalidate` on the data, without the invalidation event: expires the entry in
+   * this instance, removes it from the shared level and optionally forces the next bulk sync.
+   */
+  protected markInvalid(
+    key: K,
+    { invalidateBulkSync = true }: { invalidateBulkSync?: boolean } = {}
+  ) {
     this.expire(key);
+    this.deleteShared(key);
     if (invalidateBulkSync) {
       this.invalidateBulkSync();
     }
   }
 
   /**
-   * Marks a valid cache entry as expired, keeping its value as a fallback for `returnOldOnError`.
+   * Marks a cache entry as expired, keeping its value as a fallback for `returnOldOnError`.
+   * It is never served as a stale value either. Only this instance is affected.
    * Unlike `invalidate`, it is never overridden by subclasses, so it is always synchronous.
    *
    * @param key - The key of the cache entry to expire.
@@ -663,13 +1317,13 @@ class LilypadCache<K extends LilypadCacheKey, V> {
 
   private expireNormalized(normalizedKey: string) {
     const entry = this.store.get(normalizedKey);
-    if (entry && !isStale(entry)) {
-      this.set(entry.key, entry.value, -1); // sets to expired
+    if (entry && entry.expirationTime > 0) {
+      this.writeEntry({ ...entry, expirationTime: 0, ticket: this.nextTicket() });
     }
   }
 
   /**
-   * Deletes the specified key from the cache.
+   * Deletes the specified key from the cache, and from the shared level.
    *
    * If the key is present in the set of protected keys, the deletion is skipped.
    *
@@ -680,7 +1334,11 @@ class LilypadCache<K extends LilypadCacheKey, V> {
    * @returns `false` if the key is protected and was left untouched.
    */
   delete(key: K, options: { force?: boolean; setNull?: boolean } = {}) {
-    return this.deleteNormalized(this.normalizeKey(key), options);
+    const deleted = this.deleteNormalized(this.normalizeKey(key), options);
+    if (deleted) {
+      this.deleteShared(key);
+    }
+    return deleted;
   }
 
   private deleteNormalized(
@@ -692,12 +1350,8 @@ class LilypadCache<K extends LilypadCacheKey, V> {
     }
     const entry = this.store.get(normalizedKey);
     if (options.setNull) {
-      if (entry) {
-        this.set(entry.key, null);
-      } else {
-        // No entry holds the original key: the normalized one is its string form
-        this.set(normalizedKey as K, null);
-      }
+      // Without an entry holding the original key, the normalized one is its string form
+      this.setLocal(entry ? entry.key : (normalizedKey as K), null);
       return true;
     }
     this.store.delete(normalizedKey);
@@ -705,7 +1359,7 @@ class LilypadCache<K extends LilypadCacheKey, V> {
   }
 
   /**
-   * Removes all entries from the cache.
+   * Removes all entries from the memory of this instance (not from the shared level).
    *
    * Iterates over all keys in the cache store and deletes each entry.
    * The deletion behavior can be customized using the `options` parameter.
@@ -721,7 +1375,8 @@ class LilypadCache<K extends LilypadCacheKey, V> {
   }
 
   /**
-   * Removes all expired entries from the cache.
+   * Removes all expired entries from the cache, except those still within the
+   * `staleWhileRevalidate` window of the cache.
    *
    * Iterates through the cache store and deletes any entries whose expiration time has passed.
    * Optionally, the deletion can be forced by providing the `force` option.
@@ -730,10 +1385,28 @@ class LilypadCache<K extends LilypadCacheKey, V> {
    * @param options.force - If true, forces deletion of expired entries regardless of other conditions.
    */
   purgeExpired(options: { force?: boolean } = {}) {
+    const now = Date.now();
     for (const [normalizedKey, entry] of this.store.entries()) {
-      if (isStale(entry)) {
+      if (now >= entry.expirationTime + this.defaultStaleWhileRevalidate) {
         this.deleteNormalized(normalizedKey, options);
       }
+    }
+    for (const [normalizedKey, failedAt] of this.failures) {
+      if (now - failedAt >= this.failureCooldown) {
+        this.failures.delete(normalizedKey);
+      }
+    }
+  }
+
+  /** Purges expired entries at most once per `cleanupOnAccessEvery`. */
+  private cleanupOnAccess() {
+    if (this.cleanupOnAccessEvery === undefined) {
+      return;
+    }
+    const now = Date.now();
+    if (now - this.lastCleanup >= this.cleanupOnAccessEvery) {
+      this.lastCleanup = now;
+      this.purgeExpired();
     }
   }
 
@@ -753,6 +1426,7 @@ class LilypadCache<K extends LilypadCacheKey, V> {
    * Disposes of the cache by stopping the cleanup interval and clearing all cached items.
    * This method should be called when the cache is no longer needed to free up resources.
    * A disposed cache ignores every later write, including the ones of fetches still in flight.
+   * The shared level is left untouched.
    */
   dispose() {
     this.logger = undefined;

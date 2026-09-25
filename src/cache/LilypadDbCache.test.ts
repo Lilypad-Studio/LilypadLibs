@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import LilypadDbCache from './LilypadDbCache';
 import type {
   LilypadDbGate,
@@ -6,6 +6,13 @@ import type {
   ListenerCallbackIdentifier,
 } from '@/dbGate/LilypadDbGate';
 import type { LilypadLibLogger } from '@/logger/LilypadLogger';
+
+// The changelog is read through this mock: the queries themselves are covered by the integration tests
+const changelog = vi.hoisted(() => ({ read: vi.fn() }));
+vi.mock('@/dbGate/LilypadChangelog', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/dbGate/LilypadChangelog')>()),
+  readLilypadChanges: changelog.read,
+}));
 
 type Item = { id: string; name: string };
 
@@ -415,6 +422,196 @@ describe('LilypadDbCache', () => {
       expect(second).toBe(first);
       expect(logger.warn).toHaveBeenCalledOnce();
       await first.dispose();
+    });
+  });
+
+  describe('changelog sync', () => {
+    const createChangelogCache = (
+      sync: Record<string, unknown> = {},
+      options: Record<string, unknown> = {}
+    ) => createCache({ sync: { strategy: 'changelog', pollInterval: 1000, ...sync }, ...options });
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      changelog.read.mockReset();
+      changelog.read.mockResolvedValue({ changes: [], cursor: 100n });
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('should not register a database listener', async () => {
+      await createChangelogCache();
+
+      expect(fake.mocks.addListener).not.toHaveBeenCalled();
+    });
+
+    it('should read with a lookback first, then from the cursor once per interval', async () => {
+      const cache = await createChangelogCache();
+
+      await cache.getOrFetch('1');
+      expect(changelog.read).toHaveBeenCalledWith(fake.gate, {
+        tableName: 'items',
+        since: { lookback: 120_000 }, // TTL + staleWhileRevalidate + 1 minute
+        changelogTable: undefined,
+      });
+
+      await cache.getOrFetch('1');
+      expect(changelog.read).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(1000);
+      await cache.getOrFetch('1');
+      expect(changelog.read).toHaveBeenLastCalledWith(
+        fake.gate,
+        expect.objectContaining({ since: { cursor: 100n } })
+      );
+    });
+
+    it('should expire the changed keys it holds, so that the next read fetches them', async () => {
+      const cache = await createChangelogCache();
+      await cache.getOrFetch('1');
+      fake.rows.set('1', { id: '1', name: 'ONE' });
+      changelog.read.mockResolvedValueOnce({
+        changes: [{ id: '5', xid: 100n, rowId: '1', op: 'UPDATE' }],
+        cursor: 101n,
+      });
+
+      await vi.advanceTimersByTimeAsync(1000);
+      const value = await cache.getOrFetch('1');
+
+      expect(value).toEqual({ id: '1', name: 'ONE' });
+      expect(fake.mocks.selectFromTableByPrimaryKey).toHaveBeenCalledTimes(2);
+    });
+
+    it('should not query the changed rows it does not hold, but reload them with getAll', async () => {
+      const cache = await createChangelogCache();
+      await cache.getAll();
+      fake.rows.set('3', { id: '3', name: 'three' });
+      changelog.read.mockResolvedValueOnce({
+        changes: [{ id: '6', xid: 100n, rowId: '3', op: 'INSERT' }],
+        cursor: 101n,
+      });
+
+      await vi.advanceTimersByTimeAsync(1000);
+      const items = await cache.getAll();
+
+      expect(fake.mocks.selectFromTableByPrimaryKey).not.toHaveBeenCalled();
+      expect(items).toContainEqual({ id: '3', name: 'three' });
+    });
+
+    it('should cache the deleted rows as null', async () => {
+      const cache = await createChangelogCache();
+      await cache.getOrFetch('1');
+      changelog.read.mockResolvedValueOnce({
+        changes: [{ id: '7', xid: 100n, rowId: '1', op: 'DELETE' }],
+        cursor: 101n,
+      });
+
+      await vi.advanceTimersByTimeAsync(1000);
+
+      expect(await cache.getOrFetch('1')).toBeNull();
+    });
+
+    it('should apply each change once, even when a later read returns it again', async () => {
+      const onInvalidate = vi.fn();
+      const cache = await createChangelogCache({}, { platform: { onInvalidate } });
+      await cache.getOrFetch('1');
+      const change = { id: '8', xid: 100n, rowId: '1', op: 'UPDATE' as const };
+      // The cursor stays at 100: an older transaction is still running
+      changelog.read.mockResolvedValue({ changes: [change], cursor: 100n });
+
+      await vi.advanceTimersByTimeAsync(1000);
+      await cache.getOrFetch('2');
+      await vi.advanceTimersByTimeAsync(1000);
+      await cache.getOrFetch('2');
+      await vi.advanceTimersByTimeAsync(0);
+
+      const changelogEvents = onInvalidate.mock.calls.filter(
+        ([event]) => event.source === 'changelog'
+      );
+      expect(changelogEvents).toEqual([
+        [
+          {
+            source: 'changelog',
+            cache: 'items',
+            keys: ['1'],
+            tags: ['lilypad:items', 'lilypad:items:1'],
+          },
+        ],
+      ]);
+    });
+
+    it('should stop trusting the cursor after maxGap', async () => {
+      const cache = await createChangelogCache({ maxGap: 5000 });
+      await cache.getOrFetch('1');
+
+      await vi.advanceTimersByTimeAsync(6000);
+      await cache.getOrFetch('1');
+
+      expect(changelog.read).toHaveBeenLastCalledWith(
+        fake.gate,
+        expect.objectContaining({ since: { lookback: 120_000 } })
+      );
+      expect(fake.mocks.selectFromTableByPrimaryKey).toHaveBeenCalledTimes(2);
+    });
+
+    it('should not wait for the changelog with poll: background', async () => {
+      changelog.read.mockReturnValue(new Promise(() => {}));
+      const cache = await createChangelogCache({ poll: 'background' });
+
+      await expect(cache.getOrFetch('1')).resolves.toEqual({ id: '1', name: 'one' });
+    });
+
+    it('should keep serving reads when the changelog cannot be read', async () => {
+      const logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+      changelog.read.mockRejectedValue(new Error('no changelog table'));
+      const cache = await createChangelogCache({}, { logger });
+
+      await expect(cache.getOrFetch('1')).resolves.toEqual({ id: '1', name: 'one' });
+      expect(logger.error).toHaveBeenCalledWith(
+        cache.id,
+        'Error reading the changelog:',
+        expect.any(Error)
+      );
+    });
+  });
+
+  describe('lazy listen', () => {
+    it('should start LISTEN on the first read instead of on creation', async () => {
+      const cache = await createCache({ sync: { strategy: 'listen', connect: 'lazy' } });
+      expect(fake.mocks.addListener).not.toHaveBeenCalled();
+
+      await cache.getOrFetch('1');
+      await cache.getOrFetch('2');
+
+      expect(fake.mocks.addListener).toHaveBeenCalledOnce();
+    });
+
+    it('should retry a failed lazy LISTEN on the next read', async () => {
+      const cache = await createCache({ sync: { strategy: 'listen', connect: 'lazy' } });
+      fake.mocks.addListener.mockRejectedValueOnce(new Error('database unreachable'));
+
+      await cache.getOrFetch('1');
+      await cache.getOrFetch('2');
+
+      expect(fake.mocks.addListener).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('invalidation events of writes', () => {
+    it('should send the writes of this instance as write events', async () => {
+      const onInvalidate = vi.fn();
+      const cache = await createCache({ platform: { onInvalidate } });
+
+      await cache.sqlUpdate({ id: '1', name: 'renamed' });
+      await cache.sqlDelete('2');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(onInvalidate.mock.calls.map(([event]) => [event.source, event.keys])).toEqual([
+        ['write', ['1']],
+        ['write', ['2']],
+      ]);
     });
   });
 });

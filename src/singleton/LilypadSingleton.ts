@@ -1,5 +1,3 @@
-import { createHash } from 'node:crypto';
-
 declare global {
   var __lilypadSingletonMap: Map<string, unknown> | undefined;
   var __lilypadSingletonSignatureMap: Map<string, string> | undefined;
@@ -21,19 +19,12 @@ export type LilypadSingletonAble =
  * Describes the options a singleton was created with. When a later call asks for the same
  * singleton with a different `value`, `onMismatch` is called: the existing instance is returned
  * anyway, so the options of that call are ignored.
+ * The value is kept in a global map: hash it if the options contain secrets.
  */
 export type LilypadSingletonSignature = {
   value: string;
   onMismatch: () => void;
 };
-
-/**
- * Hashes the parts of a signature, so that secrets (e.g. connection strings) never sit in the
- * global registry in clear text.
- */
-export function createLilypadSingletonSignatureValue(parts: unknown[]): string {
-  return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
-}
 
 function checkSignature(identifier: string, signature?: LilypadSingletonSignature) {
   if (!signature) {

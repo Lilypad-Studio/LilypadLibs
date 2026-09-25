@@ -1,8 +1,7 @@
-import { randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import type { LilypadLibLogger } from '@/logger/LilypadLogger';
 import {
   createLilypadSingletonAbleAsync,
-  createLilypadSingletonSignatureValue,
   LilypadSingletonAble,
   removeLilypadSingletonInstance,
 } from '@/singleton/LilypadSingleton';
@@ -30,7 +29,48 @@ export type LilypadDbGateOptions = {
    * have already timed out do not pile up.
    */
   statementTimeout?: number;
+  /** Connection pool of the main client. Every duration is in milliseconds. */
+  pool?: LilypadDbPoolOptions;
 };
+
+export type LilypadDbPoolOptions = {
+  /** Maximum number of connections (postgres.js default: 10). */
+  max?: number;
+  /** Closes connections idle for this long (postgres.js default: never). */
+  idleTimeout?: number;
+  /** Fails a connection attempt after this long (postgres.js default: 30 s). */
+  connectTimeout?: number;
+  /** Closes connections older than this (postgres.js default: 30 to 60 minutes). */
+  maxLifetime?: number;
+};
+
+/**
+ * Pool settings for serverless platforms (e.g. Vercel Functions), where many short-lived instances
+ * each open their own pool:
+ * - few connections per instance, so that many instances do not exhaust the database;
+ * - idle connections closed quickly, so that a suspended instance does not keep them open.
+ *
+ * Use it with a pooled connection string (e.g. PgBouncer in transaction mode). Adjust `max` to the
+ * number of queries a single instance runs in parallel.
+ */
+export const lilypadServerlessPool: Readonly<LilypadDbPoolOptions> = Object.freeze({
+  max: 3,
+  idleTimeout: 5_000,
+  connectTimeout: 10_000,
+});
+
+/** postgres.js takes durations in seconds. */
+function toPostgresPoolOptions(pool: LilypadDbPoolOptions | undefined) {
+  const seconds = (ms: number | undefined) => (ms === undefined ? undefined : ms / 1000);
+  return Object.fromEntries(
+    Object.entries({
+      max: pool?.max,
+      idle_timeout: seconds(pool?.idleTimeout),
+      connect_timeout: seconds(pool?.connectTimeout),
+      max_lifetime: seconds(pool?.maxLifetime),
+    }).filter(([, value]) => value !== undefined)
+  );
+}
 
 type LilypadDbGateOptionsWithSingleton = LilypadDbGateOptions & LilypadSingletonAble;
 
@@ -114,7 +154,7 @@ type ChannelListener = {
  * @public
  */
 export class LilypadDbGate {
-  public readonly id = `LilypadDbGate-${randomUUID()}`;
+  public readonly id = `LilypadDbGate-${globalThis.crypto.randomUUID()}`;
   private listenerConnectionString: string;
   public sql: postgres.Sql;
   private listenerConnection: postgres.Sql | undefined;
@@ -127,6 +167,7 @@ export class LilypadDbGate {
     this.listenerConnectionString = options.listenerConnectionString || options.connectionString;
     this.sql = postgres(options.connectionString, {
       prepare: false,
+      ...toPostgresPoolOptions(options.pool),
       ...(options.statementTimeout !== undefined && {
         connection: { statement_timeout: options.statementTimeout },
       }),
@@ -135,6 +176,8 @@ export class LilypadDbGate {
 
   /**
    * Creates a gate and registers the listeners of `options.listen`.
+   * Without listeners it opens no connection: the pool connects on the first query, so creating a
+   * gate at module level does not reach the database (e.g. during a build).
    * With `singleton: true`, a later call with the same identifier returns the existing gate and
    * ignores its own options (a warning is logged if they differ).
    */
@@ -148,11 +191,17 @@ export class LilypadDbGate {
         return instance;
       },
       {
-        value: createLilypadSingletonSignatureValue([
-          options.connectionString,
-          options.listenerConnectionString,
-          options.statementTimeout,
-        ]),
+        // Hashed: the connection strings contain credentials
+        value: createHash('sha256')
+          .update(
+            JSON.stringify([
+              options.connectionString,
+              options.listenerConnectionString,
+              options.statementTimeout,
+              options.pool,
+            ])
+          )
+          .digest('hex'),
         onMismatch: () =>
           void options.logger?.warn(
             `LilypadDbGate singleton "${options.singleton ? options.singletonIdentifier : ''}" already exists with different connection options: the new options are ignored.`

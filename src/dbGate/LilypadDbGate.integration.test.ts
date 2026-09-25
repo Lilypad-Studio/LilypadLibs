@@ -3,6 +3,12 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testconta
 import postgres from 'postgres';
 import { LilypadDbGate, type LilypadDbSchema } from './LilypadDbGate';
 import LilypadDbCache from '@/cache/LilypadDbCache';
+import {
+  lilypadChangelogSql,
+  lilypadChangelogTriggerSql,
+  pruneLilypadChangelog,
+  readLilypadChanges,
+} from './LilypadChangelog';
 import type { LilypadLoggerType } from '@/logger/LilypadLogger';
 
 type User = { id: number; name: string; role: string };
@@ -55,6 +61,8 @@ describe('LilypadDbGate (integration)', () => {
       CREATE TRIGGER users_cache_events AFTER INSERT OR UPDATE OR DELETE ON users
       FOR EACH ROW EXECUTE FUNCTION notify_cache_events()
     `;
+    await admin.unsafe(lilypadChangelogSql({ notifyChannel: false }));
+    await admin.unsafe(lilypadChangelogTriggerSql({ table: 'users', primaryKey: 'id' }));
     gate = await LilypadDbGate.create({
       connectionString: container.getConnectionUri(),
       listen: [],
@@ -68,7 +76,7 @@ describe('LilypadDbGate (integration)', () => {
   });
 
   beforeEach(async () => {
-    await admin`TRUNCATE users RESTART IDENTITY`;
+    await admin`TRUNCATE users, lilypad_cache_changes RESTART IDENTITY`;
   });
 
   describe('CRUD', () => {
@@ -337,6 +345,86 @@ describe('LilypadDbGate (integration)', () => {
       });
 
       await expect(closingGate.close()).resolves.toBeUndefined();
+    });
+  });
+
+  describe('changelog', () => {
+    const readAll = () =>
+      readLilypadChanges(gate, { tableName: 'users', since: { lookback: 60_000 } });
+
+    it('should record inserts, updates, deletes and primary key changes', async () => {
+      await admin`INSERT INTO users (name) VALUES ('Ada')`;
+      await admin`UPDATE users SET role = 'admin' WHERE id = 1`;
+      await admin`UPDATE users SET id = 2 WHERE id = 1`;
+      await admin`DELETE FROM users WHERE id = 2`;
+
+      const { changes } = await readAll();
+
+      expect(changes.map(({ op, rowId }) => `${op}:${rowId}`)).toEqual([
+        'INSERT:1',
+        'UPDATE:1',
+        'DELETE:1', // the primary key change removes the old key...
+        'UPDATE:2', // ...and updates the new one
+        'DELETE:2',
+      ]);
+    });
+
+    it('should not miss a transaction that commits after a later one', async () => {
+      const slow = await admin.reserve();
+      try {
+        await slow`BEGIN`;
+        await slow`INSERT INTO users (name) VALUES ('slow')`; // id 1, not committed yet
+        await admin`INSERT INTO users (name) VALUES ('fast')`; // id 2, committed
+        const first = await readAll();
+        expect(first.changes.map((change) => change.rowId)).toEqual(['2']);
+
+        await slow`COMMIT`;
+        const next = await readLilypadChanges(gate, {
+          tableName: 'users',
+          since: { cursor: first.cursor },
+        });
+
+        expect(next.changes.map((change) => change.rowId)).toContain('1');
+      } finally {
+        slow.release();
+      }
+    });
+
+    it('should delete the rows older than the retention', async () => {
+      await admin`INSERT INTO users (name) VALUES ('Ada')`;
+
+      expect(await pruneLilypadChangelog(gate, { olderThan: 0 })).toBe(1);
+      expect((await readAll()).changes).toEqual([]);
+    });
+
+    it('should keep a LilypadDbCache in sync without LISTEN', async () => {
+      const cache = await LilypadDbCache.create<number, User, 'id'>(60_000, {
+        dbGate: { gate, schema: usersSchema },
+        sync: { strategy: 'changelog', pollInterval: 0 },
+      });
+      await cache.sqlCreate({ name: 'Ada', role: 'dev' });
+      expect(await cache.getOrFetch(1)).toMatchObject({ role: 'dev' });
+
+      await admin`UPDATE users SET role = 'admin' WHERE id = 1`;
+      expect(await cache.getOrFetch(1)).toMatchObject({ role: 'admin' });
+
+      await admin`INSERT INTO users (name) VALUES ('Grace')`;
+      expect((await cache.getAll()).map((user) => user.name).sort()).toEqual(['Ada', 'Grace']);
+
+      await admin`DELETE FROM users WHERE id = 1`;
+      expect(await cache.getOrFetch(1)).toBeNull();
+      await cache.dispose();
+    });
+
+    it('should let LISTEN and the changelog work together', async () => {
+      const listened = vi.fn();
+      await gate.addListener({ channel: 'cache_events', callbackId: 'both', callback: listened });
+
+      await admin`INSERT INTO users (name) VALUES ('Ada')`;
+
+      await vi.waitFor(() => expect(listened).toHaveBeenCalled());
+      expect((await readAll()).changes).toHaveLength(1);
+      await gate.removeListener('cache_events', 'both');
     });
   });
 

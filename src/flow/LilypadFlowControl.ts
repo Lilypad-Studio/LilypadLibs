@@ -26,6 +26,11 @@ export interface ExecuteFnOptions<T> {
   fn: (signal: AbortSignal) => Promise<T>;
   retries?: number;
   backOffTime?: (attempt: number) => number;
+  /**
+   * Timeout of each attempt of this execution, in milliseconds; overrides the instance's `timeout`.
+   * Callers that join an in-flight execution share the timeout of the call that started it.
+   */
+  timeout?: number;
 }
 
 /**
@@ -99,9 +104,12 @@ export class LilypadFlowControl<T> {
    * to ensure no memory leaks occur regardless of whether the operation succeeds or times out.
    * JavaScript cannot forcibly stop a running promise: `executionFn` should observe the signal to stop its work.
    */
-  async executeWithTimeout(executionFn: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  async executeWithTimeout(
+    executionFn: (signal: AbortSignal) => Promise<T>,
+    timeout: number | undefined = this.timeout
+  ): Promise<T> {
     const controller = new AbortController();
-    if (this.timeout === undefined) {
+    if (timeout === undefined) {
       return executionFn(controller.signal);
     }
     let timeoutId: ReturnType<typeof setTimeout>;
@@ -110,7 +118,7 @@ export class LilypadFlowControl<T> {
         const error = new Error('Operation timed out');
         controller.abort(error);
         reject(error);
-      }, this.timeout);
+      }, timeout);
     });
     try {
       return await Promise.race([executionFn(controller.signal), timeoutPromise]);
@@ -232,7 +240,7 @@ export class LilypadFlowControl<T> {
 
     // Execution Pipeline (Retries and Timeout)
     const executionPromise = this.executeWithRetries({
-      executionFn: () => this.executeWithTimeout(options.fn),
+      executionFn: () => this.executeWithTimeout(options.fn, options.timeout ?? this.timeout),
       retries: options.retries ?? this.retries ?? 0,
       errorFn: options.errorFn,
       backOffTime: options.backOffTime,

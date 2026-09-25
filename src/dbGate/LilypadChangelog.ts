@@ -1,0 +1,195 @@
+import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
+
+/**
+ * The changelog records every change of the cached tables in a table, so that each instance can
+ * read the changes made since its last check with one query. It needs no long-lived connection
+ * (unlike `LISTEN/NOTIFY`), so it suits serverless platforms, and it also catches the changes made
+ * by other programs. It needs PostgreSQL 13 or later (`xid8`).
+ */
+export const LILYPAD_DEFAULT_CHANGELOG_TABLE = 'lilypad_cache_changes';
+export const LILYPAD_DEFAULT_NOTIFY_CHANNEL = 'cache_events';
+
+/** Quotes an identifier; `schema.table` is quoted part by part. */
+function quoteIdentifier(identifier: string): string {
+  return identifier
+    .split('.')
+    .map((part) => `"${part.replace(/"/g, '""')}"`)
+    .join('.');
+}
+
+function quoteLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+/** The trigger function name for a changelog table. */
+function triggerFunctionName(changelogTable: string): string {
+  return `${changelogTable.replace(/\W/g, '_')}_record`;
+}
+
+export type LilypadChangelogSqlOptions = {
+  /** Name of the changelog table. Defaults to `lilypad_cache_changes`. */
+  table?: string;
+  /**
+   * Channel on which the trigger also sends a `NOTIFY` for the `listen` strategy, or `false` to
+   * send none. Defaults to `cache_events`.
+   */
+  notifyChannel?: string | false;
+};
+
+/**
+ * The SQL that creates the changelog table and its trigger function. Run it once, in a migration.
+ * It is idempotent (`IF NOT EXISTS` / `CREATE OR REPLACE`).
+ *
+ * Then attach the trigger to every cached table with {@link lilypadChangelogTriggerSql}.
+ */
+export function lilypadChangelogSql(options: LilypadChangelogSqlOptions = {}): string {
+  const table = options.table ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
+  const channel = options.notifyChannel ?? LILYPAD_DEFAULT_NOTIFY_CHANNEL;
+  const quotedTable = quoteIdentifier(table);
+  const indexPrefix = table.replace(/\W/g, '_');
+  const notify = (idExpression: string, opExpression: string) =>
+    channel === false
+      ? ''
+      : `
+    PERFORM pg_notify(${quoteLiteral(channel)}, json_build_object(
+      'table', TG_TABLE_NAME, 'id', ${idExpression}, 'op', ${opExpression}
+    )::text);`;
+
+  return `CREATE TABLE IF NOT EXISTS ${quotedTable} (
+  id         bigserial   PRIMARY KEY,
+  xid        xid8        NOT NULL DEFAULT pg_current_xact_id(),
+  table_name text        NOT NULL,
+  row_id     text        NOT NULL,
+  op         text        NOT NULL,
+  changed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${indexPrefix}_table_xid_idx`)}
+  ON ${quotedTable} (table_name, xid);
+CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${indexPrefix}_changed_at_idx`)}
+  ON ${quotedTable} (changed_at);
+
+-- Records a change of a row; the trigger argument is the primary key column.
+CREATE OR REPLACE FUNCTION ${quoteIdentifier(triggerFunctionName(table))}() RETURNS trigger AS $$
+DECLARE
+  new_id text;
+  old_id text;
+BEGIN
+  IF TG_OP <> 'DELETE' THEN
+    new_id := to_jsonb(NEW) ->> TG_ARGV[0];
+  END IF;
+  IF TG_OP <> 'INSERT' THEN
+    old_id := to_jsonb(OLD) ->> TG_ARGV[0];
+  END IF;
+
+  -- An update that changes the primary key also deletes the old key
+  IF TG_OP = 'UPDATE' AND old_id IS DISTINCT FROM new_id THEN
+    INSERT INTO ${quotedTable} (table_name, row_id, op) VALUES (TG_TABLE_NAME, old_id, 'DELETE');${notify('old_id', `'DELETE'`)}
+  END IF;
+
+  INSERT INTO ${quotedTable} (table_name, row_id, op)
+    VALUES (TG_TABLE_NAME, COALESCE(new_id, old_id), TG_OP);${notify('COALESCE(new_id, old_id)', 'TG_OP')}
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+`;
+}
+
+/**
+ * The SQL that attaches the changelog trigger to a cached table. Run it once per table, in a
+ * migration, after {@link lilypadChangelogSql}.
+ *
+ * @param options.table - The cached table (as in its `LilypadDbSchema`).
+ * @param options.primaryKey - Its primary key column.
+ * @param options.changelogTable - The changelog table, if not the default one.
+ */
+export function lilypadChangelogTriggerSql(options: {
+  table: string;
+  primaryKey: string;
+  changelogTable?: string;
+}): string {
+  const changelogTable = options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
+  const triggerName = `${options.table.replace(/\W/g, '_')}_lilypad_changes`;
+  return `DROP TRIGGER IF EXISTS ${quoteIdentifier(triggerName)} ON ${quoteIdentifier(options.table)};
+CREATE TRIGGER ${quoteIdentifier(triggerName)}
+  AFTER INSERT OR UPDATE OR DELETE ON ${quoteIdentifier(options.table)}
+  FOR EACH ROW EXECUTE FUNCTION ${quoteIdentifier(triggerFunctionName(changelogTable))}(${quoteLiteral(options.primaryKey)});
+`;
+}
+
+export type LilypadChange = {
+  /** The id of the changelog row. */
+  id: string;
+  /** The transaction that made the change. */
+  xid: bigint;
+  rowId: string;
+  op: 'INSERT' | 'UPDATE' | 'DELETE';
+};
+
+/**
+ * Reads the changes of a table since `cursor`, and the cursor for the next read.
+ *
+ * The cursor is the oldest transaction still running at the time of the read: the next read
+ * returns every change of that transaction or of later ones, so a transaction that commits after
+ * a read is never missed, whatever the order of the commits. A change can therefore be returned
+ * by several reads: callers skip the ids they have already processed.
+ *
+ * Without a cursor (first read, or a cursor no longer trusted), `since.lookback` returns the
+ * changes recorded in the last `lookback` milliseconds instead.
+ */
+export async function readLilypadChanges(
+  gate: LilypadDbGate,
+  options: {
+    tableName: string;
+    since: { cursor: bigint } | { lookback: number };
+    changelogTable?: string;
+  }
+): Promise<{ changes: LilypadChange[]; cursor: bigint }> {
+  const sql = gate.sql;
+  const changelogTable = options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
+  const since = options.since;
+  const condition =
+    'cursor' in since
+      ? sql`c.xid >= ${since.cursor.toString()}::xid8`
+      : sql`c.changed_at >= clock_timestamp() - make_interval(secs => ${since.lookback / 1000})`;
+
+  // One statement, so the snapshot and the rows are read together even through a pooler
+  const rows = await sql`
+    WITH snapshot AS (SELECT pg_snapshot_xmin(pg_current_snapshot())::text AS next_cursor)
+    SELECT snapshot.next_cursor, c.id::text AS id, c.xid::text AS xid, c.row_id, c.op
+    FROM snapshot
+    LEFT JOIN ${sql(changelogTable)} c ON c.table_name = ${options.tableName} AND ${condition}
+    ORDER BY c.id
+  `;
+
+  const changes: LilypadChange[] = [];
+  for (const row of rows) {
+    if (row.id !== null) {
+      changes.push({
+        id: row.id as string,
+        xid: BigInt(row.xid as string),
+        rowId: row.row_id as string,
+        op: row.op as LilypadChange['op'],
+      });
+    }
+  }
+  return { changes, cursor: BigInt(rows[0].next_cursor as string) };
+}
+
+/**
+ * Deletes the changelog rows older than `olderThan` milliseconds. Call it periodically (e.g. from
+ * a scheduled job): `olderThan` must be much larger than the `maxGap` and the `lookback` of the
+ * caches.
+ *
+ * @returns The number of deleted rows.
+ */
+export async function pruneLilypadChangelog(
+  gate: LilypadDbGate,
+  options: { olderThan: number; changelogTable?: string }
+): Promise<number> {
+  const changelogTable = options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
+  const result = await gate.sql`
+    DELETE FROM ${gate.sql(changelogTable)}
+    WHERE changed_at < clock_timestamp() - make_interval(secs => ${options.olderThan / 1000})
+  `;
+  return result.count;
+}

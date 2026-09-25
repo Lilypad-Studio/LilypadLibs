@@ -21,6 +21,22 @@ export default defineConfig({
         },
       },
       {
+        // The tests of the modules exported by the edge-compatible entries, run again in an edge
+        // runtime (no Node.js globals): they fail if these modules start relying on Node.js APIs
+        extends: true,
+        test: {
+          name: 'edge',
+          environment: 'edge-runtime',
+          include: [
+            'src/cache/LilypadCache*.test.ts',
+            'src/flow/**/*.test.ts',
+            'src/logger/**/*.test.ts',
+            'src/serializer/**/*.test.ts',
+            'src/singleton/**/*.test.ts',
+          ],
+        },
+      },
+      {
         // Requires Docker: each suite starts its own PostgreSQL container
         extends: true,
         test: {

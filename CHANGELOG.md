@@ -1,0 +1,46 @@
+# Changelog
+
+## 0.2.0
+
+### Upgrading from 0.0.1
+
+These changes can break existing code. Check each item that applies to you.
+
+| Change | What to do |
+| --- | --- |
+| Node.js 20 or later is required. | Upgrade Node.js. |
+| Singletons created by `create()` are registered under `<Class>:<identifier>` (e.g. `LilypadDbGate:main`). | Code that read them with `getLilypadSingletonInstance('main')` must call `create()` again instead. If two versions of the library run in the same process, each builds its own instances until both are upgraded. |
+| `insertSanitizationFn`: its result now **replaces** the data, instead of being merged into it. | A function that returned only the changed fields must now return the whole object (`(data) => ({ ...data, title: data.title?.trim() })`). |
+| `getAll()` rejects when the table cannot be loaded (it used to return an empty or partial list). | Catch its error where an empty list was acceptable. |
+| `bulkSync()` resolves to a boolean (it resolved to `undefined`). | Only code that checked the result is affected. |
+| `LilypadFlowControl.rateLimit()` is synchronous: it throws instead of rejecting. | Replace `await expect(...).rejects` / `.catch()` with `try/catch`. |
+| `flowControlTimeout` no longer applies to `bulkSync`, which has its own `bulkSyncTimeout` (30 s). | Set `bulkSyncTimeout` if you relied on `flowControlTimeout` for bulk syncs. |
+| `defaultErrorTtl` defaults to the TTL, at most 5 minutes (it was always 5 minutes). | Set it explicitly to keep the former value. |
+| The logger no longer uses `util.inspect`: objects are formatted by an internal formatter, close to it (`[Circular]` instead of `[Circular *1]`). | Only code that parsed log messages is affected. |
+| A channel named `then` or `flush` is rejected. | Rename the channel. |
+| `LilypadDbCache` caches deleted rows as `null` even for protected keys. | None: protected keys were wrongly kept. |
+| Notification triggers that the library installs send `id` as a string. | None: the cache accepts numbers and strings. |
+| `useDefaultDbListener` and `defaultListenerOptions` are deprecated. | Use `sync: { strategy: 'none' }` or `sync: { strategy: 'listen', listenerOptions }`. They still work. |
+
+### Added
+
+- **Next.js / Vercel support** without depending on either: see [docs/nextjs-vercel.md](docs/nextjs-vercel.md).
+  - `LilypadPlatform` (`background`, `afterResponse`, `shared`, `onInvalidate`), accepted by the logger and the caches.
+  - Subpath entries (`@lilypad/libs/logger`, `/cache`, `/flow`, `/serializer`, `/singleton`, `/platform`, `/db`), ESM builds, and edge-runtime compatibility for every module except `/db`.
+- **LilypadCache**: a shared level between instances (`shared`, `name`, `codec`, soft refresh lock), `staleWhileRevalidate`, `failureCooldown` (shared between instances), `getOrSetDetailed` with the status of the value, `maxEntries` (LRU), `cleanupOnAccessEvery`, a per-call `timeout`, invalidation events.
+- **LilypadDbCache**: the `sync` option, with the `changelog` strategy (a trigger writes every change to a table; each instance reads it at most once per `pollInterval`, missing no commit whatever its order), `listen` with `connect: 'lazy'`, and `none`. Helpers `lilypadChangelogSql`, `lilypadChangelogTriggerSql`, `pruneLilypadChangelog`, `readLilypadChanges`.
+- **LilypadDbGate**: `pool` options, the `lilypadServerlessPool` preset, `statementTimeout`, `onReconnect` on listeners, typed partial updates (`LilypadDbSchema<T, PK>`).
+- **Logger**: `platform`, `flush()`, `context`, structured records for components (`sendRecord`), `LilypadJsonConsoleLogger`. `LilypadDiscordLogger` batches messages and retries rate-limited requests.
+- **LilypadFlowControl**: per-execution `timeout`, `isInFlight`.
+- Numeric cache keys keep their type (`LilypadCacheKey = string | number`).
+
+### Fixed
+
+- `insertSanitizationFn` could not remove properties from the written data.
+- A failing `errorLogging` callback made the logger reject, which terminated the process.
+- Out-of-order refreshes could leave an old row in a `LilypadDbCache`; writes are now ordered by when they started.
+- Concurrent `getOrSet` calls shared the error options of the first caller.
+- A bulk sync that timed out still overwrote the cache later.
+- `LISTEN` subscriptions were not told about reconnections, which lose notifications.
+- Properties set to `undefined` made inserts and updates fail.
+- Several smaller issues: see the commit history.

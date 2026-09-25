@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import LilypadConsoleLogger from './ConsoleLogger';
 import LilypadDiscordLogger from './DiscordLogger';
+import LilypadJsonConsoleLogger from './JsonConsoleLogger';
 
 describe('LilypadConsoleLogger', () => {
   afterEach(() => {
@@ -147,5 +148,59 @@ describe('LilypadDiscordLogger', () => {
     await expect(
       new LilypadDiscordLogger<'info'>(webhookUrl).output('info', 'message')
     ).rejects.toThrow('timeout');
+  });
+});
+
+describe('LilypadJsonConsoleLogger', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('should write one JSON line with the record fields, the context and the errors', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const component = new LilypadJsonConsoleLogger<'error'>();
+    const error = new Error('boom');
+
+    await component.output('error', 'Failed Error: boom', {
+      logger: {} as never,
+      record: {
+        type: 'error',
+        message: 'Failed Error: boom',
+        parts: ['Failed', error],
+        timestamp: new Date('2026-01-02T03:04:05.000Z'),
+        loggerName: 'billing',
+        context: { requestId: 'req-1' },
+      },
+    });
+
+    expect(log).toHaveBeenCalledOnce();
+    expect(JSON.parse(log.mock.calls[0][0] as string)).toEqual({
+      requestId: 'req-1',
+      time: '2026-01-02T03:04:05.000Z',
+      level: 'error',
+      logger: 'billing',
+      msg: 'Failed Error: boom',
+      errors: [{ name: 'Error', message: 'boom', stack: error.stack }],
+    });
+  });
+
+  it('should not let context fields override the record fields', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    await new LilypadJsonConsoleLogger<'info'>().output('info', 'message', {
+      logger: {} as never,
+      record: {
+        type: 'info',
+        message: 'message',
+        parts: ['message'],
+        timestamp: new Date(),
+        context: { level: 'spoofed', msg: 'spoofed' },
+      },
+    });
+
+    expect(JSON.parse(log.mock.calls[0][0] as string)).toMatchObject({
+      level: 'info',
+      msg: 'message',
+    });
   });
 });

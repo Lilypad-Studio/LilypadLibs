@@ -1,7 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   createLilypadSingletonAbleAsync,
-  createLilypadSingletonSignatureValue,
   getLilypadSingletonInstance,
   getLilypadSingletonInstanceAsync,
   removeLilypadSingletonInstance,
@@ -126,12 +125,5 @@ describe('LilypadSingleton', () => {
     await expect(failing).rejects.toThrow('creation failed');
 
     expect(getLilypadSingletonInstance(id, () => ({ value: 3 }))).toBe(replacement);
-  });
-
-  it('should hash signature values', () => {
-    const value = createLilypadSingletonSignatureValue(['postgres://user:secret@host/db']);
-
-    expect(value).toMatch(/^[0-9a-f]{64}$/);
-    expect(value).not.toContain('secret');
   });
 });

@@ -50,7 +50,10 @@ describe('LilypadLogger', () => {
 
     await logger.info('test message');
 
-    expect(mockComponent.output).toHaveBeenCalledWith('info', 'test message', { logger: logger });
+    expect(mockComponent.output).toHaveBeenCalledWith('info', 'test message', {
+      logger: logger,
+      record: expect.objectContaining({ type: 'info', message: 'test message' }),
+    });
   });
 
   it('should stringify non-string messages', async () => {
@@ -64,9 +67,11 @@ describe('LilypadLogger', () => {
     const obj = { key: 'value' };
     await logger.info(obj);
 
-    expect(mockComponent.output).toHaveBeenCalledWith('info', "{ key: 'value' }", {
-      logger: logger,
-    });
+    expect(mockComponent.output).toHaveBeenCalledWith(
+      'info',
+      "{ key: 'value' }",
+      expect.objectContaining({ logger })
+    );
   });
 
   it('should keep message and stack of errors', async () => {
@@ -91,7 +96,7 @@ describe('LilypadLogger', () => {
     await expect(logger.info(circular, 10n)).resolves.toBeUndefined();
 
     const message = vi.mocked(mockComponent.output).mock.calls[0][1];
-    expect(message).toContain('[Circular *1]');
+    expect(message).toContain('[Circular]');
     expect(message).toContain('10n');
   });
 
@@ -305,5 +310,94 @@ describe('LilypadLogger', () => {
       })
     ).toBe(logger);
     removeLilypadSingletonInstance(identifier);
+  });
+
+  describe('serverless support', () => {
+    it('should hand every message being sent to platform.background', async () => {
+      let resolveOutput!: () => void;
+      mockComponent.output = vi.fn(() => new Promise<void>((resolve) => (resolveOutput = resolve)));
+      const background = vi.fn();
+      const logger = LilypadLogger.create<mockType>({
+        components: { info: [mockComponent], error: [] },
+        platform: { background },
+      });
+
+      const logged = logger.info('after the response');
+
+      expect(background).toHaveBeenCalledOnce();
+      const task = background.mock.calls[0][0] as Promise<unknown>;
+      let settled = false;
+      void task.then(() => (settled = true));
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      resolveOutput();
+      await logged;
+      await task;
+      expect(settled).toBe(true);
+    });
+
+    it('should still log when platform.background throws', async () => {
+      const logger = LilypadLogger.create<mockType>({
+        components: { info: [mockComponent], error: [] },
+        platform: {
+          background: () => {
+            throw new Error('outside a request scope');
+          },
+        },
+      });
+
+      await expect(logger.info('message')).resolves.toBeUndefined();
+      expect(mockComponent.output).toHaveBeenCalledOnce();
+    });
+
+    it('should resolve flush once every pending message is sent', async () => {
+      let resolveOutput!: () => void;
+      mockComponent.output = vi.fn(() => new Promise<void>((resolve) => (resolveOutput = resolve)));
+      const logger = LilypadLogger.create<mockType>({
+        components: { info: [mockComponent], error: [] },
+      });
+      void logger.info('pending');
+
+      let flushed = false;
+      const flushing = logger.flush().then(() => (flushed = true));
+      await Promise.resolve();
+      expect(flushed).toBe(false);
+
+      resolveOutput();
+      await flushing;
+      expect(flushed).toBe(true);
+    });
+
+    it('should add the context to the record, read when the message is logged', async () => {
+      let requestId = 'req-1';
+      const logger = LilypadLogger.create<mockType>({
+        components: { info: [mockComponent], error: [] },
+        context: () => ({ requestId }),
+      });
+
+      const logged = logger.info('message');
+      requestId = 'req-2';
+      await logged;
+
+      expect(mockComponent.output).toHaveBeenCalledWith(
+        'info',
+        'message',
+        expect.objectContaining({
+          record: expect.objectContaining({ context: { requestId: 'req-1' } }),
+        })
+      );
+    });
+
+    it('should log without context when the context function throws', async () => {
+      const logger = LilypadLogger.create<mockType>({
+        components: { info: [mockComponent], error: [] },
+        context: () => {
+          throw new Error('no request');
+        },
+      });
+
+      await expect(logger.info('message')).resolves.toBeUndefined();
+      expect(mockComponent.output).toHaveBeenCalledOnce();
+    });
   });
 });
