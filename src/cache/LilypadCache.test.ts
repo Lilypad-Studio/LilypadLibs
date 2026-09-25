@@ -651,6 +651,61 @@ describe('LilypadCache', () => {
         customCache.dispose();
       });
 
+      describe('completeness of bulkGet after a bulk sync', () => {
+        const createSyncedCache = (options: { ttl?: number; bulkSyncTtl?: number } = {}) => {
+          const syncFn = vi.fn(
+            async () =>
+              [
+                ['key1', 1],
+                ['key2', 2],
+              ] as [string, number][]
+          );
+          const syncedCache = new LilypadCache<string, number>(options.ttl ?? 1000, {
+            defaultBulkSyncTtl: options.bulkSyncTtl,
+            bulkSyncFn: syncFn,
+            maxEntries: 3,
+          });
+          return { syncedCache, syncFn };
+        };
+
+        it('should not keep the bulk sync fresh beyond the expiration of its entries', async () => {
+          const { syncedCache, syncFn } = createSyncedCache({ ttl: 1000, bulkSyncTtl: 5000 });
+          await syncedCache.bulkAsyncGet();
+
+          await vi.advanceTimersByTimeAsync(1000);
+          const values = await syncedCache.bulkAsyncGet();
+
+          expect(syncFn).toHaveBeenCalledTimes(2);
+          expect(values.size).toBe(2);
+          syncedCache.dispose();
+        });
+
+        it('should sync again after clear', async () => {
+          const { syncedCache, syncFn } = createSyncedCache();
+          await syncedCache.bulkAsyncGet();
+
+          syncedCache.clear();
+          const values = await syncedCache.bulkAsyncGet();
+
+          expect(syncFn).toHaveBeenCalledTimes(2);
+          expect(values.size).toBe(2);
+          syncedCache.dispose();
+        });
+
+        it('should sync again after an entry is evicted by maxEntries', async () => {
+          const { syncedCache, syncFn } = createSyncedCache();
+          await syncedCache.bulkAsyncGet();
+
+          syncedCache.set('other1', 10);
+          syncedCache.set('other2', 20); // evicts key1
+          const values = await syncedCache.bulkAsyncGet();
+
+          expect(syncFn).toHaveBeenCalledTimes(2);
+          expect(values.get('key1')).toBe(1);
+          syncedCache.dispose();
+        });
+      });
+
       describe('invalidate', () => {
         it('should expire a valid cached value', () => {
           cache.set('key1', 123, 1000);

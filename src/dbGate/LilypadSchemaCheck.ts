@@ -39,6 +39,11 @@ export type LilypadSchemaProblemCode =
   | 'missing-changelog-trigger'
   /** The changelog trigger of the table records another column than the primary key. */
   | 'wrong-trigger-primary-key'
+  /**
+   * `TRUNCATE` of the table is not recorded (or not notified, with `notifyChannel`): it fires no
+   * row trigger, so the caches would keep the removed rows.
+   */
+  | 'missing-truncate-trigger'
   /** No trigger of the table sends notifications on the channel. */
   | 'missing-notify-trigger';
 
@@ -90,6 +95,7 @@ const TRIGGER_TYPE_ROW = 1;
 const TRIGGER_TYPE_INSERT = 4;
 const TRIGGER_TYPE_DELETE = 8;
 const TRIGGER_TYPE_UPDATE = 16;
+const TRIGGER_TYPE_TRUNCATE = 32;
 const CHANGELOG_TRIGGER_TYPE =
   TRIGGER_TYPE_ROW | TRIGGER_TYPE_INSERT | TRIGGER_TYPE_DELETE | TRIGGER_TYPE_UPDATE;
 
@@ -102,6 +108,15 @@ type TriggerInfo = {
   enabled: boolean;
   source: string;
 };
+
+/** An enabled statement-level trigger on TRUNCATE. */
+function firesOnTruncate(trigger: TriggerInfo): boolean {
+  return (
+    trigger.enabled &&
+    (trigger.type & TRIGGER_TYPE_ROW) === 0 &&
+    (trigger.type & TRIGGER_TYPE_TRUNCATE) !== 0
+  );
+}
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -243,6 +258,13 @@ export async function checkLilypadSchema(
           message: `The changelog trigger of "${table}" records the column "${working[0].args.split('\\000')[0]}", not the primary key "${primaryKey}".`,
           fix,
         });
+      } else if (!triggers.some((trigger) => trigger.changelog && firesOnTruncate(trigger))) {
+        problems.push({
+          code: 'missing-truncate-trigger',
+          table,
+          message: `The changelog does not record TRUNCATE of "${table}": the caches would keep the removed rows.`,
+          fix,
+        });
       }
     }
 
@@ -257,14 +279,24 @@ export async function checkLilypadSchema(
           (trigger.type & TRIGGER_TYPE_ROW) !== 0 &&
           notifies.test(trigger.source)
       );
+      const fix =
+        lilypadChangelogSql({ table: customChangelogTable, notifyChannel }) +
+        lilypadChangelogTriggerSql({ table, primaryKey, changelogTable: customChangelogTable });
       if (!notifying) {
         problems.push({
           code: 'missing-notify-trigger',
           table,
           message: `No trigger of "${table}" sends notifications on the "${notifyChannel}" channel: the cache is not told about changes made elsewhere.`,
-          fix:
-            lilypadChangelogSql({ table: customChangelogTable, notifyChannel }) +
-            lilypadChangelogTriggerSql({ table, primaryKey, changelogTable: customChangelogTable }),
+          fix,
+        });
+      } else if (
+        !triggers.some((trigger) => firesOnTruncate(trigger) && notifies.test(trigger.source))
+      ) {
+        problems.push({
+          code: 'missing-truncate-trigger',
+          table,
+          message: `No trigger of "${table}" sends a notification on the "${notifyChannel}" channel for TRUNCATE: the caches would keep the removed rows.`,
+          fix,
         });
       }
     }

@@ -14,7 +14,7 @@ export const LILYPAD_DEFAULT_NOTIFY_CHANNEL = 'cache_events';
  * The function carries it in its comment (`lilypad-changelog:<version>`), so that
  * `checkLilypadSchema` can tell an installation made by an older version of the library.
  */
-export const LILYPAD_CHANGELOG_VERSION = 2;
+export const LILYPAD_CHANGELOG_VERSION = 3;
 export const LILYPAD_CHANGELOG_VERSION_PREFIX = 'lilypad-changelog:';
 
 /** Quotes an identifier; `schema.table` is quoted part by part. */
@@ -32,6 +32,12 @@ function quoteLiteral(value: string): string {
 /** The trigger function name for a changelog table. */
 export function triggerFunctionName(changelogTable: string): string {
   return `${changelogTable.replace(/\W/g, '_')}_record`;
+}
+
+/** The names of the row trigger and of the TRUNCATE trigger that record the changes of a table. */
+export function changelogTriggerNames(table: string): { row: string; truncate: string } {
+  const prefix = table.replace(/\W/g, '_');
+  return { row: `${prefix}_lilypad_changes`, truncate: `${prefix}_lilypad_truncate` };
 }
 
 export type LilypadChangelogSqlOptions = {
@@ -60,7 +66,8 @@ export function lilypadChangelogSql(options: LilypadChangelogSqlOptions = {}): s
       ? ''
       : `
     PERFORM pg_notify(${quoteLiteral(channel)}, json_build_object(
-      'schema', TG_TABLE_SCHEMA, 'table', TG_TABLE_NAME, 'id', ${idExpression}, 'op', ${opExpression}
+      'schema', TG_TABLE_SCHEMA, 'table', TG_TABLE_NAME, 'id', ${idExpression}, 'op', ${opExpression},
+      'xid', pg_current_xact_id()::text
     )::text);`;
   const functionName = quoteIdentifier(triggerFunctionName(table));
 
@@ -69,23 +76,31 @@ export function lilypadChangelogSql(options: LilypadChangelogSqlOptions = {}): s
   xid          xid8        NOT NULL DEFAULT pg_current_xact_id(),
   table_schema text,
   table_name   text        NOT NULL,
-  row_id       text        NOT NULL,
+  row_id       text,
   op           text        NOT NULL,
   changed_at   timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 -- Version 1 had no schema column: tables of the same name in different schemas were mixed up
 ALTER TABLE ${quotedTable} ADD COLUMN IF NOT EXISTS table_schema text;
+-- Version 3 records TRUNCATE, which concerns no single row
+ALTER TABLE ${quotedTable} ALTER COLUMN row_id DROP NOT NULL;
 CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${indexPrefix}_table_xid_idx`)}
   ON ${quotedTable} (table_name, xid);
 CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${indexPrefix}_changed_at_idx`)}
   ON ${quotedTable} (changed_at);
 
--- Records a change of a row; the trigger argument is the primary key column.
+-- Records a change of a row, or a TRUNCATE of the table; the trigger argument is the primary key column.
 CREATE OR REPLACE FUNCTION ${functionName}() RETURNS trigger AS $$
 DECLARE
   new_id text;
   old_id text;
 BEGIN
+  IF TG_OP = 'TRUNCATE' THEN
+    INSERT INTO ${quotedTable} (table_schema, table_name, row_id, op)
+      VALUES (TG_TABLE_SCHEMA, TG_TABLE_NAME, NULL, 'TRUNCATE');${notify('NULL', `'TRUNCATE'`)}
+    RETURN NULL;
+  END IF;
+
   IF TG_OP <> 'DELETE' THEN
     new_id := to_jsonb(NEW) ->> TG_ARGV[0];
   END IF;
@@ -109,8 +124,9 @@ COMMENT ON FUNCTION ${functionName}() IS ${quoteLiteral(`${LILYPAD_CHANGELOG_VER
 }
 
 /**
- * The SQL that attaches the changelog trigger to a cached table. Run it once per table, in a
- * migration, after {@link lilypadChangelogSql}.
+ * The SQL that attaches the changelog triggers to a cached table: one for the changes of its rows,
+ * and one for `TRUNCATE`, which fires no row trigger. Run it once per table, in a migration, after
+ * {@link lilypadChangelogSql}.
  *
  * @param options.table - The cached table (as in its `LilypadDbSchema`).
  * @param options.primaryKey - Its primary key column.
@@ -122,22 +138,30 @@ export function lilypadChangelogTriggerSql(options: {
   changelogTable?: string;
 }): string {
   const changelogTable = options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
-  const triggerName = `${options.table.replace(/\W/g, '_')}_lilypad_changes`;
-  return `DROP TRIGGER IF EXISTS ${quoteIdentifier(triggerName)} ON ${quoteIdentifier(options.table)};
-CREATE TRIGGER ${quoteIdentifier(triggerName)}
-  AFTER INSERT OR UPDATE OR DELETE ON ${quoteIdentifier(options.table)}
-  FOR EACH ROW EXECUTE FUNCTION ${quoteIdentifier(triggerFunctionName(changelogTable))}(${quoteLiteral(options.primaryKey)});
+  const names = changelogTriggerNames(options.table);
+  const table = quoteIdentifier(options.table);
+  const execute = `EXECUTE FUNCTION ${quoteIdentifier(triggerFunctionName(changelogTable))}(${quoteLiteral(options.primaryKey)})`;
+  return `DROP TRIGGER IF EXISTS ${quoteIdentifier(names.row)} ON ${table};
+CREATE TRIGGER ${quoteIdentifier(names.row)}
+  AFTER INSERT OR UPDATE OR DELETE ON ${table}
+  FOR EACH ROW ${execute};
+DROP TRIGGER IF EXISTS ${quoteIdentifier(names.truncate)} ON ${table};
+CREATE TRIGGER ${quoteIdentifier(names.truncate)}
+  AFTER TRUNCATE ON ${table}
+  FOR EACH STATEMENT ${execute};
 `;
 }
 
+/**
+ * A change recorded by the changelog: a change of one row, or a `TRUNCATE` of the table (which
+ * removed every row, and has no `rowId`).
+ */
 export type LilypadChange = {
   /** The id of the changelog row. */
   id: string;
   /** The transaction that made the change. */
   xid: bigint;
-  rowId: string;
-  op: 'INSERT' | 'UPDATE' | 'DELETE';
-};
+} & ({ rowId: string; op: 'INSERT' | 'UPDATE' | 'DELETE' } | { rowId: null; op: 'TRUNCATE' });
 
 /**
  * Reads the changes of a table since `cursor`, and the cursor for the next read.
@@ -194,9 +218,9 @@ export async function readLilypadChanges(
       changes.push({
         id: row.id as string,
         xid: BigInt(row.xid as string),
-        rowId: row.row_id as string,
-        op: row.op as LilypadChange['op'],
-      });
+        rowId: row.row_id as string | null,
+        op: row.op,
+      } as LilypadChange);
     }
   }
   return { changes, cursor: BigInt(rows[0].next_cursor as string) };

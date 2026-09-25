@@ -452,7 +452,7 @@ const cachedOnly = products.bulkGet({}); // synchronous, no reload
 ```
 
 - A load replaces the whole content of the cache. Protected keys (see below) are kept, but marked as expired. Values written while the load was running are kept, since they are newer than its data.
-- A load happens again only after `defaultBulkSyncTtl`, or after `invalidate()` (also when `invalidate()` is called while a load is running).
+- A load happens again only after `defaultBulkSyncTtl` (at most the cache TTL, since the loaded values expire then), after `invalidate()` (also when `invalidate()` is called while a load is running), after `clear()`, or after `maxEntries` evicted an entry.
 - `bulkSync()` resolves to `true` when the cache is synced, `false` when the load failed or `bulkSyncFn` returned no data. A failed load is logged and **not thrown**, unless you call `bulkSync(syncFn, { throwOnError: true })`: the cache keeps its current content, and the next call tries again. A load that times out (`bulkSyncTimeout`) writes nothing.
 - `bulkSyncFn` receives an `AbortSignal`, aborted on timeout.
 - `bulkSync(syncFn)` and `bulkAsyncGet({ syncFn })` use `syncFn` for this load instead of `bulkSyncFn`.
@@ -578,6 +578,7 @@ const post = await gate.insertToTable(postsSchema, {
 
 const all = await gate.selectAllFromTable(postsSchema); // Post[], read in batches of 1 000 rows
 const one = await gate.selectFromTableByPrimaryKey(postsSchema, 1); // Post | null
+const some = await gate.selectFromTableByPrimaryKeys(postsSchema, [1, 2, 3]); // Post[], one query
 
 // UPDATE ... WHERE id = 1: only the given columns are written; throws if no such row exists
 const updated = await gate.updateToTable(postsSchema, { id: 1, title: 'Updated' });
@@ -586,6 +587,8 @@ await gate.deleteFromTable(postsSchema, 1); // does nothing if the row does not 
 ```
 
 - `insertToTable` and `updateToTable` return the row as stored by the database (`RETURNING *`), including generated columns. They return `null` if `selectSanitizationFn` rejects that row.
+- `insertToTableDetailed`, `updateToTableDetailed` and `deleteFromTableDetailed` also return the id of the transaction that made the write (`{ row, xid }`, and `{ xid }` for a delete, without `xid` if no row was deleted): the id the changelog records. `LilypadDbCache` uses it to recognize its own writes.
+- `selectFromTableByPrimaryKeys` leaves out the keys without a row.
 - An insert or update throws before querying if the primary key is missing (always required by updates; by inserts unless `primaryKeyShouldAutoDetermine`), or if no column is left to write.
 - With `primaryKeyShouldAutoDetermine`, updates never write the primary key column: it only identifies the row.
 
@@ -683,11 +686,13 @@ const account = await accounts.getOrFetch(7);
 // null      -> no row with id 7 (this result is cached too)
 // undefined -> the query failed; the error has been logged, nothing is thrown
 
-const everyAccount = await accounts.getAll(); // loads the whole table, then serves it from the cache
-const someAccounts = await accounts.getAll([1, 2]);
+const everyAccount = await accounts.getAll(); // loads the whole table once, then serves it from the cache
+const someAccounts = await accounts.getAll([1, 2]); // queries only the keys it does not hold
 ```
 
-`getOrFetch(key, options)` accepts the options of [`getOrSet`](#getorset-read-through-the-cache) (`ttl`, `staleWhileRevalidate`, `timeout`, ...), and [`getOrSetDetailed`](#getorset-read-through-the-cache) works too. `get()` reads memory only: a cache miss is fetched from the database by `getOrFetch`, not by `get`. `getAll` loads the table again when `defaultBulkSyncTtl` has passed, after an `invalidate()` that failed, or after a notification about a row the cache does not hold. `getAll` rejects when the table cannot be loaded.
+`getOrFetch(key, options)` accepts the options of [`getOrSet`](#getorset-read-through-the-cache) (`ttl`, `staleWhileRevalidate`, `timeout`, ...), and [`getOrSetDetailed`](#getorset-read-through-the-cache) works too. `get()` reads memory only: a cache miss is fetched from the database by `getOrFetch`, not by `get`.
+
+`getAll()` loads the whole table the first time. The cache then keeps track of the rows of the table (the writes, the fetches and the changes it learns about), and later calls query only the rows it does not hold up to date, by primary key, in one query: rows changed or inserted elsewhere, rows that expired. When those are more than a quarter of the table, it loads the whole table instead. It loads the whole table again only when it may have missed changes (the `LISTEN` connection was lost, or the changelog was not read for longer than `maxGap`), or, with the `none` strategy, after `defaultBulkSyncTtl`. `getAll(keys)` queries only the keys it does not hold. `getAll` rejects when the rows cannot be loaded.
 
 ### Writing through the cache
 
@@ -731,13 +736,14 @@ await sql.unsafe(lilypadChangelogSql()); // the changelog table and the trigger 
 await sql.unsafe(lilypadChangelogTriggerSql({ table: 'accounts', primaryKey: 'id' })); // per table
 ```
 
-The trigger records each change in the `lilypad_cache_changes` table and also sends a notification on the `cache_events` channel, so it serves both strategies. It records the schema of the table too, so tables of the same name in different schemas are not mixed up. It needs PostgreSQL 13 or later. Both functions return SQL that can safely be run again (`IF NOT EXISTS`, `CREATE OR REPLACE`, `DROP TRIGGER IF EXISTS`).
+The trigger records each change in the `lilypad_cache_changes` table and also sends a notification on the `cache_events` channel, so it serves both strategies. A second trigger, on each table, records `TRUNCATE`, which fires no row trigger. It records the schema of the table too, so tables of the same name in different schemas are not mixed up. It needs PostgreSQL 13 or later. Both functions return SQL that can safely be run again (`IF NOT EXISTS`, `CREATE OR REPLACE`, `DROP TRIGGER IF EXISTS`).
 
 - `lilypadChangelogSql({ table, notifyChannel })`: `table` renames the changelog table (default: `LILYPAD_DEFAULT_CHANGELOG_TABLE`, that is `lilypad_cache_changes`). `notifyChannel: false` sends no notification, for the `changelog` strategy alone. The `listen` strategy of `LilypadDbCache` always listens on `cache_events`, so keep that name if you use it.
-- `lilypadChangelogTriggerSql({ table, primaryKey, changelogTable })`: `table` and `primaryKey` are those of the cached table; pass `changelogTable` if you renamed it.
+- `lilypadChangelogTriggerSql({ table, primaryKey, changelogTable })`: `table` and `primaryKey` are those of the cached table; pass `changelogTable` if you renamed it. It creates two triggers: `<table>_lilypad_changes` for the rows, `<table>_lilypad_truncate` for `TRUNCATE`.
+- If you installed the changelog with an earlier version of the library, run both functions again: `lilypadChangelogSql()` updates the trigger function (version 3: `TRUNCATE`, and the transaction id in notifications), `lilypadChangelogTriggerSql()` adds the `TRUNCATE` trigger. The schema check reports both (`outdated-changelog`, `missing-truncate-trigger`).
 - An `UPDATE` that changes the primary key is recorded as a `DELETE` of the old key followed by an `UPDATE` of the new one.
 - Delete the old changelog rows periodically with `pruneLilypadChangelog(gate, { olderThan, changelogTable })`, which resolves to the number of deleted rows. `olderThan` (ms) must be much longer than `maxGap` and `lookback` (see [the changelog section of the Next.js guide](docs/nextjs-vercel.md#deleting-old-changelog-rows)).
-- `readLilypadChanges(gate, { tableName, since, changelogTable })` is the low-level read the cache uses, if you want to consume the changelog yourself. It resolves to `{ changes, cursor }`; pass `since: { cursor }` on the next call (or `since: { lookback }` the first time). The same change can be returned by several reads, so skip the `id`s you have already processed.
+- `readLilypadChanges(gate, { tableName, since, changelogTable })` is the low-level read the cache uses, if you want to consume the changelog yourself. It resolves to `{ changes, cursor }`; pass `since: { cursor }` on the next call (or `since: { lookback }` the first time). The same change can be returned by several reads, so skip the `id`s you have already processed. A `TRUNCATE` change has `rowId: null`.
 
 ```ts
 const accounts = await LilypadDbCache.create<number, Account, 'id'>(60_000, {
@@ -748,11 +754,19 @@ const accounts = await LilypadDbCache.create<number, Account, 'id'>(60_000, {
 
 When the cache learns about a change of its table:
 
-- on `INSERT` and `UPDATE`, it re-fetches (`listen`) or expires (`changelog`) the key if it holds it (or is fetching it). For other keys it sends no query: the next `getAll` reloads the table instead;
+- on `INSERT` and `UPDATE`, it re-fetches (`listen`) or expires (`changelog`) the key if it holds it (or is fetching it). For other keys it sends no query: it notes that the row exists, and the next `getAll` fetches it;
 - on `DELETE`, it caches the key as `null`, also for protected keys;
+- on `TRUNCATE`, it expires every entry and knows the table is empty, without a query. Copies of the rows in the shared level are then ignored;
+- a change made by `sqlCreate`, `sqlUpdate` or `sqlDelete` of the same instance is skipped when the cache still holds the row that write returned: the instance that writes does not query the row again;
 - if it may have missed changes (the `LISTEN` connection was lost, or the changelog was not read for longer than `maxGap`), it marks every entry as expired.
 
-Rows are stored in the order the changes happened: a slow query can never overwrite the result of a newer one.
+Rows are stored in the order the changes happened: a slow query can never overwrite the result of a newer one. A write whose row changed while it was running (a change applied meanwhile, or a read that may have seen the row before the write) is not cached: the next read fetches the row.
+
+#### The TTL while the cache is in sync
+
+With `listen` or `changelog`, as long as the sync is trusted (`LISTEN` active, changelog read within `maxGap`), the cache sees every change of its table. A row that reaches its TTL without a change is then still up to date: the cache keeps it without a query, until it is `maxAge` old (default: 1 hour). The TTL keeps bounding the shared level, which is never extended this way, and the copies read from it, which are queried again at their TTL.
+
+`maxAge` bounds how long a change that the triggers do not see (triggers disabled, `session_replication_role = replica` during a restore) can go unnoticed. Set `maxAge: 0` to query the rows again at each TTL. With the `none` strategy the TTL applies as in `LilypadCache`.
 
 The options of the `changelog` strategy:
 
@@ -762,6 +776,7 @@ The options of the `changelog` strategy:
 | `poll` | `'await'` | `'await'`: a read that falls due waits for the changelog. `'background'`: it does not wait, and may return data one interval older |
 | `maxGap` | 1 hour | If the changelog has not been read for this long, the instance no longer trusts its memory and expires every entry |
 | `lookback` | TTL + `staleWhileRevalidate` + 1 min | On the first read, or after `maxGap`, the changes of this period are applied, which also removes older copies from the shared level |
+| `maxAge` | 1 hour | How long a row can be kept past its TTL while the sync is trusted: see [The TTL while the cache is in sync](#the-ttl-while-the-cache-is-in-sync). `listen` accepts it too |
 | `table` | `lilypad_cache_changes` | The changelog table, if you renamed it |
 | `verify` | `'warn'` | Checks that the changelog and the trigger are installed: see [Checking the database setup](#checking-the-database-setup) |
 
@@ -797,7 +812,7 @@ for (const { code, table, message, fix } of problems) {
 }
 ```
 
-`tables` gives the schema each table resolves to (`null` if it does not exist). The codes are `unsupported-version`, `missing-table`, `missing-changelog`, `outdated-changelog` (installed by an older version of the library: run `lilypadChangelogSql()` again), `missing-changelog-trigger` (missing, disabled or not on every `INSERT`, `UPDATE` and `DELETE`), `wrong-trigger-primary-key` and `missing-notify-trigger`.
+`tables` gives the schema each table resolves to (`null` if it does not exist). The codes are `unsupported-version`, `missing-table`, `missing-changelog`, `outdated-changelog` (installed by an older version of the library: run `lilypadChangelogSql()` again), `missing-changelog-trigger` (missing, disabled or not on every `INSERT`, `UPDATE` and `DELETE`), `wrong-trigger-primary-key`, `missing-notify-trigger` and `missing-truncate-trigger` (`TRUNCATE` is not recorded, or, with `notifyChannel`, not notified: add it with `lilypadChangelogTriggerSql`, or handle `TG_OP = 'TRUNCATE'` in your own trigger).
 
 #### Custom notification triggers and callbacks
 

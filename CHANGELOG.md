@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Upgrading
+
+| Change | What to do |
+| --- | --- |
+| The changelog is at version 3: it records `TRUNCATE` (with `row_id` `NULL`), and its notifications carry the transaction id (`xid`). | Run `lilypadChangelogSql()` and `lilypadChangelogTriggerSql()` again for each table. Until then, the schema check reports `outdated-changelog` and `missing-truncate-trigger`, and `TRUNCATE` is not seen. |
+| `LilypadChange` is a union: a `TRUNCATE` change has `rowId: null`. | Code that reads the changelog with `readLilypadChanges` must handle `op: 'TRUNCATE'`. |
+| With `listen` or `changelog`, a row that reaches its TTL is kept without a query while the sync is trusted, until `maxAge` (default: 1 hour). | Set `sync.maxAge: 0` to query the rows again at each TTL, as before. |
+| `getAll()` no longer reloads the whole table after each change or at each TTL: it queries the changed rows by primary key. `getAll(keys)` queries only these keys, instead of loading the whole table. `defaultBulkSyncTtl` applies to `getAll` only with the `none` strategy. | None, unless you relied on `getAll` to reload the table. `bulkSync()` still loads it. |
+| `LilypadDbCache` reads rows with `selectFromTableByPrimaryKeys`, and writes with `insertToTableDetailed`, `updateToTableDetailed` and `deleteFromTableDetailed`. | Only a custom gate, or a mock of it, must implement them. |
+| A row written by `sqlCreate`/`sqlUpdate`/`sqlDelete` is not cached if its entry changed while the write was running; the next read fetches it. | None. |
+| The bulk sync of `LilypadCache` never stays fresh longer than the TTL, and `clear()` and `maxEntries` evictions force the next one. | Set the TTL, not only `defaultBulkSyncTtl`, if you want loads to last longer. |
+
+### Added
+
+- **LilypadDbGate**: `selectFromTableByPrimaryKeys`, and `insertToTableDetailed`, `updateToTableDetailed`, `deleteFromTableDetailed`, which also return the id of the transaction (`LilypadDbWriteResult`).
+- **LilypadDbCache**: `sync.maxAge`. `TRUNCATE` is applied without a query, from the changelog and from notifications.
+- **Schema check**: the `missing-truncate-trigger` problem.
+
+### Fixed
+
+- `getAll()` left out, for up to the TTL, the rows changed elsewhere (with `changelog`), the rows whose refresh after a notification failed, the rows cached with a shorter TTL, and the rows changed while the table was loading.
+- `getAll()` could return an empty list just before the bulk sync expired, or until it expired after `clear()`.
+- A change applied between the end of a write and the caching of its result could be overwritten by the older row of the write.
+- A `TRUNCATE` of a cached table was never seen: the caches kept the removed rows until their TTL.
+
 ## 0.2.0
 
 ### Upgrading from 0.0.1

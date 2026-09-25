@@ -43,23 +43,28 @@ function createFakeGate(initialRows: Item[] = []) {
   const rows = new Map(initialRows.map((row) => [row.id, row]));
   const listeners = new Map<string, ListenerCallbackIdentifier>();
   let generatedIds = 0;
+  let lastXid = 1000n;
 
   const mocks = {
     selectAllFromTable: vi.fn(async () => [...rows.values()]),
     selectFromTableByPrimaryKey: vi.fn(
       async (_schema: unknown, key: string) => rows.get(String(key)) ?? null
     ),
-    insertToTable: vi.fn(async (_schema: unknown, item: Partial<Item>) => {
+    selectFromTableByPrimaryKeys: vi.fn(async (_schema: unknown, keys: string[]) =>
+      keys.flatMap((key) => rows.get(String(key)) ?? [])
+    ),
+    insertToTableDetailed: vi.fn(async (_schema: unknown, item: Partial<Item>) => {
       const row = { ...item, id: item.id ?? `generated-${++generatedIds}` } as Item;
       rows.set(row.id, row);
-      return row;
+      return { row, xid: ++lastXid };
     }),
-    updateToTable: vi.fn(async (_schema: unknown, item: Item) => {
+    updateToTableDetailed: vi.fn(async (_schema: unknown, item: Item) => {
       rows.set(item.id, item);
-      return item;
+      return { row: item as Item | null, xid: ++lastXid };
     }),
-    deleteFromTable: vi.fn(async (_schema: unknown, key: string) => {
+    deleteFromTableDetailed: vi.fn(async (_schema: unknown, key: string) => {
       rows.delete(key);
+      return { xid: ++lastXid };
     }),
     addListener: vi.fn(async (listener: ListenerCallbackIdentifier) => {
       listeners.set(listener.callbackId, listener);
@@ -282,12 +287,15 @@ describe('LilypadDbCache', () => {
 
       await cache.sqlUpdate({ id: '1', name: 'one' });
 
-      expect(fake.mocks.updateToTable).toHaveBeenCalledOnce();
+      expect(fake.mocks.updateToTableDetailed).toHaveBeenCalledOnce();
     });
 
     it('should cache the row returned by the database after an update', async () => {
       const cache = await createCache();
-      fake.mocks.updateToTable.mockResolvedValueOnce({ id: '1', name: 'sanitized' });
+      fake.mocks.updateToTableDetailed.mockResolvedValueOnce({
+        row: { id: '1', name: 'sanitized' },
+        xid: 1n,
+      });
 
       await cache.sqlUpdate({ id: '1', name: 'raw' });
 
@@ -300,7 +308,7 @@ describe('LilypadDbCache', () => {
 
       await cache.sqlDelete('1');
 
-      expect(fake.mocks.deleteFromTable).toHaveBeenCalledWith(schema, '1');
+      expect(fake.mocks.deleteFromTableDetailed).toHaveBeenCalledWith(schema, '1');
       expect(cache.get('1')).toBeNull();
     });
   });
@@ -400,6 +408,19 @@ describe('LilypadDbCache', () => {
       await expect(fake.notify('null')).resolves.toBeUndefined();
       await expect(fake.notify('42')).resolves.toBeUndefined();
       expect(fake.mocks.selectFromTableByPrimaryKey).not.toHaveBeenCalled();
+    });
+
+    it('should keep a row in getAll when its refresh after a notification fails', async () => {
+      const cache = await createCache();
+      await cache.getAll();
+      fake.mocks.selectFromTableByPrimaryKey.mockRejectedValueOnce(new Error('query failed'));
+
+      await fake.notify({ table: 'items', id: '1', op: 'UPDATE' });
+
+      expect(await cache.getAll()).toEqual([
+        { id: '1', name: 'one' },
+        { id: '2', name: 'two' },
+      ]);
     });
 
     it('should reject getAll when the table cannot be loaded', async () => {
@@ -516,6 +537,60 @@ describe('LilypadDbCache', () => {
       expect(items).toContainEqual({ id: '3', name: 'three' });
     });
 
+    it('should keep every row in getAll after a write read back from the changelog', async () => {
+      fake = createFakeGate(['1', '2', '3', '4', '5'].map((id) => ({ id, name: `row ${id}` })));
+      const writer = await createChangelogCache();
+      const reader = await createChangelogCache();
+      expect(await writer.getAll()).toHaveLength(5);
+      expect(await reader.getAll()).toHaveLength(5);
+
+      await writer.sqlUpdate({ id: '1', name: 'renamed' });
+      changelog.read.mockResolvedValue({
+        changes: [{ id: '9', xid: 100n, rowId: '1', op: 'UPDATE' }],
+        cursor: 101n,
+      });
+      await vi.advanceTimersByTimeAsync(1000);
+
+      for (const cache of [writer, reader]) {
+        const items = await cache.getAll();
+        expect(items).toHaveLength(5);
+        expect(items).toContainEqual({ id: '1', name: 'renamed' });
+      }
+    });
+
+    it('should keep in getAll a row changed while the table is loading', async () => {
+      const cache = await createChangelogCache();
+      await cache.getAll();
+      // An insert forces the next bulk sync
+      fake.rows.set('3', { id: '3', name: 'three' });
+      changelog.read.mockResolvedValueOnce({
+        changes: [{ id: '10', xid: 100n, rowId: '3', op: 'INSERT' }],
+        cursor: 101n,
+      });
+      let resolveLoad!: (rows: Item[]) => void;
+      fake.mocks.selectAllFromTable.mockReturnValueOnce(
+        new Promise<Item[]>((resolve) => (resolveLoad = resolve))
+      );
+      await vi.advanceTimersByTimeAsync(1000);
+      const loading = cache.getAll();
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Row 1 changes while the table is loading: another read applies the change
+      const loadedRows = [...fake.rows.values()];
+      fake.rows.set('1', { id: '1', name: 'ONE' });
+      changelog.read.mockResolvedValueOnce({
+        changes: [{ id: '11', xid: 101n, rowId: '1', op: 'UPDATE' }],
+        cursor: 102n,
+      });
+      await vi.advanceTimersByTimeAsync(1000);
+      await cache.getOrFetch('2');
+      resolveLoad(loadedRows);
+
+      const items = await loading;
+      expect(items).toHaveLength(3);
+      expect(items).toContainEqual({ id: '1', name: 'ONE' });
+    });
+
     it('should cache the deleted rows as null', async () => {
       const cache = await createChangelogCache();
       await cache.getOrFetch('1');
@@ -590,6 +665,300 @@ describe('LilypadDbCache', () => {
         'Error reading the changelog:',
         expect.any(Error)
       );
+    });
+  });
+
+  describe('database traffic', () => {
+    /** Enough rows that a few changed ones are fetched by key instead of reloading the table. */
+    const manyRows = (count: number): Item[] =>
+      Array.from({ length: count }, (_, index) => ({
+        id: String(index + 1),
+        name: `row ${index + 1}`,
+      }));
+    const createChangelogCache = (
+      sync: Record<string, unknown> = {},
+      options: Record<string, unknown> = {}
+    ) => createCache({ sync: { strategy: 'changelog', pollInterval: 1000, ...sync }, ...options });
+    const noChanges = { changes: [], cursor: 100n };
+    /** How many rows each kind of query has read. */
+    const queries = () => ({
+      table: fake.mocks.selectAllFromTable.mock.calls.length,
+      byKey: fake.mocks.selectFromTableByPrimaryKey.mock.calls.length,
+      byKeys: fake.mocks.selectFromTableByPrimaryKeys.mock.calls.map(([, keys]) => keys),
+    });
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      fake = createFakeGate(manyRows(8));
+      changelog.read.mockReset();
+      changelog.read.mockResolvedValue(noChanges);
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('should fetch only the changed row after a write, and nothing on the writing instance', async () => {
+      const writer = await createChangelogCache();
+      const reader = await createChangelogCache();
+      await writer.getAll();
+      await reader.getAll();
+
+      await writer.sqlUpdate({ id: '1', name: 'renamed' });
+      const { xid } = await fake.mocks.updateToTableDetailed.mock.results[0].value;
+      changelog.read.mockResolvedValue({
+        changes: [{ id: '9', xid, rowId: '1', op: 'UPDATE' }],
+        cursor: 100n,
+      });
+      await vi.advanceTimersByTimeAsync(1000);
+
+      for (const cache of [writer, reader]) {
+        const items = await cache.getAll();
+        expect(items).toHaveLength(8);
+        expect(items).toContainEqual({ id: '1', name: 'renamed' });
+      }
+      expect(queries()).toEqual({ table: 2, byKey: 0, byKeys: [['1']] });
+    });
+
+    it('should fetch a row inserted elsewhere without reloading the table', async () => {
+      const cache = await createChangelogCache();
+      await cache.getAll();
+      fake.rows.set('9', { id: '9', name: 'new' });
+      changelog.read.mockResolvedValueOnce({
+        changes: [{ id: '10', xid: 100n, rowId: '9', op: 'INSERT' }],
+        cursor: 101n,
+      });
+
+      await vi.advanceTimersByTimeAsync(1000);
+      const items = await cache.getAll();
+
+      expect(items).toHaveLength(9);
+      expect(queries()).toEqual({ table: 1, byKey: 0, byKeys: [['9']] });
+    });
+
+    it('should keep the rows past their TTL without a query while the sync is trusted', async () => {
+      const cache = await createChangelogCache();
+      await cache.getAll();
+
+      await vi.advanceTimersByTimeAsync(61_000);
+
+      expect(await cache.getAll()).toHaveLength(8);
+      expect(await cache.getOrFetch('1')).toEqual({ id: '1', name: 'row 1' });
+      expect(cache.get('2')).toEqual({ id: '2', name: 'row 2' });
+      expect(queries()).toEqual({ table: 1, byKey: 0, byKeys: [] });
+    });
+
+    it('should query the rows again once they reach maxAge', async () => {
+      const cache = await createChangelogCache({ maxAge: 90_000 });
+      await cache.getAll();
+
+      await vi.advanceTimersByTimeAsync(61_000);
+      await cache.getAll();
+      expect(queries().table).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      await cache.getAll();
+      expect(queries().table).toBe(2);
+    });
+
+    it('should query the rows again after the TTL with the none strategy', async () => {
+      const cache = await createCache({ sync: { strategy: 'none' } });
+      await cache.getAll();
+
+      await vi.advanceTimersByTimeAsync(61_000);
+      await cache.getAll();
+
+      expect(queries().table).toBe(2);
+    });
+
+    it('should return a row cached with a shorter TTL, fetching only that row', async () => {
+      const cache = await createCache({ sync: { strategy: 'none' } });
+      await cache.getAll();
+      cache.set('1', { id: '1', name: 'short-lived' }, 1000);
+
+      await vi.advanceTimersByTimeAsync(2000);
+      const items = await cache.getAll();
+
+      expect(items).toHaveLength(8);
+      expect(items).toContainEqual({ id: '1', name: 'row 1' });
+      expect(queries()).toEqual({ table: 1, byKey: 0, byKeys: [['1']] });
+    });
+
+    it('should fetch only the requested keys with getAll(keys)', async () => {
+      const cache = await createCache({ sync: { strategy: 'none' } });
+
+      expect(await cache.getAll(['2', '2', 'missing'])).toEqual([{ id: '2', name: 'row 2' }]);
+      expect(await cache.getAll(['2'])).toEqual([{ id: '2', name: 'row 2' }]);
+      expect(queries()).toEqual({ table: 0, byKey: 0, byKeys: [['2', 'missing']] });
+    });
+
+    it('should not keep past its TTL a row copied from the shared level', async () => {
+      const shared = new Map<string, unknown>();
+      const store = {
+        get: async (key: string) => structuredClone(shared.get(key) ?? null),
+        set: async (key: string, value: unknown) => void shared.set(key, structuredClone(value)),
+        delete: async (key: string) => void shared.delete(key),
+      };
+      const first = await createChangelogCache({}, { shared: { store } });
+      const second = await createChangelogCache({}, { shared: { store } });
+      await first.getOrFetch('1');
+      await vi.advanceTimersByTimeAsync(0);
+
+      const fetchOne = () => fake.mocks.selectFromTableByPrimaryKey(schema, '1');
+      expect((await second.getOrSetDetailed('1', fetchOne)).status).toBe('L2-HIT');
+      await vi.advanceTimersByTimeAsync(61_000);
+      await second.getOrFetch('1');
+
+      // The copy of the shared level may be older than a change: it is fetched again
+      expect(queries().byKey).toBe(2);
+    });
+
+    describe('TRUNCATE', () => {
+      it('should empty the table read from the changelog without reloading it', async () => {
+        const onInvalidate = vi.fn();
+        const cache = await createChangelogCache({}, { platform: { onInvalidate } });
+        await cache.getAll();
+        fake.rows.clear();
+        changelog.read.mockResolvedValueOnce({
+          changes: [{ id: '11', xid: 100n, rowId: null, op: 'TRUNCATE' }],
+          cursor: 101n,
+        });
+
+        await vi.advanceTimersByTimeAsync(1000);
+
+        expect(await cache.getAll()).toEqual([]);
+        expect(await cache.getOrFetch('1')).toBeNull();
+        expect(queries()).toEqual({ table: 1, byKey: 1, byKeys: [] });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(onInvalidate).toHaveBeenCalledWith(
+          expect.objectContaining({
+            source: 'changelog',
+            tags: expect.arrayContaining(['lilypad:items']),
+          })
+        );
+      });
+
+      it('should apply the inserts that follow a TRUNCATE', async () => {
+        const cache = await createChangelogCache();
+        await cache.getAll();
+        fake.rows.clear();
+        fake.rows.set('20', { id: '20', name: 'after' });
+        changelog.read.mockResolvedValueOnce({
+          changes: [
+            { id: '11', xid: 100n, rowId: null, op: 'TRUNCATE' },
+            { id: '12', xid: 101n, rowId: '20', op: 'INSERT' },
+          ],
+          cursor: 102n,
+        });
+
+        await vi.advanceTimersByTimeAsync(1000);
+
+        expect(await cache.getAll()).toEqual([{ id: '20', name: 'after' }]);
+      });
+
+      it('should apply a TRUNCATE notification', async () => {
+        const cache = await createCache();
+        await cache.getAll();
+        fake.rows.clear();
+
+        await fake.notify({ schema: 'public', table: 'items', op: 'TRUNCATE' });
+
+        expect(cache.get('1')).toBeUndefined();
+        expect(await cache.getAll()).toEqual([]);
+      });
+
+      it('should not cache a row read before a TRUNCATE', async () => {
+        const cache = await createCache();
+        let resolveRead!: (row: Item | null) => void;
+        fake.mocks.selectFromTableByPrimaryKey.mockReturnValueOnce(
+          new Promise<Item | null>((resolve) => (resolveRead = resolve))
+        );
+        const fetching = cache.getOrFetch('1');
+
+        await fake.notify({ table: 'items', op: 'TRUNCATE' });
+        resolveRead({ id: '1', name: 'row 1' });
+        await fetching;
+
+        expect(cache.get('1')).toBeUndefined();
+      });
+    });
+
+    describe('writes of this instance', () => {
+      it('should not fetch again a row it wrote when its notification arrives', async () => {
+        const cache = await createCache();
+        await cache.sqlUpdate({ id: '1', name: 'renamed' });
+        const { xid } = await fake.mocks.updateToTableDetailed.mock.results[0].value;
+
+        await fake.notify({ table: 'items', id: '1', op: 'UPDATE', xid: String(xid) });
+
+        expect(queries().byKey).toBe(0);
+        expect(cache.get('1')).toEqual({ id: '1', name: 'renamed' });
+      });
+
+      it('should skip the changes of several writes of the same row', async () => {
+        const cache = await createChangelogCache();
+        await cache.getAll();
+        await cache.sqlCreate({ id: '9', name: 'new' });
+        await cache.sqlUpdate({ id: '9', name: 'renamed' });
+        const [created, updated] = await Promise.all([
+          fake.mocks.insertToTableDetailed.mock.results[0].value,
+          fake.mocks.updateToTableDetailed.mock.results[0].value,
+        ]);
+        changelog.read.mockResolvedValueOnce({
+          changes: [
+            { id: '20', xid: created.xid, rowId: '9', op: 'INSERT' },
+            { id: '21', xid: updated.xid, rowId: '9', op: 'UPDATE' },
+          ],
+          cursor: 100n,
+        });
+
+        await vi.advanceTimersByTimeAsync(1000);
+
+        expect(await cache.getAll()).toContainEqual({ id: '9', name: 'renamed' });
+        expect(queries()).toEqual({ table: 1, byKey: 0, byKeys: [] });
+      });
+
+      it('should fetch the row when the change is not the one of its write', async () => {
+        const cache = await createCache();
+        await cache.sqlUpdate({ id: '1', name: 'renamed' });
+        fake.rows.set('1', { id: '1', name: 'changed elsewhere' });
+
+        await fake.notify({ table: 'items', id: '1', op: 'UPDATE', xid: '1' });
+
+        expect(cache.get('1')).toEqual({ id: '1', name: 'changed elsewhere' });
+      });
+
+      it('should not cache a written row when the entry changed during the write', async () => {
+        const cache = await createCache({ sync: { strategy: 'none' } });
+        let resolveWrite!: (result: { row: Item; xid: bigint }) => void;
+        fake.mocks.updateToTableDetailed.mockReturnValueOnce(
+          new Promise((resolve) => (resolveWrite = resolve))
+        );
+        const writing = cache.sqlUpdate({ id: '1', name: 'renamed' });
+
+        // A read during the write may see the row before or after it
+        await cache.getOrFetch('1');
+        resolveWrite({ row: { id: '1', name: 'renamed' }, xid: 5n });
+        await writing;
+
+        expect(cache.get('1')).toBeUndefined();
+        expect(await cache.getOrFetch('1')).toEqual({ id: '1', name: 'row 1' });
+      });
+
+      it('should not let a read started before the write overwrite it', async () => {
+        const cache = await createCache({ sync: { strategy: 'none' } });
+        let resolveRead!: (row: Item | null) => void;
+        fake.mocks.selectFromTableByPrimaryKey.mockReturnValueOnce(
+          new Promise<Item | null>((resolve) => (resolveRead = resolve))
+        );
+        const fetching = cache.getOrFetch('1');
+
+        await cache.sqlUpdate({ id: '1', name: 'renamed' });
+        resolveRead({ id: '1', name: 'row 1' });
+        await fetching;
+
+        expect(cache.get('1')).toEqual({ id: '1', name: 'renamed' });
+      });
     });
   });
 

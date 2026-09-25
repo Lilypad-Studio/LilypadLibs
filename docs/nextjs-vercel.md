@@ -150,9 +150,9 @@ await sql.unsafe(lilypadChangelogTriggerSql({ table: 'users', primaryKey: 'id' }
 
 Or print the SQL and paste it into your migration tool: both functions return plain SQL strings. It needs PostgreSQL 13 or later.
 
-- The changelog table (`lilypad_cache_changes`) records the table, the primary key and the operation of every change. An update that changes the primary key is recorded as a delete of the old key and an update of the new one.
+- The changelog table (`lilypad_cache_changes`) records the table, the primary key and the operation of every change. An update that changes the primary key is recorded as a delete of the old key and an update of the new one. `lilypadChangelogTriggerSql` also adds a trigger for `TRUNCATE`, which fires no row trigger.
 - The trigger also sends a `NOTIFY` on `cache_events`, so `listen` and `changelog` can coexist (for example a long-running worker next to the Vercel app). Pass `{ notifyChannel: false }` to skip it.
-- If you installed the changelog with an earlier version of the library, run `lilypadChangelogSql()` again: it adds the schema column and updates the trigger function.
+- If you installed the changelog with an earlier version of the library, run `lilypadChangelogSql()` and `lilypadChangelogTriggerSql()` again: they update the trigger function (version 3) and add the `TRUNCATE` trigger.
 - The cache checks the setup once, with its first read of the changelog, and logs a warning with the missing SQL (`verify: 'warn'`, the default). With `verify: 'throw'`, `create` rejects instead, but it then queries the database: keep the default for code that runs during `next build`. To check in a deployment script, call `checkLilypadSchema(gate, { tables: [{ table: 'users', primaryKey: 'id' }] })` (see the [README](../README.md#checking-the-database-setup)).
 
 ### Using it
@@ -174,6 +174,16 @@ const users = await LilypadDbCache.create<number, User, 'id'>(60_000, {
 - **`lookback`**: on its first read, or after `maxGap`, an instance applies the changes of this period, which also removes older copies from the shared level. The default (TTL + `staleWhileRevalidate` + 1 minute) covers the lifetime of any shared entry.
 - **No change is ever missed** because of the order in which transactions commit. The cursor is the oldest transaction still running, not the last row read.
 - `get()` is synchronous, so it cannot read the changelog. Use `getOrFetch`, `getOrSet` or `getAll`.
+
+### What it costs in queries
+
+The traffic between the application and the database stays proportional to the changes, not to the TTL or to the size of the tables:
+
+- **The TTL costs no query while the changelog is read.** A row that reaches its TTL without a change is kept until `maxAge` (default: 1 hour), because the changelog would have reported its change. Only the shared level and the copies read from it keep the TTL.
+- **`getAll` loads a table once per instance**, then queries only the rows changed or inserted elsewhere, by primary key, in one query. It loads the whole table again only when more than a quarter of it must be queried, or when the instance stopped trusting the changelog (`maxGap`).
+- **The instance that writes queries nothing afterwards**: `sqlCreate`, `sqlUpdate` and `sqlDelete` cache the row the database returns, and the change read back from the changelog is recognized as its own.
+- **A `TRUNCATE`** empties the caches without any query.
+- **Each read of the changelog** is one indexed query per table, at most once per `pollInterval`, only when the cache is used.
 
 ### Deleting old changelog rows
 
@@ -282,6 +292,8 @@ The subpaths also keep the bundles small, since `postgres` is only pulled in by 
 - **The shared level is per region** on Vercel. The changelog keeps every region correct; only the hit rate is per region.
 - **`bulkSync` and `getAll`** fill the memory of the instance, not the shared level: a whole table is not copied into it.
 - **`clear()` and `dispose()`** act on the instance only. To empty a cache everywhere, expire its tag (`lilypad:<name>`) in the Runtime Cache.
+- **After a `TRUNCATE`**, the shared level may still hold copies of the removed rows, until their TTL. Instances that read the change ignore them, but an instance that has not read the changelog yet may use them. The invalidation event carries the tag `lilypad:<table>`: expire it to empty the shared level at once.
+- **Changes the triggers do not see** (triggers disabled, `session_replication_role = replica`, as `pg_restore` does) reach the caches only after `maxAge`. Lower it, or restart the instances, after such an operation.
 - **Rate limits** of `LilypadFlowControl` (`rate`) apply per instance. A limit shared by every instance would need a store with atomic increments (e.g. Redis); the Runtime Cache does not provide them.
 - **`get()`** reads only the memory of the instance, synchronously: it neither reads the shared level nor the changelog.
 

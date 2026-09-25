@@ -112,8 +112,17 @@ export type LilypadDbInsertData<T, PK extends keyof T = keyof T> = Omit<T, PK> &
 /** The data of an update: the primary key identifies the row, the other columns are optional. */
 export type LilypadDbUpdateData<T, PK extends keyof T = keyof T> = Partial<T> & Pick<T, PK>;
 
+/**
+ * The result of an insert or an update: the row as stored by the database (`null` if the
+ * `selectSanitizationFn` discards it), and the id of the transaction that wrote it, as recorded
+ * by the changelog (`xid`).
+ */
+export type LilypadDbWriteResult<T> = { row: T | null; xid: bigint };
+
 /** Rows read at a time by `selectAllFromTable`. */
 const SELECT_ALL_BATCH_SIZE = 1000;
+/** The column that carries the transaction id in the results of writes. */
+const XID_COLUMN = '__lilypad_xid';
 
 export function lilypadMissingPrimaryKeyError(
   schema: { primaryKey: PropertyKey; tableName: string },
@@ -311,6 +320,31 @@ export class LilypadDbGate {
     return typedResults;
   }
 
+  /**
+   * Selects the rows with these primary keys, in one query. Keys without a row are left out of
+   * the result, as are the rows the `selectSanitizationFn` discards.
+   */
+  async selectFromTableByPrimaryKeys<T, PK extends keyof T = keyof T>(
+    options: LilypadDbSchema<T, PK>,
+    primaryKeyValues: T[PK][]
+  ): Promise<T[]> {
+    if (primaryKeyValues.length === 0) {
+      return [];
+    }
+    const results = await this.sql`
+      SELECT ${this.selectedColumns(options)} FROM ${this.sql(options.tableName)}
+      WHERE ${this.sql(String(options.primaryKey))} IN ${this.sql(primaryKeyValues as string[])}
+    `;
+    const typedRows: T[] = [];
+    for (const row of results) {
+      const typedRow = this.mapRow(options, row);
+      if (typedRow !== null) {
+        typedRows.push(typedRow);
+      }
+    }
+    return typedRows;
+  }
+
   async selectFromTableByPrimaryKey<T, PK extends keyof T = keyof T>(
     options: LilypadDbSchema<T, PK>,
     primaryKeyValue: T[PK]
@@ -336,13 +370,30 @@ export class LilypadDbGate {
     options: LilypadDbSchema<T, PK>,
     data: LilypadDbInsertData<T, PK>
   ): Promise<T | null> {
+    return (await this.insertToTableDetailed(options, data)).row;
+  }
+
+  /** Like {@link insertToTable}, but also returns the id of the transaction that wrote the row. */
+  async insertToTableDetailed<T, PK extends keyof T = keyof T>(
+    options: LilypadDbSchema<T, PK>,
+    data: LilypadDbInsertData<T, PK>
+  ): Promise<LilypadDbWriteResult<T>> {
     const { data: insertData, columns } = this.prepareWrite(options, data as Partial<T>, 'insert');
 
     const results = await this.sql`
       INSERT INTO ${this.sql(options.tableName)} ${this.sql(insertData, columns)}
-      RETURNING *
+      RETURNING *, txid_current()::text AS ${this.sql(XID_COLUMN)}
     `;
-    return this.mapRow(options, results[0]);
+    return this.writeResult(options, results[0]);
+  }
+
+  /** Splits a row returned by a write into the row and the id of its transaction. */
+  private writeResult<T, PK extends keyof T>(
+    schema: LilypadDbSchema<T, PK>,
+    returned: postgres.Row
+  ): LilypadDbWriteResult<T> {
+    const { [XID_COLUMN]: xid, ...row } = returned;
+    return { row: this.mapRow(schema, row), xid: BigInt(xid as string) };
   }
 
   /**
@@ -356,6 +407,14 @@ export class LilypadDbGate {
     options: LilypadDbSchema<T, PK>,
     data: LilypadDbUpdateData<T, PK>
   ): Promise<T | null> {
+    return (await this.updateToTableDetailed(options, data)).row;
+  }
+
+  /** Like {@link updateToTable}, but also returns the id of the transaction that wrote the row. */
+  async updateToTableDetailed<T, PK extends keyof T = keyof T>(
+    options: LilypadDbSchema<T, PK>,
+    data: LilypadDbUpdateData<T, PK>
+  ): Promise<LilypadDbWriteResult<T>> {
     const {
       data: updateData,
       columns,
@@ -366,24 +425,37 @@ export class LilypadDbGate {
       UPDATE ${this.sql(options.tableName)}
       SET ${this.sql(updateData, columns)}
       WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue as string}
-      RETURNING *
+      RETURNING *, txid_current()::text AS ${this.sql(XID_COLUMN)}
     `;
     if (results.count === 0) {
       throw new Error(
         `No row with primary key "${String(primaryKeyValue)}" found in table "${options.tableName}".`
       );
     }
-    return this.mapRow(options, results[0]);
+    return this.writeResult(options, results[0]);
   }
 
   async deleteFromTable<T, PK extends keyof T = keyof T>(
     options: LilypadDbSchema<T, PK>,
     primaryKeyValue: T[PK]
   ): Promise<void> {
-    await this.sql`
+    await this.deleteFromTableDetailed(options, primaryKeyValue);
+  }
+
+  /**
+   * Like {@link deleteFromTable}, but also returns the id of the transaction that deleted the row
+   * (`undefined` when no row had this primary key).
+   */
+  async deleteFromTableDetailed<T, PK extends keyof T = keyof T>(
+    options: LilypadDbSchema<T, PK>,
+    primaryKeyValue: T[PK]
+  ): Promise<{ xid?: bigint }> {
+    const results = await this.sql`
       DELETE FROM ${this.sql(options.tableName)}
       WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue as string}
+      RETURNING txid_current()::text AS ${this.sql(XID_COLUMN)}
     `;
+    return results.length > 0 ? { xid: BigInt(results[0][XID_COLUMN] as string) } : {};
   }
 
   // LISTENER MANAGEMENT

@@ -10,6 +10,7 @@ export type {
   LilypadDbColumnType,
   LilypadDbInsertData,
   LilypadDbUpdateData,
+  LilypadDbWriteResult,
   ListenerCallbackIdentifier,
 } from '../dbGate/LilypadDbGate';
 

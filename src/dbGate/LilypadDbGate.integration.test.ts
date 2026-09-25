@@ -49,6 +49,12 @@ describe('LilypadDbGate (integration)', () => {
     await admin`
       CREATE FUNCTION notify_cache_events() RETURNS trigger AS $$
       BEGIN
+        IF TG_OP = 'TRUNCATE' THEN
+          PERFORM pg_notify('cache_events', json_build_object(
+            'table', TG_TABLE_NAME, 'op', TG_OP
+          )::text);
+          RETURN NULL;
+        END IF;
         PERFORM pg_notify('cache_events', json_build_object(
           'table', TG_TABLE_NAME,
           'id', COALESCE(NEW.id, OLD.id),
@@ -61,6 +67,10 @@ describe('LilypadDbGate (integration)', () => {
     await admin`
       CREATE TRIGGER users_cache_events AFTER INSERT OR UPDATE OR DELETE ON users
       FOR EACH ROW EXECUTE FUNCTION notify_cache_events()
+    `;
+    await admin`
+      CREATE TRIGGER users_cache_events_truncate AFTER TRUNCATE ON users
+      FOR EACH STATEMENT EXECUTE FUNCTION notify_cache_events()
     `;
     await admin.unsafe(lilypadChangelogSql({ notifyChannel: false }));
     await admin.unsafe(lilypadChangelogTriggerSql({ table: 'users', primaryKey: 'id' }));
@@ -77,7 +87,9 @@ describe('LilypadDbGate (integration)', () => {
   });
 
   beforeEach(async () => {
-    await admin`TRUNCATE users, lilypad_cache_changes RESTART IDENTITY`;
+    // The changelog records the TRUNCATE of users: it is emptied afterwards
+    await admin`TRUNCATE users RESTART IDENTITY`;
+    await admin`TRUNCATE lilypad_cache_changes RESTART IDENTITY`;
   });
 
   describe('CRUD', () => {
@@ -134,6 +146,15 @@ describe('LilypadDbGate (integration)', () => {
       expect(selectSanitizationFn).toHaveBeenCalledWith(
         expect.objectContaining({ is_admin: true })
       );
+    });
+
+    it('should select the rows of several primary keys in one query', async () => {
+      await admin`INSERT INTO users (name) VALUES ('Ada'), ('Grace'), ('Linus')`;
+
+      const rows = await gate.selectFromTableByPrimaryKeys(usersSchema, [1, 3, 42]);
+
+      expect(rows.map((row) => row.name).sort()).toEqual(['Ada', 'Linus']);
+      expect(await gate.selectFromTableByPrimaryKeys(usersSchema, [])).toEqual([]);
     });
 
     it('should update a row and return it', async () => {
@@ -370,6 +391,31 @@ describe('LilypadDbGate (integration)', () => {
       ]);
     });
 
+    it('should record TRUNCATE', async () => {
+      await admin`INSERT INTO users (name) VALUES ('Ada')`;
+      await admin`TRUNCATE users`;
+
+      const { changes } = await readAll();
+
+      expect(changes.map(({ op, rowId }) => `${op}:${rowId}`)).toEqual([
+        'INSERT:1',
+        'TRUNCATE:null',
+      ]);
+    });
+
+    it('should return with each write the transaction id that the changelog records', async () => {
+      const created = await gate.insertToTableDetailed(usersSchema, { name: 'Ada', role: 'dev' });
+      const updated = await gate.updateToTableDetailed(usersSchema, { id: 1, role: 'admin' });
+      const deleted = await gate.deleteFromTableDetailed(usersSchema, 1);
+
+      const { changes } = await readAll();
+
+      expect(created.row).toEqual({ id: 1, name: 'Ada', role: 'dev' });
+      expect(updated.row).toEqual({ id: 1, name: 'Ada', role: 'admin' });
+      expect(changes.map((change) => change.xid)).toEqual([created.xid, updated.xid, deleted.xid]);
+      expect(await gate.deleteFromTableDetailed(usersSchema, 1)).toEqual({});
+    });
+
     it('should not miss a transaction that commits after a later one', async () => {
       const slow = await admin.reserve();
       try {
@@ -414,7 +460,35 @@ describe('LilypadDbGate (integration)', () => {
 
       await admin`DELETE FROM users WHERE id = 1`;
       expect(await cache.getOrFetch(1)).toBeNull();
+
+      await admin`TRUNCATE users`;
+      expect(await cache.getAll()).toEqual([]);
       await cache.dispose();
+    });
+
+    it('should not query again the rows the cache wrote itself', async () => {
+      const cache = await LilypadDbCache.create<number, User, 'id'>(60_000, {
+        dbGate: { gate, schema: usersSchema },
+        sync: { strategy: 'changelog', pollInterval: 0 },
+      });
+      await cache.getAll();
+      const created = await cache.sqlCreate({ name: 'Ada', role: 'dev' });
+      const updated = await cache.sqlUpdate({ id: created!.id, role: 'admin' });
+      const queries = [
+        vi.spyOn(gate, 'selectAllFromTable'),
+        vi.spyOn(gate, 'selectFromTableByPrimaryKey'),
+        vi.spyOn(gate, 'selectFromTableByPrimaryKeys'),
+      ];
+      try {
+        expect(await cache.getAll()).toEqual([updated]);
+        expect(await cache.getOrFetch(created!.id)).toEqual(updated);
+        for (const query of queries) {
+          expect(query).not.toHaveBeenCalled();
+        }
+      } finally {
+        queries.forEach((query) => query.mockRestore());
+        await cache.dispose();
+      }
     });
 
     it('should let LISTEN and the changelog work together', async () => {
@@ -480,6 +554,38 @@ describe('LilypadDbGate (integration)', () => {
         expect(result.problems[0].message).toContain('disabled');
       } finally {
         await admin`ALTER TABLE users ENABLE TRIGGER users_lilypad_changes`;
+      }
+    });
+
+    it('should report a table whose TRUNCATE is not recorded', async () => {
+      await admin`CREATE TABLE unwatched (id int PRIMARY KEY)`;
+      // The row trigger alone, as installed by version 2
+      await admin`
+        CREATE TRIGGER unwatched_lilypad_changes AFTER INSERT OR UPDATE OR DELETE ON unwatched
+        FOR EACH ROW EXECUTE FUNCTION lilypad_cache_changes_record('id')
+      `;
+      try {
+        const options = { tables: [{ table: 'unwatched', primaryKey: 'id' }] };
+        const result = await checkLilypadSchema(gate, options);
+        expect(codes(result)).toEqual(['missing-truncate-trigger']);
+
+        await admin.unsafe(result.problems[0].fix!);
+
+        expect((await checkLilypadSchema(gate, options)).ok).toBe(true);
+      } finally {
+        await admin`DROP TABLE unwatched`;
+      }
+    });
+
+    it('should report a changelog installed by version 2', async () => {
+      await admin`COMMENT ON FUNCTION lilypad_cache_changes_record() IS 'lilypad-changelog:2'`;
+      try {
+        const result = await checkLilypadSchema(gate, { tables: [] });
+
+        expect(codes(result)).toEqual(['outdated-changelog']);
+        expect(result.problems[0].message).toContain('version 2');
+      } finally {
+        await admin.unsafe(lilypadChangelogSql({ notifyChannel: false }));
       }
     });
 
@@ -562,6 +668,7 @@ describe('LilypadDbGate (integration)', () => {
 
     beforeEach(async () => {
       await admin`TRUNCATE archive.users, archive.changes`;
+      await admin`TRUNCATE lilypad_cache_changes`;
     });
 
     it('should read the changes of the table of the given schema only', async () => {
@@ -665,6 +772,11 @@ describe('LilypadDbGate (integration)', () => {
 
       await admin`DELETE FROM users WHERE id = 1`;
       await vi.waitFor(() => expect(cache.get(1)).toBeNull());
+
+      await admin`INSERT INTO users (name) VALUES ('Grace')`;
+      expect(await cache.getAll()).toHaveLength(1);
+      await admin`TRUNCATE users`;
+      await vi.waitFor(async () => expect(await cache.getAll()).toEqual([]));
 
       await cache.dispose();
     });
