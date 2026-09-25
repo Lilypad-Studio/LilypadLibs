@@ -274,9 +274,9 @@ describe('LilypadSerializer', () => {
       });
 
       const [first, second] = serializer.deserialize([{}, {}]);
-      first.tags.push('mutated');
+      first!.tags.push('mutated');
 
-      expect(second.tags).toEqual([]);
+      expect(second!.tags).toEqual([]);
     });
   });
 
@@ -334,5 +334,27 @@ describe('LilypadSerializer', () => {
         });
       expect(create).toBeTypeOf('function');
     });
+  });
+});
+
+describe('LilypadSerializer null values', () => {
+  type Source = { note: string | null };
+  type Target = { n: string | null };
+
+  it('should keep a null value instead of replacing it with a non-null default', () => {
+    const serializer = new LilypadSerializer<Source, Target, { note: 'n' }>({
+      serialization: {
+        note: {
+          target: 'n',
+          serialize: (item) => item.note,
+          deserialize: (item) => item.n,
+          default: 'none',
+        },
+      },
+    });
+
+    const roundTrip = serializer.deserialize(serializer.serialize([{ note: null }]));
+
+    expect(roundTrip).toEqual([{ note: null }]);
   });
 });

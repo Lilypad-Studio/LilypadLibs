@@ -37,8 +37,8 @@ interface LilypadSerializerConstructorOptions<FROM extends object, TO extends ob
  * - Custom serialization and deserialization functions can be provided for each key.
  * - Default values and equality checks can be specified to skip serialization of default values.
  * - When a function in the serialization map returns `undefined`, that key is omitted from the serialized output.
- * - When deserialization returns `null` or `undefined`, the key gets a copy of its default value
- *   (object defaults are cloned, so deserialized items never share them).
+ * - When deserialization returns `undefined`, the key gets a copy of its default value (object
+ *   defaults are cloned, so deserialized items never share them). `null` is kept as a value.
  *
  * @example
  * ```typescript

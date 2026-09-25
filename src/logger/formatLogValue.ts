@@ -5,12 +5,25 @@ const MAX_DEPTH = 4;
  * Formats a part of a log message, in a style close to `util.inspect` but without Node.js APIs,
  * so that the logger also runs in edge runtimes.
  * - Strings are returned as they are.
- * - Errors keep their stack (or name and message) and their `cause`.
- * - It never throws: circular references print as `[Circular]`, BigInts as `10n`.
+ * - Errors keep their stack (or name and message), their own properties (e.g. the `code` and
+ *   `detail` of a database error) and their `cause`.
+ * - It never throws: circular references print as `[Circular]`, BigInts as `10n`, a getter
+ *   that throws as `[Getter threw]`.
  */
 export function formatLogValue(value: unknown): string {
-  return typeof value === 'string' ? value : formatNested(value, 0, new Set());
+  if (typeof value === 'string') {
+    return value;
+  }
+  try {
+    return formatNested(value, 0, new Set());
+  } catch {
+    // e.g. a Proxy whose traps throw
+    return '[Unformattable value]';
+  }
 }
+
+/** Properties of errors printed by the stack, or separately. */
+const ERROR_OWN_KEYS = new Set(['name', 'stack', 'message', 'cause']);
 
 function formatNested(value: unknown, depth: number, seen: Set<object>): string {
   switch (typeof value) {
@@ -71,10 +84,7 @@ function formatNested(value: unknown, depth: number, seen: Set<object>): string 
     if (depth >= MAX_DEPTH) {
       return '[Object]';
     }
-    const entries = Object.entries(value).map(
-      ([key, item]) => `${formatKey(key)}: ${formatNested(item, depth + 1, seen)}`
-    );
-    return entries.length === 0 ? '{}' : `{ ${entries.join(', ')} }`;
+    return formatProperties(value, depth, seen);
   } finally {
     seen.delete(value);
   }
@@ -84,6 +94,12 @@ function formatError(error: Error, depth: number, seen: Set<object>): string {
   seen.add(error);
   try {
     let formatted = error.stack ?? `${error.name}: ${error.message}`;
+    if (depth < MAX_DEPTH) {
+      const properties = formatProperties(error, depth, seen, ERROR_OWN_KEYS);
+      if (properties !== '{}') {
+        formatted += ` ${properties}`;
+      }
+    }
     if (error.cause !== undefined) {
       formatted += `\n[cause]: ${formatNested(error.cause, depth + 1, seen)}`;
     }
@@ -91,6 +107,33 @@ function formatError(error: Error, depth: number, seen: Set<object>): string {
   } finally {
     seen.delete(error);
   }
+}
+
+/**
+ * The own enumerable properties of an object, as `{ key: value, ... }`. A getter that throws does
+ * not stop the others from being printed.
+ */
+function formatProperties(
+  value: object,
+  depth: number,
+  seen: Set<object>,
+  excluded?: Set<string>
+): string {
+  const entries: string[] = [];
+  for (const key of Object.keys(value)) {
+    if (excluded?.has(key)) {
+      continue;
+    }
+    let item: unknown;
+    try {
+      item = (value as Record<string, unknown>)[key];
+    } catch {
+      entries.push(`${formatKey(key)}: [Getter threw]`);
+      continue;
+    }
+    entries.push(`${formatKey(key)}: ${formatNested(item, depth + 1, seen)}`);
+  }
+  return entries.length === 0 ? '{}' : `{ ${entries.join(', ')} }`;
 }
 
 function formatKey(key: string): string {

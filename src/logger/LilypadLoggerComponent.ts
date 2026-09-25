@@ -93,6 +93,23 @@ export default abstract class LilypadLoggerComponent<T extends string> {
   protected abstract send(message: string, type: T): Promise<void>;
 }
 
+/**
+ * Writes a message on the console: channels named `error` go to `console.error`, `warn` to
+ * `console.warn` (case-insensitive), the others to `console.log`.
+ */
+export function writeToConsole(message: string, type: string): void {
+  switch (type.toLowerCase()) {
+    case 'error':
+      console.error(message);
+      break;
+    case 'warn':
+      console.warn(message);
+      break;
+    default:
+      console.log(message);
+  }
+}
+
 /** `JSON.stringify` that never throws (circular references, BigInts). */
 export function safeJson(value: unknown): string {
   const seen = new WeakSet<object>();

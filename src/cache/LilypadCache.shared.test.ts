@@ -68,9 +68,10 @@ describe('LilypadCache platform features', () => {
 
   /** Two caches with the same name and store stand for two instances of the application. */
   function createInstance<V>(
-    options: ConstructorParameters<typeof LilypadCache<string, V>>[1] = {}
+    options: ConstructorParameters<typeof LilypadCache<string, V>>[0] = {}
   ) {
-    const cache = new LilypadCache<string, V>(1000, {
+    const cache = new LilypadCache<string, V>({
+      ttl: 1000,
       name: 'products',
       shared: { store: fake.store },
       ...options,
@@ -84,21 +85,24 @@ describe('LilypadCache platform features', () => {
     fake = createFakeStore();
   });
 
-  afterEach(() => {
-    caches.splice(0).forEach((cache) => cache.dispose());
+  afterEach(async () => {
+    await Promise.all(caches.splice(0).map((cache) => cache.dispose()));
     vi.useRealTimers();
   });
 
   describe('configuration', () => {
     it('should require a name and a store for the shared level', () => {
-      expect(() => new LilypadCache(1000, { shared: { store: fake.store } })).toThrow(
+      expect(() => new LilypadCache({ ttl: 1000, shared: { store: fake.store } })).toThrow(
         '`name` is required'
       );
-      expect(() => new LilypadCache(1000, { name: 'x', shared: {} })).toThrow('needs a `store`');
+      expect(() => new LilypadCache({ ttl: 1000, name: 'x', shared: {} })).toThrow(
+        'needs a `store`'
+      );
     });
 
     it('should use the store of the platform by default', async () => {
-      const cache = new LilypadCache<string, number>(1000, {
+      const cache = new LilypadCache<string, number>({
+        ttl: 1000,
         name: 'products',
         platform: { shared: fake.store },
         shared: {},
@@ -112,7 +116,7 @@ describe('LilypadCache platform features', () => {
         expect.objectContaining({ value: 1 }),
         expect.objectContaining({ tags: ['lilypad:products'] })
       );
-      cache.dispose();
+      void cache.dispose();
     });
   });
 
@@ -211,9 +215,20 @@ describe('LilypadCache platform features', () => {
       expect((await cache.getOrSetDetailed('malformed', async () => 3)).status).toBe('MISS');
     });
 
-    it('should not replace a shared value fetched later by another instance', async () => {
-      const slow = createInstance<number>();
-      const fast = createInstance<number>();
+    it('should write without reading the shared entry first by default', async () => {
+      const cache = createInstance<number>();
+
+      cache.set('a', 1);
+      await settle();
+
+      expect(fake.store.get).not.toHaveBeenCalled();
+      expect(fake.data.has('lilypad:products:a')).toBe(true);
+    });
+
+    it('should not replace a shared value fetched later with checkBeforeWrite', async () => {
+      const shared = { store: fake.store, checkBeforeWrite: true };
+      const slow = createInstance<number>({ shared });
+      const fast = createInstance<number>({ shared });
       const slowFetch = deferred<number>();
       const slowResult = slow.getOrSet('p1', () => slowFetch.promise);
       await vi.advanceTimersByTimeAsync(10);
@@ -286,7 +301,7 @@ describe('LilypadCache platform features', () => {
       await cache.getOrSetDetailed('p1', fetch);
       expect(fetch).not.toHaveBeenCalled();
 
-      await works[0]();
+      await works[0]!();
       expect(fetch).toHaveBeenCalledOnce();
       expect(cache.get('p1')).toBe(2);
     });
@@ -515,10 +530,69 @@ describe('LilypadCache platform features', () => {
       await settle();
 
       expect(logger.error).toHaveBeenCalledWith(
-        cache.id,
+        cache.name,
         'Error in onInvalidate:',
         expect.any(Error)
       );
+    });
+  });
+
+  describe('cached fallbacks', () => {
+    const failing = async (): Promise<number> => {
+      throw new Error('source down');
+    };
+
+    it('should report a cached fallback as a failed refresh', async () => {
+      const cache = createInstance<number>();
+      await cache.getOrSetDetailed('p1', failing, { errorFn: () => 7 });
+
+      const result = await cache.getOrSetDetailed('p1', async () => 1);
+
+      expect(result).toEqual({ value: 7, status: 'L1-HIT', refreshFailed: true });
+    });
+
+    it('should refresh a cached fallback in the background once the cooldown is over', async () => {
+      const cache = createInstance<number>({ failureCooldown: 10_000 });
+      await cache.getOrSetDetailed('p1', failing, { errorFn: () => 7, errorTtl: 60_000 });
+      const fetch = vi.fn(async () => 1);
+
+      await cache.getOrSetDetailed('p1', fetch);
+      await settle();
+      expect(fetch).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      await expect(cache.getOrSetDetailed('p1', fetch)).resolves.toMatchObject({ value: 7 });
+      await settle();
+
+      expect(fetch).toHaveBeenCalledOnce();
+      await expect(cache.getOrSetDetailed('p1', fetch)).resolves.toEqual({
+        value: 1,
+        status: 'L1-HIT',
+        refreshFailed: false,
+      });
+    });
+  });
+
+  describe('invalidation and the shared level', () => {
+    it('should not adopt a shared copy produced before the key was invalidated', async () => {
+      const cache = createInstance<number>();
+      await cache.getOrSet('p1', async () => 1);
+      await settle();
+      await vi.advanceTimersByTimeAsync(100);
+      const producedBefore = Date.now();
+      await vi.advanceTimersByTimeAsync(100);
+      cache.invalidate('p1');
+      await settle();
+      // e.g. another instance that read the row before the change, writing after the removal
+      fake.data.set('lilypad:products:p1', {
+        value: { lilypad: 1, value: 2, fetchedAt: producedBefore, expiresAt: Date.now() + 1000 },
+        expiresAt: Date.now() + 1000,
+      });
+
+      await expect(cache.getOrSetDetailed('p1', async () => 3)).resolves.toMatchObject({
+        value: 3,
+        status: 'MISS',
+      });
     });
   });
 });

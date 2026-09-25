@@ -51,3 +51,53 @@ describe('formatLogValue', () => {
     );
   });
 });
+
+describe('formatLogValue robustness', () => {
+  it('should print the own properties of errors, such as the code of a database error', () => {
+    const error = Object.assign(new Error('duplicate key'), {
+      code: '23505',
+      detail: 'Key (id)=(1) already exists.',
+    });
+
+    const formatted = formatLogValue(error);
+
+    expect(formatted).toContain('Error: duplicate key');
+    expect(formatted).toContain("{ code: '23505', detail: 'Key (id)=(1) already exists.' }");
+  });
+
+  it('should not repeat the name of errors that set it as an own property', () => {
+    class CustomError extends Error {
+      constructor() {
+        super('custom');
+        this.name = 'CustomError';
+      }
+    }
+
+    expect(formatLogValue(new CustomError())).not.toContain("name: 'CustomError'");
+  });
+
+  it('should keep formatting when a getter throws', () => {
+    const value = {
+      ok: 1,
+      get broken(): number {
+        throw new Error('boom');
+      },
+    };
+    Object.defineProperty(value, 'broken', { enumerable: true });
+
+    expect(formatLogValue(value)).toBe('{ ok: 1, broken: [Getter threw] }');
+  });
+
+  it('should never throw, even for a Proxy whose traps throw', () => {
+    const hostile = new Proxy(
+      {},
+      {
+        ownKeys() {
+          throw new Error('trap');
+        },
+      }
+    );
+
+    expect(formatLogValue(hostile)).toBe('[Unformattable value]');
+  });
+});

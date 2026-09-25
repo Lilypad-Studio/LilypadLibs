@@ -4,12 +4,17 @@
  */
 export { default as LilypadCache, LilypadCacheCooldownError } from '../cache/LilypadCache';
 export type {
+  LilypadCacheEntry,
+  LilypadCacheEntryOrigin,
   LilypadCacheGetOptions,
   LilypadCachedValueType,
   LilypadCacheKey,
   LilypadCacheOptions,
+  LilypadCacheRead,
   LilypadCacheResult,
   LilypadCacheSharedOptions,
   LilypadCacheStatus,
+  LilypadCacheSyncFn,
+  LilypadCacheValueRetrieval,
   LilypadSharedCodec,
 } from '../cache/LilypadCache';

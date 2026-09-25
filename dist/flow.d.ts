@@ -1,8 +1,7 @@
-import { a as LilypadLibLogger } from './LilypadLogger-Bgz_B7cT.js';
-import './singleton.js';
-import './platform.js';
+import { L as LilypadLibLogger } from './LilypadLibLogger-DPBngeVh.js';
 
-interface FlowControlOptions {
+interface LilypadFlowControlOptions {
+    /** Minimum time between two executions of each consumer/function pair, in milliseconds. */
     rate?: number;
     /**
      * Maximum duration of each attempt, in milliseconds. With retries, the total duration can be up to
@@ -12,10 +11,11 @@ interface FlowControlOptions {
     retries?: number;
     logger?: LilypadLibLogger;
 }
-interface ExecuteFnOptions<T> {
+interface LilypadExecuteFnOptions<T> {
     /**
-     * Called once the execution has definitively failed (after all retries).
-     * Its return value becomes the result of the execution; to propagate the error, throw from it.
+     * Called once the execution has definitively failed (after all retries), or when it is refused
+     * by the rate limit. Its return value becomes the result of the execution; to propagate the
+     * error, throw from it.
      */
     errorFn?: (error: unknown) => T;
     functionIdentifier: string;
@@ -32,6 +32,15 @@ interface ExecuteFnOptions<T> {
      * Callers that join an in-flight execution share the timeout of the call that started it.
      */
     timeout?: number;
+}
+/** Thrown when an attempt exceeds its timeout. */
+declare class LilypadTimeoutError extends Error {
+    readonly timeout: number;
+    constructor(timeout: number);
+}
+/** Thrown when an execution is refused by the rate limit. */
+declare class LilypadRateLimitError extends Error {
+    constructor(rateKey: string);
 }
 /**
  * A flow control utility class that manages execution of asynchronous operations with support for
@@ -57,12 +66,15 @@ interface ExecuteFnOptions<T> {
  * ```
  *
  * @remarks
- * - **Rate Limiting**: Enforces a minimum interval between executions per consumer/function pair
+ * - **Rate Limiting**: Enforces a minimum interval between executions per consumer/function pair.
+ *   A refused execution fails with a `LilypadRateLimitError`, which goes to `errorFn` like any
+ *   other failure.
  * - **Single-Flight**: Deduplicates concurrent requests for the same function identifier. Callers that
  *   join an in-flight execution share its result, including the outcome of the first caller's `errorFn`.
  * - **Retries**: Automatically retries failed operations with configurable backoff strategies
- * - **Timeout**: Fails an attempt that exceeds the specified timeout duration and aborts its signal.
- *   The timeout applies to each attempt, not to the whole execution.
+ * - **Timeout**: Fails an attempt that exceeds the specified timeout duration with a
+ *   `LilypadTimeoutError`, and aborts its signal. The timeout applies to each attempt, not to the
+ *   whole execution.
  *
  * @property rate - Minimum milliseconds between executions for rate limiting
  * @property timeout - Maximum milliseconds to wait for each attempt
@@ -76,22 +88,24 @@ declare class LilypadFlowControl<T> {
     private logger?;
     private singleFlightMap;
     private rateMap;
-    constructor(options?: FlowControlOptions);
+    constructor(options?: LilypadFlowControlOptions);
     /**
      * Executes an asynchronous function with a timeout constraint.
      *
-     * @template T The type of value returned by the execution function.
+     * @template R The type of value returned by the execution function (the one of the instance by
+     * default).
      * @param executionFn An asynchronous function to execute. It receives a signal that is aborted on timeout.
+     * @param timeout The timeout, in milliseconds. Defaults to the instance's `timeout`.
      * @returns A promise that resolves with the result of `executionFn` if it completes before the timeout,
      *          or rejects with an error if the timeout is exceeded.
-     * @throws {Error} Throws an error with message 'Operation timed out' if the execution exceeds the configured timeout duration.
+     * @throws {LilypadTimeoutError} If the execution exceeds the timeout.
      *
      * @remarks
      * This method uses `Promise.race()` to implement the timeout mechanism. The timeout is cleared in the finally block
      * to ensure no memory leaks occur regardless of whether the operation succeeds or times out.
      * JavaScript cannot forcibly stop a running promise: `executionFn` should observe the signal to stop its work.
      */
-    executeWithTimeout(executionFn: (signal: AbortSignal) => Promise<T>, timeout?: number | undefined): Promise<T>;
+    executeWithTimeout<R = T>(executionFn: (signal: AbortSignal) => Promise<R>, timeout?: number | undefined): Promise<R>;
     /**
      * Executes a given asynchronous function with retry logic and optional exponential backoff.
      *
@@ -123,7 +137,7 @@ declare class LilypadFlowControl<T> {
      *
      * @param consumerIdentifier - A unique identifier for the consumer (e.g., user or service).
      * @param functionIdentifier - A unique identifier for the function being rate-limited.
-     * @throws {Error} If the rate limit is exceeded for the given consumer and function.
+     * @throws {LilypadRateLimitError} If the rate limit is exceeded for the given consumer and function.
      */
     rateLimit(consumerIdentifier: string, functionIdentifier: string): void;
     /**
@@ -139,6 +153,7 @@ declare class LilypadFlowControl<T> {
      * retries, and timeout handling. Ensures that only one execution per function identifier
      * is in-flight at a time, and subsequent calls return the same promise until completion.
      * Calls that join an in-flight execution are not rate limited, since they do not start a new one.
+     * An execution refused by the rate limit goes to `errorFn`, like a failed one.
      *
      * @template T - The return type of the function to execute.
      * @param options - The execution options, including:
@@ -149,7 +164,7 @@ declare class LilypadFlowControl<T> {
      *   - backOffTime: Optional backoff time between retries.
      * @returns A promise that resolves with the result of the executed function.
      */
-    executeFn(options: ExecuteFnOptions<T>): Promise<T>;
+    executeFn(options: LilypadExecuteFnOptions<T>): Promise<T>;
 }
 
-export { type ExecuteFnOptions, type FlowControlOptions, LilypadFlowControl };
+export { type LilypadExecuteFnOptions, LilypadFlowControl, type LilypadFlowControlOptions, LilypadRateLimitError, LilypadTimeoutError };

@@ -31,6 +31,7 @@ export default defineConfig({
             'src/cache/LilypadCache*.test.ts',
             'src/flow/**/*.test.ts',
             'src/logger/**/*.test.ts',
+            'src/platform/**/*.test.ts',
             'src/serializer/**/*.test.ts',
             'src/singleton/**/*.test.ts',
           ],

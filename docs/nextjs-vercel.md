@@ -82,7 +82,7 @@ Even so, create instances on first use, through a function, rather than with a t
 ```ts
 // Good: nothing runs until a request calls getUsers()
 export const getUsers = async () =>
-  LilypadDbCache.create<number, User, 'id'>(60_000, { singleton: true, singletonIdentifier: 'users', ... });
+  LilypadDbCache.create<number, User, 'id'>({ ttl: 60_000, singleton: true, singletonIdentifier: 'users', ... });
 
 // Avoid: runs when the module is imported, including during the build
 export const users = await LilypadDbCache.create(...);
@@ -96,7 +96,8 @@ With `singleton: true`, every call returns the same instance for the lifetime of
 import { LilypadCache } from '@lilypad/libs/cache';
 import { platform } from './lilypad-platform';
 
-const prices = new LilypadCache<string, Price>(60_000, {
+const prices = new LilypadCache<string, Price>({
+  ttl: 60_000,
   name: 'prices', // required with `shared`; unique per shared store
   platform,
   shared: {
@@ -121,7 +122,7 @@ The lookup order of `getOrSet` is: memory of the instance (**L1**), shared level
 - **`refreshLockTtl`**: prevents several instances from refreshing the same key at the same time. It is a soft lock (read and write are not atomic): rarely, two instances still refresh together, which is harmless.
 - **`failureCooldown`**: while a source is down, requests do not all retry it. The cooldown is shared through L2. During it, a stale value or the `errorFn`/`returnOldOnError` fallbacks are used, otherwise `LilypadCacheCooldownError` is thrown.
 - **`cleanupOnAccessEvery`** replaces `autoCleanupInterval`, whose timer does not run while an instance is suspended.
-- **`status`** (`L1-HIT`, `L2-HIT`, `STALE`, `MISS`) and **`refreshFailed`** let you log the hit rate, or show "prices as of …" when the refresh failed.
+- **`status`** (`L1-HIT`, `L2-HIT`, `STALE`, `MISS`) and **`refreshFailed`** let you log the hit rate, or show "prices as of …" when the refresh failed. `refreshFailed` stays `true` while a fallback chosen after an error is cached; with `failureCooldown`, that fallback is refreshed in the background once the cooldown is over.
 - Per-call `timeout` overrides `flowControlTimeout`: keep the fetch within the remaining time of the request.
 
 ## 5. Database caches: keeping every instance up to date
@@ -158,7 +159,8 @@ Or print the SQL and paste it into your migration tool: both functions return pl
 ### Using it
 
 ```ts
-const users = await LilypadDbCache.create<number, User, 'id'>(60_000, {
+const users = await LilypadDbCache.create<number, User, 'id'>({
+  ttl: 60_000,
   dbGate: { gate: await getGate(), schema: usersSchema },
   platform,
   shared: { refreshLockTtl: 60_000 },
@@ -168,7 +170,7 @@ const users = await LilypadDbCache.create<number, User, 'id'>(60_000, {
 });
 ```
 
-- **`pollInterval`**: the largest delay you accept for changes made elsewhere. Each read of the changelog is one indexed query. It happens only when the cache is used, so an idle instance costs nothing.
+- **`pollInterval`**: the largest delay you accept for changes made elsewhere. Each read of the changelog is one indexed query, shared by every cache of the gate. It happens only when a cache is used, so an idle instance costs nothing. If the read fails, the next attempts back off (from `pollInterval`, up to one minute) instead of adding a failing query to every request.
 - **`poll: 'await'`** (default): a read that falls due waits for the changelog, so it never returns data older than `pollInterval`. With `'background'` the request does not pay for the query, but may see data one interval older.
 - **`maxGap`** (default: 1 hour): an instance that has not read the changelog for this long stops trusting its memory, and expires it.
 - **`lookback`**: on its first read, or after `maxGap`, an instance applies the changes of this period, which also removes older copies from the shared level. The default (TTL + `staleWhileRevalidate` + 1 minute) covers the lifetime of any shared entry.
@@ -183,7 +185,7 @@ The traffic between the application and the database stays proportional to the c
 - **`getAll` loads a table once per instance**, then queries only the rows changed or inserted elsewhere, by primary key, in one query. It loads the whole table again only when more than a quarter of it must be queried, or when the instance stopped trusting the changelog (`maxGap`).
 - **The instance that writes queries nothing afterwards**: `sqlCreate`, `sqlUpdate` and `sqlDelete` cache the row the database returns, and the change read back from the changelog is recognized as its own.
 - **A `TRUNCATE`** empties the caches without any query.
-- **Each read of the changelog** is one indexed query per table, at most once per `pollInterval`, only when the cache is used.
+- **Each read of the changelog** is one query for every cached table of the gate, at most once per `pollInterval`, only when a cache is used.
 
 ### Deleting old changelog rows
 
@@ -288,7 +290,7 @@ The subpaths also keep the bundles small, since `postgres` is only pulled in by 
 
 ## 9. Known limits
 
-- **A rare race on the shared level.** A query that starts before a change and stores its result after the changelog has been read can leave an old value in the shared level until its TTL. This is why the TTL of database caches with `shared` should stay short (≤ 60 s).
+- **A rare race on the shared level.** A query that starts before a change and stores its result after the changelog has been read can leave an old value in the shared level until its TTL. Instances that had the key and invalidated it ignore that copy, but the others may adopt it. This is why the TTL of database caches with `shared` should stay short (≤ 60 s).
 - **The shared level is per region** on Vercel. The changelog keeps every region correct; only the hit rate is per region.
 - **`bulkSync` and `getAll`** fill the memory of the instance, not the shared level: a whole table is not copied into it.
 - **`clear()` and `dispose()`** act on the instance only. To empty a cache everywhere, expire its tag (`lilypad:<name>`) in the Runtime Cache.
@@ -315,4 +317,4 @@ Pass `platform` to the logger. In scripts, `await logger.flush()` before exiting
 The source failed less than `failureCooldown` ago and there is no stale value or fallback. Look for the original error in the logs (`Error fetching cache key`), or add an `errorFn`.
 
 **`refreshFailed: true` on a response.**
-The last background refresh failed: the value is the last one fetched successfully. The error is in the logs.
+The last fetch of the key failed: the value is the last one fetched successfully, or a fallback (`errorFn`, `returnOldOnError`). The error is in the logs.

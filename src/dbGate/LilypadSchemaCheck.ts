@@ -162,6 +162,9 @@ export async function checkLilypadSchema(
       to_regprocedure(${functionSignature}::text) IS NOT NULL AS has_function,
       obj_description(to_regprocedure(${functionSignature}::text), 'pg_proc') AS function_comment
   `;
+  if (!database) {
+    throw new Error('Reading the database settings returned no row.');
+  }
 
   if ((database.version as number) < 130000) {
     problems.push({
@@ -255,7 +258,7 @@ export async function checkLilypadSchema(
         problems.push({
           code: 'wrong-trigger-primary-key',
           table,
-          message: `The changelog trigger of "${table}" records the column "${working[0].args.split('\\000')[0]}", not the primary key "${primaryKey}".`,
+          message: `The changelog trigger of "${table}" records the column "${working[0]?.args.split('\\000')[0]}", not the primary key "${primaryKey}".`,
           fix,
         });
       } else if (!triggers.some((trigger) => trigger.changelog && firesOnTruncate(trigger))) {

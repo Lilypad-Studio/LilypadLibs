@@ -1,4 +1,8 @@
-import LilypadLoggerComponent, { safeJson, type LilypadLogRecord } from '../LilypadLoggerComponent';
+import LilypadLoggerComponent, {
+  safeJson,
+  writeToConsole,
+  type LilypadLogRecord,
+} from '../LilypadLoggerComponent';
 
 /**
  * A logger component that writes one JSON object per message on the console, for log platforms
@@ -37,16 +41,8 @@ export default class LilypadJsonConsoleLogger<T extends string> extends LilypadL
     await this.send(line, record.type);
   }
 
-  protected async send(message: string, type: T): Promise<void> {
-    switch (type.toLowerCase()) {
-      case 'error':
-        console.error(message);
-        break;
-      case 'warn':
-        console.warn(message);
-        break;
-      default:
-        console.log(message);
-    }
+  protected send(message: string, type: T): Promise<void> {
+    writeToConsole(message, type);
+    return Promise.resolve();
   }
 }

@@ -9,10 +9,28 @@ import type { LilypadLibLogger } from '@/logger/LilypadLogger';
 import { LilypadSchemaCheckError } from '@/dbGate/LilypadSchemaCheck';
 
 // The changelog is read through this mock: the queries themselves are covered by the integration tests
-const changelog = vi.hoisted(() => ({ read: vi.fn() }));
+const changelog = vi.hoisted(() => {
+  const read = vi.fn();
+  // The shared reader reads every table in one query: delegated here to one read per table
+  const batch = vi.fn(
+    async (
+      gate: unknown,
+      options: { requests: { tableName: string; since: unknown }[]; changelogTable?: string }
+    ) => {
+      const results = (await Promise.all(
+        options.requests.map((request) =>
+          read(gate, { ...request, changelogTable: options.changelogTable })
+        )
+      )) as { changes: unknown[]; cursor: bigint }[];
+      return { changes: results.map((result) => result.changes), cursor: results[0]?.cursor };
+    }
+  );
+  return { read, batch };
+});
 vi.mock('@/dbGate/LilypadChangelog', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/dbGate/LilypadChangelog')>()),
   readLilypadChanges: changelog.read,
+  readLilypadChangesBatch: changelog.batch,
 }));
 
 // The schema check is mocked too: its queries are covered by the integration tests
@@ -100,7 +118,8 @@ describe('LilypadDbCache', () => {
   });
 
   const createCache = (options: Record<string, unknown> = {}) =>
-    LilypadDbCache.create<string, Item>(60000, {
+    LilypadDbCache.create<string, Item>({
+      ttl: 60000,
       dbGate: { gate: fake.gate, schema },
       ...options,
     });
@@ -110,11 +129,11 @@ describe('LilypadDbCache', () => {
       await createCache();
 
       expect(fake.mocks.addListener).toHaveBeenCalledOnce();
-      expect([...fake.listeners.values()][0].channel).toBe('cache_events');
+      expect([...fake.listeners.values()][0]!.channel).toBe('cache_events');
     });
 
     it('should not register a listener when the default listener is disabled', async () => {
-      await createCache({ useDefaultDbListener: false });
+      await createCache({ sync: { strategy: 'none' } });
 
       expect(fake.mocks.addListener).not.toHaveBeenCalled();
     });
@@ -191,11 +210,10 @@ describe('LilypadDbCache', () => {
       expect(fake.mocks.selectFromTableByPrimaryKey).not.toHaveBeenCalled();
     });
 
-    it('should leave the cache to the callback by default', async () => {
+    it('should leave the cache to onNotification with applyChanges: false', async () => {
       const callback = vi.fn();
       const cache = await createCache({
-        useDefaultDbListener: true,
-        defaultListenerOptions: { callback },
+        sync: { strategy: 'listen', applyChanges: false, onNotification: callback },
       });
 
       await fake.notify({ table: 'items', id: '1', op: 'UPDATE' });
@@ -204,13 +222,12 @@ describe('LilypadDbCache', () => {
       expect(cache.getComprehensive('1').type).toBe('miss');
     });
 
-    it('should update the entry before the callback when requested', async () => {
+    it('should update the entry before onNotification by default', async () => {
       let valueSeenByCallback: unknown;
       const cache = await createCache({
-        useDefaultDbListener: true,
-        defaultListenerOptions: {
-          automaticallyInvalidateDataBeforeCallback: true,
-          callback: () => {
+        sync: {
+          strategy: 'listen',
+          onNotification: () => {
             valueSeenByCallback = cache.get('1');
           },
         },
@@ -253,21 +270,42 @@ describe('LilypadDbCache', () => {
       expect(fake.mocks.selectFromTableByPrimaryKey).toHaveBeenCalledOnce();
     });
 
-    it('should return undefined when the fetch fails', async () => {
+    it('should reject when the fetch fails', async () => {
       const cache = await createCache();
       fake.mocks.selectFromTableByPrimaryKey.mockRejectedValueOnce(new Error('query failed'));
 
-      expect(await cache.getOrFetch('1')).toBeUndefined();
+      await expect(cache.getOrFetch('1')).rejects.toThrow('query failed');
     });
 
-    it('should expire the entry when the update after an invalidation fails', async () => {
+    it('should return the fallback of errorFn when the fetch fails', async () => {
       const cache = await createCache();
-      await cache.getOrFetch('1');
       fake.mocks.selectFromTableByPrimaryKey.mockRejectedValueOnce(new Error('query failed'));
 
-      await cache.invalidate('1');
+      const result = await cache.getOrFetchDetailed('1', { errorFn: () => null });
+
+      expect(result).toEqual({ value: null, status: 'MISS', refreshFailed: true });
+    });
+
+    it('should expire the entry on invalidate, without a query', async () => {
+      const cache = await createCache();
+      await cache.getOrFetch('1');
+
+      cache.invalidate('1');
 
       expect(cache.getComprehensive('1').type).toBe('expired');
+      expect(fake.mocks.selectFromTableByPrimaryKey).toHaveBeenCalledOnce();
+    });
+
+    it('should re-fetch the key on refresh, and reject when the query fails', async () => {
+      const cache = await createCache();
+      await cache.getOrFetch('1');
+      fake.rows.set('1', { id: '1', name: 'ONE' });
+
+      await expect(cache.refresh('1')).resolves.toEqual({ id: '1', name: 'ONE' });
+      expect(cache.get('1')).toEqual({ id: '1', name: 'ONE' });
+
+      fake.mocks.selectFromTableByPrimaryKey.mockRejectedValueOnce(new Error('query failed'));
+      await expect(cache.refresh('1')).rejects.toThrow('query failed');
     });
   });
 
@@ -347,7 +385,7 @@ describe('LilypadDbCache', () => {
       expect(cache.get('1')).toEqual({ id: '1', name: 'ONE' });
     });
 
-    it('should keep the newest row when refreshes complete out of order', async () => {
+    it('should run one more query for the notifications received during a refresh', async () => {
       const cache = await createCache();
       await cache.getOrFetch('1');
       const firstRead = deferred<Item | null>();
@@ -356,13 +394,20 @@ describe('LilypadDbCache', () => {
         .mockReturnValueOnce(firstRead.promise)
         .mockReturnValueOnce(secondRead.promise);
 
-      const firstRefresh = fake.notify({ table: 'items', id: '1', op: 'UPDATE' });
-      const secondRefresh = fake.notify({ table: 'items', id: '1', op: 'UPDATE' });
-      secondRead.resolve({ id: '1', name: 'second' });
-      await secondRefresh;
+      const refreshes = [
+        fake.notify({ table: 'items', id: '1', op: 'UPDATE' }),
+        fake.notify({ table: 'items', id: '1', op: 'UPDATE' }),
+        fake.notify({ table: 'items', id: '1', op: 'UPDATE' }),
+      ];
       firstRead.resolve({ id: '1', name: 'first' });
-      await firstRefresh;
+      await vi.waitFor(() =>
+        expect(fake.mocks.selectFromTableByPrimaryKey).toHaveBeenCalledTimes(3)
+      );
+      secondRead.resolve({ id: '1', name: 'second' });
+      await Promise.all(refreshes);
 
+      // The fetch of getOrFetch, the running refresh, and one queued for the other two
+      expect(fake.mocks.selectFromTableByPrimaryKey).toHaveBeenCalledTimes(3);
       expect(cache.get('1')).toEqual({ id: '1', name: 'second' });
     });
 
@@ -382,7 +427,7 @@ describe('LilypadDbCache', () => {
     it('should expire every entry and force a bulk sync when LISTEN reconnects', async () => {
       const cache = await createCache();
       await cache.getAll();
-      const listener = [...fake.listeners.values()][0];
+      const listener = [...fake.listeners.values()][0]!;
 
       await listener.onReconnect?.();
 
@@ -434,7 +479,8 @@ describe('LilypadDbCache', () => {
   describe('typing and singletons', () => {
     it('should require the primary key to update, with a declared primary key', async () => {
       const typedSchema: LilypadDbSchema<Item, 'id'> = { ...schema, primaryKey: 'id' };
-      const cache = await LilypadDbCache.create<string, Item, 'id'>(60000, {
+      const cache = await LilypadDbCache.create<string, Item, 'id'>({
+        ttl: 60000,
         dbGate: { gate: fake.gate, schema: typedSchema },
       });
 
@@ -450,7 +496,8 @@ describe('LilypadDbCache', () => {
       const options = { singleton: true, singletonIdentifier: 'LilypadDbCache.test-mismatch' };
       const first = await createCache(options);
 
-      const second = await LilypadDbCache.create<string, Item>(30000, {
+      const second = await LilypadDbCache.create<string, Item>({
+        ttl: 30000,
         dbGate: { gate: fake.gate, schema },
         logger: logger as unknown as LilypadLibLogger,
         ...(options as { singleton: true; singletonIdentifier: string }),
@@ -491,7 +538,7 @@ describe('LilypadDbCache', () => {
       expect(changelog.read).toHaveBeenCalledWith(fake.gate, {
         tableName: 'items',
         since: { lookback: 120_000 }, // TTL + staleWhileRevalidate + 1 minute
-        changelogTable: undefined,
+        changelogTable: 'lilypad_cache_changes',
       });
 
       await cache.getOrFetch('1');
@@ -661,7 +708,7 @@ describe('LilypadDbCache', () => {
 
       await expect(cache.getOrFetch('1')).resolves.toEqual({ id: '1', name: 'one' });
       expect(logger.error).toHaveBeenCalledWith(
-        cache.id,
+        cache.name,
         'Error reading the changelog:',
         expect.any(Error)
       );
@@ -705,7 +752,7 @@ describe('LilypadDbCache', () => {
       await reader.getAll();
 
       await writer.sqlUpdate({ id: '1', name: 'renamed' });
-      const { xid } = await fake.mocks.updateToTableDetailed.mock.results[0].value;
+      const { xid } = await fake.mocks.updateToTableDetailed.mock.results[0]!.value;
       changelog.read.mockResolvedValue({
         changes: [{ id: '9', xid, rowId: '1', op: 'UPDATE' }],
         cursor: 100n,
@@ -887,7 +934,7 @@ describe('LilypadDbCache', () => {
       it('should not fetch again a row it wrote when its notification arrives', async () => {
         const cache = await createCache();
         await cache.sqlUpdate({ id: '1', name: 'renamed' });
-        const { xid } = await fake.mocks.updateToTableDetailed.mock.results[0].value;
+        const { xid } = await fake.mocks.updateToTableDetailed.mock.results[0]!.value;
 
         await fake.notify({ table: 'items', id: '1', op: 'UPDATE', xid: String(xid) });
 
@@ -901,8 +948,8 @@ describe('LilypadDbCache', () => {
         await cache.sqlCreate({ id: '9', name: 'new' });
         await cache.sqlUpdate({ id: '9', name: 'renamed' });
         const [created, updated] = await Promise.all([
-          fake.mocks.insertToTableDetailed.mock.results[0].value,
-          fake.mocks.updateToTableDetailed.mock.results[0].value,
+          fake.mocks.insertToTableDetailed.mock.results[0]!.value,
+          fake.mocks.updateToTableDetailed.mock.results[0]!.value,
         ]);
         changelog.read.mockResolvedValueOnce({
           changes: [
@@ -990,8 +1037,8 @@ describe('LilypadDbCache', () => {
         changelog: false,
         notifyChannel: 'cache_events',
       });
-      expect(schemaCheck.check.mock.invocationCallOrder[0]).toBeLessThan(
-        fake.mocks.addListener.mock.invocationCallOrder[0]
+      expect(schemaCheck.check.mock.invocationCallOrder[0]!).toBeLessThan(
+        fake.mocks.addListener.mock.invocationCallOrder[0]!
       );
     });
 
@@ -1032,8 +1079,8 @@ describe('LilypadDbCache', () => {
       await vi.waitFor(() => expect(logger.warn).toHaveBeenCalled());
 
       expect(logger.warn).toHaveBeenCalledOnce();
-      const [id, message] = logger.warn.mock.calls[0];
-      expect(id).toBe(cache.id);
+      const [id, message] = logger.warn.mock.calls[0]!;
+      expect(id).toBe(cache.name);
       expect(message).toContain('LilypadDbCache "items" (sync: changelog)');
       expect(message).toContain('has no changelog trigger');
       expect(message).toContain('CREATE TRIGGER items_lilypad_changes ...');
@@ -1058,7 +1105,7 @@ describe('LilypadDbCache', () => {
 
       expect(fake.mocks.addListener).toHaveBeenCalledOnce();
       expect(logger.warn).toHaveBeenCalledWith(
-        cache.id,
+        cache.name,
         'LilypadDbCache "items" (sync: listen): could not check the database schema:',
         expect.any(Error)
       );
@@ -1110,7 +1157,8 @@ describe('LilypadDbCache', () => {
     });
 
     it('should take the schema from a qualified table name, even without a check', async () => {
-      const cache = await LilypadDbCache.create<string, Item>(60000, {
+      const cache = await LilypadDbCache.create<string, Item>({
+        ttl: 60000,
         dbGate: { gate: fake.gate, schema: { ...schema, tableName: 'app.items' } },
         sync: { strategy: 'listen', verify: 'off' },
       });
@@ -1124,7 +1172,8 @@ describe('LilypadDbCache', () => {
     });
 
     it('should read the changelog of the qualified table name', async () => {
-      const cache = await LilypadDbCache.create<string, Item>(60000, {
+      const cache = await LilypadDbCache.create<string, Item>({
+        ttl: 60000,
         dbGate: { gate: fake.gate, schema: { ...schema, tableName: 'app.items' } },
         sync: { strategy: 'changelog', pollInterval: 0 },
       });
@@ -1149,14 +1198,22 @@ describe('LilypadDbCache', () => {
       expect(fake.mocks.addListener).toHaveBeenCalledOnce();
     });
 
-    it('should retry a failed lazy LISTEN on the next read', async () => {
-      const cache = await createCache({ sync: { strategy: 'listen', connect: 'lazy' } });
-      fake.mocks.addListener.mockRejectedValueOnce(new Error('database unreachable'));
+    it('should retry a failed lazy LISTEN after a backoff, not at every read', async () => {
+      vi.useFakeTimers();
+      try {
+        const cache = await createCache({ sync: { strategy: 'listen', connect: 'lazy' } });
+        fake.mocks.addListener.mockRejectedValueOnce(new Error('database unreachable'));
 
-      await cache.getOrFetch('1');
-      await cache.getOrFetch('2');
+        await cache.getOrFetch('1');
+        await cache.getOrFetch('2');
+        expect(fake.mocks.addListener).toHaveBeenCalledTimes(1);
 
-      expect(fake.mocks.addListener).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(1000);
+        await cache.getOrFetch('2');
+        expect(fake.mocks.addListener).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -1173,6 +1230,153 @@ describe('LilypadDbCache', () => {
         ['write', ['1']],
         ['write', ['2']],
       ]);
+    });
+  });
+
+  describe('getAll with maxEntries', () => {
+    it('should return every row even when the table does not fit in the cache', async () => {
+      fake = createFakeGate(
+        Array.from({ length: 10 }, (_, index) => ({ id: String(index), name: `n${index}` }))
+      );
+      const cache = await createCache({ sync: { strategy: 'none' }, maxEntries: 4 });
+
+      const first = await cache.getAll();
+      const second = await cache.getAll();
+
+      expect(first).toHaveLength(10);
+      expect(second.map((row) => row.id).sort()).toEqual(first.map((row) => row.id).sort());
+    });
+  });
+
+  describe('getAll(keys) in parallel', () => {
+    it('should not mix up key sets that join to the same string', async () => {
+      fake = createFakeGate([
+        { id: 'a', name: 'A' },
+        { id: 'b', name: 'B' },
+        { id: 'a,b', name: 'AB' },
+      ]);
+      const cache = await createCache({ sync: { strategy: 'none' } });
+
+      const [joined, separate] = await Promise.all([
+        cache.getAll(['a,b']),
+        cache.getAll(['a', 'b']),
+      ]);
+
+      expect(joined.map((row) => row.id)).toEqual(['a,b']);
+      expect(separate.map((row) => row.id)).toEqual(['a', 'b']);
+    });
+
+    it('should share the query of a key already being fetched', async () => {
+      const cache = await createCache({ sync: { strategy: 'none' } });
+
+      await Promise.all([cache.getAll(['1', '2']), cache.getAll(['2'])]);
+
+      expect(fake.mocks.selectFromTableByPrimaryKeys).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe('changelog failures and reads in flight', () => {
+    const createChangelogCache = (sync: Record<string, unknown> = {}) =>
+      createCache({ sync: { strategy: 'changelog', pollInterval: 1000, ...sync } });
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      changelog.read.mockReset();
+      changelog.read.mockResolvedValue({ changes: [], cursor: 100n });
+      changelog.batch.mockClear();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('should back off after a failed read instead of retrying at every read', async () => {
+      changelog.read.mockRejectedValue(new Error('no changelog table'));
+      const cache = await createChangelogCache();
+
+      await cache.getOrFetch('1');
+      await vi.advanceTimersByTimeAsync(1000);
+      await cache.getOrFetch('1');
+      expect(changelog.read).toHaveBeenCalledTimes(2);
+
+      // Second failure: the next attempt waits 2 s
+      await vi.advanceTimersByTimeAsync(1000);
+      await cache.getOrFetch('1');
+      expect(changelog.read).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(1000);
+      await cache.getOrFetch('1');
+      expect(changelog.read).toHaveBeenCalledTimes(3);
+    });
+
+    it('should discard a read in flight when its row changes, without a query', async () => {
+      const cache = await createChangelogCache();
+      await cache.getAll(['2']); // first read of the changelog
+      let release!: (row: Item | null) => void;
+      fake.mocks.selectFromTableByPrimaryKey.mockReturnValueOnce(
+        new Promise((resolve) => (release = resolve))
+      );
+      const pending = cache.getOrFetch('1');
+      changelog.read.mockResolvedValueOnce({
+        changes: [{ id: '1', xid: 100n, rowId: '1', op: 'UPDATE' }],
+        cursor: 101n,
+      });
+
+      // The changelog read of a later read applies the change while the fetch is in flight
+      await vi.advanceTimersByTimeAsync(1000);
+      await cache.getAll(['2']);
+      release({ id: '1', name: 'before the change' });
+      await pending;
+
+      expect(cache.getComprehensive('1').type).toBe('miss');
+      expect(fake.mocks.selectFromTableByPrimaryKey).toHaveBeenCalledOnce();
+    });
+
+    it('should read the changelog of every cache of the gate in one query', async () => {
+      const first = await createChangelogCache();
+      const second = await LilypadDbCache.create<string, Item>({
+        ttl: 60000,
+        name: 'items-2',
+        dbGate: { gate: fake.gate, schema },
+        sync: { strategy: 'changelog', pollInterval: 1000 },
+      });
+
+      await first.getOrFetch('1');
+      await second.getOrFetch('1');
+
+      expect(changelog.batch).toHaveBeenCalledOnce();
+      expect(changelog.batch.mock.calls[0]![1].requests).toHaveLength(2);
+      await second.dispose();
+    });
+  });
+
+  describe('numeric primary keys', () => {
+    type NumericItem = { id: number; name: string };
+    const numericSchema: LilypadDbSchema<NumericItem, 'id'> = {
+      tableName: 'items',
+      primaryKey: 'id',
+      cols: { id: { type: 'number' }, name: { type: 'string' } },
+    };
+
+    it('should convert the ids of notifications to numbers for a number column', async () => {
+      const cache = await LilypadDbCache.create<number, NumericItem, 'id'>({
+        dbGate: { gate: fake.gate, schema: numericSchema },
+      });
+
+      await fake.notify({ table: 'items', id: '42', op: 'DELETE' });
+
+      expect([...cache.bulkGet({}).keys()]).toEqual([42]);
+      await cache.dispose();
+    });
+  });
+
+  describe('disposed cache', () => {
+    it('should reject reads', async () => {
+      const cache = await createCache();
+      await cache.dispose();
+
+      await expect(cache.getAll()).rejects.toThrow('is disposed');
+      await expect(cache.getOrFetch('1')).rejects.toThrow('is disposed');
     });
   });
 });

@@ -1,12 +1,9 @@
 /**
  * `@lilypad/libs/logger`: the logger and its components. Runs in Node.js and in edge runtimes.
  */
-export { default as createLogger, LilypadLogger } from '../logger/LilypadLogger';
-export type {
-  LilypadLibLogger,
-  LilypadLoggerConstructorOptions,
-  LilypadLoggerType,
-} from '../logger/LilypadLogger';
+export { LilypadLogger } from '../logger/LilypadLogger';
+export type { LilypadLoggerConstructorOptions, LilypadLoggerType } from '../logger/LilypadLogger';
+export type { LilypadLibLogger, LilypadLibLogLevel } from '../logger/LilypadLibLogger';
 
 export { default as LilypadLoggerComponent } from '../logger/LilypadLoggerComponent';
 export type {

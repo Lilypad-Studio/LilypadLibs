@@ -2,6 +2,7 @@ import { getLilypadSingletonInstance, LilypadSingletonAble } from '@/singleton/L
 import LilypadLoggerComponent, { type LilypadLogRecord } from '@/logger/LilypadLoggerComponent';
 import { formatLogValue } from '@/logger/formatLogValue';
 import { runInBackground, type LilypadPlatform } from '@/platform/LilypadPlatform';
+import type { LilypadLibLogLevel } from '@/logger/LilypadLibLogger';
 
 /**
  * Options for constructing a {@link LilypadLogger} instance.
@@ -77,7 +78,8 @@ export class LilypadLogger<T extends string> {
   /**
    * Creates a new LilypadLogger instance or retrieves a singleton instance.
    *
-   * @template T - The log level type, defaults to 'log' | 'error' | 'warn'
+   * @template T - The log level type, defaults to the levels the other Lilypad modules log on
+   * ('error' | 'warn' | 'info' | 'debug'), so that the logger can be passed to them
    * @param options - Configuration options for the logger
    * @param options.singleton - Whether to use a singleton instance
    * @param options.singletonIdentifier - Unique identifier for the singleton instance
@@ -97,7 +99,7 @@ export class LilypadLogger<T extends string> {
    *   components: { info: [new LilypadConsoleLogger()], error: [new LilypadConsoleLogger()] },
    * });
    */
-  public static create<T extends string = 'log' | 'error' | 'warn'>(
+  public static create<T extends string = LilypadLibLogLevel>(
     options: LilypadLoggerConstructorOptions<T>
   ): LilypadLoggerType<T> {
     if (options.singleton) {
@@ -172,7 +174,7 @@ export class LilypadLogger<T extends string> {
           );
           errors = results
             .filter((result) => result.status === 'rejected')
-            .map((result) => result.reason);
+            .map((result): unknown => result.reason);
         } catch (error) {
           errors = [error];
         }
@@ -256,26 +258,4 @@ async function reportComponentError(
 
 export type LilypadLoggerType<T extends string> = LilypadLogger<T> & ChannelMethods<T>;
 
-/** The logger accepted by the other Lilypad modules. */
-export type LilypadLibLogger = LilypadLoggerType<'error' | 'warn' | 'info' | 'debug'>;
-
-/**
- * Creates a new Lilypad logger instance with the specified options.
- *
- * @template T - The type of log channels supported by this logger. Defaults to 'log' | 'error' | 'warn'.
- * @param options - Configuration options for the logger instance.
- * @returns A new logger instance that combines LilypadLogger functionality with channel methods.
- *
- * @example
- * ```typescript
- * const logger = createLogger({
- *   // logger options
- * });
- * ```
- * @deprecated Use {@link LilypadLogger.create} instead.
- */
-export default function createLogger<T extends string = 'log' | 'error' | 'warn'>(
-  options: LilypadLoggerConstructorOptions<T>
-): LilypadLoggerType<T> {
-  return LilypadLogger.create<T>(options) as LilypadLoggerType<T>;
-}
+export type { LilypadLibLogger, LilypadLibLogLevel } from './LilypadLibLogger';

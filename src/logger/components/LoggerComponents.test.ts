@@ -174,7 +174,7 @@ describe('LilypadJsonConsoleLogger', () => {
     });
 
     expect(log).toHaveBeenCalledOnce();
-    expect(JSON.parse(log.mock.calls[0][0] as string)).toEqual({
+    expect(JSON.parse(log.mock.calls[0]![0] as string)).toEqual({
       requestId: 'req-1',
       time: '2026-01-02T03:04:05.000Z',
       level: 'error',
@@ -198,9 +198,51 @@ describe('LilypadJsonConsoleLogger', () => {
       },
     });
 
-    expect(JSON.parse(log.mock.calls[0][0] as string)).toMatchObject({
+    expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({
       level: 'info',
       msg: 'message',
     });
+  });
+});
+
+describe('LilypadDiscordLogger queue limit', () => {
+  const webhookUrl = 'https://discord.test/api/webhooks/123/token';
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('should drop the oldest messages beyond maxQueueSize, and say so', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 204 }) as Response);
+    vi.stubGlobal('fetch', fetchMock);
+    const logger = new LilypadDiscordLogger<'info'>(webhookUrl, { maxQueueSize: 2 });
+
+    // The first message is sent at once; the others wait for the next request
+    const sent = ['m1', 'm2', 'm3', 'm4', 'm5'].map((message) => logger.output('info', message));
+    await vi.advanceTimersByTimeAsync(1000);
+    await Promise.all(sent);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [, init] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
+    const lines: string[] = JSON.parse(init.body as string).content.split('\n');
+    expect(lines).toEqual([
+      '… 2 log messages dropped (queue full)',
+      expect.stringContaining('[INFO]: m4'),
+      expect.stringContaining('[INFO]: m5'),
+    ]);
+  });
+
+  it('should release the body of the responses', async () => {
+    const cancel = vi.fn(async () => {});
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({ ok: true, status: 204, body: { cancel } }) as unknown as Response)
+    );
+
+    await new LilypadDiscordLogger<'info'>(webhookUrl).output('info', 'message');
+
+    expect(cancel).toHaveBeenCalledOnce();
   });
 });

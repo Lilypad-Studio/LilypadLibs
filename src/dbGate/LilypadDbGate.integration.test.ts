@@ -8,6 +8,7 @@ import {
   lilypadChangelogTriggerSql,
   pruneLilypadChangelog,
   readLilypadChanges,
+  readLilypadChangesBatch,
 } from './LilypadChangelog';
 import { checkLilypadSchema } from './LilypadSchemaCheck';
 import type { LilypadLoggerType } from '@/logger/LilypadLogger';
@@ -120,7 +121,7 @@ describe('LilypadDbGate (integration)', () => {
       await gate.updateToTable(usersSchema, { ...payload, id: 1 });
 
       const [row] = await admin`SELECT is_admin FROM users WHERE id = 1`;
-      expect(row.is_admin).toBe(false);
+      expect(row!.is_admin).toBe(false);
     });
 
     it('should select only the schema columns', async () => {
@@ -185,10 +186,10 @@ describe('LilypadDbGate (integration)', () => {
       expect(await gate.selectAllFromTable(usersSchema)).toEqual([]);
     });
 
-    it('should write the result of the insertSanitizationFn, which can remove properties', async () => {
+    it('should write the result of the writeSanitizationFn, which can remove properties', async () => {
       const schema: LilypadDbSchema<User, 'id'> = {
         ...usersSchema,
-        insertSanitizationFn: ({ role: _role, ...rest }) => rest,
+        writeSanitizationFn: ({ role: _role, ...rest }) => rest,
       };
 
       const created = await gate.insertToTable(schema, { name: 'Mallory', role: 'admin' });
@@ -233,8 +234,8 @@ describe('LilypadDbGate (integration)', () => {
       const schema = { ...usersSchema, tableName: 'users; DROP TABLE users; --' };
 
       await expect(gate.selectAllFromTable(schema)).rejects.toThrow('does not exist');
-      const [{ exists }] = await admin`SELECT to_regclass('users') IS NOT NULL AS exists`;
-      expect(exists).toBe(true);
+      const [check] = await admin`SELECT to_regclass('users') IS NOT NULL AS exists`;
+      expect(check?.exists).toBe(true);
     });
   });
 
@@ -437,6 +438,26 @@ describe('LilypadDbGate (integration)', () => {
       }
     });
 
+    it('should read several requests in one query, each from its own cursor or lookback', async () => {
+      await admin`INSERT INTO users (name) VALUES ('Ada')`;
+      const { cursor } = await readAll();
+      await admin`INSERT INTO users (name) VALUES ('Grace')`;
+
+      const { changes } = await readLilypadChangesBatch(gate, {
+        requests: [
+          { tableName: 'users', since: { lookback: 60_000 } },
+          { tableName: 'users', since: { cursor } },
+          { tableName: 'no_such_table', since: { lookback: 60_000 } },
+        ],
+      });
+
+      expect(changes.map((list) => list.map((change) => change.rowId))).toEqual([
+        ['1', '2'],
+        ['2'],
+        [],
+      ]);
+    });
+
     it('should delete the rows older than the retention', async () => {
       await admin`INSERT INTO users (name) VALUES ('Ada')`;
 
@@ -445,7 +466,8 @@ describe('LilypadDbGate (integration)', () => {
     });
 
     it('should keep a LilypadDbCache in sync without LISTEN', async () => {
-      const cache = await LilypadDbCache.create<number, User, 'id'>(60_000, {
+      const cache = await LilypadDbCache.create<number, User, 'id'>({
+        ttl: 60_000,
         dbGate: { gate, schema: usersSchema },
         sync: { strategy: 'changelog', pollInterval: 0 },
       });
@@ -467,7 +489,8 @@ describe('LilypadDbGate (integration)', () => {
     });
 
     it('should not query again the rows the cache wrote itself', async () => {
-      const cache = await LilypadDbCache.create<number, User, 'id'>(60_000, {
+      const cache = await LilypadDbCache.create<number, User, 'id'>({
+        ttl: 60_000,
         dbGate: { gate, schema: usersSchema },
         sync: { strategy: 'changelog', pollInterval: 0 },
       });
@@ -537,7 +560,7 @@ describe('LilypadDbGate (integration)', () => {
         const result = await checkLilypadSchema(gate, options);
         expect(codes(result)).toEqual(['missing-changelog-trigger']);
 
-        await admin.unsafe(result.problems[0].fix!);
+        await admin.unsafe(result.problems[0]!.fix!);
 
         expect((await checkLilypadSchema(gate, options)).ok).toBe(true);
       } finally {
@@ -551,7 +574,7 @@ describe('LilypadDbGate (integration)', () => {
         const result = await checkLilypadSchema(gate, { tables: [users] });
 
         expect(codes(result)).toEqual(['missing-changelog-trigger']);
-        expect(result.problems[0].message).toContain('disabled');
+        expect(result.problems[0]!.message).toContain('disabled');
       } finally {
         await admin`ALTER TABLE users ENABLE TRIGGER users_lilypad_changes`;
       }
@@ -569,7 +592,7 @@ describe('LilypadDbGate (integration)', () => {
         const result = await checkLilypadSchema(gate, options);
         expect(codes(result)).toEqual(['missing-truncate-trigger']);
 
-        await admin.unsafe(result.problems[0].fix!);
+        await admin.unsafe(result.problems[0]!.fix!);
 
         expect((await checkLilypadSchema(gate, options)).ok).toBe(true);
       } finally {
@@ -583,7 +606,7 @@ describe('LilypadDbGate (integration)', () => {
         const result = await checkLilypadSchema(gate, { tables: [] });
 
         expect(codes(result)).toEqual(['outdated-changelog']);
-        expect(result.problems[0].message).toContain('version 2');
+        expect(result.problems[0]!.message).toContain('version 2');
       } finally {
         await admin.unsafe(lilypadChangelogSql({ notifyChannel: false }));
       }
@@ -595,7 +618,7 @@ describe('LilypadDbGate (integration)', () => {
       });
 
       expect(codes(result)).toEqual(['wrong-trigger-primary-key']);
-      expect(result.problems[0].message).toContain('"id"');
+      expect(result.problems[0]!.message).toContain('"id"');
     });
 
     it('should report a table whose triggers send no notification on the channel', async () => {
@@ -622,8 +645,8 @@ describe('LilypadDbGate (integration)', () => {
       });
 
       expect(codes(result)).toEqual(['missing-changelog', 'missing-changelog-trigger']);
-      expect(result.problems[0].fix).toContain('CREATE TABLE IF NOT EXISTS "other_changes"');
-      expect(result.problems[1].fix).toContain('EXECUTE FUNCTION "other_changes_record"');
+      expect(result.problems[0]!.fix).toContain('CREATE TABLE IF NOT EXISTS "other_changes"');
+      expect(result.problems[1]!.fix).toContain('EXECUTE FUNCTION "other_changes_record"');
     });
 
     it('should report a changelog installed by version 1, and upgrade it', async () => {
@@ -635,9 +658,9 @@ describe('LilypadDbGate (integration)', () => {
         const options = { tables: [], changelog: { table: 'legacy_changes' } };
         const result = await checkLilypadSchema(gate, options);
         expect(codes(result)).toEqual(['outdated-changelog']);
-        expect(result.problems[0].message).toContain('version 1');
+        expect(result.problems[0]!.message).toContain('version 1');
 
-        await admin.unsafe(result.problems[0].fix!);
+        await admin.unsafe(result.problems[0]!.fix!);
 
         expect((await checkLilypadSchema(gate, options)).ok).toBe(true);
       } finally {
@@ -711,7 +734,8 @@ describe('LilypadDbGate (integration)', () => {
     });
 
     it('should not apply to a LilypadDbCache the notifications of the other schema', async () => {
-      const cache = await LilypadDbCache.create<number, User, 'id'>(60_000, {
+      const cache = await LilypadDbCache.create<number, User, 'id'>({
+        ttl: 60_000,
         dbGate: { gate, schema: usersSchema },
       });
       // Registered after the cache: when it sees a notification, the cache has applied it
@@ -760,7 +784,8 @@ describe('LilypadDbGate (integration)', () => {
 
   describe('with LilypadDbCache', () => {
     it('should keep the cache in sync through cache_events notifications', async () => {
-      const cache = await LilypadDbCache.create<number, User, 'id'>(60000, {
+      const cache = await LilypadDbCache.create<number, User, 'id'>({
+        ttl: 60000,
         dbGate: { gate, schema: usersSchema },
       });
       const created = await cache.sqlCreate({ name: 'Ada', role: 'dev' });

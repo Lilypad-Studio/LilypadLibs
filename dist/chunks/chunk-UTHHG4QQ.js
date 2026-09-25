@@ -1,4 +1,18 @@
 "use strict";Object.defineProperty(exports, "__esModule", {value: true}); function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } var _class;// src/flow/LilypadFlowControl.ts
+var LilypadTimeoutError = class extends Error {
+  
+  constructor(timeout) {
+    super(`Operation timed out after ${timeout}ms`);
+    this.name = "LilypadTimeoutError";
+    this.timeout = timeout;
+  }
+};
+var LilypadRateLimitError = class extends Error {
+  constructor(rateKey) {
+    super(`Rate limit exceeded for ${rateKey}`);
+    this.name = "LilypadRateLimitError";
+  }
+};
 var RATE_MAP_PRUNE_THRESHOLD = 1e3;
 var LilypadFlowControl = (_class = class {
   
@@ -16,11 +30,13 @@ var LilypadFlowControl = (_class = class {
   /**
    * Executes an asynchronous function with a timeout constraint.
    *
-   * @template T The type of value returned by the execution function.
+   * @template R The type of value returned by the execution function (the one of the instance by
+   * default).
    * @param executionFn An asynchronous function to execute. It receives a signal that is aborted on timeout.
+   * @param timeout The timeout, in milliseconds. Defaults to the instance's `timeout`.
    * @returns A promise that resolves with the result of `executionFn` if it completes before the timeout,
    *          or rejects with an error if the timeout is exceeded.
-   * @throws {Error} Throws an error with message 'Operation timed out' if the execution exceeds the configured timeout duration.
+   * @throws {LilypadTimeoutError} If the execution exceeds the timeout.
    *
    * @remarks
    * This method uses `Promise.race()` to implement the timeout mechanism. The timeout is cleared in the finally block
@@ -35,7 +51,7 @@ var LilypadFlowControl = (_class = class {
     let timeoutId;
     const timeoutPromise = new Promise((_, reject) => {
       timeoutId = setTimeout(() => {
-        const error = new Error("Operation timed out");
+        const error = new LilypadTimeoutError(timeout);
         controller.abort(error);
         reject(error);
       }, timeout);
@@ -90,7 +106,7 @@ var LilypadFlowControl = (_class = class {
    *
    * @param consumerIdentifier - A unique identifier for the consumer (e.g., user or service).
    * @param functionIdentifier - A unique identifier for the function being rate-limited.
-   * @throws {Error} If the rate limit is exceeded for the given consumer and function.
+   * @throws {LilypadRateLimitError} If the rate limit is exceeded for the given consumer and function.
    */
   rateLimit(consumerIdentifier, functionIdentifier) {
     if (this.rate !== void 0) {
@@ -98,7 +114,7 @@ var LilypadFlowControl = (_class = class {
       const now = Date.now();
       const lastExecution = _nullishCoalesce(this.rateMap.get(rateKey), () => ( 0));
       if (now - lastExecution < this.rate) {
-        throw new Error(`Rate limit exceeded for ${rateKey}`);
+        throw new LilypadRateLimitError(rateKey);
       }
       this.rateMap.set(rateKey, now);
       if (this.rateMap.size > RATE_MAP_PRUNE_THRESHOLD) {
@@ -127,6 +143,7 @@ var LilypadFlowControl = (_class = class {
    * retries, and timeout handling. Ensures that only one execution per function identifier
    * is in-flight at a time, and subsequent calls return the same promise until completion.
    * Calls that join an in-flight execution are not rate limited, since they do not start a new one.
+   * An execution refused by the rate limit goes to `errorFn`, like a failed one.
    *
    * @template T - The return type of the function to execute.
    * @param options - The execution options, including:
@@ -142,7 +159,14 @@ var LilypadFlowControl = (_class = class {
     if (inFlight) {
       return inFlight;
     }
-    this.rateLimit(options.consumerIdentifier, options.functionIdentifier);
+    try {
+      this.rateLimit(options.consumerIdentifier, options.functionIdentifier);
+    } catch (error) {
+      if (options.errorFn) {
+        return options.errorFn(error);
+      }
+      throw error;
+    }
     const executionPromise = this.executeWithRetries({
       executionFn: () => this.executeWithTimeout(options.fn, _nullishCoalesce(options.timeout, () => ( this.timeout))),
       retries: _nullishCoalesce(_nullishCoalesce(options.retries, () => ( this.retries)), () => ( 0)),
@@ -158,5 +182,7 @@ var LilypadFlowControl = (_class = class {
 
 
 
-exports.LilypadFlowControl = LilypadFlowControl;
-//# sourceMappingURL=chunk-FOAUQ67X.js.map
+
+
+exports.LilypadTimeoutError = LilypadTimeoutError; exports.LilypadRateLimitError = LilypadRateLimitError; exports.LilypadFlowControl = LilypadFlowControl;
+//# sourceMappingURL=chunk-UTHHG4QQ.js.map

@@ -5,6 +5,7 @@ const DISCORD_MAX_CONTENT_LENGTH = 2000;
 const DISCORD_REQUEST_TIMEOUT = 5000;
 /** Wait used after a 429 response without a valid `retry-after` header. */
 const DEFAULT_RETRY_AFTER = 1000;
+const DEFAULT_MAX_QUEUE_SIZE = 100;
 
 export type LilypadDiscordLoggerOptions = {
   /**
@@ -14,6 +15,11 @@ export type LilypadDiscordLoggerOptions = {
   minRequestInterval?: number;
   /** How many times a request rate limited by Discord (429) is retried. Defaults to 1. */
   rateLimitRetries?: number;
+  /**
+   * Maximum number of messages waiting to be sent. Beyond it the oldest are dropped (their
+   * `output` resolves), and the next request says how many were dropped. Defaults to 100.
+   */
+  maxQueueSize?: number;
 };
 
 type QueuedMessage = {
@@ -49,13 +55,18 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
  * - A rate limited request (429) is retried after the `retry-after` time given by Discord.
  * - A failed request makes `output` reject for every message of the batch, so the logger reports
  *   it through its `errorLogging` callback.
+ * - At most `maxQueueSize` messages wait to be sent: during a flood of messages the oldest are
+ *   dropped, so that memory and the pending `output` promises stay bounded.
  */
 export default class LilypadDiscordLogger<T extends string> extends LilypadLoggerComponent<T> {
   private webhookUrl: string;
   private minRequestInterval: number;
   private rateLimitRetries: number;
+  private maxQueueSize: number;
 
   private queue: QueuedMessage[] = [];
+  /** Messages dropped since the last batch, announced in the next one. */
+  private dropped = 0;
   private flushing = false;
   private nextRequestAt = 0;
 
@@ -64,11 +75,17 @@ export default class LilypadDiscordLogger<T extends string> extends LilypadLogge
     this.webhookUrl = webhookUrl;
     this.minRequestInterval = options.minRequestInterval ?? 1000;
     this.rateLimitRetries = options.rateLimitRetries ?? 1;
+    this.maxQueueSize = Math.max(1, options.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE);
   }
 
   protected send(message: string): Promise<void> {
     return new Promise((resolve, reject) => {
       this.queue.push({ content: message.slice(0, DISCORD_MAX_CONTENT_LENGTH), resolve, reject });
+      while (this.queue.length > this.maxQueueSize) {
+        // Resolved, not rejected: a rejection per dropped message would flood errorLogging too
+        this.queue.shift()?.resolve();
+        this.dropped++;
+      }
       void this.flush();
     });
   }
@@ -97,13 +114,18 @@ export default class LilypadDiscordLogger<T extends string> extends LilypadLogge
 
   /** Takes the queued messages that fit in one Discord message, always at least one. */
   private takeBatch(): QueuedMessage[] {
-    let length = this.queue[0].content.length;
+    if (this.dropped > 0) {
+      const notice = `… ${this.dropped} log messages dropped (queue full)`;
+      this.dropped = 0;
+      this.queue.unshift({ content: notice, resolve: () => {}, reject: () => {} });
+    }
+    let length = this.queue[0]!.content.length;
     let count = 1;
     while (
       count < this.queue.length &&
-      length + 1 + this.queue[count].content.length <= DISCORD_MAX_CONTENT_LENGTH
+      length + 1 + this.queue[count]!.content.length <= DISCORD_MAX_CONTENT_LENGTH
     ) {
-      length += 1 + this.queue[count].content.length;
+      length += 1 + this.queue[count]!.content.length;
       count++;
     }
     return this.queue.splice(0, count);
@@ -115,6 +137,8 @@ export default class LilypadDiscordLogger<T extends string> extends LilypadLogge
       for (let attempt = 0; ; attempt++) {
         const response = await this.post(content);
         this.nextRequestAt = Date.now() + this.minRequestInterval;
+        // An unread body keeps the connection busy until it is garbage collected
+        void response.body?.cancel().catch(() => {});
 
         if (response.status === 429 && attempt < this.rateLimitRetries) {
           this.nextRequestAt = Date.now() + retryAfterMs(response);

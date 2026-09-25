@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test -- --run
+      - run: npm run typecheck
+      - run: npx eslint . --max-warnings 0
+      - run: npm run build
+      # dist/ is committed (the package is installed from git): it must match the sources
+      - name: Check that dist/ is up to date
+        run: git diff --exit-code -- dist
+
+  integration:
+    # The runners have Docker: testcontainers starts PostgreSQL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run test:integration

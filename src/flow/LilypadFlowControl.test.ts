@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { LilypadFlowControl } from './LilypadFlowControl';
+import {
+  LilypadFlowControl,
+  LilypadRateLimitError,
+  LilypadTimeoutError,
+} from './LilypadFlowControl';
 
 /**
  * Runs `run` with fake timers, advancing them until every pending timer (timeouts, backoffs) has fired.
@@ -615,5 +619,44 @@ describe('LilypadFlowControl', () => {
       expect(result).toBe('success');
       expect(backoffSpy).toHaveBeenCalled();
     });
+  });
+});
+
+describe('LilypadFlowControl errors', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('should fail a timed out attempt with a LilypadTimeoutError', async () => {
+    const flowControl = new LilypadFlowControl<string>({ timeout: 100 });
+
+    const result = withFakeTimers(() =>
+      flowControl.executeWithTimeout(() => new Promise<string>(() => {}))
+    );
+
+    await expect(result).rejects.toBeInstanceOf(LilypadTimeoutError);
+    await expect(result).rejects.toMatchObject({ timeout: 100 });
+  });
+
+  it('should pass an execution refused by the rate limit to errorFn', async () => {
+    const flowControl = new LilypadFlowControl<string>({ rate: 1000 });
+    const run = () =>
+      flowControl.executeFn({
+        functionIdentifier: 'fn',
+        consumerIdentifier: 'user',
+        fn: async () => 'ok',
+        errorFn: (error) => (error instanceof LilypadRateLimitError ? 'limited' : 'other'),
+      });
+
+    await expect(run()).resolves.toBe('ok');
+    await expect(run()).resolves.toBe('limited');
+  });
+
+  it('should type executeWithTimeout per call', async () => {
+    const flowControl = new LilypadFlowControl<string>();
+
+    const value: number = await flowControl.executeWithTimeout(async () => 42);
+
+    expect(value).toBe(42);
   });
 });

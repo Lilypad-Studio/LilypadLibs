@@ -1,6 +1,6 @@
 import {
   LilypadSerializer
-} from "./chunks/chunk-3A6ENYA7.mjs";
+} from "./chunks/chunk-YYIH6TJ4.mjs";
 export {
   LilypadSerializer
 };

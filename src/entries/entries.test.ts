@@ -34,7 +34,7 @@ function externalImports(entryFile: string): Set<string> {
       /^\s*(import|export)(\s+type)?\s[^;]*?from\s+['"]([^'"]+)['"]/gms
     );
     for (const [, , typeOnly, specifier] of statements) {
-      if (typeOnly) {
+      if (typeOnly || !specifier) {
         continue;
       }
       const resolved = resolveImport(file, specifier);

@@ -81,7 +81,7 @@ describe('LilypadLogger', () => {
 
     await logger.error('Failure:', new Error('boom'));
 
-    const message = vi.mocked(mockComponent.output).mock.calls[0][1];
+    const message = vi.mocked(mockComponent.output).mock.calls[0]![1];
     expect(message).toContain('Failure: Error: boom');
     expect(message).toContain('LilypadLogger.test.ts');
   });
@@ -95,7 +95,7 @@ describe('LilypadLogger', () => {
 
     await expect(logger.info(circular, 10n)).resolves.toBeUndefined();
 
-    const message = vi.mocked(mockComponent.output).mock.calls[0][1];
+    const message = vi.mocked(mockComponent.output).mock.calls[0]![1];
     expect(message).toContain('[Circular]');
     expect(message).toContain('10n');
   });
@@ -325,7 +325,7 @@ describe('LilypadLogger', () => {
       const logged = logger.info('after the response');
 
       expect(background).toHaveBeenCalledOnce();
-      const task = background.mock.calls[0][0] as Promise<unknown>;
+      const task = background.mock.calls[0]![0] as Promise<unknown>;
       let settled = false;
       void task.then(() => (settled = true));
       await Promise.resolve();

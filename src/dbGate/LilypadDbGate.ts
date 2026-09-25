@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { LilypadLibLogger } from '@/logger/LilypadLogger';
+import { libLog, type LilypadLibLogger } from '@/logger/LilypadLibLogger';
 import {
   createLilypadSingletonAbleAsync,
   LilypadSingletonAble,
@@ -89,20 +89,24 @@ export type LilypadDbSchema<T, PK extends keyof T = keyof T> = {
    * Transforms the data of inserts and updates. Its result replaces the data: omitting a property
    * removes it from the write.
    */
-  insertSanitizationFn?: (data: Partial<T>) => Partial<T>;
+  writeSanitizationFn?: (data: Partial<T>) => Partial<T>;
   selectSanitizationFn?: (row: unknown) => T | null;
   /**
-   * The columns of the table.
+   * The columns of the table, one for each property of `T`.
    * - Without a `selectSanitizationFn`, only these columns are selected.
    * - Only these columns are written by inserts and updates: any other property of the data is ignored.
    *
-   * The column metadata (`type`, `nullable`, `default`) is descriptive and is not used by the gate.
+   * The metadata is optional. Only the `type` of the primary key is used: with `number`,
+   * `LilypadDbCache` converts to numbers the ids that notifications and the changelog carry as text.
    */
-  cols: {
-    [K in keyof T]: {
-      type: LilypadDbColumnType;
-    } & ({ nullable?: false } | { nullable: true; default: T[K] | null });
-  };
+  cols: { [K in keyof T]: LilypadDbColumn<T[K]> };
+};
+
+/** The metadata of a column. `nullable` and `default` are descriptive: the library ignores them. */
+export type LilypadDbColumn<V = unknown> = {
+  type?: LilypadDbColumnType;
+  nullable?: boolean;
+  default?: V | null;
 };
 
 /** The data of an insert: the primary key can be omitted when the database generates it. */
@@ -121,6 +125,8 @@ export type LilypadDbWriteResult<T> = { row: T | null; xid: bigint };
 
 /** Rows read at a time by `selectAllFromTable`. */
 const SELECT_ALL_BATCH_SIZE = 1000;
+/** Primary keys per query of `selectFromTableByPrimaryKeys`. */
+const PRIMARY_KEYS_BATCH_SIZE = 1000;
 /** The column that carries the transaction id in the results of writes. */
 const XID_COLUMN = '__lilypad_xid';
 
@@ -165,7 +171,7 @@ type ChannelListener = {
 export class LilypadDbGate {
   public readonly id = `LilypadDbGate-${globalThis.crypto.randomUUID()}`;
   private listenerConnectionString: string;
-  public sql: postgres.Sql;
+  public readonly sql: postgres.Sql;
   private listenerConnection: postgres.Sql | undefined;
   protected logger?: LilypadLibLogger;
   private listeners: Map<string, ChannelListener> = new Map();
@@ -212,7 +218,9 @@ export class LilypadDbGate {
           )
           .digest('hex'),
         onMismatch: () =>
-          void options.logger?.warn(
+          libLog(
+            options.logger,
+            'warn',
             `LilypadDbGate singleton "${options.singleton ? options.singletonIdentifier : ''}" already exists with different connection options: the new options are ignored.`
           ),
       }
@@ -248,7 +256,7 @@ export class LilypadDbGate {
     }
     const typedRow: Partial<T> = {};
     for (const key in schema.cols) {
-      typedRow[key] = row[key];
+      typedRow[key] = row[key] as T[typeof key];
     }
     return typedRow as T;
   }
@@ -263,7 +271,7 @@ export class LilypadDbGate {
 
   /**
    * Prepares the data of an insert/update:
-   * - applies the schema's `insertSanitizationFn`, whose result replaces the data;
+   * - applies the schema's `writeSanitizationFn`, whose result replaces the data;
    * - validates the primary key, which an update always needs to find the row;
    * - restricts the written columns to the schema columns, so that extra properties of `data`
    *   (e.g. coming from a request body) are never written to the table;
@@ -274,8 +282,8 @@ export class LilypadDbGate {
     data: Partial<T>,
     operation: 'insert' | 'update'
   ) {
-    const writeData: Partial<T> = schema.insertSanitizationFn
-      ? { ...schema.insertSanitizationFn({ ...data }) }
+    const writeData: Partial<T> = schema.writeSanitizationFn
+      ? { ...schema.writeSanitizationFn({ ...data }) }
       : { ...data };
 
     const primaryKeyValue = writeData[schema.primaryKey];
@@ -321,25 +329,26 @@ export class LilypadDbGate {
   }
 
   /**
-   * Selects the rows with these primary keys, in one query. Keys without a row are left out of
-   * the result, as are the rows the `selectSanitizationFn` discards.
+   * Selects the rows with these primary keys, in one query per batch of 1000 keys (Postgres limits
+   * the parameters of a query). Keys without a row are left out of the result, as are the rows the
+   * `selectSanitizationFn` discards.
    */
   async selectFromTableByPrimaryKeys<T, PK extends keyof T = keyof T>(
     options: LilypadDbSchema<T, PK>,
     primaryKeyValues: T[PK][]
   ): Promise<T[]> {
-    if (primaryKeyValues.length === 0) {
-      return [];
-    }
-    const results = await this.sql`
-      SELECT ${this.selectedColumns(options)} FROM ${this.sql(options.tableName)}
-      WHERE ${this.sql(String(options.primaryKey))} IN ${this.sql(primaryKeyValues as string[])}
-    `;
     const typedRows: T[] = [];
-    for (const row of results) {
-      const typedRow = this.mapRow(options, row);
-      if (typedRow !== null) {
-        typedRows.push(typedRow);
+    for (let start = 0; start < primaryKeyValues.length; start += PRIMARY_KEYS_BATCH_SIZE) {
+      const batch = primaryKeyValues.slice(start, start + PRIMARY_KEYS_BATCH_SIZE);
+      const results = await this.sql`
+        SELECT ${this.selectedColumns(options)} FROM ${this.sql(options.tableName)}
+        WHERE ${this.sql(String(options.primaryKey))} IN ${this.sql(batch as string[])}
+      `;
+      for (const row of results) {
+        const typedRow = this.mapRow(options, row);
+        if (typedRow !== null) {
+          typedRows.push(typedRow);
+        }
       }
     }
     return typedRows;
@@ -354,10 +363,8 @@ export class LilypadDbGate {
       WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue as string}
     `;
 
-    if (results.length === 0) {
-      return null;
-    }
-    return this.mapRow(options, results[0]);
+    const [row] = results;
+    return row ? this.mapRow(options, row) : null;
   }
 
   /**
@@ -384,14 +391,18 @@ export class LilypadDbGate {
       INSERT INTO ${this.sql(options.tableName)} ${this.sql(insertData, columns)}
       RETURNING *, txid_current()::text AS ${this.sql(XID_COLUMN)}
     `;
-    return this.writeResult(options, results[0]);
+    return this.writeResult(options, results);
   }
 
   /** Splits a row returned by a write into the row and the id of its transaction. */
   private writeResult<T, PK extends keyof T>(
     schema: LilypadDbSchema<T, PK>,
-    returned: postgres.Row
+    results: postgres.RowList<postgres.Row[]>
   ): LilypadDbWriteResult<T> {
+    const [returned] = results;
+    if (!returned) {
+      throw new Error(`The write to table "${schema.tableName}" returned no row.`);
+    }
     const { [XID_COLUMN]: xid, ...row } = returned;
     return { row: this.mapRow(schema, row), xid: BigInt(xid as string) };
   }
@@ -432,7 +443,7 @@ export class LilypadDbGate {
         `No row with primary key "${String(primaryKeyValue)}" found in table "${options.tableName}".`
       );
     }
-    return this.writeResult(options, results[0]);
+    return this.writeResult(options, results);
   }
 
   async deleteFromTable<T, PK extends keyof T = keyof T>(
@@ -455,7 +466,8 @@ export class LilypadDbGate {
       WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue as string}
       RETURNING txid_current()::text AS ${this.sql(XID_COLUMN)}
     `;
-    return results.length > 0 ? { xid: BigInt(results[0][XID_COLUMN] as string) } : {};
+    const [deleted] = results;
+    return deleted ? { xid: BigInt(deleted[XID_COLUMN] as string) } : {};
   }
 
   // LISTENER MANAGEMENT
@@ -493,7 +505,7 @@ export class LilypadDbGate {
    * @returns The listener entry of the channel.
    */
   private initializeListener(channel: string): ChannelListener {
-    void this.logger?.debug(this.id, `Initializing listener for channel "${channel}".`);
+    libLog(this.logger, 'debug', this.id, `Initializing listener for channel "${channel}".`);
     const listener: ChannelListener = {
       callbacks: new Map(),
       listening: false,
@@ -509,7 +521,7 @@ export class LilypadDbGate {
             listener.listening = true;
           }
         )
-        .then(({ unlisten }) => unlisten)
+        .then((meta) => () => meta.unlisten())
         .catch((error: unknown) => {
           if (this.listeners.get(channel) === listener) {
             this.listeners.delete(channel);
@@ -533,7 +545,9 @@ export class LilypadDbGate {
     Promise.resolve()
       .then(callback)
       .catch((error: unknown) => {
-        void this.logger?.error(
+        libLog(
+          this.logger,
+          'error',
           this.id,
           `Error in listener callback "${callbackId}" for channel "${channel}":`,
           error
@@ -558,13 +572,15 @@ export class LilypadDbGate {
   }
 
   private executeReconnectCallbacks(channel: string, listener: ChannelListener) {
-    void this.logger?.warn(
+    libLog(
+      this.logger,
+      'warn',
       this.id,
       `LISTEN on channel "${channel}" was re-established: notifications sent meanwhile are lost.`
     );
-    for (const [callbackId, { onReconnect }] of listener.callbacks) {
-      if (onReconnect) {
-        this.runCallbackSafely(channel, callbackId, onReconnect);
+    for (const [callbackId, identifier] of listener.callbacks) {
+      if (identifier.onReconnect) {
+        this.runCallbackSafely(channel, callbackId, () => identifier.onReconnect?.());
       }
     }
   }
@@ -587,7 +603,9 @@ export class LilypadDbGate {
    */
   async addListener(identifier: ListenerCallbackIdentifier) {
     const { channel, callbackId } = identifier;
-    void this.logger?.debug(
+    libLog(
+      this.logger,
+      'debug',
       this.id,
       `Adding listener for channel "${channel}" with callback ID "${callbackId}".`
     );
@@ -595,7 +613,9 @@ export class LilypadDbGate {
     listener.callbacks.set(callbackId, identifier);
     await listener.ready;
 
-    void this.logger?.debug(
+    libLog(
+      this.logger,
+      'debug',
       this.id,
       `Listener for channel "${channel}" has ${listener.callbacks.size} callbacks.`
     );

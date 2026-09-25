@@ -1,4 +1,4 @@
-import LilypadLoggerComponent from '../LilypadLoggerComponent';
+import LilypadLoggerComponent, { writeToConsole } from '../LilypadLoggerComponent';
 
 /**
  * A logger component that outputs messages to the console.
@@ -16,16 +16,8 @@ import LilypadLoggerComponent from '../LilypadLoggerComponent';
  * (case-insensitive), and every other message to `console.log`.
  */
 export default class LilypadConsoleLogger<T extends string> extends LilypadLoggerComponent<T> {
-  protected async send(message: string, type: T): Promise<void> {
-    switch (type.toLowerCase()) {
-      case 'error':
-        console.error(message);
-        break;
-      case 'warn':
-        console.warn(message);
-        break;
-      default:
-        console.log(message);
-    }
+  protected send(message: string, type: T): Promise<void> {
+    writeToConsole(message, type);
+    return Promise.resolve();
   }
 }

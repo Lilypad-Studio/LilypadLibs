@@ -13,12 +13,38 @@
 | `LilypadDbCache` reads rows with `selectFromTableByPrimaryKeys`, and writes with `insertToTableDetailed`, `updateToTableDetailed` and `deleteFromTableDetailed`. | Only a custom gate, or a mock of it, must implement them. |
 | A row written by `sqlCreate`/`sqlUpdate`/`sqlDelete` is not cached if its entry changed while the write was running; the next read fetches it. | None. |
 | The bulk sync of `LilypadCache` never stays fresh longer than the TTL, and `clear()` and `maxEntries` evictions force the next one. | Set the TTL, not only `defaultBulkSyncTtl`, if you want loads to last longer. |
+| `@lilypad/libs` no longer exports the database modules (`LilypadDbGate`, `LilypadDbCache`, the changelog and schema helpers): the root entry never pulls in postgres.js, and runs in edge runtimes. | Import them from `@lilypad/libs/db`. |
+| `new LilypadCache(ttl, options)` becomes `new LilypadCache({ ttl, ...options })`, and `LilypadDbCache.create(ttl, options)` becomes `LilypadDbCache.create({ ttl, ...options })`. A `ttl` that is not a positive finite number throws. | Move the TTL into the options. |
+| `get(key, true)` becomes `get(key, { removeExpired: true })`. | Replace the boolean. |
+| `delete` and `clear` no longer take `setNull` (`clear({ setNull: true })` could loop forever with `maxEntries`). | Use `set(key, null)` to cache a key as "does not exist". |
+| `bulkSync` and `bulkAsyncGet` no longer take a `syncFn`: concurrent calls share one load, so a per-call function could be ignored or mark as fresh a load made by another. `bulkSync(syncFn, options)` becomes `bulkSync(options)`. | Pass the function as the `bulkSyncFn` option of the cache. |
+| `dispose()` returns a promise for every cache, not only `LilypadDbCache`. | `await` it (the lint rule `no-floating-promises` points at the calls). |
+| `getOrSet` (and `getOrFetch`, `getAll`) on a disposed cache throws, instead of querying the source at each call without caching. | Do not use a cache after `dispose()`. |
+| `LilypadDbCache.invalidate(key)` is synchronous and sends no query, as in `LilypadCache`: it expires the key, and the next read fetches it. `update(key)` is renamed `refresh(key)`, which queries the row, shares the query with concurrent calls, and times out after `flowControlTimeout`. | Replace `await cache.invalidate(key)` with `await cache.refresh(key)` where you need the row at once, and `update` with `refresh`. |
+| `LilypadDbCache.getOrFetch` rejects when the query fails, instead of resolving to `undefined` (which also means "not cached"). | Catch the error, or pass `errorFn`/`returnOldOnError`. `getOrFetchDetailed` also returns `status` and `refreshFailed`. |
+| `useDefaultDbListener` and `defaultListenerOptions` are removed, and `sync.listenerOptions` is replaced by `sync.onNotification` and `sync.applyChanges`. The cache applies the notifications by default even with a callback. | `useDefaultDbListener: false` becomes `sync: { strategy: 'none' }`. `listenerOptions: { callback, automaticallyInvalidateDataBeforeCallback: true }` becomes `{ strategy: 'listen', onNotification: callback }`; without `automaticallyInvalidateDataBeforeCallback`, add `applyChanges: false`. |
+| `LilypadLibLogger` is any object with some of the methods `error`, `warn`, `info`, `debug` (`console` and pino work). The modules log with the name of the instance as first argument, instead of its random id. `LilypadLogger.create` defaults to the channels `'error' \| 'warn' \| 'info' \| 'debug'` (it was `'log' \| 'error' \| 'warn'`), and `createLogger` is removed. | Code that reads `logger.x` of a `LilypadLibLogger` must use `logger.x?.()`. Replace `createLogger` with `LilypadLogger.create`; pass the type argument if you relied on the `log` channel. |
+| `insertSanitizationFn` is renamed `writeSanitizationFn` (it applies to updates too). The `cols` metadata is optional, and `nullable: true` no longer requires `default`. | Rename the option. |
+| With a `number` primary key column, `LilypadDbCache` converts the ids of notifications and of the changelog to numbers for keys it does not know yet (they were kept as strings). | None. Declare `bigint` keys as `'string'`: postgres.js returns them as strings. |
+| `LilypadDbGate.sql` is read-only. | Do not reassign it. |
+| `FlowControlOptions` and `ExecuteFnOptions` are renamed `LilypadFlowControlOptions` and `LilypadExecuteFnOptions`. A timeout fails with a `LilypadTimeoutError` (`Operation timed out after <n>ms`), and the rate limit with a `LilypadRateLimitError`, which now goes to `errorFn` like any failure. | Rename the types. Code that matched the whole message `Operation timed out` exactly must match its start, or use `instanceof`. |
+| `LilypadSerializer.deserialize` keeps a `null` returned by `deserialize`, instead of replacing it with the default. | Return `undefined` to get the default. |
+| A write to the shared level no longer reads the shared entry first. | Set `shared.checkBeforeWrite: true` to keep the former soft check. |
+| While a fallback chosen after an error is cached, `getOrSetDetailed` reports `refreshFailed: true` (it reported `false`), and with `failureCooldown` the key is refreshed in the background once the cooldown is over. | None. |
+| `LilypadDiscordLogger` keeps at most `maxQueueSize` messages (default: 100) waiting to be sent, and drops the oldest beyond it. | Raise `maxQueueSize` if you log bursts larger than that on Discord. |
+| Subclasses of `LilypadCache` store the results of their reads through `beginRead()`: `setIfNewer` and `storeFetched` are private. | Replace `nextTicket()` + `setIfNewer(...)` with `const read = this.beginRead(); ...; read.store(key, value)`. |
 
 ### Added
 
 - **LilypadDbGate**: `selectFromTableByPrimaryKeys`, and `insertToTableDetailed`, `updateToTableDetailed`, `deleteFromTableDetailed`, which also return the id of the transaction (`LilypadDbWriteResult`).
 - **LilypadDbCache**: `sync.maxAge`. `TRUNCATE` is applied without a query, from the changelog and from notifications.
 - **Schema check**: the `missing-truncate-trigger` problem.
+- **Changelog**: the caches of a gate read the changelog together, in one query per poll (`readLilypadChangesBatch`). A failed read, or a failed lazy `LISTEN`, is retried after an exponential backoff instead of at every read.
+- **LilypadDbCache**: `refresh(key)` and `getOrFetchDetailed`. Notifications for a key being refreshed are coalesced into one more query.
+- **LilypadCache**: `shared.checkBeforeWrite`; `beginRead()` for subclasses. Exported types `LilypadCacheEntry`, `LilypadCacheRead`, `LilypadCacheSyncFn`, `LilypadCacheValueRetrieval`.
+- **LilypadFlowControl**: `LilypadTimeoutError`, `LilypadRateLimitError`; `executeWithTimeout` is typed per call.
+- **Logger**: `formatLogValue` prints the own properties of errors (e.g. the `code` and `detail` of a database error). `LilypadDiscordLogger` option `maxQueueSize`.
+- **CI**: GitHub Actions run the unit tests (Node.js 20 and 22), the typecheck, the lint, the build (checking that `dist/` is up to date) and the integration tests.
 
 ### Fixed
 
@@ -26,6 +52,17 @@
 - `getAll()` could return an empty list just before the bulk sync expired, or until it expired after `clear()`.
 - A change applied between the end of a write and the caching of its result could be overwritten by the older row of the write.
 - A `TRUNCATE` of a cached table was never seen: the caches kept the removed rows until their TTL.
+- `getAll()` with `maxEntries` smaller than the table returned only part of it, without error.
+- Concurrent `getAll(keys)` calls whose keys joined to the same string (e.g. `['a,b']` and `['a', 'b']`) shared one query, and one of them returned the wrong rows.
+- With the `changelog` strategy, each change of a key being fetched ran a query, one after the other, while every read of the instance waited.
+- A fetch of a key that was not cached yet could cache a value read before the key was invalidated or changed.
+- An invalidated key could adopt a copy from the shared level produced before the invalidation, if its removal had failed.
+- `bulkGet({})` left out an entry written with a TTL shorter than the bulk sync while the sync still counted as fresh.
+- A row inserted again elsewhere after being cached as `null` was left out of `getAll()` until the next full load.
+- Background refreshes that never started stayed tracked forever; they are now removed by `purgeExpired`.
+- `selectFromTableByPrimaryKeys` failed with more than 65 535 keys: it now sends one query per 1 000 keys.
+- `formatLogValue` threw on a getter that throws, and the message was lost.
+- `LilypadDiscordLogger` did not read the response bodies, which kept connections busy.
 
 ## 0.2.0
 

@@ -163,6 +163,12 @@ export type LilypadChange = {
   xid: bigint;
 } & ({ rowId: string; op: 'INSERT' | 'UPDATE' | 'DELETE' } | { rowId: null; op: 'TRUNCATE' });
 
+/** What to read of a table: the changes since a cursor, or those of the last `lookback` ms. */
+export type LilypadChangesRequest = {
+  tableName: string;
+  since: { cursor: bigint } | { lookback: number };
+};
+
 /**
  * Reads the changes of a table since `cursor`, and the cursor for the next read.
  *
@@ -180,50 +186,86 @@ export type LilypadChange = {
  */
 export async function readLilypadChanges(
   gate: LilypadDbGate,
-  options: {
-    tableName: string;
-    since: { cursor: bigint } | { lookback: number };
-    changelogTable?: string;
-  }
+  options: LilypadChangesRequest & { changelogTable?: string }
 ): Promise<{ changes: LilypadChange[]; cursor: bigint }> {
-  const sql = gate.sql;
-  const changelogTable = options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
-  const since = options.since;
-  const condition =
-    'cursor' in since
-      ? sql`c.xid >= ${since.cursor.toString()}::xid8`
-      : sql`c.changed_at >= clock_timestamp() - make_interval(secs => ${since.lookback / 1000})`;
+  const { changes, cursor } = await readLilypadChangesBatch(gate, {
+    requests: [{ tableName: options.tableName, since: options.since }],
+    changelogTable: options.changelogTable,
+  });
+  return { changes: changes[0] ?? [], cursor };
+}
 
-  // One statement, so the snapshot and the rows are read together even through a pooler
+/**
+ * Like {@link readLilypadChanges}, for several tables in one query: `changes[i]` holds the changes
+ * of `requests[i]`. Every request shares the cursor for the next read.
+ */
+export async function readLilypadChangesBatch(
+  gate: LilypadDbGate,
+  options: { requests: LilypadChangesRequest[]; changelogTable?: string }
+): Promise<{ changes: LilypadChange[][]; cursor: bigint }> {
+  const sql = gate.sql;
+  const changelogTable = sql(options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE);
+  // Passed as text arrays; an empty cursor selects the lookback of the request
+  const tableRefs = options.requests.map((request) => quoteIdentifier(request.tableName));
+  const cursors = options.requests.map((request) =>
+    'cursor' in request.since ? request.since.cursor.toString() : ''
+  );
+  const lookbacks = options.requests.map((request) =>
+    'lookback' in request.since ? String(request.since.lookback / 1000) : '0'
+  );
+
+  // One statement, so the snapshot and the rows are read together even through a pooler. Each
+  // branch of the lateral subquery can use its own index: (table_name, xid) or (changed_at).
   const rows = await sql`
     WITH snapshot AS (SELECT pg_snapshot_xmin(pg_current_snapshot())::text AS next_cursor),
-    target AS (
-      SELECT n.nspname AS schema_name, t.relname AS rel_name
-      FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace
-      WHERE t.oid = to_regclass(${quoteIdentifier(options.tableName)}::text)
+    requests AS (
+      SELECT (r.ordinality - 1)::int AS request, r.table_ref,
+        NULLIF(r.since_cursor, '')::xid8 AS since_cursor, r.lookback_secs::float8 AS lookback_secs
+      FROM unnest(
+        ${sql.array(tableRefs)}::text[], ${sql.array(cursors)}::text[], ${sql.array(lookbacks)}::text[]
+      ) WITH ORDINALITY AS r(table_ref, since_cursor, lookback_secs, ordinality)
+    ),
+    targets AS (
+      SELECT requests.*, n.nspname AS schema_name, t.relname AS rel_name
+      FROM requests
+      JOIN pg_class t ON t.oid = to_regclass(requests.table_ref)
+      JOIN pg_namespace n ON n.oid = t.relnamespace
     )
-    SELECT snapshot.next_cursor, c.id::text AS id, c.xid::text AS xid, c.row_id, c.op
+    SELECT snapshot.next_cursor, targets.request, c.id::text AS id, c.xid::text AS xid, c.row_id, c.op
     FROM snapshot
-    LEFT JOIN target ON true
-    LEFT JOIN ${sql(changelogTable)} c
-      ON c.table_name = target.rel_name
-      AND (c.table_schema = target.schema_name OR c.table_schema IS NULL)
-      AND ${condition}
+    LEFT JOIN targets ON true
+    LEFT JOIN LATERAL (
+      SELECT c.id, c.xid, c.row_id, c.op FROM ${changelogTable} c
+      WHERE targets.since_cursor IS NOT NULL
+        AND c.table_name = targets.rel_name
+        AND (c.table_schema = targets.schema_name OR c.table_schema IS NULL)
+        AND c.xid >= targets.since_cursor
+      UNION ALL
+      SELECT c.id, c.xid, c.row_id, c.op FROM ${changelogTable} c
+      WHERE targets.since_cursor IS NULL
+        AND c.table_name = targets.rel_name
+        AND (c.table_schema = targets.schema_name OR c.table_schema IS NULL)
+        AND c.changed_at >= clock_timestamp() - make_interval(secs => targets.lookback_secs)
+    ) c ON true
     ORDER BY c.id
   `;
 
-  const changes: LilypadChange[] = [];
+  const changes: LilypadChange[][] = options.requests.map(() => []);
   for (const row of rows) {
     if (row.id !== null) {
-      changes.push({
+      changes[row.request as number]?.push({
         id: row.id as string,
         xid: BigInt(row.xid as string),
         rowId: row.row_id as string | null,
-        op: row.op,
+        op: row.op as LilypadChange['op'],
       } as LilypadChange);
     }
   }
-  return { changes, cursor: BigInt(rows[0].next_cursor as string) };
+  const nextCursor: unknown = rows[0]?.next_cursor;
+  if (typeof nextCursor !== 'string') {
+    throw new Error('Reading the changelog returned no snapshot.');
+  }
+  return { changes, cursor: BigInt(nextCursor) };
 }
 
 /**

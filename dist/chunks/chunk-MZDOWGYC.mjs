@@ -1,15 +1,23 @@
-"use strict";Object.defineProperty(exports, "__esModule", {value: true}); function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } var _class; var _class2;
-
-var _chunkLL3KVXOKjs = require('./chunk-LL3KVXOK.js');
-
-
-var _chunkGU4ZU4STjs = require('./chunk-GU4ZU4ST.js');
+import {
+  runInBackground
+} from "./chunk-3L5FE6KG.mjs";
+import {
+  getLilypadSingletonInstance
+} from "./chunk-4263BVWE.mjs";
 
 // src/logger/formatLogValue.ts
 var MAX_DEPTH = 4;
 function formatLogValue(value) {
-  return typeof value === "string" ? value : formatNested(value, 0, /* @__PURE__ */ new Set());
+  if (typeof value === "string") {
+    return value;
+  }
+  try {
+    return formatNested(value, 0, /* @__PURE__ */ new Set());
+  } catch {
+    return "[Unformattable value]";
+  }
 }
+var ERROR_OWN_KEYS = /* @__PURE__ */ new Set(["name", "stack", "message", "cause"]);
 function formatNested(value, depth, seen) {
   switch (typeof value) {
     case "string":
@@ -68,10 +76,7 @@ function formatNested(value, depth, seen) {
     if (depth >= MAX_DEPTH) {
       return "[Object]";
     }
-    const entries = Object.entries(value).map(
-      ([key, item]) => `${formatKey(key)}: ${formatNested(item, depth + 1, seen)}`
-    );
-    return entries.length === 0 ? "{}" : `{ ${entries.join(", ")} }`;
+    return formatProperties(value, depth, seen);
   } finally {
     seen.delete(value);
   }
@@ -79,7 +84,13 @@ function formatNested(value, depth, seen) {
 function formatError(error, depth, seen) {
   seen.add(error);
   try {
-    let formatted = _nullishCoalesce(error.stack, () => ( `${error.name}: ${error.message}`));
+    let formatted = error.stack ?? `${error.name}: ${error.message}`;
+    if (depth < MAX_DEPTH) {
+      const properties = formatProperties(error, depth, seen, ERROR_OWN_KEYS);
+      if (properties !== "{}") {
+        formatted += ` ${properties}`;
+      }
+    }
     if (error.cause !== void 0) {
       formatted += `
 [cause]: ${formatNested(error.cause, depth + 1, seen)}`;
@@ -89,24 +100,42 @@ function formatError(error, depth, seen) {
     seen.delete(error);
   }
 }
+function formatProperties(value, depth, seen, excluded) {
+  const entries = [];
+  for (const key of Object.keys(value)) {
+    if (excluded == null ? void 0 : excluded.has(key)) {
+      continue;
+    }
+    let item;
+    try {
+      item = value[key];
+    } catch {
+      entries.push(`${formatKey(key)}: [Getter threw]`);
+      continue;
+    }
+    entries.push(`${formatKey(key)}: ${formatNested(item, depth + 1, seen)}`);
+  }
+  return entries.length === 0 ? "{}" : `{ ${entries.join(", ")} }`;
+}
 function formatKey(key) {
   return /^[A-Za-z_$][\w$]*$/.test(key) ? key : `'${key}'`;
 }
 
 // src/logger/LilypadLogger.ts
-var LilypadLogger = (_class = class _LilypadLogger {
-  __init() {this.components = {}}
+var LilypadLogger = class _LilypadLogger {
+  components = {};
   // Optional logger name
-  
+  _name;
   get __name() {
     return this._name;
   }
   /** The messages still being sent, awaited by `flush`. */
-  __init2() {this._pending = /* @__PURE__ */ new Set()}
+  _pending = /* @__PURE__ */ new Set();
   /**
    * Creates a new LilypadLogger instance or retrieves a singleton instance.
    *
-   * @template T - The log level type, defaults to 'log' | 'error' | 'warn'
+   * @template T - The log level type, defaults to the levels the other Lilypad modules log on
+   * ('error' | 'warn' | 'info' | 'debug'), so that the logger can be passed to them
    * @param options - Configuration options for the logger
    * @param options.singleton - Whether to use a singleton instance
    * @param options.singletonIdentifier - Unique identifier for the singleton instance
@@ -129,7 +158,7 @@ var LilypadLogger = (_class = class _LilypadLogger {
   static create(options) {
     if (options.singleton) {
       const registryKey = `LilypadLogger:${options.singletonIdentifier}`;
-      return _chunkGU4ZU4STjs.getLilypadSingletonInstance.call(void 0, registryKey, () => new _LilypadLogger(options), {
+      return getLilypadSingletonInstance(registryKey, () => new _LilypadLogger(options), {
         // No secrets in these options: the signature can stay in clear text
         value: JSON.stringify([options.name, Object.keys(options.components).sort()]),
         onMismatch: () => console.warn(
@@ -139,7 +168,7 @@ var LilypadLogger = (_class = class _LilypadLogger {
     }
     return new _LilypadLogger(options);
   }
-  constructor(options) {;_class.prototype.__init.call(this);_class.prototype.__init2.call(this);
+  constructor(options) {
     const reservedKeys = /* @__PURE__ */ new Set([
       "components",
       "register",
@@ -190,7 +219,7 @@ var LilypadLogger = (_class = class _LilypadLogger {
         const task = send(message, readContext(options.context));
         this._pending.add(task);
         void task.finally(() => this._pending.delete(task));
-        _chunkLL3KVXOKjs.runInBackground.call(void 0, options.platform, task, () => {
+        runInBackground(options.platform, task, () => {
         });
         return task;
       };
@@ -209,7 +238,7 @@ var LilypadLogger = (_class = class _LilypadLogger {
           `Logger type "${type}" was not defined when the logger was created and cannot be registered.`
         );
       }
-      this.components[type].push(..._nullishCoalesce(newComponents[type], () => ( [])));
+      this.components[type].push(...newComponents[type] ?? []);
     }
     return this;
   }
@@ -222,11 +251,11 @@ var LilypadLogger = (_class = class _LilypadLogger {
       await Promise.all(this._pending);
     }
   }
-}, _class);
+};
 function readContext(context) {
   try {
     return context == null ? void 0 : context();
-  } catch (e) {
+  } catch {
     return void 0;
   }
 }
@@ -240,9 +269,6 @@ async function reportComponentError(type, error, errorLogging) {
     }
   }
   console.error(`Error in logger component for type "${type}":`, error);
-}
-function createLogger(options) {
-  return LilypadLogger.create(options);
 }
 
 // src/logger/LilypadLoggerComponent.ts
@@ -263,13 +289,13 @@ var LilypadLoggerComponent = class {
   }
   async output(type, message, options) {
     var _a;
-    const record = _nullishCoalesce((options == null ? void 0 : options.record), () => ( {
+    const record = (options == null ? void 0 : options.record) ?? {
       type,
       message,
       parts: [message],
       timestamp: /* @__PURE__ */ new Date(),
       loggerName: (_a = options == null ? void 0 : options.logger) == null ? void 0 : _a.__name
-    }));
+    };
     await this.sendRecord(record);
   }
   /**
@@ -280,6 +306,18 @@ var LilypadLoggerComponent = class {
     await this.send(this.formatRecord(record), record.type);
   }
 };
+function writeToConsole(message, type) {
+  switch (type.toLowerCase()) {
+    case "error":
+      console.error(message);
+      break;
+    case "warn":
+      console.warn(message);
+      break;
+    default:
+      console.log(message);
+  }
+}
 function safeJson(value) {
   const seen = /* @__PURE__ */ new WeakSet();
   try {
@@ -298,24 +336,16 @@ function safeJson(value) {
       }
       return item;
     });
-  } catch (e2) {
+  } catch {
     return '"[Unserializable]"';
   }
 }
 
 // src/logger/components/ConsoleLogger.ts
 var LilypadConsoleLogger = class extends LilypadLoggerComponent {
-  async send(message, type) {
-    switch (type.toLowerCase()) {
-      case "error":
-        console.error(message);
-        break;
-      case "warn":
-        console.warn(message);
-        break;
-      default:
-        console.log(message);
-    }
+  send(message, type) {
+    writeToConsole(message, type);
+    return Promise.resolve();
   }
 };
 
@@ -339,17 +369,9 @@ var LilypadJsonConsoleLogger = class extends LilypadLoggerComponent {
     });
     await this.send(line, record.type);
   }
-  async send(message, type) {
-    switch (type.toLowerCase()) {
-      case "error":
-        console.error(message);
-        break;
-      case "warn":
-        console.warn(message);
-        break;
-      default:
-        console.log(message);
-    }
+  send(message, type) {
+    writeToConsole(message, type);
+    return Promise.resolve();
   }
 };
 
@@ -357,23 +379,33 @@ var LilypadJsonConsoleLogger = class extends LilypadLoggerComponent {
 var DISCORD_MAX_CONTENT_LENGTH = 2e3;
 var DISCORD_REQUEST_TIMEOUT = 5e3;
 var DEFAULT_RETRY_AFTER = 1e3;
+var DEFAULT_MAX_QUEUE_SIZE = 100;
 var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-var LilypadDiscordLogger = (_class2 = class extends LilypadLoggerComponent {
-  
-  
-  
-  __init3() {this.queue = []}
-  __init4() {this.flushing = false}
-  __init5() {this.nextRequestAt = 0}
+var LilypadDiscordLogger = class extends LilypadLoggerComponent {
+  webhookUrl;
+  minRequestInterval;
+  rateLimitRetries;
+  maxQueueSize;
+  queue = [];
+  /** Messages dropped since the last batch, announced in the next one. */
+  dropped = 0;
+  flushing = false;
+  nextRequestAt = 0;
   constructor(webhookUrl, options = {}) {
-    super();_class2.prototype.__init3.call(this);_class2.prototype.__init4.call(this);_class2.prototype.__init5.call(this);;
+    super();
     this.webhookUrl = webhookUrl;
-    this.minRequestInterval = _nullishCoalesce(options.minRequestInterval, () => ( 1e3));
-    this.rateLimitRetries = _nullishCoalesce(options.rateLimitRetries, () => ( 1));
+    this.minRequestInterval = options.minRequestInterval ?? 1e3;
+    this.rateLimitRetries = options.rateLimitRetries ?? 1;
+    this.maxQueueSize = Math.max(1, options.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE);
   }
   send(message) {
     return new Promise((resolve, reject) => {
+      var _a;
       this.queue.push({ content: message.slice(0, DISCORD_MAX_CONTENT_LENGTH), resolve, reject });
+      while (this.queue.length > this.maxQueueSize) {
+        (_a = this.queue.shift()) == null ? void 0 : _a.resolve();
+        this.dropped++;
+      }
       void this.flush();
     });
   }
@@ -400,6 +432,13 @@ var LilypadDiscordLogger = (_class2 = class extends LilypadLoggerComponent {
   }
   /** Takes the queued messages that fit in one Discord message, always at least one. */
   takeBatch() {
+    if (this.dropped > 0) {
+      const notice = `\u2026 ${this.dropped} log messages dropped (queue full)`;
+      this.dropped = 0;
+      this.queue.unshift({ content: notice, resolve: () => {
+      }, reject: () => {
+      } });
+    }
     let length = this.queue[0].content.length;
     let count = 1;
     while (count < this.queue.length && length + 1 + this.queue[count].content.length <= DISCORD_MAX_CONTENT_LENGTH) {
@@ -409,11 +448,14 @@ var LilypadDiscordLogger = (_class2 = class extends LilypadLoggerComponent {
     return this.queue.splice(0, count);
   }
   async sendBatch(batch) {
+    var _a;
     const content = batch.map((message) => message.content).join("\n");
     try {
       for (let attempt = 0; ; attempt++) {
         const response = await this.post(content);
         this.nextRequestAt = Date.now() + this.minRequestInterval;
+        void ((_a = response.body) == null ? void 0 : _a.cancel().catch(() => {
+        }));
         if (response.status === 429 && attempt < this.rateLimitRetries) {
           this.nextRequestAt = Date.now() + retryAfterMs(response);
           await sleep(this.nextRequestAt - Date.now());
@@ -442,19 +484,18 @@ var LilypadDiscordLogger = (_class2 = class extends LilypadLoggerComponent {
       signal: AbortSignal.timeout(DISCORD_REQUEST_TIMEOUT)
     });
   }
-}, _class2);
+};
 function retryAfterMs(response) {
   var _a;
   const seconds = Number((_a = response.headers) == null ? void 0 : _a.get("retry-after"));
   return Number.isFinite(seconds) && seconds > 0 ? seconds * 1e3 : DEFAULT_RETRY_AFTER;
 }
 
-
-
-
-
-
-
-
-exports.LilypadLogger = LilypadLogger; exports.createLogger = createLogger; exports.LilypadLoggerComponent = LilypadLoggerComponent; exports.LilypadConsoleLogger = LilypadConsoleLogger; exports.LilypadJsonConsoleLogger = LilypadJsonConsoleLogger; exports.LilypadDiscordLogger = LilypadDiscordLogger;
-//# sourceMappingURL=chunk-MRWDJMGP.js.map
+export {
+  LilypadLogger,
+  LilypadLoggerComponent,
+  LilypadConsoleLogger,
+  LilypadJsonConsoleLogger,
+  LilypadDiscordLogger
+};
+//# sourceMappingURL=chunk-MZDOWGYC.mjs.map

@@ -1,15 +1,15 @@
-"use strict";Object.defineProperty(exports, "__esModule", {value: true}); function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } }// src/serializer/LilypadSerializer.ts
+// src/serializer/LilypadSerializer.ts
 var LilypadSerializer = class {
   constructor(options) {
     this.options = options;
     this.fromKeys = Object.keys(options.serialization);
   }
-  
+  fromKeys;
   serialize(input) {
     return input.map((item) => {
       const packedItem = {};
       this.fromKeys.forEach((fromKey) => {
-        const isEqual = _nullishCoalesce(this.options.serialization[fromKey].equality, () => ( ((v, d) => v === d)));
+        const isEqual = this.options.serialization[fromKey].equality ?? ((v, d) => v === d);
         if (isEqual(item[fromKey], this.options.serialization[fromKey].default)) {
           return;
         }
@@ -27,7 +27,8 @@ var LilypadSerializer = class {
     return input.map((item) => {
       const unpackedItem = {};
       this.fromKeys.forEach((fromKey) => {
-        unpackedItem[fromKey] = _nullishCoalesce(this.options.serialization[fromKey].deserialize(item), () => ( cloneDefault(this.options.serialization[fromKey].default)));
+        const value = this.options.serialization[fromKey].deserialize(item);
+        unpackedItem[fromKey] = value === void 0 ? cloneDefault(this.options.serialization[fromKey].default) : value;
       });
       return unpackedItem;
     });
@@ -37,7 +38,7 @@ function cloneDefault(value) {
   return typeof value === "object" && value !== null ? structuredClone(value) : value;
 }
 
-
-
-exports.LilypadSerializer = LilypadSerializer;
-//# sourceMappingURL=chunk-USVZH5LR.js.map
+export {
+  LilypadSerializer
+};
+//# sourceMappingURL=chunk-YYIH6TJ4.mjs.map
