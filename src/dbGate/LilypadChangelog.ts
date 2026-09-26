@@ -340,8 +340,8 @@ export async function readLilypadChangesBatch(
         string_to_array(NULLIF(r.since_xip, ''), ',')::xid8[] AS since_xip,
         r.lookback_secs::float8 AS lookback_secs
       FROM unnest(
-        ${sql.array(tableRefs)}::text[], ${sql.array(xmaxes)}::text[],
-        ${sql.array(xips)}::text[], ${sql.array(lookbacks)}::text[]
+        ${textArrayLiteral(tableRefs)}::text[], ${textArrayLiteral(xmaxes)}::text[],
+        ${textArrayLiteral(xips)}::text[], ${textArrayLiteral(lookbacks)}::text[]
       ) WITH ORDINALITY AS r(table_ref, since_xmax, since_xip, lookback_secs, ordinality)
     ),
     targets AS (
@@ -393,6 +393,16 @@ export async function readLilypadChangesBatch(
     xip: nextXip === '' ? [] : nextXip.split(',').map((xid) => BigInt(xid)),
   };
   return { changes, cursor };
+}
+
+/**
+ * The Postgres literal of a `text[]`, passed as a string parameter. Not `sql.array()`: postgres.js
+ * registers the array types of a client once its first connection has fetched them, but builds
+ * the first query of that connection before, so an array sent by the first query of a process is
+ * serialized as `a,b` (malformed array literal), with or without an explicit type.
+ */
+function textArrayLiteral(values: readonly string[]): string {
+  return `{${values.map((value) => `"${value.replace(/[\\"]/g, '\\$&')}"`).join(',')}}`;
 }
 
 /**

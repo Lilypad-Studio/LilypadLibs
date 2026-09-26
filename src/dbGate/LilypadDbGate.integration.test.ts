@@ -602,6 +602,32 @@ describe('LilypadDbGate (integration)', () => {
       ]);
     });
 
+    it('should read the changelog with the first query of a new gate', async () => {
+      // postgres.js has not loaded the array types yet when it builds the first query
+      await admin`INSERT INTO users (name) VALUES ('Ada')`;
+      const coldGate = await LilypadDbGate.create({
+        connectionString: container.getConnectionUri(),
+      });
+
+      try {
+        const { changes } = await readLilypadChangesBatch(coldGate, {
+          requests: [
+            { tableName: 'users', since: { lookback: 60_000 } },
+            { tableName: 'users', since: { cursor: { xmax: 1n, xip: [1n, 2n] } } },
+            { tableName: 'no "such" \\ table', since: { lookback: 60_000 } },
+          ],
+        });
+
+        expect(changes.map((list) => list.map((change) => change.rowId))).toEqual([
+          ['1'],
+          ['1'],
+          [],
+        ]);
+      } finally {
+        await coldGate.close();
+      }
+    });
+
     it('should delete the rows older than the retention', async () => {
       await admin`INSERT INTO users (name) VALUES ('Ada')`;
 
