@@ -718,7 +718,13 @@ var TRIGGER_TYPE_INSERT = 4;
 var TRIGGER_TYPE_DELETE = 8;
 var TRIGGER_TYPE_UPDATE = 16;
 var TRIGGER_TYPE_TRUNCATE = 32;
-var CHANGELOG_TRIGGER_TYPE = TRIGGER_TYPE_ROW | TRIGGER_TYPE_INSERT | TRIGGER_TYPE_DELETE | TRIGGER_TYPE_UPDATE;
+var ROW_EVENTS = TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE | TRIGGER_TYPE_DELETE;
+var ROW_EVENT_NAMES = [
+  [TRIGGER_TYPE_INSERT, "INSERT"],
+  [TRIGGER_TYPE_UPDATE, "UPDATE"],
+  [TRIGGER_TYPE_DELETE, "DELETE"]
+];
+var CHANGELOG_TRIGGER_TYPE = TRIGGER_TYPE_ROW | ROW_EVENTS;
 function firesOnTruncate(trigger) {
   return trigger.enabled && (trigger.type & TRIGGER_TYPE_ROW) === 0 && (trigger.type & TRIGGER_TYPE_TRUNCATE) !== 0;
 }
@@ -843,15 +849,23 @@ async function checkLilypadSchema(gate, options) {
         `pg_notify\\s*\\(\\s*'${escapeRegExp(notifyChannel.replace(/'/g, "''"))}'`,
         "i"
       );
-      const notifying = triggers.some(
+      const notifiedEvents = triggers.filter(
         (trigger) => trigger.enabled && (trigger.type & TRIGGER_TYPE_ROW) !== 0 && notifies.test(trigger.source)
-      );
+      ).reduce((events, trigger) => events | trigger.type & ROW_EVENTS, 0);
       const fix = lilypadChangelogSql({ table: customChangelogTable, notifyChannel }) + lilypadChangelogTriggerSql({ table, primaryKey, changelogTable: customChangelogTable });
-      if (!notifying) {
+      if (notifiedEvents === 0) {
         problems.push({
           code: "missing-notify-trigger",
           table,
           message: `No trigger of "${table}" sends notifications on the "${notifyChannel}" channel: the cache is not told about changes made elsewhere.`,
+          fix
+        });
+      } else if (notifiedEvents !== ROW_EVENTS) {
+        const names = (events) => ROW_EVENT_NAMES.filter(([bit]) => (events & bit) !== 0).map(([, name]) => name).join(", ");
+        problems.push({
+          code: "missing-notify-trigger",
+          table,
+          message: `The triggers of "${table}" send notifications on the "${notifyChannel}" channel only on ${names(notifiedEvents)}: the cache is not told about ${names(ROW_EVENTS & ~notifiedEvents)} made elsewhere.`,
           fix
         });
       } else if (!triggers.some((trigger) => firesOnTruncate(trigger) && notifies.test(trigger.source))) {
@@ -892,7 +906,10 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
    * of the table in any schema are applied.
    */
   tableSchema;
+  /** The schema check, once it has run or while it runs; reset when it could not run. */
   schemaCheck;
+  schemaCheckFailures = 0;
+  schemaCheckRetryAt = 0;
   /**
    * The keys of the rows of the table, as far as this instance knows. Each load of the table sets
    * them; the writes, the fetches and the changes keep them up to date. `getAll` returns these
@@ -1020,7 +1037,9 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
   }
   /**
    * Checks once that the database has the triggers the sync strategy needs, and resolves the schema
-   * of the table. With `verify: 'warn'` it never rejects: problems and failures are logged.
+   * of the table. With `verify: 'warn'` it never rejects: problems and failures are logged. A check
+   * that could not run (e.g. the database was unreachable) is forgotten, so that a later read runs
+   * it again (see {@link checkSchemaInBackground}); a check that found problems is not repeated.
    *
    * @throws A `LilypadSchemaCheckError` with `verify: 'throw'`, or the error of the check.
    */
@@ -1029,9 +1048,28 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
     if (mode === "off") {
       return Promise.resolve();
     }
-    this.schemaCheck ??= this.runSchemaCheck(mode);
+    if (!this.schemaCheck) {
+      const check = this.runSchemaCheck(mode).then((ran) => {
+        if (!ran && this.schemaCheck === check) {
+          this.schemaCheck = void 0;
+        }
+      });
+      this.schemaCheck = check;
+    }
     return this.schemaCheck;
   }
+  /**
+   * Runs the schema check in the background, unless it has already run, is running, or failed less
+   * than a backoff ago. Reads call it to retry a check that could not run.
+   */
+  checkSchemaInBackground(now) {
+    if (this.schemaCheck || now < this.schemaCheckRetryAt || this.schemaVerification() === "off") {
+      return;
+    }
+    runInBackground(this.platform, this.verifySchema(), () => {
+    });
+  }
+  /** @returns `false` if the check could not run (with `verify: 'warn'`; `throw` rejects). */
   async runSchemaCheck(mode) {
     var _a, _b;
     const { tableName, primaryKey } = this.dbGate.schema;
@@ -1043,8 +1081,10 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
         notifyChannel: this.sync.strategy === "listen" ? LILYPAD_DEFAULT_NOTIFY_CHANNEL : false
       });
       this.tableSchema = ((_a = result.tables[0]) == null ? void 0 : _a.schema) ?? this.tableSchema;
+      this.schemaCheckFailures = 0;
+      this.schemaCheckRetryAt = 0;
       if (result.ok) {
-        return;
+        return true;
       }
       if (mode === "throw") {
         throw new LilypadSchemaCheckError(subject, result.problems);
@@ -1055,10 +1095,13 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
       } else {
         console.warn(message);
       }
+      return true;
     } catch (error) {
       if (mode === "throw") {
         throw error;
       }
+      this.schemaCheckFailures++;
+      this.schemaCheckRetryAt = Date.now() + retryDelay(this.schemaCheckFailures, 1e3);
       libLog(
         this.logger,
         "warn",
@@ -1066,6 +1109,7 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
         `${subject}: could not check the database schema:`,
         error
       );
+      return false;
     }
   }
   // SYNCHRONIZATION
@@ -1150,8 +1194,12 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
    */
   syncBeforeRead() {
     const now = Date.now();
-    if (this.sync.strategy === "listen" && this.sync.connect === "lazy") {
-      if (this.listening || now < this.listenRetryAt) {
+    if (this.sync.strategy === "listen") {
+      if (this.listening) {
+        this.checkSchemaInBackground(now);
+        return void 0;
+      }
+      if (this.sync.connect !== "lazy" || now < this.listenRetryAt) {
         return void 0;
       }
       return this.startListening().catch((error) => {
@@ -1164,10 +1212,7 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCache_default {
     if (now - this.lastChangelogRead < this.sync.pollInterval || now < this.changelogRetryAt) {
       return void 0;
     }
-    if (!this.schemaCheck) {
-      runInBackground(this.platform, this.verifySchema(), () => {
-      });
-    }
+    this.checkSchemaInBackground(now);
     const reading = this.readChangelog();
     if (this.sync.poll === "background") {
       runInBackground(this.platform, reading, () => {

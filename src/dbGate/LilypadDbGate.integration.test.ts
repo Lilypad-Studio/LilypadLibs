@@ -638,6 +638,54 @@ describe('LilypadDbGate (integration)', () => {
       }
     });
 
+    it('should report a table whose triggers notify only some of INSERT, UPDATE and DELETE', async () => {
+      await admin`CREATE TABLE unwatched (id int PRIMARY KEY)`;
+      await admin`
+        CREATE TRIGGER unwatched_cache_events AFTER UPDATE ON unwatched
+        FOR EACH ROW EXECUTE FUNCTION notify_cache_events()
+      `;
+      try {
+        const result = await checkLilypadSchema(gate, {
+          tables: [{ table: 'unwatched', primaryKey: 'id' }],
+          changelog: false,
+          notifyChannel: 'cache_events',
+        });
+
+        expect(codes(result)).toEqual(['missing-notify-trigger']);
+        expect(result.problems[0]!.message).toContain('only on UPDATE');
+        expect(result.problems[0]!.message).toContain('not told about INSERT, DELETE');
+      } finally {
+        await admin`DROP TABLE unwatched`;
+      }
+    });
+
+    it('should accept notifications split across several triggers', async () => {
+      await admin`CREATE TABLE unwatched (id int PRIMARY KEY)`;
+      await admin`
+        CREATE TRIGGER unwatched_insert AFTER INSERT ON unwatched
+        FOR EACH ROW EXECUTE FUNCTION notify_cache_events()
+      `;
+      await admin`
+        CREATE TRIGGER unwatched_update_delete AFTER UPDATE OR DELETE ON unwatched
+        FOR EACH ROW EXECUTE FUNCTION notify_cache_events()
+      `;
+      await admin`
+        CREATE TRIGGER unwatched_truncate AFTER TRUNCATE ON unwatched
+        FOR EACH STATEMENT EXECUTE FUNCTION notify_cache_events()
+      `;
+      try {
+        const result = await checkLilypadSchema(gate, {
+          tables: [{ table: 'unwatched', primaryKey: 'id' }],
+          changelog: false,
+          notifyChannel: 'cache_events',
+        });
+
+        expect(result.ok).toBe(true);
+      } finally {
+        await admin`DROP TABLE unwatched`;
+      }
+    });
+
     it('should report a missing changelog', async () => {
       const result = await checkLilypadSchema(gate, {
         tables: [users],

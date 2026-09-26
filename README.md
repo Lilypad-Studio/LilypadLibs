@@ -14,6 +14,8 @@ Server-side TypeScript utilities from Lilypad Studios:
 
 **Running on Next.js or Vercel?** Read [Using Lilypad on Next.js and Vercel](docs/nextjs-vercel.md): it shows how to connect the library to the platform, and the recommended options for each module.
 
+**Want to know how it works inside?** Read [How @lilypad/libs works](docs/how-it-works.md): a top-down tour of the internals, from the general design down to single functions.
+
 **Contents:** [Installation](#installation) · [Quick start](#quick-start) · [Conventions](#conventions-used-across-the-library) · [Next.js / Vercel](docs/nextjs-vercel.md) · [Logger](#logger) · [LilypadCache](#lilypadcache) · [LilypadDbGate](#lilypaddbgate) · [LilypadDbCache](#lilypaddbcache) · [LilypadFlowControl](#lilypadflowcontrol) · [LilypadSerializer](#lilypadserializer) · [Singletons](#singletons) · [Troubleshooting](#troubleshooting) · [Contributing](#contributing)
 
 ## Installation
@@ -790,11 +792,11 @@ The library does not create the changelog or the triggers itself: without them, 
 
 | `verify` | When | If something is missing |
 | --- | --- | --- |
-| `'warn'` (default) | Once, when the cache first uses the database: before `LISTEN`, or with the first read of the changelog (which does not wait for it) | A warning on the logger (on `console.warn` without a logger), with the SQL that fixes it |
+| `'warn'` (default) | Once, when the cache first uses the database: before `LISTEN`, or with the first read of the changelog (which does not wait for it). If the check cannot run (e.g. the database is unreachable), a later read runs it again, after a backoff | A warning on the logger (on `console.warn` without a logger), with the SQL that fixes it |
 | `'throw'` | In `create`, which then queries the database whatever the strategy | `create` rejects with a `LilypadSchemaCheckError`, whose `problems` list what is missing |
 | `'off'` | Never | |
 
-With `changelog`, the check looks for the changelog table, its trigger function (installed by this version of the library) and the changelog trigger on the table, recording its primary key. With `listen`, it looks for a trigger of the table whose function calls `pg_notify('cache_events', ...)`: yours or the library's. If you send notifications another way, set `verify: 'off'`.
+With `changelog`, the check looks for the changelog table, its trigger function (installed by this version of the library) and the changelog trigger on the table, recording its primary key. With `listen`, it looks for triggers of the table whose function calls `pg_notify('cache_events', ...)` (yours or the library's), firing on each `INSERT`, `UPDATE` and `DELETE` row. If you send notifications another way, set `verify: 'off'`.
 
 The check also finds the schema of the table, so that with `listen` the cache ignores the notifications of a table of the same name in another schema. With `verify: 'off'`, it can do so only if `tableName` is qualified (`'app.accounts'`).
 
@@ -814,7 +816,7 @@ for (const { code, table, message, fix } of problems) {
 }
 ```
 
-`tables` gives the schema each table resolves to (`null` if it does not exist). The codes are `unsupported-version`, `missing-table`, `missing-changelog`, `outdated-changelog` (installed by an older version of the library: run `lilypadChangelogSql()` again), `missing-changelog-trigger` (missing, disabled or not on every `INSERT`, `UPDATE` and `DELETE`), `wrong-trigger-primary-key`, `missing-notify-trigger` and `missing-truncate-trigger` (`TRUNCATE` is not recorded, or, with `notifyChannel`, not notified: add it with `lilypadChangelogTriggerSql`, or handle `TG_OP = 'TRUNCATE'` in your own trigger).
+`tables` gives the schema each table resolves to (`null` if it does not exist). The codes are `unsupported-version`, `missing-table`, `missing-changelog`, `outdated-changelog` (installed by an older version of the library: run `lilypadChangelogSql()` again), `missing-changelog-trigger` (missing, disabled or not on every `INSERT`, `UPDATE` and `DELETE`), `wrong-trigger-primary-key`, `missing-notify-trigger` (no trigger notifies on the channel, or not on each of `INSERT`, `UPDATE` and `DELETE`) and `missing-truncate-trigger` (`TRUNCATE` is not recorded, or, with `notifyChannel`, not notified: add it with `lilypadChangelogTriggerSql`, or handle `TG_OP = 'TRUNCATE'` in your own trigger).
 
 #### Custom notification triggers and callbacks
 
@@ -995,4 +997,4 @@ npm run lint              # eslint --fix, modifies files
 npm run build
 ```
 
-The pre-commit hook runs the unit tests, the typecheck, the lint check and the build, then stages `dist/`. The CI (`.github/workflows/ci.yml`) runs the same checks on Node.js 20 and 22, checks that the committed `dist/` matches the sources, and runs the integration tests. See [CLAUDE.md](CLAUDE.md) for architecture notes.
+The pre-commit hook runs the unit tests, the typecheck, the lint check and the build, then stages `dist/`. The CI (`.github/workflows/ci.yml`) runs the same checks on Node.js 20 and 22, checks that the committed `dist/` matches the sources, and runs the integration tests. See [How @lilypad/libs works](docs/how-it-works.md) for a guided tour of the internals, and [CLAUDE.md](CLAUDE.md) for condensed architecture notes.

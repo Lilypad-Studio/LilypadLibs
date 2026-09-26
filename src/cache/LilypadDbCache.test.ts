@@ -1111,6 +1111,64 @@ describe('LilypadDbCache', () => {
       );
     });
 
+    it('should retry a check that could not run on a later read, after a backoff (listen)', async () => {
+      vi.useFakeTimers();
+      try {
+        schemaCheck.check.mockRejectedValueOnce(new Error('connection refused'));
+        schemaCheck.check.mockResolvedValue(missingTrigger);
+        const logger = createLogger();
+        const cache = await createCache({ logger });
+        expect(schemaCheck.check).toHaveBeenCalledOnce();
+
+        await cache.getOrFetch('1');
+        await vi.advanceTimersByTimeAsync(0);
+        expect(schemaCheck.check).toHaveBeenCalledOnce(); // within the backoff
+
+        await vi.advanceTimersByTimeAsync(1000);
+        await cache.getOrFetch('1');
+        await vi.advanceTimersByTimeAsync(0);
+        expect(schemaCheck.check).toHaveBeenCalledTimes(2);
+        expect(logger.warn).toHaveBeenLastCalledWith(
+          cache.name,
+          expect.stringContaining('has no changelog trigger')
+        );
+
+        // A check that ran is not repeated, even if it found problems
+        await vi.advanceTimersByTimeAsync(60_000);
+        await cache.getOrFetch('1');
+        await vi.advanceTimersByTimeAsync(0);
+        expect(schemaCheck.check).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('should retry a check that could not run on a later read, after a backoff (changelog)', async () => {
+      vi.useFakeTimers();
+      try {
+        schemaCheck.check.mockRejectedValueOnce(new Error('connection refused'));
+        const cache = await createCache({ sync: { strategy: 'changelog', pollInterval: 0 } });
+
+        await cache.getOrFetch('1');
+        await vi.advanceTimersByTimeAsync(0);
+        await cache.getOrFetch('1');
+        await vi.advanceTimersByTimeAsync(0);
+        expect(schemaCheck.check).toHaveBeenCalledOnce(); // within the backoff
+
+        await vi.advanceTimersByTimeAsync(1000);
+        await cache.getOrFetch('1');
+        await vi.advanceTimersByTimeAsync(0);
+        expect(schemaCheck.check).toHaveBeenCalledTimes(2);
+
+        await vi.advanceTimersByTimeAsync(60_000);
+        await cache.getOrFetch('1');
+        await vi.advanceTimersByTimeAsync(0);
+        expect(schemaCheck.check).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('should reject create with verify: throw, before connecting', async () => {
       schemaCheck.check.mockResolvedValue(missingTrigger);
 

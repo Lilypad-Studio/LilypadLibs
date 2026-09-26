@@ -223,7 +223,10 @@ export default class LilypadDbCache<
    * of the table in any schema are applied.
    */
   private tableSchema?: string;
+  /** The schema check, once it has run or while it runs; reset when it could not run. */
   private schemaCheck?: Promise<void>;
+  private schemaCheckFailures = 0;
+  private schemaCheckRetryAt = 0;
 
   /**
    * The keys of the rows of the table, as far as this instance knows. Each load of the table sets
@@ -382,7 +385,9 @@ export default class LilypadDbCache<
 
   /**
    * Checks once that the database has the triggers the sync strategy needs, and resolves the schema
-   * of the table. With `verify: 'warn'` it never rejects: problems and failures are logged.
+   * of the table. With `verify: 'warn'` it never rejects: problems and failures are logged. A check
+   * that could not run (e.g. the database was unreachable) is forgotten, so that a later read runs
+   * it again (see {@link checkSchemaInBackground}); a check that found problems is not repeated.
    *
    * @throws A `LilypadSchemaCheckError` with `verify: 'throw'`, or the error of the check.
    */
@@ -391,11 +396,32 @@ export default class LilypadDbCache<
     if (mode === 'off') {
       return Promise.resolve();
     }
-    this.schemaCheck ??= this.runSchemaCheck(mode);
+    if (!this.schemaCheck) {
+      // Reset in a callback, not in runSchemaCheck: the check must be registered before it can be forgotten
+      const check: Promise<void> = this.runSchemaCheck(mode).then((ran) => {
+        if (!ran && this.schemaCheck === check) {
+          this.schemaCheck = undefined;
+        }
+      });
+      this.schemaCheck = check;
+    }
     return this.schemaCheck;
   }
 
-  private async runSchemaCheck(mode: 'warn' | 'throw'): Promise<void> {
+  /**
+   * Runs the schema check in the background, unless it has already run, is running, or failed less
+   * than a backoff ago. Reads call it to retry a check that could not run.
+   */
+  private checkSchemaInBackground(now: number) {
+    if (this.schemaCheck || now < this.schemaCheckRetryAt || this.schemaVerification() === 'off') {
+      return;
+    }
+    // Only diagnostics: reads do not wait for it
+    runInBackground(this.platform, this.verifySchema(), () => {});
+  }
+
+  /** @returns `false` if the check could not run (with `verify: 'warn'`; `throw` rejects). */
+  private async runSchemaCheck(mode: 'warn' | 'throw'): Promise<boolean> {
     const { tableName, primaryKey } = this.dbGate.schema;
     const subject = `LilypadDbCache "${tableName}" (sync: ${this.sync.strategy})`;
     try {
@@ -405,8 +431,10 @@ export default class LilypadDbCache<
         notifyChannel: this.sync.strategy === 'listen' ? LILYPAD_DEFAULT_NOTIFY_CHANNEL : false,
       });
       this.tableSchema = result.tables[0]?.schema ?? this.tableSchema;
+      this.schemaCheckFailures = 0;
+      this.schemaCheckRetryAt = 0;
       if (result.ok) {
-        return;
+        return true;
       }
       if (mode === 'throw') {
         throw new LilypadSchemaCheckError(subject, result.problems);
@@ -418,10 +446,13 @@ export default class LilypadDbCache<
         // A missing trigger would otherwise go unnoticed: the cache just stays stale
         console.warn(message);
       }
+      return true;
     } catch (error) {
       if (mode === 'throw') {
         throw error;
       }
+      this.schemaCheckFailures++;
+      this.schemaCheckRetryAt = Date.now() + retryDelay(this.schemaCheckFailures, 1000);
       libLog(
         this.logger,
         'warn',
@@ -429,6 +460,7 @@ export default class LilypadDbCache<
         `${subject}: could not check the database schema:`,
         error
       );
+      return false;
     }
   }
 
@@ -523,8 +555,13 @@ export default class LilypadDbCache<
    */
   protected syncBeforeRead(): Promise<void> | undefined {
     const now = Date.now();
-    if (this.sync.strategy === 'listen' && this.sync.connect === 'lazy') {
-      if (this.listening || now < this.listenRetryAt) {
+    if (this.sync.strategy === 'listen') {
+      if (this.listening) {
+        // Starting LISTEN ran the check: this only retries one that could not run
+        this.checkSchemaInBackground(now);
+        return undefined;
+      }
+      if (this.sync.connect !== 'lazy' || now < this.listenRetryAt) {
         return undefined;
       }
       return this.startListening().catch((error: unknown) => {
@@ -537,10 +574,7 @@ export default class LilypadDbCache<
     if (now - this.lastChangelogRead < this.sync.pollInterval || now < this.changelogRetryAt) {
       return undefined;
     }
-    if (!this.schemaCheck) {
-      // Only diagnostics: reads do not wait for it
-      runInBackground(this.platform, this.verifySchema(), () => {});
-    }
+    this.checkSchemaInBackground(now);
     const reading = this.readChangelog();
     if (this.sync.poll === 'background') {
       runInBackground(this.platform, reading, () => {});

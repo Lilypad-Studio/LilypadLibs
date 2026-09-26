@@ -420,7 +420,10 @@ declare class LilypadDbCache<K extends LilypadCacheKey & V[PK], V extends object
      * of the table in any schema are applied.
      */
     private tableSchema?;
+    /** The schema check, once it has run or while it runs; reset when it could not run. */
     private schemaCheck?;
+    private schemaCheckFailures;
+    private schemaCheckRetryAt;
     /**
      * The keys of the rows of the table, as far as this instance knows. Each load of the table sets
      * them; the writes, the fetches and the changes keep them up to date. `getAll` returns these
@@ -470,11 +473,19 @@ declare class LilypadDbCache<K extends LilypadCacheKey & V[PK], V extends object
     private schemaVerification;
     /**
      * Checks once that the database has the triggers the sync strategy needs, and resolves the schema
-     * of the table. With `verify: 'warn'` it never rejects: problems and failures are logged.
+     * of the table. With `verify: 'warn'` it never rejects: problems and failures are logged. A check
+     * that could not run (e.g. the database was unreachable) is forgotten, so that a later read runs
+     * it again (see {@link checkSchemaInBackground}); a check that found problems is not repeated.
      *
      * @throws A `LilypadSchemaCheckError` with `verify: 'throw'`, or the error of the check.
      */
     private verifySchema;
+    /**
+     * Runs the schema check in the background, unless it has already run, is running, or failed less
+     * than a backoff ago. Reads call it to retry a check that could not run.
+     */
+    private checkSchemaInBackground;
+    /** @returns `false` if the check could not run (with `verify: 'warn'`; `throw` rejects). */
     private runSchemaCheck;
     /**
      * Registers the listener once, after the schema check (which resolves the schema of the table,
@@ -837,7 +848,10 @@ type LilypadSchemaProblemCode =
  * row trigger, so the caches would keep the removed rows.
  */
  | 'missing-truncate-trigger'
-/** No trigger of the table sends notifications on the channel. */
+/**
+ * No enabled trigger of the table sends notifications on the channel, or not for each of INSERT,
+ * UPDATE and DELETE.
+ */
  | 'missing-notify-trigger';
 type LilypadSchemaProblem = {
     code: LilypadSchemaProblemCode;

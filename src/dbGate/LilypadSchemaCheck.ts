@@ -44,7 +44,10 @@ export type LilypadSchemaProblemCode =
    * row trigger, so the caches would keep the removed rows.
    */
   | 'missing-truncate-trigger'
-  /** No trigger of the table sends notifications on the channel. */
+  /**
+   * No enabled trigger of the table sends notifications on the channel, or not for each of INSERT,
+   * UPDATE and DELETE.
+   */
   | 'missing-notify-trigger';
 
 export type LilypadSchemaProblem = {
@@ -96,8 +99,13 @@ const TRIGGER_TYPE_INSERT = 4;
 const TRIGGER_TYPE_DELETE = 8;
 const TRIGGER_TYPE_UPDATE = 16;
 const TRIGGER_TYPE_TRUNCATE = 32;
-const CHANGELOG_TRIGGER_TYPE =
-  TRIGGER_TYPE_ROW | TRIGGER_TYPE_INSERT | TRIGGER_TYPE_DELETE | TRIGGER_TYPE_UPDATE;
+const ROW_EVENTS = TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE | TRIGGER_TYPE_DELETE;
+const ROW_EVENT_NAMES: [number, string][] = [
+  [TRIGGER_TYPE_INSERT, 'INSERT'],
+  [TRIGGER_TYPE_UPDATE, 'UPDATE'],
+  [TRIGGER_TYPE_DELETE, 'DELETE'],
+];
+const CHANGELOG_TRIGGER_TYPE = TRIGGER_TYPE_ROW | ROW_EVENTS;
 
 type TriggerInfo = {
   /** Whether it calls the changelog trigger function. */
@@ -276,20 +284,34 @@ export async function checkLilypadSchema(
         `pg_notify\\s*\\(\\s*'${escapeRegExp(notifyChannel.replace(/'/g, "''"))}'`,
         'i'
       );
-      const notifying = triggers.some(
-        (trigger) =>
-          trigger.enabled &&
-          (trigger.type & TRIGGER_TYPE_ROW) !== 0 &&
-          notifies.test(trigger.source)
-      );
+      // The row events notified by any enabled trigger: they may be split across several triggers
+      const notifiedEvents = triggers
+        .filter(
+          (trigger) =>
+            trigger.enabled &&
+            (trigger.type & TRIGGER_TYPE_ROW) !== 0 &&
+            notifies.test(trigger.source)
+        )
+        .reduce((events, trigger) => events | (trigger.type & ROW_EVENTS), 0);
       const fix =
         lilypadChangelogSql({ table: customChangelogTable, notifyChannel }) +
         lilypadChangelogTriggerSql({ table, primaryKey, changelogTable: customChangelogTable });
-      if (!notifying) {
+      if (notifiedEvents === 0) {
         problems.push({
           code: 'missing-notify-trigger',
           table,
           message: `No trigger of "${table}" sends notifications on the "${notifyChannel}" channel: the cache is not told about changes made elsewhere.`,
+          fix,
+        });
+      } else if (notifiedEvents !== ROW_EVENTS) {
+        const names = (events: number) =>
+          ROW_EVENT_NAMES.filter(([bit]) => (events & bit) !== 0)
+            .map(([, name]) => name)
+            .join(', ');
+        problems.push({
+          code: 'missing-notify-trigger',
+          table,
+          message: `The triggers of "${table}" send notifications on the "${notifyChannel}" channel only on ${names(notifiedEvents)}: the cache is not told about ${names(ROW_EVENTS & ~notifiedEvents)} made elsewhere.`,
           fix,
         });
       } else if (
