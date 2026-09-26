@@ -35,6 +35,7 @@ function facts(overrides: Partial<LilypadSchemaFacts> = {}): LilypadSchemaFacts 
       hasSchemaColumn: true,
       hasFunction: true,
       functionComment: 'lilypad-changelog:4',
+      functionSource: null,
     },
     tables: [{ schema: 'public', triggers: [changelogRow, changelogTruncate] }],
     ...overrides,
@@ -78,6 +79,7 @@ describe('evaluateLilypadSchema', () => {
           hasSchemaColumn: false,
           hasFunction: false,
           functionComment: null,
+          functionSource: null,
         },
       }),
       changelogOptions
@@ -98,6 +100,57 @@ describe('evaluateLilypadSchema', () => {
     );
 
     expect(codes(result)).toEqual(['outdated-changelog']);
+  });
+
+  describe('notifications of the changelog fix', () => {
+    const missing = facts({
+      changelog: {
+        hasTable: false,
+        hasSchemaColumn: false,
+        hasFunction: false,
+        functionComment: null,
+        functionSource: null,
+      },
+    });
+    const outdated = (functionSource: string) =>
+      facts({
+        changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:3', functionSource },
+      });
+    const fix = (result: ReturnType<typeof evaluateLilypadSchema>) => result.problems[0]!.fix!;
+
+    it('should create a changelog that sends no notification when they are not checked', () => {
+      const result = evaluateLilypadSchema(missing, changelogOptions);
+
+      expect(fix(result)).toContain('COMMENT ON FUNCTION');
+      expect(fix(result)).not.toContain('pg_notify');
+    });
+
+    it('should create a changelog that notifies on the checked channel', () => {
+      const result = evaluateLilypadSchema(missing, {
+        ...changelogOptions,
+        notifyChannel: 'cache_events',
+      });
+
+      expect(codes(result)).toContain('missing-changelog');
+      expect(fix(result)).toContain("pg_notify('cache_events'");
+    });
+
+    it('should keep an outdated changelog without notifications', () => {
+      const result = evaluateLilypadSchema(
+        outdated('BEGIN INSERT INTO changes; END'),
+        changelogOptions
+      );
+
+      expect(codes(result)).toEqual(['outdated-changelog']);
+      expect(fix(result)).not.toContain('pg_notify');
+    });
+
+    it('should keep the channel an outdated changelog notifies on', () => {
+      const result = evaluateLilypadSchema(outdated(notifySource("app''events")), changelogOptions);
+
+      expect(codes(result)).toEqual(['outdated-changelog']);
+      expect(fix(result)).toContain("pg_notify('app''events'");
+    });
   });
 
   it('should report a missing table', () => {

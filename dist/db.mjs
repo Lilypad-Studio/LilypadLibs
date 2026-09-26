@@ -1208,6 +1208,15 @@ function firesOnTruncate(trigger) {
 function escapeRegExp(value) {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+/**
+* The channel on which an installed changelog function sends notifications (its first
+* `pg_notify`, in the `TRUNCATE` branch, where the literal is not escaped for `format()`), or
+* `false` if it sends none.
+*/
+function installedNotifyChannel(source) {
+	const match = source ? /pg_notify\s*\(\s*'((?:[^']|'')*)'/i.exec(source) : null;
+	return match?.[1] !== void 0 ? match[1].replace(/''/g, "'") : false;
+}
 /** The changelog table and trigger function the options designate, or `undefined` if not checked. */
 function changelogTarget(options) {
 	if (options.changelog === false) return;
@@ -1237,7 +1246,10 @@ async function readLilypadSchemaFacts(gate, options) {
           AND attname = 'table_schema' AND NOT attisdropped
       ) AS has_schema_column,
       to_regprocedure(${changelog.functionSignature}::text) IS NOT NULL AS has_function,
-      obj_description(to_regprocedure(${changelog.functionSignature}::text), 'pg_proc') AS function_comment
+      obj_description(to_regprocedure(${changelog.functionSignature}::text), 'pg_proc') AS function_comment,
+      (
+        SELECT prosrc FROM pg_proc WHERE oid = to_regprocedure(${changelog.functionSignature}::text)
+      ) AS function_source
   `;
 	if (!database) throw new Error("Reading the database settings returned no row.");
 	const tables = [];
@@ -1276,7 +1288,8 @@ async function readLilypadSchemaFacts(gate, options) {
 			hasTable: database.has_changelog_table,
 			hasSchemaColumn: database.has_schema_column,
 			hasFunction: database.has_function,
-			functionComment: database.function_comment
+			functionComment: database.function_comment,
+			functionSource: database.function_source
 		},
 		tables
 	};
@@ -1306,7 +1319,10 @@ function evaluateLilypadSchema(facts, options) {
 		message: `PostgreSQL ${facts.version} is too old: the changelog needs PostgreSQL 13 or later.`
 	});
 	if (changelog) {
-		const changelogSql = lilypadChangelogSql({ table: changelog.custom });
+		const changelogSql = lilypadChangelogSql({
+			table: changelog.custom,
+			notifyChannel: notifyChannel !== false ? notifyChannel : installedNotifyChannel(facts.changelog.functionSource)
+		});
 		const { hasTable, hasSchemaColumn, hasFunction, functionComment } = facts.changelog;
 		if (!hasTable || !hasFunction) problems.push({
 			code: "missing-changelog",

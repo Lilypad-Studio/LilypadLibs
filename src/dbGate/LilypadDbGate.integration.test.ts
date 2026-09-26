@@ -826,6 +826,21 @@ describe('LilypadDbGate (integration)', () => {
 
         expect(codes(result)).toEqual(['outdated-changelog']);
         expect(result.problems[0]!.message).toContain('version 2');
+        // Installed with notifyChannel: false, so the fix sends no notification either
+        expect(result.problems[0]!.fix).not.toContain('pg_notify');
+      } finally {
+        await admin.unsafe(lilypadChangelogSql({ notifyChannel: false }));
+      }
+    });
+
+    it('should keep the notifications of an outdated changelog in its fix', async () => {
+      await admin.unsafe(lilypadChangelogSql({ notifyChannel: "app'events" }));
+      await admin`COMMENT ON FUNCTION lilypad_cache_changes_record() IS 'lilypad-changelog:3'`;
+      try {
+        const result = await checkLilypadSchema(gate, { tables: [] });
+
+        expect(codes(result)).toEqual(['outdated-changelog']);
+        expect(result.problems[0]!.fix).toBe(lilypadChangelogSql({ notifyChannel: "app'events" }));
       } finally {
         await admin.unsafe(lilypadChangelogSql({ notifyChannel: false }));
       }

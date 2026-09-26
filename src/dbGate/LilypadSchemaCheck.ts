@@ -24,6 +24,9 @@ export type LilypadSchemaCheckOptions = {
    * Checks that each table has a trigger that sends notifications on this channel (the `listen`
    * strategy). The trigger may be the changelog trigger or one of your own: its function must call
    * `pg_notify` with the channel name as a literal. Defaults to `false`: not checked.
+   *
+   * The SQL that fixes a missing or outdated changelog notifies on this channel, or, with `false`,
+   * on the channel the installed trigger function notifies on (none if it sends none).
    */
   notifyChannel?: string | false;
 };
@@ -172,6 +175,16 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/**
+ * The channel on which an installed changelog function sends notifications (its first
+ * `pg_notify`, in the `TRUNCATE` branch, where the literal is not escaped for `format()`), or
+ * `false` if it sends none.
+ */
+function installedNotifyChannel(source: string | null): string | false {
+  const match = source ? /pg_notify\s*\(\s*'((?:[^']|'')*)'/i.exec(source) : null;
+  return match?.[1] !== undefined ? match[1].replace(/''/g, "'") : false;
+}
+
 /** What `checkLilypadSchema` reads from the catalogs, before it evaluates it. */
 export type LilypadSchemaFacts = {
   /** `server_version_num`, e.g. `160002`. */
@@ -181,6 +194,8 @@ export type LilypadSchemaFacts = {
     hasSchemaColumn: boolean;
     hasFunction: boolean;
     functionComment: string | null;
+    /** The source of the trigger function (`null` if it does not exist). */
+    functionSource: string | null;
   };
   /** For each table of the options, in order: `schema` is `null` if the table does not exist. */
   tables: { schema: string | null; triggers: LilypadTriggerInfo[] }[];
@@ -224,7 +239,10 @@ export async function readLilypadSchemaFacts(
           AND attname = 'table_schema' AND NOT attisdropped
       ) AS has_schema_column,
       to_regprocedure(${changelog.functionSignature}::text) IS NOT NULL AS has_function,
-      obj_description(to_regprocedure(${changelog.functionSignature}::text), 'pg_proc') AS function_comment
+      obj_description(to_regprocedure(${changelog.functionSignature}::text), 'pg_proc') AS function_comment,
+      (
+        SELECT prosrc FROM pg_proc WHERE oid = to_regprocedure(${changelog.functionSignature}::text)
+      ) AS function_source
   `;
   if (!database) {
     throw new Error('Reading the database settings returned no row.');
@@ -271,6 +289,7 @@ export async function readLilypadSchemaFacts(
       hasSchemaColumn: database.has_schema_column as boolean,
       hasFunction: database.has_function as boolean,
       functionComment: database.function_comment as string | null,
+      functionSource: database.function_source as string | null,
     },
     tables,
   };
@@ -312,7 +331,16 @@ export function evaluateLilypadSchema(
   }
 
   if (changelog) {
-    const changelogSql = lilypadChangelogSql({ table: changelog.custom });
+    // The fix notifies on the channel the check requires, or else on the one the installed function
+    // notifies on: a changelog installed with `notifyChannel: false` must not start notifying, nor
+    // one shared with `listen` caches stop
+    const changelogSql = lilypadChangelogSql({
+      table: changelog.custom,
+      notifyChannel:
+        notifyChannel !== false
+          ? notifyChannel
+          : installedNotifyChannel(facts.changelog.functionSource),
+    });
     const { hasTable, hasSchemaColumn, hasFunction, functionComment } = facts.changelog;
     if (!hasTable || !hasFunction) {
       problems.push({

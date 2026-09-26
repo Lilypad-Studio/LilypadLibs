@@ -843,7 +843,7 @@ for (const { code, table, message, fix } of problems) {
 }
 ```
 
-`tables` gives the schema each table resolves to (`null` if it does not exist). The codes are `unsupported-version`, `missing-table`, `missing-changelog`, `outdated-changelog` (installed by an older version of the library: run `lilypadChangelogSql()` again), `missing-changelog-trigger` (missing, disabled or not on every `INSERT`, `UPDATE` and `DELETE`), `wrong-trigger-primary-key`, `missing-notify-trigger` (no trigger notifies on the channel, or not on each of `INSERT`, `UPDATE` and `DELETE`) and `missing-truncate-trigger` (`TRUNCATE` is not recorded, or, with `notifyChannel`, not notified: add it with `lilypadChangelogTriggerSql`, or handle `TG_OP = 'TRUNCATE'` in your own trigger).
+`tables` gives the schema each table resolves to (`null` if it does not exist). The codes are `unsupported-version`, `missing-table`, `missing-changelog`, `outdated-changelog` (installed by an older version of the library: run `lilypadChangelogSql()` again, with the same `notifyChannel`; the suggested SQL keeps the channel of the installed function, or the one the check requires), `missing-changelog-trigger` (missing, disabled or not on every `INSERT`, `UPDATE` and `DELETE`), `wrong-trigger-primary-key`, `missing-notify-trigger` (no trigger notifies on the channel, or not on each of `INSERT`, `UPDATE` and `DELETE`) and `missing-truncate-trigger` (`TRUNCATE` is not recorded, or, with `notifyChannel`, not notified: add it with `lilypadChangelogTriggerSql`, or handle `TG_OP = 'TRUNCATE'` in your own trigger).
 
 #### Custom notification triggers and callbacks
 
