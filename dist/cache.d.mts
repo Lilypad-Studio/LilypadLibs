@@ -1,5 +1,5 @@
-import { h as LilypadCacheKey, r as LilypadCacheCore, i as LilypadCacheOptions, g as LilypadCachedValueType, p as LilypadCacheValueFn, f as LilypadCacheGetOptions, l as LilypadCacheResult } from './LilypadCacheCore-CwC0ToZN.mjs';
-export { a as LilypadCacheBulkSyncOptions, L as LilypadCacheCooldownError, b as LilypadCacheEntry, c as LilypadCacheEntryOrigin, d as LilypadCacheErrorContext, e as LilypadCacheErrorOptions, j as LilypadCachePeek, k as LilypadCacheRead, m as LilypadCacheSharedOptions, n as LilypadCacheStatus, o as LilypadCacheSyncFn, q as LilypadSharedCodec } from './LilypadCacheCore-CwC0ToZN.mjs';
+import { g as LilypadCacheKey, p as LilypadCacheCore, h as LilypadCacheOptions, f as LilypadCachedValueType, n as LilypadCacheValueFn, e as LilypadCacheGetOptions, j as LilypadCacheResult } from './LilypadCacheCore-ATnJp_rl.mjs';
+export { a as LilypadCacheBulkSyncOptions, L as LilypadCacheCooldownError, b as LilypadCacheEntryOrigin, c as LilypadCacheErrorContext, d as LilypadCacheErrorOptions, i as LilypadCachePeek, k as LilypadCacheSharedOptions, l as LilypadCacheStatus, m as LilypadCacheSyncFn, o as LilypadSharedCodec } from './LilypadCacheCore-ATnJp_rl.mjs';
 import './LilypadLibLogger-DPBngeVh.mjs';
 import './platform.mjs';
 import './flow.mjs';
@@ -90,22 +90,25 @@ declare class LilypadCache<K extends LilypadCacheKey, V> extends LilypadCacheCor
         throwOnError?: boolean;
     }): Promise<boolean>;
     /**
-     * Returns the fresh values of `keys`, or, without keys, every fresh entry (keyed by the key it
-     * was stored with).
+     * Returns the fresh values of `keys`, keyed as given. Missing and expired keys are left out.
      *
      * @throws If the cache is disposed.
      */
-    bulkGet(options?: {
-        keys?: K[];
-    }): Map<K, LilypadCachedValueType<V>>;
+    getMany(keys: Iterable<K>): Map<K, LilypadCachedValueType<V>>;
     /**
-     * Like `bulkGet`, after a `bulkSync` (unless `doSync` is false).
+     * Returns every fresh entry, keyed by the key it was stored with. It is the whole source only
+     * while the last `bulkSync` is fresh: use `getAll` to sync first.
      *
      * @throws If the cache is disposed.
      */
-    bulkAsyncGet(options?: {
-        keys?: K[];
-        doSync?: boolean;
+    entries(): Map<K, LilypadCachedValueType<V>>;
+    /**
+     * Like `entries()`, after a `bulkSync` (unless `sync` is false).
+     *
+     * @throws If the cache is disposed.
+     */
+    getAll(options?: {
+        sync?: boolean;
     }): Promise<Map<K, LilypadCachedValueType<V>>>;
     /**
      * Forces the next `bulkSync` call to fetch fresh data, even if a sync is currently running (that

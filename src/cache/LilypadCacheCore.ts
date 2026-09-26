@@ -79,6 +79,11 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
   private cleanupIntervalId?: ReturnType<typeof setInterval> & { unref?: () => void };
 
   protected protectedKeys: Set<string> = new Set();
+  /**
+   * With `maxEntries`, the stored keys that can be evicted (not protected), least recently used
+   * first. The protected keys stay out of it, so that an eviction never scans them.
+   */
+  private evictionOrder = new Set<string>();
 
   protected logger?: LilypadLibLogger;
   protected platform?: LilypadPlatform;
@@ -92,8 +97,8 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
   protected readonly bulkSyncFlowControl: LilypadFlowControl;
 
   /**
-   * When the last bulk sync stops counting as fresh. `bulkGet({})` returns every entry of the
-   * source only while it is fresh.
+   * When the last bulk sync stops counting as fresh. `entries()` returns every entry of the source
+   * only while it is fresh.
    */
   protected bulkSyncExpirationTime: number = 0;
   protected bulkSyncFn?: LilypadCacheSyncFn<K, V>;
@@ -174,11 +179,9 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
     }
 
     this.flowControl = new LilypadFlowControl({
-      logger: this.logger,
       timeout: options.fetchTimeout ?? DEFAULT_FETCH_TIMEOUT,
     });
     this.bulkSyncFlowControl = new LilypadFlowControl({
-      logger: this.logger,
       timeout: options.bulkSync?.timeout ?? DEFAULT_BULK_SYNC_TIMEOUT,
     });
 
@@ -216,7 +219,8 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
       ticket,
       startedAt,
       store: (key, value, ttl) => this.setIfNewer(key, value, ttl, ticket, startedAt),
-      storeFetched: (key, value, ttl) => this.storeFetched(key, value, ttl, ticket, startedAt),
+      storeFetched: (key, value, ttl, staleWhileRevalidate) =>
+        this.storeFetched(key, value, ttl, ticket, startedAt, staleWhileRevalidate),
     };
   }
 
@@ -251,16 +255,13 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
       return false;
     }
     const normalizedKey = this.normalizeKey(entry.key);
-    if (this.maxEntries !== undefined) {
-      // Re-inserted at the end: the Map order is the order of use
-      this.store.delete(normalizedKey);
-    }
     this.store.set(normalizedKey, entry);
+    this.markUsed(normalizedKey);
     // The ticket of the entry now orders the reads of the key
     this.fences.delete(normalizedKey);
     if (newValue) {
       this.onValueStored(entry);
-      // Otherwise bulkGet would leave the key out while the bulk sync still counts as fresh
+      // Otherwise entries() would leave the key out while the bulk sync still counts as fresh
       if (entry.expirationTime < this.bulkSyncExpirationTime) {
         this.forceNextBulkSync();
       }
@@ -285,36 +286,37 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
       this.fences.set(normalizedKey, Math.max(entry.ticket, this.fences.get(normalizedKey) ?? 0));
     }
     this.store.delete(normalizedKey);
+    this.evictionOrder.delete(normalizedKey);
   }
 
   /**
    * Removes the least recently used entries beyond `maxEntries`, sparing protected keys. An
-   * eviction forces the next bulk sync, since `bulkGet` would no longer return the evicted keys.
+   * eviction forces the next bulk sync, since `entries()` would no longer return the evicted keys.
    */
   private evictOverflow() {
-    if (this.maxEntries === undefined || this.store.size <= this.maxEntries) {
+    if (this.maxEntries === undefined) {
       return;
     }
     let evicted = false;
-    for (const [normalizedKey, entry] of this.store) {
-      if (this.store.size <= this.maxEntries) {
+    while (this.store.size > this.maxEntries) {
+      const oldest = this.evictionOrder.values().next();
+      if (oldest.done) {
+        // Only protected keys are left
         break;
       }
-      if (!this.protectedKeys.has(normalizedKey)) {
-        this.dropEntry(normalizedKey, entry);
-        evicted = true;
-      }
+      this.dropEntry(oldest.value, this.store.get(oldest.value)!);
+      evicted = true;
     }
     if (evicted) {
       this.forceNextBulkSync();
     }
   }
 
-  /** Marks an entry as recently used, for `maxEntries`. */
-  private touch(normalizedKey: string, entry: LilypadCacheEntry<K, V>) {
-    if (this.maxEntries !== undefined) {
-      this.store.delete(normalizedKey);
-      this.store.set(normalizedKey, entry);
+  /** Marks a stored key as the most recently used one, for `maxEntries`. */
+  private markUsed(normalizedKey: string) {
+    if (this.maxEntries !== undefined && !this.protectedKeys.has(normalizedKey)) {
+      this.evictionOrder.delete(normalizedKey);
+      this.evictionOrder.add(normalizedKey);
     }
   }
 
@@ -401,7 +403,8 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
     value: LilypadCachedValueType<V>,
     ttl: number | undefined,
     ticket: number,
-    fetchedAt: number
+    fetchedAt: number,
+    staleWhileRevalidate?: number
   ): boolean {
     const normalizedKey = this.normalizeKey(key);
     if (this.failures.delete(normalizedKey) && this.failureCooldown > 0) {
@@ -412,7 +415,7 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
     }
     const entry = this.store.get(normalizedKey);
     if (entry) {
-      this.writeShared(entry);
+      this.writeShared(entry, staleWhileRevalidate);
     }
     return true;
   }
@@ -431,7 +434,7 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
     const normalizedKey = this.normalizeKey(key);
     const entry = this.store.get(normalizedKey);
     if (entry && !isStale(entry)) {
-      this.touch(normalizedKey, entry);
+      this.markUsed(normalizedKey);
       return entry.value;
     }
     if (options.removeExpired) {
@@ -562,7 +565,7 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
     if (!options.skipCache) {
       const local = this.store.get(normalizedKey);
       if (local && !isStale(local)) {
-        this.touch(normalizedKey, local);
+        this.markUsed(normalizedKey);
         return this.freshHit(key, local, 'L1-HIT', valueFn, options);
       }
 
@@ -635,32 +638,30 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
     options: LilypadCacheGetOptions<K, V>
   ): Promise<LilypadCachedValueType<V>> {
     const normalizedKey = this.normalizeKey(key);
-    return this.flowControl.executeFn<LilypadCachedValueType<V>>({
-      functionIdentifier: this.getOrSetFlightId(normalizedKey),
-      consumerIdentifier: '',
-      timeout: options.timeout,
-      // Runs once per fetch, while the fallback is chosen per caller in errorReturn
-      errorFn: (error) => {
-        libLog(
-          this.logger,
-          'error',
-          this.name,
-          `Error fetching cache key "${normalizedKey}": `,
-          error
-        );
-        this.recordFailure(normalizedKey);
-        throw error;
-      },
-      fn: async (signal) => {
-        const read = this.beginRead();
-        const value = await valueFn(signal);
-        // After a timeout the caller already got an error/fallback: a late result is not cached
-        if (!signal.aborted) {
-          read.storeFetched(key, value, options.ttl);
-        }
-        return value;
-      },
-    });
+    return this.flowControl.singleFlight(this.getOrSetFlightId(normalizedKey), () =>
+      this.flowControl
+        .executeWithTimeout(async (signal) => {
+          const read = this.beginRead();
+          const value = await valueFn(signal);
+          // After a timeout the caller already got an error/fallback: a late result is not cached
+          if (!signal.aborted) {
+            read.storeFetched(key, value, options.ttl, options.staleWhileRevalidate);
+          }
+          return value;
+        }, options.timeout)
+        .catch((error: unknown) => {
+          // Once per fetch, while the fallback is chosen per caller in errorReturn
+          libLog(
+            this.logger,
+            'error',
+            this.name,
+            `Error fetching cache key "${normalizedKey}": `,
+            error
+          );
+          this.recordFailure(normalizedKey);
+          throw error;
+        })
+    );
   }
 
   /**
@@ -741,12 +742,16 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
     });
   }
 
-  /** Writes an entry to the shared level in the background, kept through the stale window. */
-  private writeShared(entry: LilypadCacheEntry<K, V>) {
+  /**
+   * Writes an entry to the shared level in the background, kept through the stale window: the
+   * cache's, or a longer one asked by the read that fetched it.
+   */
+  private writeShared(entry: LilypadCacheEntry<K, V>, staleWhileRevalidate: number = 0) {
+    const staleWindow = Math.max(staleWhileRevalidate, this.defaultStaleWhileRevalidate);
     this.shared?.write(
       this.normalizeKey(entry.key),
       { value: entry.value, fetchedAt: entry.fetchedAt, expiresAt: entry.expirationTime },
-      entry.expirationTime + this.defaultStaleWhileRevalidate - Date.now()
+      entry.expirationTime + staleWindow - Date.now()
     );
   }
 
@@ -810,15 +815,14 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
       return false;
     }
     try {
-      return await this.bulkSyncFlowControl.executeFn<boolean>({
-        functionIdentifier: `LilypadCache-bulkSync`,
-        consumerIdentifier: '',
-        errorFn: (error) => {
-          libLog(this.logger, 'error', this.name, 'Error during bulk sync: ', error);
-          throw error;
-        },
-        fn: async (signal) => this.runBulkSync(bulkSyncFn, signal),
-      });
+      return await this.bulkSyncFlowControl.singleFlight('LilypadCache-bulkSync', () =>
+        this.bulkSyncFlowControl
+          .executeWithTimeout((signal) => this.runBulkSync(bulkSyncFn, signal))
+          .catch((error: unknown) => {
+            libLog(this.logger, 'error', this.name, 'Error during bulk sync: ', error);
+            throw error;
+          })
+      );
     } catch (error) {
       if (options.throwOnError) {
         throw error;
@@ -844,8 +848,30 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
       libLog(this.logger, 'warn', this.name, 'Bulk sync function returned no data');
       return false;
     }
+    // Taken before the entries are written, which expire at the earliest `defaultTtl` after it
+    const storedAt = Date.now();
+    this.replaceEntries(read, data);
 
-    const incoming = new Map<string, [K, LilypadCachedValueType<V>]>();
+    // An invalidation that happened while the sync was running may not be reflected in its data
+    if (this.bulkSyncInvalidationTicket < read.ticket) {
+      // Never beyond the expiration of the entries: `entries()` would then return an incomplete
+      // (or empty) set while the sync still counts as fresh
+      this.bulkSyncExpirationTime = storedAt + Math.min(this.bulkSyncTtl, this.defaultTtl);
+    }
+    return true;
+  }
+
+  /**
+   * Replaces the content of the cache with a complete load of the source, started with `read`:
+   * the loaded entries are stored (unless written since), the others are removed (protected keys
+   * are only expired), and the reads of missing keys started before the load are discarded. The
+   * entries written after the load started are kept: they are newer than its data.
+   */
+  protected replaceEntries(
+    read: LilypadCacheRead<K, V>,
+    data: Iterable<readonly [K, LilypadCachedValueType<V>]>
+  ) {
+    const incoming = new Map<string, readonly [K, LilypadCachedValueType<V>]>();
     for (const [key, value] of data) {
       incoming.set(this.normalizeKey(key), [key, value]);
     }
@@ -854,12 +880,10 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
         this.logger,
         'warn',
         this.name,
-        `Bulk sync returned ${incoming.size} entries, more than maxEntries (${this.maxEntries}): bulkGet cannot return them all.`
+        `Loaded ${incoming.size} entries, more than maxEntries (${this.maxEntries}): the cache cannot hold them all.`
       );
     }
-    // Taken before the entries are written, which expire at the earliest `defaultTtl` after it
-    const storedAt = Date.now();
-    // A copy of the entries: expiring an entry re-inserts it, with maxEntries
+    // A copy of the entries, which the loop removes or rewrites
     for (const [normalizedKey, entry] of [...this.store]) {
       // Entries written after the sync started are newer than its data; incoming keys are overwritten below
       if (entry.ticket > read.ticket || incoming.has(normalizedKey)) {
@@ -873,14 +897,6 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
       read.store(key, value);
     }
     this.ticketFloor = Math.max(this.ticketFloor, read.ticket);
-
-    // An invalidation that happened while the sync was running may not be reflected in its data
-    if (this.bulkSyncInvalidationTicket < read.ticket) {
-      // Never beyond the expiration of the entries: `bulkGet` would then return an incomplete
-      // (or empty) set while the sync still counts as fresh
-      this.bulkSyncExpirationTime = storedAt + Math.min(this.bulkSyncTtl, this.defaultTtl);
-    }
-    return true;
   }
 
   /** Forces the next bulk sync to fetch fresh data, even if a sync is currently running. */
@@ -890,23 +906,31 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
   }
 
   /**
-   * Returns the fresh values of `keys`, or, without keys, every fresh entry (keyed by the key it was
-   * stored with, e.g. a number stays a number). Missing and expired keys are left out.
+   * Returns the fresh values of `keys`, keyed as given. Missing and expired keys are left out.
    *
    * @throws If the cache is disposed.
    */
-  protected bulkGet(options: { keys?: K[] } = {}): Map<K, LilypadCachedValueType<V>> {
+  protected getMany(keys: Iterable<K>): Map<K, LilypadCachedValueType<V>> {
     this.assertNotDisposed();
     const result = new Map<K, LilypadCachedValueType<V>>();
-    if (options.keys) {
-      for (const key of options.keys) {
-        const value = this.get(key);
-        if (value !== undefined) {
-          result.set(key, value);
-        }
+    for (const key of keys) {
+      const value = this.get(key);
+      if (value !== undefined) {
+        result.set(key, value);
       }
-      return result;
     }
+    return result;
+  }
+
+  /**
+   * Returns every fresh entry, keyed by the key it was stored with (e.g. a number stays a number).
+   * Expired entries are left out.
+   *
+   * @throws If the cache is disposed.
+   */
+  protected entries(): Map<K, LilypadCachedValueType<V>> {
+    this.assertNotDisposed();
+    const result = new Map<K, LilypadCachedValueType<V>>();
     for (const entry of this.store.values()) {
       if (!isStale(entry)) {
         result.set(entry.key, entry.value);
@@ -916,21 +940,17 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
   }
 
   /**
-   * Like `bulkGet`, after a `bulkSync` (unless `doSync` is false).
+   * Like `entries()`, after a `bulkSync` (unless `sync` is false).
    *
    * @throws If the cache is disposed.
    */
-  protected async bulkAsyncGet({
-    keys,
-    doSync = true,
-  }: {
-    keys?: K[];
-    doSync?: boolean;
-  } = {}): Promise<Map<K, LilypadCachedValueType<V>>> {
-    if (doSync) {
+  protected async getAllEntries({ sync = true }: { sync?: boolean } = {}): Promise<
+    Map<K, LilypadCachedValueType<V>>
+  > {
+    if (sync) {
       await this.bulkSync();
     }
-    return this.bulkGet({ keys });
+    return this.entries();
   }
 
   /**
@@ -955,7 +975,10 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
   addProtectedKeys(keys: K[]): this {
     this.assertNotDisposed();
     for (const key of keys) {
-      this.protectedKeys.add(this.normalizeKey(key));
+      const normalizedKey = this.normalizeKey(key);
+      this.protectedKeys.add(normalizedKey);
+      // Never evicted
+      this.evictionOrder.delete(normalizedKey);
     }
     return this;
   }
@@ -967,7 +990,10 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
   removeProtectedKeys(keys: K[]): this {
     this.assertNotDisposed();
     for (const key of keys) {
-      this.protectedKeys.delete(this.normalizeKey(key));
+      const normalizedKey = this.normalizeKey(key);
+      if (this.protectedKeys.delete(normalizedKey) && this.store.has(normalizedKey)) {
+        this.markUsed(normalizedKey);
+      }
     }
     return this;
   }
@@ -983,7 +1009,7 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
    * `platform.onInvalidate` receives a `manual` event.
    *
    * @param options.invalidateBulkSync - If true (default), forces the next bulk sync. With false,
-   * `bulkGet({})` leaves the key out until the next bulk sync.
+   * `entries()` leaves the key out until the next bulk sync.
    * @throws If the cache is disposed.
    */
   invalidate(key: K, { invalidateBulkSync = true }: { invalidateBulkSync?: boolean } = {}) {
@@ -1097,7 +1123,7 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
     for (const normalizedKey of [...this.store.keys()]) {
       this.removeEntry(normalizedKey, force);
     }
-    // Otherwise a bulk sync still fresh would let bulkGet return the emptied cache as complete
+    // Otherwise a bulk sync still fresh would let entries() return the emptied cache as complete
     this.forceNextBulkSync();
   }
 

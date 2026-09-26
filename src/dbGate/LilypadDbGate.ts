@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { LilypadListenHeartbeat } from '@/dbGate/LilypadListenHeartbeat';
+import { LilypadBackoff } from '@/internal/LilypadBackoff';
 import { assertNumberOption } from '@/internal/LilypadValidation';
 import { libLog, type LilypadLibLogger } from '@/logger/LilypadLibLogger';
 import {
@@ -10,7 +11,8 @@ import {
 import postgres from 'postgres';
 
 type ListenerCallback = (payload: unknown) => void | Promise<void>;
-export type ListenerCallbackIdentifier = {
+/** A callback registered on a channel with `addListener`. */
+export type LilypadDbListener = {
   channel: string;
   callbackId: string;
   callback: ListenerCallback;
@@ -25,13 +27,15 @@ export type LilypadDbGateOptions = {
   connectionString: string;
   /** The connection used for `LISTEN`, if not `connectionString` (e.g. a direct, unpooled one). */
   listenerConnectionString?: string;
-  listen?: ListenerCallbackIdentifier[];
+  listen?: LilypadDbListener[];
   /**
    * Maximum duration of each query of the main client, in milliseconds (Postgres
-   * `statement_timeout`): the server cancels longer queries, so that slow queries whose callers
-   * have already timed out do not pile up.
+   * `statement_timeout`): the server cancels longer queries. A caller that times out (e.g. after
+   * the `fetchTimeout` of a cache) does not stop its query: without this bound, slow queries would
+   * keep the connections of the pool busy, and the queries behind them would wait. Defaults to
+   * 30 seconds; `false` leaves the setting of the database.
    */
-  statementTimeout?: number;
+  statementTimeout?: number | false;
   /** Connection pool of the main client. Every duration is in milliseconds. */
   pool?: LilypadDbPoolOptions;
   /**
@@ -83,7 +87,20 @@ function toPostgresPoolOptions(pool: LilypadDbPoolOptions | undefined) {
 
 type LilypadDbGateOptionsWithSingleton = LilypadDbGateOptions & LilypadSingletonAble;
 
-export type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'json' | 'array';
+/**
+ * The type of a column. For a primary key it tells `LilypadDbCache` how to read the ids that
+ * notifications and the changelog carry as text: `number` converts them to numbers; `string` and
+ * `bigint` keep them as strings. Declare `bigint`/`bigserial` columns as `bigint`: postgres.js
+ * returns them as strings, so their keys and the row property are strings (type them as such).
+ */
+export type LilypadDbColumnType =
+  | 'string'
+  | 'number'
+  | 'bigint'
+  | 'boolean'
+  | 'date'
+  | 'json'
+  | 'array';
 
 /**
  * @typeParam T - The row type.
@@ -93,7 +110,11 @@ export type LilypadDbColumnType = 'string' | 'number' | 'boolean' | 'date' | 'js
 export type LilypadDbSchema<T, PK extends keyof T = keyof T> = {
   tableName: string;
   primaryKey: PK;
-  primaryKeyShouldAutoDetermine?: boolean;
+  /**
+   * The database generates the primary key (e.g. `serial`, `identity`, a default): inserts leave
+   * it out, even when the data has one, and return the generated one.
+   */
+  generatedPrimaryKey?: boolean;
   /**
    * Transforms the data of inserts and updates. Its result replaces the data: omitting a property
    * removes it from the write.
@@ -155,6 +176,9 @@ export class LilypadDbNotFoundError extends Error {
 const SELECT_ALL_BATCH_SIZE = 1000;
 /** Primary keys per query of `selectFromTableByPrimaryKeys`. */
 const PRIMARY_KEYS_BATCH_SIZE = 1000;
+const DEFAULT_STATEMENT_TIMEOUT = 30_000;
+/** How long `close` waits for the queries still running, in ms, by default. */
+const DEFAULT_CLOSE_TIMEOUT = 5_000;
 /** The column that carries the transaction id in the results of writes. */
 const XID_COLUMN = '__lilypad_xid';
 const DEFAULT_LISTEN_HEARTBEAT = 15_000;
@@ -169,7 +193,7 @@ export function lilypadMissingPrimaryKeyError(
 }
 
 type ChannelListener = {
-  callbacks: Map<string, ListenerCallbackIdentifier>;
+  callbacks: Map<string, LilypadDbListener>;
   /** Resolves, once LISTEN is active on the channel, with the function that stops listening. */
   ready: Promise<() => Promise<void>>;
   /** Becomes true on the first LISTEN: later ones are reconnections. */
@@ -201,18 +225,24 @@ export class LilypadDbGate {
   private readonly heartbeat?: LilypadListenHeartbeat;
   private readonly heartbeatChannel = `lilypad_heartbeat_${this.id.slice(-36).replace(/-/g, '')}`;
   private heartbeatStop?: Promise<() => Promise<void>>;
+  /** A heartbeat that could not start is retried after a backoff (see `isListenHealthy`). */
+  private readonly heartbeatBackoff = new LilypadBackoff(() => 1000);
+  private closing?: Promise<void>;
 
   private constructor(options: LilypadDbGateOptions) {
-    assertNumberOption('LilypadDbGate', 'statementTimeout', options.statementTimeout, 'positive');
+    if (options.statementTimeout !== false) {
+      assertNumberOption('LilypadDbGate', 'statementTimeout', options.statementTimeout, 'positive');
+    }
     if (options.listenHeartbeat !== false) {
       assertNumberOption('LilypadDbGate', 'listenHeartbeat', options.listenHeartbeat, 'positive');
     }
     this.logger = options.logger;
+    const statementTimeout = resolveStatementTimeout(options);
     this.sql = postgres(options.connectionString, {
       prepare: false,
       ...toPostgresPoolOptions(options.pool),
-      ...(options.statementTimeout !== undefined && {
-        connection: { statement_timeout: options.statementTimeout },
+      ...(statementTimeout !== undefined && {
+        connection: { statement_timeout: statementTimeout },
       }),
     });
     const listenerConnectionString = options.listenerConnectionString;
@@ -252,7 +282,7 @@ export class LilypadDbGate {
             JSON.stringify([
               options.connectionString,
               options.listenerConnectionString,
-              options.statementTimeout,
+              resolveStatementTimeout(options),
               options.pool,
               options.listenHeartbeat,
             ])
@@ -329,11 +359,11 @@ export class LilypadDbGate {
       : { ...data };
 
     const primaryKeyValue = writeData[schema.primaryKey];
-    const primaryKeyRequired = operation === 'update' || !schema.primaryKeyShouldAutoDetermine;
+    const primaryKeyRequired = operation === 'update' || !schema.generatedPrimaryKey;
     if (primaryKeyRequired && (primaryKeyValue === undefined || primaryKeyValue === null)) {
       throw lilypadMissingPrimaryKeyError(schema, operation);
     }
-    if (schema.primaryKeyShouldAutoDetermine) {
+    if (schema.generatedPrimaryKey) {
       delete writeData[schema.primaryKey];
     }
 
@@ -358,6 +388,7 @@ export class LilypadDbGate {
     schema: LilypadDbSchema<T, PK>,
     options: { signal?: AbortSignal } = {}
   ): Promise<T[]> {
+    this.assertOpen();
     const { signal } = options;
     signal?.throwIfAborted();
     const typedResults: T[] = [];
@@ -387,6 +418,7 @@ export class LilypadDbGate {
     schema: LilypadDbSchema<T, PK>,
     primaryKeyValues: T[PK][]
   ): Promise<T[]> {
+    this.assertOpen();
     const typedRows: T[] = [];
     for (let start = 0; start < primaryKeyValues.length; start += PRIMARY_KEYS_BATCH_SIZE) {
       const batch = primaryKeyValues.slice(start, start + PRIMARY_KEYS_BATCH_SIZE);
@@ -408,6 +440,7 @@ export class LilypadDbGate {
     schema: LilypadDbSchema<T, PK>,
     primaryKeyValue: T[PK]
   ): Promise<T | null> {
+    this.assertOpen();
     const results = await this.sql`
       SELECT ${this.selectedColumns(schema)} FROM ${this.sql(schema.tableName)}
       WHERE ${this.sql(String(schema.primaryKey))} = ${primaryKeyValue as string}
@@ -428,6 +461,7 @@ export class LilypadDbGate {
     schema: LilypadDbSchema<T, PK>,
     data: LilypadDbInsertData<T, PK>
   ): Promise<LilypadDbWriteResult<T>> {
+    this.assertOpen();
     const { data: insertData, columns } = this.prepareWrite(schema, data as Partial<T>, 'insert');
 
     const results = await this.sql`
@@ -462,6 +496,7 @@ export class LilypadDbGate {
     schema: LilypadDbSchema<T, PK>,
     data: LilypadDbUpdateData<T, PK>
   ): Promise<LilypadDbWriteResult<T>> {
+    this.assertOpen();
     const {
       data: updateData,
       columns,
@@ -489,6 +524,7 @@ export class LilypadDbGate {
     schema: LilypadDbSchema<T, PK>,
     primaryKeyValue: T[PK]
   ): Promise<LilypadDbDeleteResult> {
+    this.assertOpen();
     const results = await this.sql`
       DELETE FROM ${this.sql(schema.tableName)}
       WHERE ${this.sql(String(schema.primaryKey))} = ${primaryKeyValue as string}
@@ -597,7 +633,8 @@ export class LilypadDbGate {
    * @returns A promise that resolves once LISTEN is active on the channel.
    * @throws If LISTEN fails; in that case the callback is not registered.
    */
-  async addListener(identifier: ListenerCallbackIdentifier) {
+  async addListener(identifier: LilypadDbListener) {
+    this.assertOpen();
     const { channel, callbackId } = identifier;
     libLog(
       this.logger,
@@ -649,22 +686,31 @@ export class LilypadDbGate {
     return true;
   }
 
+  /** Starts the heartbeat, unless it is running or starting. It never rejects. */
   private async startHeartbeat() {
     const heartbeat = this.heartbeat;
-    if (!heartbeat || this.heartbeatStop) {
+    if (!heartbeat || this.heartbeatStop || this.closing) {
       return;
     }
-    this.heartbeatStop = this.listenClient()
+    const starting: Promise<() => Promise<void>> = this.listenClient()
       .listen(this.heartbeatChannel, () => heartbeat.beat())
       .then((meta) => {
-        heartbeat.start();
+        // Unless stopHeartbeat (or close) ran meanwhile: it awaits this promise to UNLISTEN
+        if (this.heartbeatStop === starting) {
+          heartbeat.start();
+        }
         return () => meta.unlisten();
       });
+    this.heartbeatStop = starting;
     try {
-      await this.heartbeatStop;
+      await starting;
+      this.heartbeatBackoff.succeed();
     } catch (error) {
-      // Without a heartbeat, isListenHealthy() stays false: the caches just trust LISTEN less
-      this.heartbeatStop = undefined;
+      // Until it starts, isListenHealthy() stays false: the caches just trust LISTEN less
+      if (this.heartbeatStop === starting) {
+        this.heartbeatStop = undefined;
+      }
+      this.heartbeatBackoff.fail();
       libLog(this.logger, 'warn', this.id, 'Could not start the LISTEN heartbeat:', error);
     }
   }
@@ -691,16 +737,53 @@ export class LilypadDbGate {
     if (!this.heartbeat) {
       return this.listeners.size > 0;
     }
+    if (!this.heartbeatStop && this.listeners.size > 0 && this.heartbeatBackoff.ready()) {
+      // The heartbeat could not start: retried here, since the caches ask this before trusting
+      void this.startHeartbeat();
+    }
     return this.heartbeat.healthy();
   }
 
-  async close() {
+  /** Whether `close` was called: the gate then rejects every query and listener. */
+  get closed(): boolean {
+    return this.closing !== undefined;
+  }
+
+  private assertOpen() {
+    if (this.closing) {
+      throw new Error(`LilypadDbGate "${this.id}" is closed.`);
+    }
+  }
+
+  /**
+   * Closes the connections, after the queries still running (for at most `timeout` ms; the ones
+   * still running then are cancelled). Later queries and listeners are rejected. Calling it again
+   * returns the same promise.
+   *
+   * @param options.timeout - How long to wait for the running queries, in ms. Defaults to 5 s.
+   */
+  close(options: { timeout?: number } = {}): Promise<void> {
+    this.closing ??= this.closeConnections(options.timeout ?? DEFAULT_CLOSE_TIMEOUT);
+    return this.closing;
+  }
+
+  private async closeConnections(timeout: number) {
+    assertNumberOption('LilypadDbGate', 'close timeout', timeout, 'non-negative');
     this.listeners.clear();
     this.heartbeat?.stop();
     this.heartbeatStop = undefined;
     this.releaseSingleton();
 
-    await this.listenerClient?.end();
-    await this.sql.end();
+    // postgres.js takes seconds
+    await Promise.all([
+      this.listenerClient?.end({ timeout: timeout / 1000 }),
+      this.sql.end({ timeout: timeout / 1000 }),
+    ]);
   }
+}
+
+function resolveStatementTimeout(options: LilypadDbGateOptions): number | undefined {
+  return options.statementTimeout === false
+    ? undefined
+    : (options.statementTimeout ?? DEFAULT_STATEMENT_TIMEOUT);
 }

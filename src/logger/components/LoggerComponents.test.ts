@@ -2,7 +2,12 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { LilypadConsoleLogger } from './ConsoleLogger';
 import { LilypadDiscordLogger } from './DiscordLogger';
 import { LilypadJsonConsoleLogger } from './JsonConsoleLogger';
-import { safeJson } from '../LilypadLoggerComponent';
+import { safeJson, type LilypadLogRecord } from '../LilypadLoggerComponent';
+
+/** A record as the logger builds it. */
+function record<T extends string>(type: T, message: string): LilypadLogRecord<T> {
+  return { type, message, parts: [message], timestamp: new Date() };
+}
 
 describe('LilypadConsoleLogger', () => {
   afterEach(() => {
@@ -22,7 +27,7 @@ describe('LilypadConsoleLogger', () => {
       error: vi.spyOn(console, 'error').mockImplementation(() => {}),
     };
 
-    await new LilypadConsoleLogger<string>().output(type, 'message');
+    await new LilypadConsoleLogger<string>().write(record(type, 'message'));
 
     for (const [name, spy] of Object.entries(spies)) {
       expect(spy).toHaveBeenCalledTimes(name === method ? 1 : 0);
@@ -53,7 +58,7 @@ describe('LilypadDiscordLogger', () => {
   it('should post the formatted message to the webhook with mentions disabled', async () => {
     const fetchMock = stubFetch();
 
-    await new LilypadDiscordLogger<'error'>(webhookUrl).output('error', 'hello @everyone');
+    await new LilypadDiscordLogger<'error'>(webhookUrl).write(record('error', 'hello @everyone'));
 
     expect(fetchMock).toHaveBeenCalledWith(
       webhookUrl,
@@ -67,7 +72,7 @@ describe('LilypadDiscordLogger', () => {
   it('should truncate messages to the Discord limit of 2000 characters', async () => {
     const fetchMock = stubFetch();
 
-    await new LilypadDiscordLogger<'info'>(webhookUrl).output('info', 'x'.repeat(5000));
+    await new LilypadDiscordLogger<'info'>(webhookUrl).write(record('info', 'x'.repeat(5000)));
 
     expect(sentBody(fetchMock).content).toHaveLength(2000);
   });
@@ -76,7 +81,7 @@ describe('LilypadDiscordLogger', () => {
     stubFetch({ ok: false, status: 500, statusText: 'Internal Server Error' });
 
     await expect(
-      new LilypadDiscordLogger<'info'>(webhookUrl).output('info', 'message')
+      new LilypadDiscordLogger<'info'>(webhookUrl).write(record('info', 'message'))
     ).rejects.toThrow('Discord webhook request failed with status 500 Internal Server Error');
   });
 
@@ -86,9 +91,9 @@ describe('LilypadDiscordLogger', () => {
     const logger = new LilypadDiscordLogger<'info'>(webhookUrl);
 
     const sent = [
-      logger.output('info', 'first'),
-      logger.output('info', 'second'),
-      logger.output('info', 'third'),
+      logger.write(record('info', 'first')),
+      logger.write(record('info', 'second')),
+      logger.write(record('info', 'third')),
     ];
     await vi.advanceTimersByTimeAsync(0);
     expect(fetchMock).toHaveBeenCalledOnce();
@@ -118,7 +123,7 @@ describe('LilypadDiscordLogger', () => {
       .mockResolvedValueOnce({ ok: true, status: 204 });
     vi.stubGlobal('fetch', fetchMock);
 
-    const sent = new LilypadDiscordLogger<'info'>(webhookUrl).output('info', 'message');
+    const sent = new LilypadDiscordLogger<'info'>(webhookUrl).write(record('info', 'message'));
     await vi.advanceTimersByTimeAsync(1999);
     expect(fetchMock).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(1);
@@ -131,11 +136,51 @@ describe('LilypadDiscordLogger', () => {
     vi.useFakeTimers();
     stubFetch({ ok: false, status: 429, statusText: 'Too Many Requests' });
 
-    const sent = new LilypadDiscordLogger<'info'>(webhookUrl).output('info', 'message');
+    const sent = new LilypadDiscordLogger<'info'>(webhookUrl).write(record('info', 'message'));
     const assertion = expect(sent).rejects.toThrow('status 429');
     await vi.advanceTimersByTimeAsync(1000);
 
     await assertion;
+  });
+
+  it('should fail without waiting when Discord asks to retry after more than 30 seconds', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: false,
+      status: 429,
+      statusText: 'Too Many Requests',
+      headers: new Headers({ 'retry-after': '3600' }),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(
+      new LilypadDiscordLogger<'info'>(webhookUrl).write(record('info', 'message'))
+    ).rejects.toThrow('status 429');
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('should reject one message per failed batch, with the number of messages lost', async () => {
+    vi.useFakeTimers();
+    stubFetch({ ok: false, status: 500, statusText: 'Internal Server Error' });
+    const logger = new LilypadDiscordLogger<'info'>(webhookUrl);
+    const first = logger.write(record('info', 'first'));
+    first.catch(() => {});
+    await vi.advanceTimersByTimeAsync(0);
+
+    const batch = ['second', 'third', 'fourth'].map((message) =>
+      logger.write(record('info', message))
+    );
+    const settled = Promise.allSettled(batch);
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect((await settled).map((result) => result.status)).toEqual([
+      'fulfilled',
+      'fulfilled',
+      'rejected',
+    ]);
+    await expect(batch[2]).rejects.toThrow('3 log messages could not be sent to Discord');
+    await expect(batch[2]).rejects.toMatchObject({
+      cause: expect.objectContaining({ message: expect.stringContaining('status 500') }),
+    });
   });
 
   it('should reject when the request times out', async () => {
@@ -147,7 +192,7 @@ describe('LilypadDiscordLogger', () => {
     );
 
     await expect(
-      new LilypadDiscordLogger<'info'>(webhookUrl).output('info', 'message')
+      new LilypadDiscordLogger<'info'>(webhookUrl).write(record('info', 'message'))
     ).rejects.toThrow('timeout');
   });
 });
@@ -162,16 +207,13 @@ describe('LilypadJsonConsoleLogger', () => {
     const component = new LilypadJsonConsoleLogger<'error'>();
     const error = new Error('boom');
 
-    await component.output('error', 'Failed Error: boom', {
-      logger: {} as never,
-      record: {
-        type: 'error',
-        message: 'Failed Error: boom',
-        parts: ['Failed', error],
-        timestamp: new Date('2026-01-02T03:04:05.000Z'),
-        loggerName: 'billing',
-        context: { requestId: 'req-1' },
-      },
+    await component.write({
+      type: 'error',
+      message: 'Failed Error: boom',
+      parts: ['Failed', error],
+      timestamp: new Date('2026-01-02T03:04:05.000Z'),
+      loggerName: 'billing',
+      context: { requestId: 'req-1' },
     });
 
     expect(log).toHaveBeenCalledOnce();
@@ -188,15 +230,9 @@ describe('LilypadJsonConsoleLogger', () => {
   it('should not let context fields override the record fields', async () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
 
-    await new LilypadJsonConsoleLogger<'info'>().output('info', 'message', {
-      logger: {} as never,
-      record: {
-        type: 'info',
-        message: 'message',
-        parts: ['message'],
-        timestamp: new Date(),
-        context: { level: 'spoofed', msg: 'spoofed' },
-      },
+    await new LilypadJsonConsoleLogger<'info'>().write({
+      ...record('info', 'message'),
+      context: { level: 'spoofed', msg: 'spoofed' },
     });
 
     expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({
@@ -221,7 +257,9 @@ describe('LilypadDiscordLogger queue limit', () => {
     const logger = new LilypadDiscordLogger<'info'>(webhookUrl, { maxQueueSize: 2 });
 
     // The first message is sent at once; the others wait for the next request
-    const sent = ['m1', 'm2', 'm3', 'm4', 'm5'].map((message) => logger.output('info', message));
+    const sent = ['m1', 'm2', 'm3', 'm4', 'm5'].map((message) =>
+      logger.write(record('info', message))
+    );
     await vi.advanceTimersByTimeAsync(1000);
     await Promise.all(sent);
 
@@ -242,7 +280,7 @@ describe('LilypadDiscordLogger queue limit', () => {
       vi.fn(async () => ({ ok: true, status: 204, body: { cancel } }) as unknown as Response)
     );
 
-    await new LilypadDiscordLogger<'info'>(webhookUrl).output('info', 'message');
+    await new LilypadDiscordLogger<'info'>(webhookUrl).write(record('info', 'message'));
 
     expect(cancel).toHaveBeenCalledOnce();
   });

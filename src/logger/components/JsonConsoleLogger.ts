@@ -23,7 +23,7 @@ import {
  * ```
  */
 export class LilypadJsonConsoleLogger<T extends string> extends LilypadLoggerComponent<T> {
-  protected override async sendRecord(record: LilypadLogRecord<T>): Promise<void> {
+  write(record: LilypadLogRecord<T>): Promise<void> {
     const errors = record.parts.filter((part): part is Error => part instanceof Error);
     const line = safeJson({
       ...record.context,
@@ -39,11 +39,7 @@ export class LilypadJsonConsoleLogger<T extends string> extends LilypadLoggerCom
         })),
       }),
     });
-    await this.send(line, record.type);
-  }
-
-  protected send(message: string, type: T): Promise<void> {
-    writeToConsole(message, type);
+    writeToConsole(line, record.type);
     return Promise.resolve();
   }
 }

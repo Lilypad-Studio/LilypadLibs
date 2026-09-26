@@ -4,7 +4,7 @@ import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
 import type { LilypadLibLogLevel } from '@/logger/LilypadLibLogger';
 import type { LilypadInvalidationEvent, LilypadPlatform } from '@/platform/LilypadPlatform';
 
-export type LilypadDbCacheDefaultNotificationPayload = {
+export type LilypadDbNotification = {
   /**
    * The schema of the table. Notifications without it match the table in any schema (the triggers
    * of version 1 of the changelog, and custom triggers that do not send it).
@@ -53,7 +53,7 @@ export type LilypadDbCacheListenSync = LilypadDbCacheTrustedSyncOptions & {
    */
   applyChanges?: boolean;
   /** Called with every notification of the table, after the cache has applied it. */
-  onNotification?: (payload: LilypadDbCacheDefaultNotificationPayload) => Promise<void> | void;
+  onNotification?: (payload: LilypadDbNotification) => Promise<void> | void;
 };
 
 export type LilypadDbCacheChangelogSync = LilypadDbCacheTrustedSyncOptions & {

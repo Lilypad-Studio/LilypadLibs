@@ -127,22 +127,22 @@ describe('LilypadFlowControl', () => {
         withFakeTimers(() =>
           flowControl.executeWithRetries({
             executionFn: () => Promise.reject(new Error('fail')),
-            errorFn: undefined,
             backOffTime: () => 20,
           })
         )
       ).rejects.toThrow('fail');
     });
 
-    it('should use errorFn when provided and retries exhausted', async () => {
+    it('should reject with the error of the last attempt', async () => {
       flowControl = new LilypadFlowControl({ retries: 1 });
-      const result = await withFakeTimers(() =>
-        flowControl.executeWithRetries({
-          executionFn: () => Promise.reject(new Error('fail')),
-          errorFn: () => 'fallback',
-        })
-      );
-      expect(result).toBe('fallback');
+      let attempts = 0;
+      await expect(
+        withFakeTimers(() =>
+          flowControl.executeWithRetries({
+            executionFn: () => Promise.reject(new Error(`fail ${++attempts}`)),
+          })
+        )
+      ).rejects.toThrow('fail 2');
     });
 
     it('should use custom backoff time', async () => {
@@ -159,7 +159,6 @@ describe('LilypadFlowControl', () => {
             }
             return Promise.resolve('success');
           },
-          errorFn: undefined,
           backOffTime: backoffSpy,
         })
       );
@@ -171,18 +170,18 @@ describe('LilypadFlowControl', () => {
   describe('rateLimit', () => {
     it('should allow execution when rate limit is not set', () => {
       flowControl = new LilypadFlowControl();
-      expect(() => flowControl.rateLimit('user1', 'func1')).not.toThrow();
+      expect(() => flowControl.rateLimit('user1#func1')).not.toThrow();
     });
 
     it('should allow first execution when rate limit is set', () => {
       flowControl = new LilypadFlowControl({ rate: 1000 });
-      expect(() => flowControl.rateLimit('user1', 'func1')).not.toThrow();
+      expect(() => flowControl.rateLimit('user1#func1')).not.toThrow();
     });
 
     it('should reject execution when rate limit is exceeded', () => {
       flowControl = new LilypadFlowControl({ rate: 1000 });
-      flowControl.rateLimit('user1', 'func1');
-      expect(() => flowControl.rateLimit('user1', 'func1')).toThrow(
+      flowControl.rateLimit('user1#func1');
+      expect(() => flowControl.rateLimit('user1#func1')).toThrow(
         'Rate limit exceeded for user1#func1'
       );
     });
@@ -190,35 +189,35 @@ describe('LilypadFlowControl', () => {
     it('should allow execution after rate limit expires', () => {
       vi.useFakeTimers();
       flowControl = new LilypadFlowControl({ rate: 100 });
-      flowControl.rateLimit('user1', 'func1');
+      flowControl.rateLimit('user1#func1');
       vi.advanceTimersByTime(150);
-      expect(() => flowControl.rateLimit('user1', 'func1')).not.toThrow();
+      expect(() => flowControl.rateLimit('user1#func1')).not.toThrow();
     });
 
     it('should track rate limits per consumer/function pair', () => {
       flowControl = new LilypadFlowControl({ rate: 1000 });
-      flowControl.rateLimit('user1', 'func1');
-      expect(() => flowControl.rateLimit('user2', 'func1')).not.toThrow();
+      flowControl.rateLimit('user1#func1');
+      expect(() => flowControl.rateLimit('user2#func1')).not.toThrow();
     });
 
     it('should prune expired rate limit entries once the map grows large', () => {
       vi.useFakeTimers();
       flowControl = new LilypadFlowControl({ rate: 100 });
       for (let i = 0; i < 1000; i++) {
-        flowControl.rateLimit(`user${i}`, 'func1');
+        flowControl.rateLimit(`user${i}#func1`);
       }
       vi.advanceTimersByTime(150);
-      flowControl.rateLimit('newUser', 'func1');
+      flowControl.rateLimit('newUser#func1');
       expect(flowControl['rateMap'].size).toBe(1);
     });
 
     it('should not prune entries that are still limiting', () => {
       flowControl = new LilypadFlowControl({ rate: 60000 });
       for (let i = 0; i <= 1000; i++) {
-        flowControl.rateLimit(`user${i}`, 'func1');
+        flowControl.rateLimit(`user${i}#func1`);
       }
       expect(flowControl['rateMap'].size).toBe(1001);
-      expect(() => flowControl.rateLimit('user0', 'func1')).toThrow('Rate limit exceeded');
+      expect(() => flowControl.rateLimit('user0#func1')).toThrow('Rate limit exceeded');
     });
   });
 
@@ -328,29 +327,20 @@ describe('LilypadFlowControl', () => {
       expect(attempts).toBe(2);
     });
 
-    it('should use errorFn when provided', async () => {
-      flowControl = new LilypadFlowControl({ retries: 1 });
-      const result = await withFakeTimers(() =>
+    it('should reject every caller of a shared execution, each handling the error on its own', async () => {
+      const run = () =>
         flowControl.executeFn({
           functionIdentifier: 'func1',
-          consumerIdentifier: 'user1',
           fn: () => Promise.reject(new Error('fail')),
-          errorFn: () => 'fallback',
-        })
-      );
+        });
 
-      expect(result).toBe('fallback');
-    });
+      const [first, second] = await Promise.all([
+        run().catch(() => 'first fallback'),
+        run().catch(() => 'second fallback'),
+      ]);
 
-    it('should use errorFn without retries', async () => {
-      const result = await flowControl.executeFn({
-        functionIdentifier: 'func1',
-        consumerIdentifier: 'user1',
-        fn: () => Promise.reject(new Error('fail')),
-        errorFn: () => 'fallback',
-      });
-
-      expect(result).toBe('fallback');
+      expect(first).toBe('first fallback');
+      expect(second).toBe('second fallback');
     });
 
     it('should clear single-flight map after execution', async () => {
@@ -477,7 +467,7 @@ describe('LilypadFlowControl', () => {
       ).rejects.toThrow('Operation timed out');
     });
 
-    it('should propagate the error when errorFn rethrows it', async () => {
+    it('should propagate the error once the retries are exhausted', async () => {
       flowControl = new LilypadFlowControl({ retries: 1 });
 
       await expect(
@@ -486,27 +476,18 @@ describe('LilypadFlowControl', () => {
             functionIdentifier: 'func1',
             consumerIdentifier: 'user1',
             fn: () => Promise.reject(new Error('fail')),
-            errorFn: (error) => {
-              throw error;
-            },
           })
         )
       ).rejects.toThrow('fail');
     });
 
-    it('should resolve with undefined when errorFn handles the error of a void execution', async () => {
-      const voidFlowControl = new LilypadFlowControl();
-      const errorFn = vi.fn();
+    it('should rate limit the function alone without a consumer', async () => {
+      flowControl = new LilypadFlowControl({ rate: 1000 });
+      await flowControl.executeFn({ functionIdentifier: 'func1', fn: async () => 'ok' });
 
       await expect(
-        voidFlowControl.executeFn({
-          functionIdentifier: 'func1',
-          consumerIdentifier: 'user1',
-          fn: () => Promise.reject(new Error('fail')),
-          errorFn,
-        })
-      ).resolves.toBeUndefined();
-      expect(errorFn).toHaveBeenCalledWith(expect.any(Error));
+        flowControl.executeFn({ functionIdentifier: 'func1', fn: async () => 'ok' })
+      ).rejects.toThrow('Rate limit exceeded for func1');
     });
 
     it('should allow different consumers for different function identifier', async () => {
@@ -622,6 +603,42 @@ describe('LilypadFlowControl', () => {
   });
 });
 
+describe('LilypadFlowControl singleFlight', () => {
+  it('should share an execution between concurrent calls of the same key', async () => {
+    const flowControl = new LilypadFlowControl();
+    const fn = vi.fn(async () => 'value');
+
+    const results = await Promise.all([
+      flowControl.singleFlight('key', fn),
+      flowControl.singleFlight('key', fn),
+    ]);
+
+    expect(results).toEqual(['value', 'value']);
+    expect(fn).toHaveBeenCalledOnce();
+  });
+
+  it('should register the execution synchronously, and forget it once settled', async () => {
+    const flowControl = new LilypadFlowControl();
+
+    const flight = flowControl.singleFlight('key', async () => 'value');
+
+    expect(flowControl.isInFlight('key')).toBe(true);
+    await flight;
+    expect(flowControl.isInFlight('key')).toBe(false);
+  });
+
+  it('should reject, without registering it, a function that throws synchronously', async () => {
+    const flowControl = new LilypadFlowControl();
+
+    const flight = flowControl.singleFlight('key', () => {
+      throw new Error('sync');
+    });
+
+    expect(flowControl.isInFlight('key')).toBe(false);
+    await expect(flight).rejects.toThrow('sync');
+  });
+});
+
 describe('LilypadFlowControl errors', () => {
   afterEach(() => {
     vi.useRealTimers();
@@ -638,18 +655,26 @@ describe('LilypadFlowControl errors', () => {
     await expect(result).rejects.toMatchObject({ timeout: 100 });
   });
 
-  it('should pass an execution refused by the rate limit to errorFn', async () => {
+  it('should reject an execution refused by the rate limit with a LilypadRateLimitError', async () => {
     const flowControl = new LilypadFlowControl({ rate: 1000 });
     const run = () =>
       flowControl.executeFn({
         functionIdentifier: 'fn',
         consumerIdentifier: 'user',
         fn: async () => 'ok',
-        errorFn: (error) => (error instanceof LilypadRateLimitError ? 'limited' : 'other'),
       });
 
     await expect(run()).resolves.toBe('ok');
-    await expect(run()).resolves.toBe('limited');
+    await expect(run()).rejects.toBeInstanceOf(LilypadRateLimitError);
+  });
+
+  it.each([
+    [{ timeout: Number.NaN }, /timeout must be a positive finite number/],
+    [{ timeout: 0 }, /timeout must be a positive finite number/],
+    [{ rate: -1 }, /rate must be a non-negative finite number/],
+    [{ retries: 1.5 }, /retries must be a non-negative integer/],
+  ])('should reject the invalid options %o', (options, message) => {
+    expect(() => new LilypadFlowControl(options)).toThrow(message);
   });
 
   it('should type executeWithTimeout per call', async () => {

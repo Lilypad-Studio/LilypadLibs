@@ -6,7 +6,6 @@ export { LilypadCache } from '../cache/LilypadCache';
 export { LilypadCacheCooldownError } from '../cache/LilypadCacheTypes';
 export type {
   LilypadCacheBulkSyncOptions,
-  LilypadCacheEntry,
   LilypadCacheEntryOrigin,
   LilypadCacheErrorContext,
   LilypadCacheErrorOptions,
@@ -15,7 +14,6 @@ export type {
   LilypadCacheKey,
   LilypadCacheOptions,
   LilypadCachePeek,
-  LilypadCacheRead,
   LilypadCacheResult,
   LilypadCacheSharedOptions,
   LilypadCacheStatus,

@@ -1,9 +1,9 @@
-"use strict";Object.defineProperty(exports, "__esModule", {value: true});
-
-var _chunkUWWZT52Cjs = require('./chunk-UWWZT52C.js');
+import {
+  LilypadCacheCore
+} from "./chunk-PNYDIRFR.mjs";
 
 // src/cache/LilypadCache.ts
-var LilypadCache = class extends _chunkUWWZT52Cjs.LilypadCacheCore {
+var LilypadCache = class extends LilypadCacheCore {
   constructor(options = {}) {
     super(options);
   }
@@ -60,21 +60,29 @@ var LilypadCache = class extends _chunkUWWZT52Cjs.LilypadCacheCore {
     return super.bulkSync(options);
   }
   /**
-   * Returns the fresh values of `keys`, or, without keys, every fresh entry (keyed by the key it
-   * was stored with).
+   * Returns the fresh values of `keys`, keyed as given. Missing and expired keys are left out.
    *
    * @throws If the cache is disposed.
    */
-  bulkGet(options) {
-    return super.bulkGet(options);
+  getMany(keys) {
+    return super.getMany(keys);
   }
   /**
-   * Like `bulkGet`, after a `bulkSync` (unless `doSync` is false).
+   * Returns every fresh entry, keyed by the key it was stored with. It is the whole source only
+   * while the last `bulkSync` is fresh: use `getAll` to sync first.
    *
    * @throws If the cache is disposed.
    */
-  bulkAsyncGet(options) {
-    return super.bulkAsyncGet(options);
+  entries() {
+    return super.entries();
+  }
+  /**
+   * Like `entries()`, after a `bulkSync` (unless `sync` is false).
+   *
+   * @throws If the cache is disposed.
+   */
+  getAll(options) {
+    return this.getAllEntries(options);
   }
   /**
    * Forces the next `bulkSync` call to fetch fresh data, even if a sync is currently running (that
@@ -88,7 +96,7 @@ var LilypadCache = class extends _chunkUWWZT52Cjs.LilypadCacheCore {
   }
 };
 
-
-
-exports.LilypadCache = LilypadCache;
-//# sourceMappingURL=chunk-4GHVZLK3.js.map
+export {
+  LilypadCache
+};
+//# sourceMappingURL=chunk-76AKVSLZ.mjs.map

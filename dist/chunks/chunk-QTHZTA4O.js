@@ -1,4 +1,29 @@
-"use strict";Object.defineProperty(exports, "__esModule", {value: true}); function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } var _class;// src/flow/LilypadFlowControl.ts
+"use strict";Object.defineProperty(exports, "__esModule", {value: true}); function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } var _class;// src/internal/LilypadValidation.ts
+var DESCRIPTIONS = {
+  positive: "a positive finite number",
+  "non-negative": "a non-negative finite number",
+  "positive-integer": "a positive integer",
+  "non-negative-integer": "a non-negative integer"
+};
+function satisfies(value, rule) {
+  switch (rule) {
+    case "positive":
+      return Number.isFinite(value) && value > 0;
+    case "non-negative":
+      return Number.isFinite(value) && value >= 0;
+    case "positive-integer":
+      return Number.isInteger(value) && value > 0;
+    case "non-negative-integer":
+      return Number.isInteger(value) && value >= 0;
+  }
+}
+function assertNumberOption(owner, name, value, rule) {
+  if (value !== void 0 && (typeof value !== "number" || !satisfies(value, rule))) {
+    throw new Error(`${owner}: ${name} must be ${DESCRIPTIONS[rule]} (got ${String(value)}).`);
+  }
+}
+
+// src/flow/LilypadFlowControl.ts
 var LilypadTimeoutError = class extends Error {
   
   constructor(timeout) {
@@ -18,14 +43,16 @@ var LilypadFlowControl = (_class = class {
   
   
   
-  
   __init() {this.singleFlightMap = /* @__PURE__ */ new Map()}
   __init2() {this.rateMap = /* @__PURE__ */ new Map()}
+  /** @throws If a numeric option is not valid (e.g. `NaN`, or a negative duration). */
   constructor(options) {;_class.prototype.__init.call(this);_class.prototype.__init2.call(this);
+    assertNumberOption("LilypadFlowControl", "rate", options == null ? void 0 : options.rate, "non-negative");
+    assertNumberOption("LilypadFlowControl", "timeout", options == null ? void 0 : options.timeout, "positive");
+    assertNumberOption("LilypadFlowControl", "retries", options == null ? void 0 : options.retries, "non-negative-integer");
     this.rate = options == null ? void 0 : options.rate;
     this.timeout = options == null ? void 0 : options.timeout;
     this.retries = options == null ? void 0 : options.retries;
-    this.logger = options == null ? void 0 : options.logger;
   }
   /**
    * Executes an asynchronous function with a timeout constraint.
@@ -65,13 +92,11 @@ var LilypadFlowControl = (_class = class {
    * Executes a given asynchronous function with retry logic and optional exponential backoff.
    *
    * @template T The return type of the execution function.
-   * @param options - The options for executing with retries, including:
    * @param options.executionFn - The asynchronous function to execute.
-   * @param options.errorFn - Optional function to handle errors after all retries have been exhausted. If provided, its return value is returned instead of throwing the error; it can throw to propagate it.
    * @param options.retries - The maximum number of retry attempts. If not provided, the instance's configured retries will be used.
    * @param options.backOffTime - Optional function to calculate the backoff time (in milliseconds) before each retry attempt. Receives the current attempt number as an argument. Defaults to exponential backoff if not provided.
-   * @returns A promise that resolves with the result of `executionFn`, or with the result of `errorFn` if retries are exhausted.
-   * @throws The error thrown by `executionFn` if all retries are exhausted and no `errorFn` is provided.
+   * @returns A promise that resolves with the result of `executionFn`.
+   * @throws The error of the last attempt, once all retries are exhausted.
    */
   async executeWithRetries(options) {
     let attempts = 0;
@@ -81,9 +106,6 @@ var LilypadFlowControl = (_class = class {
         return result;
       } catch (error) {
         if (attempts >= (_nullishCoalesce(_nullishCoalesce(options.retries, () => ( this.retries)), () => ( 0)))) {
-          if (options.errorFn) {
-            return options.errorFn(error);
-          }
           throw error;
         }
         attempts++;
@@ -93,23 +115,17 @@ var LilypadFlowControl = (_class = class {
     }
   }
   /**
-   * Enforces a rate limit for a specific consumer and function combination.
-   *
-   * If a rate limit is set, this method checks whether the specified consumer
-   * has invoked the given function within the allowed time interval. If the
-   * rate limit is exceeded, an error is thrown. Otherwise, the invocation time
-   * is recorded.
+   * Enforces the rate limit (the `rate` option) for a key: records the call, or throws if the
+   * previous call of the key is more recent than `rate`. Without `rate`, it does nothing.
    *
    * It must stay synchronous: `executeFn` relies on no await happening between the single-flight
    * lookup and the registration of the new execution.
    *
-   * @param consumerIdentifier - A unique identifier for the consumer (e.g., user or service).
-   * @param functionIdentifier - A unique identifier for the function being rate-limited.
-   * @throws {LilypadRateLimitError} If the rate limit is exceeded for the given consumer and function.
+   * @param rateKey - What is limited, e.g. a consumer and a function.
+   * @throws {LilypadRateLimitError} If the rate limit is exceeded for the key.
    */
-  rateLimit(consumerIdentifier, functionIdentifier) {
+  rateLimit(rateKey) {
     if (this.rate !== void 0) {
-      const rateKey = consumerIdentifier + "#" + functionIdentifier;
       const now = Date.now();
       const lastExecution = _nullishCoalesce(this.rateMap.get(rateKey), () => ( 0));
       if (now - lastExecution < this.rate) {
@@ -132,50 +148,67 @@ var LilypadFlowControl = (_class = class {
     }
   }
   /**
-   * @returns `true` if an execution for the function identifier is currently in flight.
+   * @returns `true` if an execution for the key is currently in flight.
    */
-  isInFlight(functionIdentifier) {
-    return this.singleFlightMap.has(functionIdentifier);
+  isInFlight(key) {
+    return this.singleFlightMap.has(key);
   }
   /**
-   * Executes a provided function with optional rate limiting, single-flight deduplication,
-   * retries, and timeout handling. Ensures that only one execution per function identifier
-   * is in-flight at a time, and subsequent calls return the same promise until completion.
-   * Calls that join an in-flight execution are not rate limited, since they do not start a new one.
-   * An execution refused by the rate limit goes to `errorFn`, like a failed one.
+   * Runs `fn`, unless an execution for the same key is in flight: then its promise is returned,
+   * and `fn` is not called. The execution is registered synchronously, so that a call made right
+   * after this one joins it.
    *
-   * @template T - The return type of the function to execute.
-   * @param options - The execution options, including:
-   *   - consumerIdentifier: Unique identifier for the consumer (used for rate limiting).
-   *   - functionIdentifier: Unique identifier for the function (used for single-flight).
-   *   - fn: The function to execute.
-   *   - errorFn: Optional error handler, called once all retries are exhausted.
-   *   - backOffTime: Optional backoff time between retries.
-   * @returns A promise that resolves with the result of the executed function.
+   * The caller that joins a flight is responsible for expecting the type of the one that started it.
    */
-  async executeFn(options) {
-    const inFlight = this.singleFlightMap.get(options.functionIdentifier);
+  singleFlight(key, fn) {
+    const inFlight = this.singleFlightMap.get(key);
     if (inFlight) {
       return inFlight;
     }
+    let execution;
     try {
-      this.rateLimit(options.consumerIdentifier, options.functionIdentifier);
+      execution = fn();
     } catch (error) {
-      if (options.errorFn) {
-        return options.errorFn(error);
-      }
-      throw error;
+      return Promise.reject(error instanceof Error ? error : new Error(String(error)));
     }
-    const executionPromise = this.executeWithRetries({
-      executionFn: () => this.executeWithTimeout(options.fn, _nullishCoalesce(options.timeout, () => ( this.timeout))),
-      retries: _nullishCoalesce(_nullishCoalesce(options.retries, () => ( this.retries)), () => ( 0)),
-      errorFn: options.errorFn,
-      backOffTime: options.backOffTime
-    }).finally(() => {
-      this.singleFlightMap.delete(options.functionIdentifier);
+    const flight = execution.finally(() => {
+      if (this.singleFlightMap.get(key) === flight) {
+        this.singleFlightMap.delete(key);
+      }
     });
-    this.singleFlightMap.set(options.functionIdentifier, executionPromise);
-    return executionPromise;
+    this.singleFlightMap.set(key, flight);
+    return flight;
+  }
+  /**
+   * Executes a function with single-flight deduplication, rate limiting, retries and timeouts.
+   * Only one execution per function identifier is in flight at a time: later calls join it. Calls
+   * that join an in-flight execution are not rate limited, since they do not start a new one.
+   *
+   * @template T - The return type of the function to execute.
+   * @returns A promise that resolves with the result of the executed function.
+   * @throws {LilypadRateLimitError} If the execution is refused by the rate limit.
+   * @throws {LilypadTimeoutError} If the last attempt timed out.
+   * @throws The error of the last attempt, once the retries are exhausted.
+   */
+  executeFn(options) {
+    const { functionIdentifier, consumerIdentifier } = options;
+    if (!this.isInFlight(functionIdentifier)) {
+      try {
+        this.rateLimit(
+          consumerIdentifier === void 0 ? functionIdentifier : `${consumerIdentifier}#${functionIdentifier}`
+        );
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    }
+    return this.singleFlight(
+      functionIdentifier,
+      () => this.executeWithRetries({
+        executionFn: () => this.executeWithTimeout(options.fn, options.timeout),
+        retries: options.retries,
+        backOffTime: options.backOffTime
+      })
+    );
   }
 }, _class);
 
@@ -183,5 +216,6 @@ var LilypadFlowControl = (_class = class {
 
 
 
-exports.LilypadTimeoutError = LilypadTimeoutError; exports.LilypadRateLimitError = LilypadRateLimitError; exports.LilypadFlowControl = LilypadFlowControl;
-//# sourceMappingURL=chunk-J2XBSNY7.js.map
+
+exports.assertNumberOption = assertNumberOption; exports.LilypadTimeoutError = LilypadTimeoutError; exports.LilypadRateLimitError = LilypadRateLimitError; exports.LilypadFlowControl = LilypadFlowControl;
+//# sourceMappingURL=chunk-QTHZTA4O.js.map

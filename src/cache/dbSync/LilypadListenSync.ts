@@ -1,5 +1,5 @@
 import type {
-  LilypadDbCacheDefaultNotificationPayload,
+  LilypadDbNotification,
   LilypadDbCacheListenSync,
   LilypadDbSyncHost,
   LilypadDbSyncStrategy,
@@ -7,7 +7,7 @@ import type {
 import type { LilypadSchemaVerifier } from '@/cache/dbSync/LilypadSchemaVerifier';
 import type { LilypadCacheKey } from '@/cache/LilypadCacheTypes';
 import { LILYPAD_DEFAULT_NOTIFY_CHANNEL } from '@/dbGate/LilypadChangelog';
-import type { ListenerCallbackIdentifier } from '@/dbGate/LilypadDbGate';
+import type { LilypadDbListener } from '@/dbGate/LilypadDbGate';
 import { LilypadBackoff } from '@/internal/LilypadBackoff';
 
 const OPERATIONS = new Set(['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']);
@@ -17,9 +17,7 @@ const OPERATIONS = new Set(['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']);
  *
  * @returns The payload, or `undefined` if it does not have the expected shape.
  */
-export function parseLilypadNotification(
-  payload: unknown
-): LilypadDbCacheDefaultNotificationPayload | undefined {
+export function parseLilypadNotification(payload: unknown): LilypadDbNotification | undefined {
   if (typeof payload !== 'string') {
     return undefined;
   }
@@ -45,7 +43,7 @@ export function parseLilypadNotification(
   ) {
     return undefined;
   }
-  return parsed as LilypadDbCacheDefaultNotificationPayload;
+  return parsed as LilypadDbNotification;
 }
 
 function parseXid(xid: string | undefined): bigint | undefined {
@@ -62,7 +60,7 @@ function parseXid(xid: string | undefined): bigint | undefined {
  */
 export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSyncStrategy {
   readonly seesOwnWrites = true;
-  private readonly listener: ListenerCallbackIdentifier;
+  private readonly listener: LilypadDbListener;
   private readonly applyChanges: boolean;
   private listening?: Promise<void>;
   private readonly backoff = new LilypadBackoff(() => 1000);
@@ -177,7 +175,7 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
    * Whether a notification is about the table of this cache. `table` is the name without its
    * schema; `schema`, when the trigger sends it and the schema of the table is known, must match.
    */
-  private isForTable(payload: LilypadDbCacheDefaultNotificationPayload): boolean {
+  private isForTable(payload: LilypadDbNotification): boolean {
     if (payload.table !== this.host.tableName.split('.').pop()) {
       return false;
     }

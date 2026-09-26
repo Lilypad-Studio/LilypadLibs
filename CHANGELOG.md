@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.4.0
+
+### Upgrading from 0.3.0
+
+| Change | What to do |
+| --- | --- |
+| Node.js 22 or later is required (Node.js 20 reached its end of life in April 2026). | Upgrade Node.js. |
+| `LilypadCache`: `bulkGet({ keys })` is `getMany(keys)`, `bulkGet()` is `entries()`, and `bulkAsyncGet({ doSync })` is `getAll({ sync })`, which returns every entry (it no longer takes `keys`). | Rename the calls; for keys after a sync, `await cache.bulkSync(); cache.getMany(keys)`. |
+| `LilypadFlowControl`: `executeFn` and `executeWithRetries` no longer take `errorFn`: a failed or rate-limited execution rejects, and each caller of a shared execution handles the error with its own `.catch`. `rateLimit(consumer, fn)` is `rateLimit(key)` (`executeFn` uses `consumer#function`). `consumerIdentifier` is optional (the rate limit then applies to the function). The `logger` option is removed (it was unused). The constructor throws for an invalid `rate`, `timeout` or `retries`. | Replace `errorFn: f` with `.catch(f)` on the returned promise; `rateLimit(c, f)` → `rateLimit(`${c}#${f}`)`. |
+| Logger components implement `write(record)`, their only extension point, instead of `send(text, type)` / `sendRecord(record)`; `output()` and `LilypadLoggerComponentOptions` are removed. | Replace `protected async send(message, type)` with `async write(record)`, and use `this.formatRecord(record)` for the text line and `record.type` for the channel. Call `component.write(record)` where you called `output()`. |
+| The logger replaces with `[Redacted]` the values of `LILYPAD_DEFAULT_REDACTED_KEYS` (authorization, cookie, password, secret, token, API keys...) in the messages and the context. | Nothing, unless you log those keys on purpose: pass `redact: false`, or your own list. |
+| `logger.__name` is `logger.name`; a channel can no longer be named `name`. | Rename the property. |
+| `LilypadDiscordLogger`: a failed batch reports one error (counting the lost messages, with the original error as `cause`) instead of one per message, and a `retry-after` longer than 30 s fails the batch instead of being waited for. | None. |
+| `LilypadDbSchema.primaryKeyShouldAutoDetermine` is renamed `generatedPrimaryKey`. | Rename the option. |
+| `LilypadDbGate` sets `statement_timeout` to 30 s by default. | Pass `statementTimeout: false` to keep the setting of the database, or a longer duration for long queries. |
+| `LilypadDbGate.close()` waits at most 5 s (`close({ timeout })`) for the running queries, returns the same promise when called again, and the gate then rejects queries and `addListener`. | Do not use a gate after `close()`. |
+| `LilypadDbCache.sqlDelete` resolves to `true` if a row was deleted, `false` otherwise. | None, unless you relied on `void`. |
+| With the `changelog` strategy, a `DELETE` of a key the cache does not hold creates no `null` entry (and writes nothing to the shared level): mass deletes no longer evict the rows the cache holds. | None. |
+| With the `listen` strategy, the keys notified together are re-read with one `selectFromTableByPrimaryKeys` query, instead of one `selectFromTableByPrimaryKey` query per key. | Only a mock of the gate is affected. |
+| `LilypadDbCache.peek` renews the entries kept up to date by the sync, as `get` does. | None. |
+| The changelog is at version 4: statement triggers (`<table>_lilypad_insert`, `_update`, `_delete`) with transition tables record all the rows of a statement in one query, and read only the primary key column. `lilypadChangelogTriggerSql` drops the row trigger `<table>_lilypad_changes`. The new function still serves the row triggers of version 3. | Run `lilypadChangelogSql()`, then `lilypadChangelogTriggerSql()` for each table, in one transaction. Until then, the schema check reports `outdated-changelog`. Transition tables are not allowed on partitions: attach the triggers to the partitioned table. |
+| The schema check counts `ENABLE REPLICA` triggers as not firing (`missing-changelog-trigger`), and accepts statement triggers split by event. | Enable the triggers with `ENABLE TRIGGER`. |
+| Types renamed: `ListenerCallbackIdentifier` → `LilypadDbListener`, `LilypadDbCacheDefaultNotificationPayload` → `LilypadDbNotification`. No longer exported: `LilypadCacheEntry`, `LilypadCacheRead`, `lilypadCursorCovers`, `readLilypadChangesBatch` (internals). | Rename the imports; use `readLilypadChanges` for one table. |
+
+### Added
+
+- **LilypadDbColumnType**: `'bigint'`, for `bigint`/`bigserial` primary keys, which postgres.js returns as strings.
+- **LilypadFlowControl**: `singleFlight(key, fn)`.
+- **Logger**: the `redact` option and `LILYPAD_DEFAULT_REDACTED_KEYS`.
+- **LilypadDbGate**: the `closed` getter.
+
+### Fixed
+
+- A shared-level codec that throws no longer fails the read, nor turns a successful fetch into a failure (with a cooldown): the entry is ignored or not shared, with a warning.
+- The LISTEN heartbeat no longer keeps pinging the database when the last listener is removed while it starts, and a heartbeat that could not start is retried.
+- The value fetched with a longer `staleWhileRevalidate` than the cache's is kept in the shared level through that window.
+- `maxEntries` evictions no longer scan the protected keys.
+- The release function of a singleton no longer removes an instance registered under the same key after a manual removal.
+- A changelog read whose changes could not be applied is retried after a backoff, not at every read.
+- `LilypadDbCache.sqlCreate` no longer throws after a successful insert when the `selectSanitizationFn` drops the primary key: the row is returned, uncached.
+
 ## 0.3.0
 
 ### Upgrading from 0.2.0

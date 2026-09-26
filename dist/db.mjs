@@ -1,15 +1,16 @@
 import {
   LilypadCacheCore,
-  assertNumberOption,
   libLog
-} from "./chunks/chunk-NBFS4HMY.mjs";
-import "./chunks/chunk-7IQFDANE.mjs";
+} from "./chunks/chunk-PNYDIRFR.mjs";
+import {
+  assertNumberOption
+} from "./chunks/chunk-NPNORXCW.mjs";
 import {
   runInBackground
 } from "./chunks/chunk-3L5FE6KG.mjs";
 import {
   createLilypadSingletonAbleAsync
-} from "./chunks/chunk-3Y7IMWY6.mjs";
+} from "./chunks/chunk-YUU6MHTP.mjs";
 
 // src/dbGate/LilypadDbGate.ts
 import { createHash } from "crypto";
@@ -64,6 +65,33 @@ var LilypadListenHeartbeat = class _LilypadListenHeartbeat {
   }
 };
 
+// src/internal/LilypadBackoff.ts
+var MAX_RETRY_DELAY = 6e4;
+var LilypadBackoff = class {
+  /** @param baseDelay - The wait after the first failure, in ms; it doubles at each failure. */
+  constructor(baseDelay) {
+    this.baseDelay = baseDelay;
+  }
+  failures = 0;
+  retryAt = 0;
+  /** Whether the operation may run now: no failure, or the backoff is over. */
+  ready(now = Date.now()) {
+    return now >= this.retryAt;
+  }
+  /** Records a failure: the next attempt waits `base * 2^(failures - 1)`, up to one minute. */
+  fail(now = Date.now()) {
+    this.failures++;
+    const base = this.baseDelay();
+    const delay = Math.max(base, Math.min(base * 2 ** (this.failures - 1), MAX_RETRY_DELAY));
+    this.retryAt = now + delay;
+  }
+  /** Records a success: the next failure starts again from the base delay. */
+  succeed() {
+    this.failures = 0;
+    this.retryAt = 0;
+  }
+};
+
 // src/dbGate/LilypadDbGate.ts
 import postgres from "postgres";
 var lilypadServerlessPool = Object.freeze({
@@ -94,6 +122,8 @@ var LilypadDbNotFoundError = class extends Error {
 };
 var SELECT_ALL_BATCH_SIZE = 1e3;
 var PRIMARY_KEYS_BATCH_SIZE = 1e3;
+var DEFAULT_STATEMENT_TIMEOUT = 3e4;
+var DEFAULT_CLOSE_TIMEOUT = 5e3;
 var XID_COLUMN = "__lilypad_xid";
 var DEFAULT_LISTEN_HEARTBEAT = 15e3;
 function lilypadMissingPrimaryKeyError(schema, context) {
@@ -113,17 +143,23 @@ var LilypadDbGate = class _LilypadDbGate {
   heartbeat;
   heartbeatChannel = `lilypad_heartbeat_${this.id.slice(-36).replace(/-/g, "")}`;
   heartbeatStop;
+  /** A heartbeat that could not start is retried after a backoff (see `isListenHealthy`). */
+  heartbeatBackoff = new LilypadBackoff(() => 1e3);
+  closing;
   constructor(options) {
-    assertNumberOption("LilypadDbGate", "statementTimeout", options.statementTimeout, "positive");
+    if (options.statementTimeout !== false) {
+      assertNumberOption("LilypadDbGate", "statementTimeout", options.statementTimeout, "positive");
+    }
     if (options.listenHeartbeat !== false) {
       assertNumberOption("LilypadDbGate", "listenHeartbeat", options.listenHeartbeat, "positive");
     }
     this.logger = options.logger;
+    const statementTimeout = resolveStatementTimeout(options);
     this.sql = postgres(options.connectionString, {
       prepare: false,
       ...toPostgresPoolOptions(options.pool),
-      ...options.statementTimeout !== void 0 && {
-        connection: { statement_timeout: options.statementTimeout }
+      ...statementTimeout !== void 0 && {
+        connection: { statement_timeout: statementTimeout }
       }
     });
     const listenerConnectionString = options.listenerConnectionString;
@@ -160,7 +196,7 @@ var LilypadDbGate = class _LilypadDbGate {
           JSON.stringify([
             options.connectionString,
             options.listenerConnectionString,
-            options.statementTimeout,
+            resolveStatementTimeout(options),
             options.pool,
             options.listenHeartbeat
           ])
@@ -219,11 +255,11 @@ var LilypadDbGate = class _LilypadDbGate {
   prepareWrite(schema, data, operation) {
     const writeData = schema.writeSanitizationFn ? { ...schema.writeSanitizationFn({ ...data }) } : { ...data };
     const primaryKeyValue = writeData[schema.primaryKey];
-    const primaryKeyRequired = operation === "update" || !schema.primaryKeyShouldAutoDetermine;
+    const primaryKeyRequired = operation === "update" || !schema.generatedPrimaryKey;
     if (primaryKeyRequired && (primaryKeyValue === void 0 || primaryKeyValue === null)) {
       throw lilypadMissingPrimaryKeyError(schema, operation);
     }
-    if (schema.primaryKeyShouldAutoDetermine) {
+    if (schema.generatedPrimaryKey) {
       delete writeData[schema.primaryKey];
     }
     const columns = Object.keys(schema.cols).filter(
@@ -242,6 +278,7 @@ var LilypadDbGate = class _LilypadDbGate {
    * rejects with the reason of the signal.
    */
   async selectAllFromTable(schema, options = {}) {
+    this.assertOpen();
     const { signal } = options;
     signal == null ? void 0 : signal.throwIfAborted();
     const typedResults = [];
@@ -265,6 +302,7 @@ var LilypadDbGate = class _LilypadDbGate {
    * `selectSanitizationFn` discards.
    */
   async selectFromTableByPrimaryKeys(schema, primaryKeyValues) {
+    this.assertOpen();
     const typedRows = [];
     for (let start = 0; start < primaryKeyValues.length; start += PRIMARY_KEYS_BATCH_SIZE) {
       const batch = primaryKeyValues.slice(start, start + PRIMARY_KEYS_BATCH_SIZE);
@@ -282,6 +320,7 @@ var LilypadDbGate = class _LilypadDbGate {
     return typedRows;
   }
   async selectFromTableByPrimaryKey(schema, primaryKeyValue) {
+    this.assertOpen();
     const results = await this.sql`
       SELECT ${this.selectedColumns(schema)} FROM ${this.sql(schema.tableName)}
       WHERE ${this.sql(String(schema.primaryKey))} = ${primaryKeyValue}
@@ -297,6 +336,7 @@ var LilypadDbGate = class _LilypadDbGate {
    * the transaction that wrote it.
    */
   async insertToTable(schema, data) {
+    this.assertOpen();
     const { data: insertData, columns } = this.prepareWrite(schema, data, "insert");
     const results = await this.sql`
       INSERT INTO ${this.sql(schema.tableName)} ${this.sql(insertData, columns)}
@@ -322,6 +362,7 @@ var LilypadDbGate = class _LilypadDbGate {
    * @throws {LilypadDbNotFoundError} If no row with that primary key exists.
    */
   async updateToTable(schema, data) {
+    this.assertOpen();
     const {
       data: updateData,
       columns,
@@ -344,6 +385,7 @@ var LilypadDbGate = class _LilypadDbGate {
    * @returns Whether a row had this primary key, and the id of the transaction that deleted it.
    */
   async deleteFromTable(schema, primaryKeyValue) {
+    this.assertOpen();
     const results = await this.sql`
       DELETE FROM ${this.sql(schema.tableName)}
       WHERE ${this.sql(String(schema.primaryKey))} = ${primaryKeyValue}
@@ -438,6 +480,7 @@ var LilypadDbGate = class _LilypadDbGate {
    * @throws If LISTEN fails; in that case the callback is not registered.
    */
   async addListener(identifier) {
+    this.assertOpen();
     const { channel, callbackId } = identifier;
     libLog(
       this.logger,
@@ -484,19 +527,27 @@ var LilypadDbGate = class _LilypadDbGate {
     }
     return true;
   }
+  /** Starts the heartbeat, unless it is running or starting. It never rejects. */
   async startHeartbeat() {
     const heartbeat = this.heartbeat;
-    if (!heartbeat || this.heartbeatStop) {
+    if (!heartbeat || this.heartbeatStop || this.closing) {
       return;
     }
-    this.heartbeatStop = this.listenClient().listen(this.heartbeatChannel, () => heartbeat.beat()).then((meta) => {
-      heartbeat.start();
+    const starting = this.listenClient().listen(this.heartbeatChannel, () => heartbeat.beat()).then((meta) => {
+      if (this.heartbeatStop === starting) {
+        heartbeat.start();
+      }
       return () => meta.unlisten();
     });
+    this.heartbeatStop = starting;
     try {
-      await this.heartbeatStop;
+      await starting;
+      this.heartbeatBackoff.succeed();
     } catch (error) {
-      this.heartbeatStop = void 0;
+      if (this.heartbeatStop === starting) {
+        this.heartbeatStop = void 0;
+      }
+      this.heartbeatBackoff.fail();
       libLog(this.logger, "warn", this.id, "Could not start the LISTEN heartbeat:", error);
     }
   }
@@ -519,24 +570,55 @@ var LilypadDbGate = class _LilypadDbGate {
     if (!this.heartbeat) {
       return this.listeners.size > 0;
     }
+    if (!this.heartbeatStop && this.listeners.size > 0 && this.heartbeatBackoff.ready()) {
+      void this.startHeartbeat();
+    }
     return this.heartbeat.healthy();
   }
-  async close() {
+  /** Whether `close` was called: the gate then rejects every query and listener. */
+  get closed() {
+    return this.closing !== void 0;
+  }
+  assertOpen() {
+    if (this.closing) {
+      throw new Error(`LilypadDbGate "${this.id}" is closed.`);
+    }
+  }
+  /**
+   * Closes the connections, after the queries still running (for at most `timeout` ms; the ones
+   * still running then are cancelled). Later queries and listeners are rejected. Calling it again
+   * returns the same promise.
+   *
+   * @param options.timeout - How long to wait for the running queries, in ms. Defaults to 5 s.
+   */
+  close(options = {}) {
+    this.closing ??= this.closeConnections(options.timeout ?? DEFAULT_CLOSE_TIMEOUT);
+    return this.closing;
+  }
+  async closeConnections(timeout) {
     var _a, _b;
+    assertNumberOption("LilypadDbGate", "close timeout", timeout, "non-negative");
     this.listeners.clear();
     (_a = this.heartbeat) == null ? void 0 : _a.stop();
     this.heartbeatStop = void 0;
     this.releaseSingleton();
-    await ((_b = this.listenerClient) == null ? void 0 : _b.end());
-    await this.sql.end();
+    await Promise.all([
+      (_b = this.listenerClient) == null ? void 0 : _b.end({ timeout: timeout / 1e3 }),
+      this.sql.end({ timeout: timeout / 1e3 })
+    ]);
   }
 };
+function resolveStatementTimeout(options) {
+  return options.statementTimeout === false ? void 0 : options.statementTimeout ?? DEFAULT_STATEMENT_TIMEOUT;
+}
 
 // src/dbGate/LilypadChangelog.ts
 var LILYPAD_DEFAULT_CHANGELOG_TABLE = "lilypad_cache_changes";
 var LILYPAD_DEFAULT_NOTIFY_CHANNEL = "cache_events";
-var LILYPAD_CHANGELOG_VERSION = 3;
+var LILYPAD_CHANGELOG_VERSION = 4;
 var LILYPAD_CHANGELOG_VERSION_PREFIX = "lilypad-changelog:";
+var LILYPAD_CHANGELOG_OLD_ROWS = "lilypad_old";
+var LILYPAD_CHANGELOG_NEW_ROWS = "lilypad_new";
 function identifierPrefix(name) {
   return name.replace(/\W/g, "_");
 }
@@ -551,7 +633,16 @@ function triggerFunctionName(changelogTable) {
 }
 function changelogTriggerNames(table) {
   const prefix = identifierPrefix(table);
-  return { row: `${prefix}_lilypad_changes`, truncate: `${prefix}_lilypad_truncate` };
+  return {
+    insert: `${prefix}_lilypad_insert`,
+    update: `${prefix}_lilypad_update`,
+    delete: `${prefix}_lilypad_delete`,
+    truncate: `${prefix}_lilypad_truncate`,
+    legacyRow: `${prefix}_lilypad_changes`
+  };
+}
+function escapeFormat(value) {
+  return value.replace(/%/g, "%%");
 }
 function lilypadChangelogSql(options = {}) {
   const table = options.table ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
@@ -564,6 +655,17 @@ function lilypadChangelogSql(options = {}) {
       'xid', pg_current_xact_id()::text
     )::text);`;
   const functionName = quoteIdentifier(triggerFunctionName(table));
+  const oldRows = LILYPAD_CHANGELOG_OLD_ROWS;
+  const newRows = LILYPAD_CHANGELOG_NEW_ROWS;
+  const recordChanged = channel === false ? `INSERT INTO ${escapeFormat(quotedTable)} (table_schema, table_name, row_id, op)
+      SELECT $1, $2, changed.row_id, changed.op FROM (%s) AS changed` : `WITH recorded AS (
+        INSERT INTO ${escapeFormat(quotedTable)} (table_schema, table_name, row_id, op)
+        SELECT $1, $2, changed.row_id, changed.op FROM (%s) AS changed
+        RETURNING row_id, op
+      )
+      SELECT pg_notify(${escapeFormat(quoteLiteral(channel))}, json_build_object(
+        'schema', $1, 'table', $2, 'id', row_id, 'op', op, 'xid', pg_current_xact_id()::text
+      )::text) FROM recorded`;
   return `CREATE TABLE IF NOT EXISTS ${quotedTable} (
   id           bigserial   PRIMARY KEY,
   xid          xid8        NOT NULL DEFAULT pg_current_xact_id(),
@@ -582,11 +684,13 @@ CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${indexPrefix}_table_xid_idx`)}
 CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${indexPrefix}_changed_at_idx`)}
   ON ${quotedTable} (changed_at);
 
--- Records a change of a row, or a TRUNCATE of the table; the trigger argument is the primary key column.
+-- Records the changes of the rows of a statement, or a TRUNCATE of the table; the trigger argument
+-- is the primary key column.
 CREATE OR REPLACE FUNCTION ${functionName}() RETURNS trigger AS $$
 DECLARE
   new_id text;
   old_id text;
+  changed text;
 BEGIN
   IF TG_OP = 'TRUNCATE' THEN
     INSERT INTO ${quotedTable} (table_schema, table_name, row_id, op)
@@ -594,6 +698,30 @@ BEGIN
     RETURN NULL;
   END IF;
 
+  IF TG_LEVEL = 'STATEMENT' THEN
+    -- Statement triggers (version 4): every row of the statement in one query, from the transition
+    -- tables. Only the primary key column is read, instead of converting whole rows to JSON.
+    changed := CASE TG_OP
+      WHEN 'INSERT' THEN format(
+        'SELECT to_jsonb(n.%1$I) #>> ''{}'' AS row_id, ''INSERT'' AS op FROM ${newRows} n',
+        TG_ARGV[0])
+      WHEN 'DELETE' THEN format(
+        'SELECT to_jsonb(o.%1$I) #>> ''{}'' AS row_id, ''DELETE'' AS op FROM ${oldRows} o',
+        TG_ARGV[0])
+      -- An update that changes primary keys also deletes the old keys that no row has any more
+      ELSE format(
+        'SELECT to_jsonb(o.%1$I) #>> ''{}'' AS row_id, ''DELETE'' AS op FROM ${oldRows} o '
+        || 'WHERE NOT EXISTS (SELECT 1 FROM ${newRows} n WHERE n.%1$I = o.%1$I) '
+        || 'UNION ALL SELECT to_jsonb(n.%1$I) #>> ''{}'', ''UPDATE'' FROM ${newRows} n',
+        TG_ARGV[0])
+    END;
+    EXECUTE format($record$
+      ${recordChanged}
+    $record$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;
+    RETURN NULL;
+  END IF;
+
+  -- Row triggers, installed by version 3 and earlier: one change at a time
   IF TG_OP <> 'DELETE' THEN
     new_id := to_jsonb(NEW) ->> TG_ARGV[0];
   END IF;
@@ -620,10 +748,21 @@ function lilypadChangelogTriggerSql(options) {
   const names = changelogTriggerNames(options.table);
   const table = quoteIdentifier(options.table);
   const execute = `EXECUTE FUNCTION ${quoteIdentifier(triggerFunctionName(changelogTable))}(${quoteLiteral(options.primaryKey)})`;
-  return `DROP TRIGGER IF EXISTS ${quoteIdentifier(names.row)} ON ${table};
-CREATE TRIGGER ${quoteIdentifier(names.row)}
-  AFTER INSERT OR UPDATE OR DELETE ON ${table}
-  FOR EACH ROW ${execute};
+  const oldRows = LILYPAD_CHANGELOG_OLD_ROWS;
+  const newRows = LILYPAD_CHANGELOG_NEW_ROWS;
+  return `DROP TRIGGER IF EXISTS ${quoteIdentifier(names.legacyRow)} ON ${table};
+DROP TRIGGER IF EXISTS ${quoteIdentifier(names.insert)} ON ${table};
+CREATE TRIGGER ${quoteIdentifier(names.insert)}
+  AFTER INSERT ON ${table} REFERENCING NEW TABLE AS ${newRows}
+  FOR EACH STATEMENT ${execute};
+DROP TRIGGER IF EXISTS ${quoteIdentifier(names.update)} ON ${table};
+CREATE TRIGGER ${quoteIdentifier(names.update)}
+  AFTER UPDATE ON ${table} REFERENCING OLD TABLE AS ${oldRows} NEW TABLE AS ${newRows}
+  FOR EACH STATEMENT ${execute};
+DROP TRIGGER IF EXISTS ${quoteIdentifier(names.delete)} ON ${table};
+CREATE TRIGGER ${quoteIdentifier(names.delete)}
+  AFTER DELETE ON ${table} REFERENCING OLD TABLE AS ${oldRows}
+  FOR EACH STATEMENT ${execute};
 DROP TRIGGER IF EXISTS ${quoteIdentifier(names.truncate)} ON ${table};
 CREATE TRIGGER ${quoteIdentifier(names.truncate)}
   AFTER TRUNCATE ON ${table}
@@ -696,7 +835,7 @@ async function readLilypadChangesBatch(gate, options) {
   `;
   const changes = options.requests.map(() => []);
   for (const row of rows) {
-    if (row.id !== null) {
+    if (row.id !== null && (row.row_id !== null || row.op === "TRUNCATE")) {
       (_a = changes[row.request]) == null ? void 0 : _a.push({
         id: row.id,
         xid: BigInt(row.xid),
@@ -807,33 +946,6 @@ function getLilypadChangelogReader(gate, changelogTable = LILYPAD_DEFAULT_CHANGE
   return reader;
 }
 
-// src/internal/LilypadBackoff.ts
-var MAX_RETRY_DELAY = 6e4;
-var LilypadBackoff = class {
-  /** @param baseDelay - The wait after the first failure, in ms; it doubles at each failure. */
-  constructor(baseDelay) {
-    this.baseDelay = baseDelay;
-  }
-  failures = 0;
-  retryAt = 0;
-  /** Whether the operation may run now: no failure, or the backoff is over. */
-  ready(now = Date.now()) {
-    return now >= this.retryAt;
-  }
-  /** Records a failure: the next attempt waits `base * 2^(failures - 1)`, up to one minute. */
-  fail(now = Date.now()) {
-    this.failures++;
-    const base = this.baseDelay();
-    const delay = Math.max(base, Math.min(base * 2 ** (this.failures - 1), MAX_RETRY_DELAY));
-    this.retryAt = now + delay;
-  }
-  /** Records a success: the next failure starts again from the base delay. */
-  succeed() {
-    this.failures = 0;
-    this.retryAt = 0;
-  }
-};
-
 // src/cache/dbSync/LilypadChangelogSync.ts
 var DEFAULT_MAX_GAP = 60 * 60 * 1e3;
 var LilypadChangelogSync = class {
@@ -931,6 +1043,7 @@ var LilypadChangelogSync = class {
       this.backoff.succeed();
       host.emitInvalidation("changelog", changedKeys, { wholeCache: truncated });
     } catch (error) {
+      this.backoff.fail();
       host.log("error", "Error applying the changelog:", error);
     }
   }
@@ -1130,7 +1243,31 @@ var ROW_EVENT_NAMES = [
   [TRIGGER_TYPE_UPDATE, "UPDATE"],
   [TRIGGER_TYPE_DELETE, "DELETE"]
 ];
-var CHANGELOG_TRIGGER_TYPE = TRIGGER_TYPE_ROW | ROW_EVENTS;
+function recordedEvents(trigger) {
+  if (!trigger.changelog || !trigger.enabled) {
+    return 0;
+  }
+  const events = trigger.type & ROW_EVENTS;
+  if ((trigger.type & TRIGGER_TYPE_ROW) !== 0) {
+    return events;
+  }
+  const hasOld = trigger.oldTable === LILYPAD_CHANGELOG_OLD_ROWS;
+  const hasNew = trigger.newTable === LILYPAD_CHANGELOG_NEW_ROWS;
+  let recorded = 0;
+  if ((events & TRIGGER_TYPE_INSERT) !== 0 && hasNew) {
+    recorded |= TRIGGER_TYPE_INSERT;
+  }
+  if ((events & TRIGGER_TYPE_UPDATE) !== 0 && hasOld && hasNew) {
+    recorded |= TRIGGER_TYPE_UPDATE;
+  }
+  if ((events & TRIGGER_TYPE_DELETE) !== 0 && hasOld) {
+    recorded |= TRIGGER_TYPE_DELETE;
+  }
+  return recorded;
+}
+function eventNames(events) {
+  return ROW_EVENT_NAMES.filter(([bit]) => (events & bit) !== 0).map(([, name]) => name).join(", ");
+}
 function firesOnTruncate(trigger) {
   return trigger.enabled && (trigger.type & TRIGGER_TYPE_ROW) === 0 && (trigger.type & TRIGGER_TYPE_TRUNCATE) !== 0;
 }
@@ -1179,8 +1316,11 @@ async function readLilypadSchemaFacts(gate, options) {
             'changelog', tr.tgfoid = to_regprocedure(${changelog.functionSignature}::text)::oid,
             'args', encode(tr.tgargs, 'escape'),
             'type', tr.tgtype,
-            'enabled', tr.tgenabled <> 'D',
-            'source', p.prosrc
+            -- 'R' (ENABLE REPLICA) triggers fire only with session_replication_role = replica
+            'enabled', tr.tgenabled IN ('O', 'A'),
+            'source', p.prosrc,
+            'oldTable', tr.tgoldtable,
+            'newTable', tr.tgnewtable
           )), '[]'::json)
           FROM pg_trigger tr JOIN pg_proc p ON p.oid = tr.tgfoid
           WHERE tr.tgrelid = t.oid AND NOT tr.tgisinternal
@@ -1259,22 +1399,22 @@ function evaluateLilypadSchema(facts, options) {
         primaryKey,
         changelogTable: changelog.custom
       });
-      const working = triggers.filter(
-        (trigger) => trigger.changelog && trigger.enabled && (trigger.type & CHANGELOG_TRIGGER_TYPE) === CHANGELOG_TRIGGER_TYPE
-      );
+      const working = triggers.filter((trigger) => recordedEvents(trigger) !== 0);
+      const recorded = working.reduce((events, trigger) => events | recordedEvents(trigger), 0);
       const recordedColumn = (trigger) => trigger.args.split("\\000")[0];
-      if (working.length === 0) {
+      const wrongColumn = working.find((trigger) => recordedColumn(trigger) !== primaryKey);
+      if (recorded !== ROW_EVENTS) {
         problems.push({
           code: "missing-changelog-trigger",
           table,
-          message: triggers.some((trigger) => trigger.changelog) ? `The changelog trigger of "${table}" is disabled or does not fire on each INSERT, UPDATE and DELETE row.` : `The table "${table}" has no changelog trigger: its changes are not recorded.`,
+          message: triggers.some((trigger) => trigger.changelog) ? `The changelog triggers of "${table}" do not record ${eventNames(ROW_EVENTS & ~recorded)}: they are missing, disabled, or lack their transition tables.` : `The table "${table}" has no changelog trigger: its changes are not recorded.`,
           fix
         });
-      } else if (!working.some((trigger) => recordedColumn(trigger) === primaryKey)) {
+      } else if (wrongColumn) {
         problems.push({
           code: "wrong-trigger-primary-key",
           table,
-          message: `The changelog trigger of "${table}" records the column "${recordedColumn(working[0])}", not the primary key "${primaryKey}".`,
+          message: `The changelog trigger of "${table}" records the column "${recordedColumn(wrongColumn)}", not the primary key "${primaryKey}".`,
           fix
         });
       } else if (!triggers.some((trigger) => trigger.changelog && firesOnTruncate(trigger))) {
@@ -1291,9 +1431,10 @@ function evaluateLilypadSchema(facts, options) {
         `pg_notify\\s*\\(\\s*'${escapeRegExp(notifyChannel.replace(/'/g, "''"))}'`,
         "i"
       );
-      const notifiedEvents = triggers.filter(
-        (trigger) => trigger.enabled && (trigger.type & TRIGGER_TYPE_ROW) !== 0 && notifies.test(trigger.source)
-      ).reduce((events, trigger) => events | trigger.type & ROW_EVENTS, 0);
+      const notifiedEvents = triggers.filter((trigger) => trigger.enabled && notifies.test(trigger.source)).reduce(
+        (events, trigger) => events | ((trigger.type & TRIGGER_TYPE_ROW) !== 0 ? trigger.type & ROW_EVENTS : recordedEvents(trigger)),
+        0
+      );
       const fix = lilypadChangelogSql({ table: changelog == null ? void 0 : changelog.custom, notifyChannel }) + lilypadChangelogTriggerSql({ table, primaryKey, changelogTable: changelog == null ? void 0 : changelog.custom });
       if (notifiedEvents === 0) {
         problems.push({
@@ -1303,11 +1444,10 @@ function evaluateLilypadSchema(facts, options) {
           fix
         });
       } else if (notifiedEvents !== ROW_EVENTS) {
-        const names = (events) => ROW_EVENT_NAMES.filter(([bit]) => (events & bit) !== 0).map(([, name]) => name).join(", ");
         problems.push({
           code: "missing-notify-trigger",
           table,
-          message: `The triggers of "${table}" send notifications on the "${notifyChannel}" channel only on ${names(notifiedEvents)}: the cache is not told about ${names(ROW_EVENTS & ~notifiedEvents)} made elsewhere.`,
+          message: `The triggers of "${table}" send notifications on the "${notifyChannel}" channel only on ${eventNames(notifiedEvents)}: the cache is not told about ${eventNames(ROW_EVENTS & ~notifiedEvents)} made elsewhere.`,
           fix
         });
       } else if (!triggers.some((trigger) => firesOnTruncate(trigger) && notifies.test(trigger.source))) {
@@ -1428,10 +1568,14 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCacheCore {
   membersLoadedAt;
   /** Loads started before this ticket (before a `TRUNCATE`) no longer tell which rows exist. */
   membersFloor = 0;
-  /** Receive the rows of the next load of the table (see `loadTable`). */
-  tableLoadWaiters = /* @__PURE__ */ new Set();
+  /** The load of the whole table in flight, shared by concurrent callers. */
+  tableLoad;
   /** The queries of `fetchRows` in flight, by normalized key. */
   rowFetches = /* @__PURE__ */ new Map();
+  /** The keys to re-read after a notification, gathered into one query (see `refreshInBatch`). */
+  eagerBatch;
+  /** The keys of the batches of `refreshInBatch` pending or running, with their number. */
+  eagerReads = /* @__PURE__ */ new Map();
   /** The refreshes of `refresh` in flight, and the one queued after each (normalized keys). */
   refreshes = /* @__PURE__ */ new Map();
   /**
@@ -1500,7 +1644,6 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCacheCore {
     if (tableNameParts.length > 1) {
       this.tableSchema = tableNameParts[tableNameParts.length - 2];
     }
-    this.bulkSyncFn = (signal) => this.loadRows(signal);
     this.verifier = new LilypadSchemaVerifier({
       gate,
       tableName: schema.tableName,
@@ -1546,23 +1689,22 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCacheCore {
       defaultLookback: () => this.defaultTtl + this.defaultStaleWhileRevalidate + 6e4
     };
   }
-  /** Loads every row of the table, for the bulk sync of the base class. */
+  /**
+   * Loads every row of the table and replaces the content of the cache with them.
+   *
+   * @returns The rows loaded, by normalized key: with `maxEntries`, the cache may not hold them all.
+   */
   async loadRows(signal) {
     const read = this.beginRead();
     const primaryKey = this.schema.primaryKey;
     const entries = (await this.gate.selectAllFromTable(this.schema, { signal })).map(
       (row) => [row[primaryKey], row]
     );
-    if (!signal.aborted) {
+    if (!signal.aborted && !this.disposed) {
       this.replaceMembers(entries, read.ticket, read.startedAt);
-      if (this.tableLoadWaiters.size > 0) {
-        const rows = new Map(entries.map(([key, row]) => [this.normalizeKey(key), row]));
-        for (const waiter of this.tableLoadWaiters) {
-          waiter(rows);
-        }
-      }
+      this.replaceEntries(read, entries);
     }
-    return entries;
+    return new Map(entries.map(([key, row]) => [this.normalizeKey(key), row]));
   }
   // TRUST AND RENEWAL
   /**
@@ -1595,10 +1737,11 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCacheCore {
   /**
    * Applies a change of a row made elsewhere.
    * - A change made by a write of this instance whose result the entry still holds: nothing to do.
-   * - A change of a key held (or being read) by this instance: `eager` re-fetches it at once;
-   *   `lazy` expires it with no query, which also discards a read in flight (it may predate the
-   *   change): the next read fetches it. A `lazy` DELETE caches the key as `null` at once.
-   * - A change of any other key: no query. The shared level entry is removed.
+   * - A change of a key held (or being read) by this instance: `eager` re-fetches it at once
+   *   (with the other keys notified meanwhile, in one query); `lazy` expires it with no query,
+   *   which also discards a read in flight (it may predate the change): the next read fetches
+   *   it. A `lazy` DELETE caches the key as `null` at once.
+   * - A change of any other key: no query, and no entry. The shared level entry is removed.
    * INSERT and UPDATE note the key as a row of the table, which `getAll` returns. An `eager`
    * DELETE of a key not held leaves it there: `getAll` reads it again, and learns whether it is
    * gone. A notification is thus never trusted without a query (any role can send one).
@@ -1611,20 +1754,24 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCacheCore {
     if (xid !== void 0 && this.isOwnWrite(key, xid)) {
       return key;
     }
-    if (op === "DELETE" && mode === "lazy") {
-      this.markDeleted(key);
-      return key;
-    }
     const normalizedKey = this.normalizeKey(key);
     const held = this.store.has(normalizedKey) || this.hasReadInFlight(normalizedKey);
+    if (op === "DELETE" && mode === "lazy") {
+      if (held) {
+        this.markDeleted(key);
+      } else {
+        this.members.delete(normalizedKey);
+        this.deleteShared(key);
+      }
+      return key;
+    }
     if (op !== "DELETE") {
       this.addMember(key);
     }
     if (!held) {
       this.deleteShared(key);
-      this.forceNextBulkSync();
     } else if (mode === "eager") {
-      await this.refreshKey(key);
+      await this.refreshInBatch(key);
     } else {
       this.markInvalid(key);
     }
@@ -1760,25 +1907,23 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCacheCore {
     return Date.now() < this.membersLoadedAt + this.bulkSyncTtl;
   }
   /**
-   * Loads the whole table, even if the bulk sync of the base class still counts as fresh.
+   * Loads the whole table, bounded by `bulkSync.timeout`. Concurrent calls share one load.
    *
    * @returns The rows loaded, by normalized key: with `maxEntries`, the cache may not hold them all.
    */
-  async loadTable() {
-    let loaded = /* @__PURE__ */ new Map();
-    const waiter = (rows) => {
-      loaded = rows;
-    };
-    this.tableLoadWaiters.add(waiter);
-    try {
-      if (Date.now() < this.bulkSyncExpirationTime) {
-        this.forceNextBulkSync();
-      }
-      await this.bulkSync({ throwOnError: true });
-    } finally {
-      this.tableLoadWaiters.delete(waiter);
+  loadTable() {
+    if (!this.tableLoad) {
+      const loading = this.bulkSyncFlowControl.executeWithTimeout((signal) => this.loadRows(signal)).catch((error) => {
+        libLog(this.logger, "error", this.name, "Error loading the table: ", error);
+        throw error;
+      }).finally(() => {
+        if (this.tableLoad === loading) {
+          this.tableLoad = void 0;
+        }
+      });
+      this.tableLoad = loading;
     }
-    return loaded;
+    return this.tableLoad;
   }
   /**
    * The keys whose entry is missing or expired (after renewing the entries still up to date). A
@@ -1838,8 +1983,14 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCacheCore {
     }
     return values;
   }
-  /** One read of `fetchRows`, bounded by `bulkSync.timeout`. */
-  async queryRows(keys) {
+  /**
+   * Reads rows by primary key, bounded by `bulkSync.timeout`, and caches them (`null` for the keys
+   * without a row).
+   *
+   * @param shared - Whether the rows also go to the shared level (and end the failure cooldown of
+   * their keys), as a fetch of `getOrFetch` does.
+   */
+  async queryRows(keys, shared = false) {
     const primaryKey = this.schema.primaryKey;
     try {
       return await this.bulkSyncFlowControl.executeWithTimeout(async (signal) => {
@@ -1854,7 +2005,12 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCacheCore {
           const row = rows.get(normalizedKey) ?? null;
           values.set(normalizedKey, row);
           if (!signal.aborted) {
-            read.store(row ? row[primaryKey] : key, row);
+            const storedKey = row ? row[primaryKey] : key;
+            if (shared) {
+              read.storeFetched(storedKey, row);
+            } else {
+              read.store(storedKey, row);
+            }
           }
         }
         return values;
@@ -1902,6 +2058,17 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCacheCore {
     this.assertNotDisposed();
     this.renew(this.normalizeKey(key));
     return super.get(key, options);
+  }
+  /**
+   * Tells whether the key is cached, and whether its row is up to date or expired, with no query.
+   * Like `get`, it first renews an entry the sync keeps up to date.
+   *
+   * @throws If the cache is disposed.
+   */
+  peek(key) {
+    this.assertNotDisposed();
+    this.renew(this.normalizeKey(key));
+    return super.peek(key);
   }
   /**
    * Returns the row of the key, from the cache or else from the database. Concurrent calls for the
@@ -1988,23 +2155,62 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCacheCore {
       return value;
     });
   }
-  /** Re-fetches a key; if the query fails, expires it instead. */
-  async refreshKey(key) {
+  /**
+   * Re-reads a key after a notification, together with the other keys notified meanwhile: a change
+   * of many rows notifies each of them, and one query per row would flood the pool. The batch is
+   * sent once the notifications received together have been handled (a microtask later). The keys
+   * of a failed query are expired instead.
+   *
+   * The query of a batch starts after the notifications of its keys: it sees their changes, even
+   * when an older read of the key is still running.
+   */
+  refreshInBatch(key) {
+    let batch = this.eagerBatch;
+    if (!batch) {
+      const keys = /* @__PURE__ */ new Map();
+      const done = new Promise((resolve) => {
+        queueMicrotask(() => {
+          var _a;
+          if (((_a = this.eagerBatch) == null ? void 0 : _a.keys) === keys) {
+            this.eagerBatch = void 0;
+          }
+          resolve(this.runEagerBatch(keys));
+        });
+      });
+      batch = { keys, done };
+      this.eagerBatch = batch;
+    }
+    const normalizedKey = this.normalizeKey(key);
+    if (!batch.keys.has(normalizedKey)) {
+      batch.keys.set(normalizedKey, key);
+      this.eagerReads.set(normalizedKey, (this.eagerReads.get(normalizedKey) ?? 0) + 1);
+    }
+    return batch.done;
+  }
+  async runEagerBatch(keys) {
     try {
-      await this.refreshRow(key);
-    } catch (error) {
-      libLog(
-        this.logger,
-        "error",
-        this.name,
-        `Error updating cache key "${String(key)}" after a change: `,
-        error
-      );
-      this.markInvalid(key);
+      if (!this.disposed) {
+        await this.queryRows([...keys.values()], true);
+      }
+    } catch {
+      if (!this.disposed) {
+        for (const key of keys.values()) {
+          this.markInvalid(key);
+        }
+      }
+    } finally {
+      for (const normalizedKey of keys.keys()) {
+        const count = (this.eagerReads.get(normalizedKey) ?? 1) - 1;
+        if (count > 0) {
+          this.eagerReads.set(normalizedKey, count);
+        } else {
+          this.eagerReads.delete(normalizedKey);
+        }
+      }
     }
   }
   hasReadInFlight(normalizedKey) {
-    return super.hasReadInFlight(normalizedKey) || this.rowFetches.has(normalizedKey) || this.refreshes.has(normalizedKey);
+    return super.hasReadInFlight(normalizedKey) || this.rowFetches.has(normalizedKey) || this.refreshes.has(normalizedKey) || this.eagerReads.has(normalizedKey);
   }
   /**
    * Returns every row of the table, or the rows of `keys`.
@@ -2121,21 +2327,32 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCacheCore {
   }
   /**
    * Inserts the item in the database and caches the row returned by the database.
-   * With `primaryKeyShouldAutoDetermine`, the primary key of `item` can be omitted: the cached row
+   * With `generatedPrimaryKey`, the primary key of `item` can be omitted: the cached row
    * holds the one generated by the database.
    *
-   * @returns The created row, or `null` if the schema's `selectSanitizationFn` discards it.
+   * @returns The created row, or `null` if the schema's `selectSanitizationFn` discards it. A row
+   * that the `selectSanitizationFn` returns without its primary key is returned, but not cached.
    * @throws If the cache is disposed.
    */
   async sqlCreate(item) {
     this.assertNotDisposed();
     const startTicket = this.nextTicket();
     const { row, xid } = await this.gate.insertToTable(this.schema, item);
-    if (row !== null) {
-      const key = this.getItemPrimaryKeyValue(row);
-      this.storeWritten(key, row, startTicket, xid);
-      this.emitInvalidation("write", [key]);
+    if (row === null) {
+      return row;
     }
+    const key = row[this.schema.primaryKey];
+    if (key === void 0) {
+      libLog(
+        this.logger,
+        "warn",
+        this.name,
+        `The row created in "${this.schema.tableName}" has no primary key "${String(this.schema.primaryKey)}" after selectSanitizationFn: it is not cached.`
+      );
+      return row;
+    }
+    this.storeWritten(key, row, startTicket, xid);
+    this.emitInvalidation("write", [key]);
     return row;
   }
   /**
@@ -2158,14 +2375,17 @@ var LilypadDbCache = class _LilypadDbCache extends LilypadCacheCore {
   /**
    * Deletes the row in the database, and caches the key as `null` (also for a protected key).
    *
+   * @returns `true` if a row had this key, `false` if there was none (the key is cached as `null`
+   * either way).
    * @throws If the cache is disposed.
    */
   async sqlDelete(key) {
     this.assertNotDisposed();
     const startTicket = this.nextTicket();
-    const { xid } = await this.gate.deleteFromTable(this.schema, key);
+    const { deleted, xid } = await this.gate.deleteFromTable(this.schema, key);
     this.storeWritten(key, null, startTicket, xid);
     this.emitInvalidation("write", [key]);
+    return deleted;
   }
 };
 export {
@@ -2177,10 +2397,8 @@ export {
   checkLilypadSchema,
   lilypadChangelogSql,
   lilypadChangelogTriggerSql,
-  lilypadCursorCovers,
   lilypadServerlessPool,
   pruneLilypadChangelog,
-  readLilypadChanges,
-  readLilypadChangesBatch
+  readLilypadChanges
 };
 //# sourceMappingURL=db.mjs.map

@@ -215,6 +215,71 @@ describe('LilypadCache platform features', () => {
       expect((await cache.getOrSetDetailed('malformed', async () => 3)).status).toBe('MISS');
     });
 
+    it('should fetch as usual when the codec throws while decoding', async () => {
+      const logger = createMockLogger();
+      const codec: LilypadSharedCodec<number> = {
+        encode: (value) => value,
+        decode: () => {
+          throw new Error('invalid shape');
+        },
+      };
+      const cache = createInstance<number>({ shared: { store: fake.store, codec }, logger });
+      await fake.store.set('lilypad:2:products:v:p1', {
+        lilypad: 2,
+        value: 1,
+        fetchedAt: Date.now(),
+        expiresAt: 9e15,
+      });
+
+      const result = await cache.getOrSetDetailed('p1', async () => 2);
+
+      expect(result).toMatchObject({ value: 2, status: 'MISS', refreshFailed: false });
+      expect(logger.warn).toHaveBeenCalledWith(
+        'products',
+        'Ignoring a shared entry the codec could not decode: "p1"',
+        expect.any(Error)
+      );
+    });
+
+    it('should keep a fetched value, without a failure, when the codec throws while encoding', async () => {
+      const logger = createMockLogger();
+      const codec: LilypadSharedCodec<number> = {
+        encode: () => {
+          throw new Error('not serializable');
+        },
+        decode: (raw) => raw as number,
+      };
+      const cache = createInstance<number>({
+        shared: { store: fake.store, codec },
+        failureCooldown: 10_000,
+        logger,
+      });
+
+      const result = await cache.getOrSetDetailed('p1', async () => 2);
+      await settle();
+
+      expect(result).toMatchObject({ value: 2, status: 'MISS', refreshFailed: false });
+      expect(cache.get('p1')).toBe(2);
+      expect(logger.error).not.toHaveBeenCalled();
+      expect(fake.data.has('lilypad:2:products:v:p1')).toBe(false);
+      expect(fake.data.has('lilypad:2:products:f:p1')).toBe(false);
+      expect(() => cache.set('p2', 3)).not.toThrow();
+    });
+
+    it('should keep a fetched value in the shared level through the stale window of the read', async () => {
+      const cache = createInstance<number>({ staleWhileRevalidate: 1000 });
+
+      await cache.getOrSet('p1', async () => 1, { staleWhileRevalidate: 60_000 });
+      await settle();
+
+      // TTL 1 s plus the 60 s asked by the read, not the 1 s of the cache
+      expect(fake.store.set).toHaveBeenCalledWith(
+        'lilypad:2:products:v:p1',
+        expect.anything(),
+        expect.objectContaining({ ttl: 61 })
+      );
+    });
+
     it('should write without reading the shared entry first by default', async () => {
       const cache = createInstance<number>();
 

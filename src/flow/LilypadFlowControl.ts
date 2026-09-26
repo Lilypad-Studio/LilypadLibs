@@ -1,4 +1,4 @@
-import type { LilypadLibLogger } from '@/logger/LilypadLibLogger';
+import { assertNumberOption } from '@/internal/LilypadValidation';
 
 export interface LilypadFlowControlOptions {
   /** Minimum time between two executions of each consumer/function pair, in milliseconds. */
@@ -8,19 +8,18 @@ export interface LilypadFlowControlOptions {
    * `(retries + 1) * timeout` plus the backoff times.
    */
   timeout?: number;
+  /** How many times a failed attempt is retried. Defaults to 0. */
   retries?: number;
-  logger?: LilypadLibLogger;
 }
 
 export interface LilypadExecuteFnOptions<T> {
-  /**
-   * Called once the execution has definitively failed (after all retries), or when it is refused
-   * by the rate limit. Its return value becomes the result of the execution; to propagate the
-   * error, throw from it.
-   */
-  errorFn?: (error: unknown) => T;
+  /** Identifies the execution: concurrent calls with the same identifier share one execution. */
   functionIdentifier: string;
-  consumerIdentifier: string;
+  /**
+   * With the `rate` option, the rate limit applies to each consumer/function pair; without a
+   * consumer, to the function alone.
+   */
+  consumerIdentifier?: string;
   /**
    * The operation to execute. The received signal is aborted when the operation times out,
    * so the function can stop its work and avoid side effects after the timeout.
@@ -55,63 +54,55 @@ export class LilypadRateLimitError extends Error {
 }
 
 /**
- * Above this number of tracked consumer/function pairs, expired rate limit entries are pruned.
+ * Above this number of tracked rate limit keys, expired entries are pruned.
  */
 const RATE_MAP_PRUNE_THRESHOLD = 1000;
 
 /**
- * A flow control utility class that manages execution of asynchronous operations with support for
- * rate limiting, retries, timeouts, and single-flight request deduplication.
+ * Flow control for asynchronous operations: timeouts, retries, rate limiting and single-flight
+ * deduplication. Each one is a method of its own (`executeWithTimeout`, `executeWithRetries`,
+ * `rateLimit`, `singleFlight`), and `executeFn` combines them all.
  *
  * The class is not generic: each execution is typed by its own `fn`.
  *
  * @example
  * ```typescript
- * const flowControl = new LilypadFlowControl({
- *   rate: 1000,
- *   timeout: 5000,
- *   retries: 3,
- *   logger: myLogger
- * });
+ * const flowControl = new LilypadFlowControl({ rate: 1000, timeout: 5000, retries: 3 });
  *
  * const result = await flowControl.executeFn({
  *   functionIdentifier: 'myFunction',
  *   consumerIdentifier: 'user123',
  *   fn: (signal) => fetchData({ signal }),
- *   backOffTime: (attempt) => Math.pow(2, attempt) * 100
+ *   backOffTime: (attempt) => Math.pow(2, attempt) * 100,
  * });
  * ```
  *
  * @remarks
  * - **Rate Limiting**: Enforces a minimum interval between executions per consumer/function pair.
- *   A refused execution fails with a `LilypadRateLimitError`, which goes to `errorFn` like any
- *   other failure.
- * - **Single-Flight**: Deduplicates concurrent requests for the same function identifier. Callers that
- *   join an in-flight execution share its result, including the outcome of the first caller's `errorFn`.
+ *   A refused execution rejects with a `LilypadRateLimitError`.
+ * - **Single-Flight**: Deduplicates concurrent requests for the same function identifier. Callers
+ *   that join an in-flight execution share its outcome, and each handles an error on its own.
  * - **Retries**: Automatically retries failed operations with configurable backoff strategies
  * - **Timeout**: Fails an attempt that exceeds the specified timeout duration with a
  *   `LilypadTimeoutError`, and aborts its signal. The timeout applies to each attempt, not to the
  *   whole execution.
- *
- * @property rate - Minimum milliseconds between executions for rate limiting
- * @property timeout - Maximum milliseconds to wait for each attempt
- * @property retries - Maximum number of retry attempts for failed operations
- * @property logger - Optional logger instance for error, warning, info, and debug messages
  */
 export class LilypadFlowControl {
-  private rate?: number;
-  private timeout?: number;
-  private retries?: number;
-  private logger?: LilypadLibLogger;
+  private readonly rate?: number;
+  private readonly timeout?: number;
+  private readonly retries?: number;
 
   private singleFlightMap: Map<string, Promise<unknown>> = new Map();
   private rateMap: Map<string, number> = new Map();
 
+  /** @throws If a numeric option is not valid (e.g. `NaN`, or a negative duration). */
   constructor(options?: LilypadFlowControlOptions) {
+    assertNumberOption('LilypadFlowControl', 'rate', options?.rate, 'non-negative');
+    assertNumberOption('LilypadFlowControl', 'timeout', options?.timeout, 'positive');
+    assertNumberOption('LilypadFlowControl', 'retries', options?.retries, 'non-negative-integer');
     this.rate = options?.rate;
     this.timeout = options?.timeout;
     this.retries = options?.retries;
-    this.logger = options?.logger;
   }
 
   /**
@@ -156,18 +147,15 @@ export class LilypadFlowControl {
    * Executes a given asynchronous function with retry logic and optional exponential backoff.
    *
    * @template T The return type of the execution function.
-   * @param options - The options for executing with retries, including:
    * @param options.executionFn - The asynchronous function to execute.
-   * @param options.errorFn - Optional function to handle errors after all retries have been exhausted. If provided, its return value is returned instead of throwing the error; it can throw to propagate it.
    * @param options.retries - The maximum number of retry attempts. If not provided, the instance's configured retries will be used.
    * @param options.backOffTime - Optional function to calculate the backoff time (in milliseconds) before each retry attempt. Receives the current attempt number as an argument. Defaults to exponential backoff if not provided.
-   * @returns A promise that resolves with the result of `executionFn`, or with the result of `errorFn` if retries are exhausted.
-   * @throws The error thrown by `executionFn` if all retries are exhausted and no `errorFn` is provided.
+   * @returns A promise that resolves with the result of `executionFn`.
+   * @throws The error of the last attempt, once all retries are exhausted.
    */
   async executeWithRetries<T>(options: {
     executionFn: () => Promise<T>;
     retries?: number;
-    errorFn?: (error: unknown) => T;
     backOffTime?: (attempt: number) => number;
   }): Promise<T> {
     let attempts = 0;
@@ -177,9 +165,6 @@ export class LilypadFlowControl {
         return result;
       } catch (error) {
         if (attempts >= (options.retries ?? this.retries ?? 0)) {
-          if (options.errorFn) {
-            return options.errorFn(error);
-          }
           throw error;
         }
         attempts++;
@@ -192,23 +177,17 @@ export class LilypadFlowControl {
   }
 
   /**
-   * Enforces a rate limit for a specific consumer and function combination.
-   *
-   * If a rate limit is set, this method checks whether the specified consumer
-   * has invoked the given function within the allowed time interval. If the
-   * rate limit is exceeded, an error is thrown. Otherwise, the invocation time
-   * is recorded.
+   * Enforces the rate limit (the `rate` option) for a key: records the call, or throws if the
+   * previous call of the key is more recent than `rate`. Without `rate`, it does nothing.
    *
    * It must stay synchronous: `executeFn` relies on no await happening between the single-flight
    * lookup and the registration of the new execution.
    *
-   * @param consumerIdentifier - A unique identifier for the consumer (e.g., user or service).
-   * @param functionIdentifier - A unique identifier for the function being rate-limited.
-   * @throws {LilypadRateLimitError} If the rate limit is exceeded for the given consumer and function.
+   * @param rateKey - What is limited, e.g. a consumer and a function.
+   * @throws {LilypadRateLimitError} If the rate limit is exceeded for the key.
    */
-  rateLimit(consumerIdentifier: string, functionIdentifier: string): void {
+  rateLimit(rateKey: string): void {
     if (this.rate !== undefined) {
-      const rateKey = consumerIdentifier + '#' + functionIdentifier;
       const now = Date.now();
       const lastExecution = this.rateMap.get(rateKey) ?? 0;
       if (now - lastExecution < this.rate) {
@@ -233,57 +212,70 @@ export class LilypadFlowControl {
   }
 
   /**
-   * @returns `true` if an execution for the function identifier is currently in flight.
+   * @returns `true` if an execution for the key is currently in flight.
    */
-  isInFlight(functionIdentifier: string): boolean {
-    return this.singleFlightMap.has(functionIdentifier);
+  isInFlight(key: string): boolean {
+    return this.singleFlightMap.has(key);
   }
 
   /**
-   * Executes a provided function with optional rate limiting, single-flight deduplication,
-   * retries, and timeout handling. Ensures that only one execution per function identifier
-   * is in-flight at a time, and subsequent calls return the same promise until completion.
-   * Calls that join an in-flight execution are not rate limited, since they do not start a new one.
-   * An execution refused by the rate limit goes to `errorFn`, like a failed one.
+   * Runs `fn`, unless an execution for the same key is in flight: then its promise is returned,
+   * and `fn` is not called. The execution is registered synchronously, so that a call made right
+   * after this one joins it.
    *
-   * @template T - The return type of the function to execute.
-   * @param options - The execution options, including:
-   *   - consumerIdentifier: Unique identifier for the consumer (used for rate limiting).
-   *   - functionIdentifier: Unique identifier for the function (used for single-flight).
-   *   - fn: The function to execute.
-   *   - errorFn: Optional error handler, called once all retries are exhausted.
-   *   - backOffTime: Optional backoff time between retries.
-   * @returns A promise that resolves with the result of the executed function.
+   * The caller that joins a flight is responsible for expecting the type of the one that started it.
    */
-  async executeFn<T>(options: LilypadExecuteFnOptions<T>): Promise<T> {
-    // The caller that joins a flight is responsible for using the same type as the one that started it
-    const inFlight = this.singleFlightMap.get(options.functionIdentifier) as Promise<T> | undefined;
+  singleFlight<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const inFlight = this.singleFlightMap.get(key) as Promise<T> | undefined;
     if (inFlight) {
       return inFlight;
     }
-
-    // Rate Limiting (synchronous, see rateLimit)
+    let execution: Promise<T>;
     try {
-      this.rateLimit(options.consumerIdentifier, options.functionIdentifier);
+      execution = fn();
     } catch (error) {
-      if (options.errorFn) {
-        return options.errorFn(error);
-      }
-      throw error;
+      return Promise.reject(error instanceof Error ? error : new Error(String(error)));
     }
-
-    // Execution Pipeline (Retries and Timeout)
-    const executionPromise = this.executeWithRetries<T>({
-      executionFn: () => this.executeWithTimeout(options.fn, options.timeout ?? this.timeout),
-      retries: options.retries ?? this.retries ?? 0,
-      errorFn: options.errorFn,
-      backOffTime: options.backOffTime,
-    }).finally(() => {
-      // Clear the single-flight map after the promise resolves or rejects
-      this.singleFlightMap.delete(options.functionIdentifier);
+    const flight: Promise<T> = execution.finally(() => {
+      if (this.singleFlightMap.get(key) === flight) {
+        this.singleFlightMap.delete(key);
+      }
     });
+    this.singleFlightMap.set(key, flight);
+    return flight;
+  }
 
-    this.singleFlightMap.set(options.functionIdentifier, executionPromise);
-    return executionPromise;
+  /**
+   * Executes a function with single-flight deduplication, rate limiting, retries and timeouts.
+   * Only one execution per function identifier is in flight at a time: later calls join it. Calls
+   * that join an in-flight execution are not rate limited, since they do not start a new one.
+   *
+   * @template T - The return type of the function to execute.
+   * @returns A promise that resolves with the result of the executed function.
+   * @throws {LilypadRateLimitError} If the execution is refused by the rate limit.
+   * @throws {LilypadTimeoutError} If the last attempt timed out.
+   * @throws The error of the last attempt, once the retries are exhausted.
+   */
+  executeFn<T>(options: LilypadExecuteFnOptions<T>): Promise<T> {
+    const { functionIdentifier, consumerIdentifier } = options;
+    if (!this.isInFlight(functionIdentifier)) {
+      try {
+        // Synchronous, see rateLimit
+        this.rateLimit(
+          consumerIdentifier === undefined
+            ? functionIdentifier
+            : `${consumerIdentifier}#${functionIdentifier}`
+        );
+      } catch (error) {
+        return Promise.reject(error as Error);
+      }
+    }
+    return this.singleFlight(functionIdentifier, () =>
+      this.executeWithRetries<T>({
+        executionFn: () => this.executeWithTimeout(options.fn, options.timeout),
+        retries: options.retries,
+        backOffTime: options.backOffTime,
+      })
+    );
   }
 }

@@ -1,44 +1,35 @@
-import type { LilypadLogger } from './LilypadLogger';
-
 /**
  * A log message, as received by the components.
  */
 export type LilypadLogRecord<T extends string = string> = {
   /** The channel the message was logged on. */
   type: T;
-  /** The parts passed to the channel method, formatted and joined by spaces. */
+  /**
+   * The parts passed to the channel method, formatted and joined by spaces, with the values of the
+   * redacted keys replaced (see the logger's `redact` option).
+   */
   message: string;
-  /** The parts passed to the channel method, as they were. */
+  /** The parts passed to the channel method, as they were (not redacted). */
   parts: unknown[];
   timestamp: Date;
   loggerName?: string;
-  /** The result of the logger's `context` option when the message was logged. */
+  /** The result of the logger's `context` option when the message was logged, redacted. */
   context?: Record<string, unknown>;
 };
 
-export interface LilypadLoggerComponentOptions<T extends string> {
-  logger: ReturnType<typeof LilypadLogger.create<T>>;
-  /**
-   * Set by the logger; components called directly build a minimal one. Typed with `string`, so
-   * that components typed with different channel unions stay assignable to each other.
-   */
-  record?: LilypadLogRecord;
-}
-
 /**
- * Abstract base class for logging components in the Lilypad library.
- *
- * Provides a template for implementing custom loggers with standardized message formatting.
- * Subclasses implement {@link send}, which receives the formatted text, or override
- * {@link sendRecord} to receive the structured record (e.g. to write JSON).
+ * Abstract base class of the outputs of a {@link LilypadLogger}: a component implements
+ * {@link write}, which receives each record of the channels it is registered on. Use
+ * {@link formatRecord} for a line of text.
  *
  * @template T - A string literal type representing the log message types (e.g., 'INFO', 'ERROR', 'WARN')
  *
  * @example
  * ```typescript
- * class ConsoleLogger extends LilypadLoggerComponent<'INFO' | 'ERROR' | 'WARN'> {
- *   protected async send(message: string): Promise<void> {
- *     console.log(message);
+ * class StderrLogger extends LilypadLoggerComponent<'info' | 'error'> {
+ *   async write(record: LilypadLogRecord<'info' | 'error'>): Promise<void> {
+ *     process.stderr.write(this.formatRecord(record) + '
+');
  *   }
  * }
  * ```
@@ -61,36 +52,10 @@ export abstract class LilypadLoggerComponent<T extends string> {
     return formatted;
   }
 
-  async output(
-    type: T,
-    message: string,
-    options?: LilypadLoggerComponentOptions<T>
-  ): Promise<void> {
-    const record = (options?.record as LilypadLogRecord<T> | undefined) ?? {
-      type,
-      message,
-      parts: [message],
-      timestamp: new Date(),
-      loggerName: options?.logger?.__name,
-    };
-    await this.sendRecord(record);
-  }
-
   /**
-   * Sends a record to the output. By default it formats the record with {@link formatRecord}
-   * and passes it to {@link send}.
+   * Sends a record to the output. A rejection is reported by the logger to its `errorLogging`.
    */
-  protected async sendRecord(record: LilypadLogRecord<T>): Promise<void> {
-    await this.send(this.formatRecord(record), record.type);
-  }
-
-  /**
-   * Sends an already formatted message to the specific output channel.
-   *
-   * @param message - The formatted message.
-   * @param type - The log type of the message, for outputs that route messages by severity.
-   */
-  protected abstract send(message: string, type: T): Promise<void>;
+  abstract write(record: LilypadLogRecord<T>): Promise<void>;
 }
 
 /**

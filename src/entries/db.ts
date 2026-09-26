@@ -13,33 +13,31 @@ export type {
   LilypadDbDeleteResult,
   LilypadDbGateOptions,
   LilypadDbInsertData,
+  LilypadDbListener,
   LilypadDbPoolOptions,
   LilypadDbSchema,
   LilypadDbUpdateData,
   LilypadDbWriteResult,
-  ListenerCallbackIdentifier,
 } from '../dbGate/LilypadDbGate';
 
 export { LilypadDbCache } from '../cache/LilypadDbCache';
 export type {
   LilypadDbCacheChangelogSync,
-  LilypadDbCacheDefaultNotificationPayload,
   LilypadDbCacheListenSync,
   LilypadDbCacheOptions,
   LilypadDbCacheSchemaVerification,
   LilypadDbCacheSync,
   LilypadDbCacheTrustedSyncOptions,
   LilypadDbKey,
+  LilypadDbNotification,
 } from '../cache/LilypadDbCache';
 
 export {
   LILYPAD_DEFAULT_CHANGELOG_TABLE,
   lilypadChangelogSql,
   lilypadChangelogTriggerSql,
-  lilypadCursorCovers,
   pruneLilypadChangelog,
   readLilypadChanges,
-  readLilypadChangesBatch,
 } from '../dbGate/LilypadChangelog';
 export type {
   LilypadChange,

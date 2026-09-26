@@ -13,19 +13,8 @@ describe('LilypadLogger', () => {
   let mockComponent2: LilypadLoggerComponent<mockType>;
 
   beforeEach(() => {
-    mockComponent = {
-      output: vi.fn(),
-      getTimestamp: vi.fn(() => new Date().toISOString()),
-      formatMessage: vi.fn((channel, message) => `[${channel}] ${message}`),
-      send: vi.fn(),
-    } as unknown as LilypadLoggerComponent<mockType>;
-
-    mockComponent2 = {
-      output: vi.fn(),
-      getTimestamp: vi.fn(() => new Date().toISOString()),
-      formatMessage: vi.fn((channel, message) => `[${channel}] ${message}`),
-      send: vi.fn(),
-    } as unknown as LilypadLoggerComponent<mockType>;
+    mockComponent = { write: vi.fn() } as unknown as LilypadLoggerComponent<mockType>;
+    mockComponent2 = { write: vi.fn() } as unknown as LilypadLoggerComponent<mockType>;
   });
 
   it('should create logger with dynamic methods for each channel', () => {
@@ -40,7 +29,7 @@ describe('LilypadLogger', () => {
     expect(typeof logger.error).toBe('function');
   });
 
-  it('should call component.output with string message', async () => {
+  it('should call component.write with the record of a string message', async () => {
     const logger = LilypadLogger.create<mockType>({
       components: {
         info: [mockComponent],
@@ -50,10 +39,9 @@ describe('LilypadLogger', () => {
 
     await logger.info('test message');
 
-    expect(mockComponent.output).toHaveBeenCalledWith('info', 'test message', {
-      logger: logger,
-      record: expect.objectContaining({ type: 'info', message: 'test message' }),
-    });
+    expect(mockComponent.write).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'info', message: 'test message' })
+    );
   });
 
   it('should stringify non-string messages', async () => {
@@ -67,10 +55,8 @@ describe('LilypadLogger', () => {
     const obj = { key: 'value' };
     await logger.info(obj);
 
-    expect(mockComponent.output).toHaveBeenCalledWith(
-      'info',
-      "{ key: 'value' }",
-      expect.objectContaining({ logger })
+    expect(mockComponent.write).toHaveBeenCalledWith(
+      expect.objectContaining({ message: "{ key: 'value' }" })
     );
   });
 
@@ -81,7 +67,7 @@ describe('LilypadLogger', () => {
 
     await logger.error('Failure:', new Error('boom'));
 
-    const message = vi.mocked(mockComponent.output).mock.calls[0]![1];
+    const message = vi.mocked(mockComponent.write).mock.calls[0]![0].message;
     expect(message).toContain('Failure: Error: boom');
     expect(message).toContain('LilypadLogger.test.ts');
   });
@@ -95,12 +81,12 @@ describe('LilypadLogger', () => {
 
     await expect(logger.info(circular, 10n)).resolves.toBeUndefined();
 
-    const message = vi.mocked(mockComponent.output).mock.calls[0]![1];
+    const message = vi.mocked(mockComponent.write).mock.calls[0]![0].message;
     expect(message).toContain('[Circular]');
     expect(message).toContain('10n');
   });
 
-  it.each(['components', 'register', '__name', '_name', 'then', 'constructor', 'toString'])(
+  it.each(['components', 'register', 'name', 'then', 'constructor', 'toString'])(
     'should reject the reserved log channel "%s"',
     (channel) => {
       expect(() =>
@@ -127,12 +113,12 @@ describe('LilypadLogger', () => {
 
     await logger.info('test');
 
-    expect(mockComponent.output).toHaveBeenCalled();
-    expect(mockComponent2.output).toHaveBeenCalled();
+    expect(mockComponent.write).toHaveBeenCalled();
+    expect(mockComponent2.write).toHaveBeenCalled();
   });
 
   it('should handle component errors with errorLogging callback', async () => {
-    mockComponent.output = vi.fn(() => {
+    mockComponent.write = vi.fn(() => {
       throw new Error('Component error');
     });
     const errorLogging = vi.fn();
@@ -151,7 +137,7 @@ describe('LilypadLogger', () => {
   });
 
   it('should use console.error as fallback for component errors', async () => {
-    mockComponent.output = vi.fn(() => {
+    mockComponent.write = vi.fn(() => {
       throw new Error('Component error');
     });
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -183,8 +169,8 @@ describe('LilypadLogger', () => {
 
     await logger.info('test');
 
-    expect(mockComponent.output).toHaveBeenCalled();
-    expect(mockComponent2.output).toHaveBeenCalled();
+    expect(mockComponent.write).toHaveBeenCalled();
+    expect(mockComponent2.write).toHaveBeenCalled();
   });
 
   it('should return this for method chaining on register', () => {
@@ -212,7 +198,7 @@ describe('LilypadLogger', () => {
       name: 'TestLogger',
     });
 
-    expect(logger.__name).toBe('TestLogger');
+    expect(logger.name).toBe('TestLogger');
   });
 
   it('should initialize components correctly', () => {
@@ -238,7 +224,7 @@ describe('LilypadLogger', () => {
     await logger.info('first message');
     await logger.info('second message');
 
-    expect(mockComponent.output).toHaveBeenCalledTimes(2);
+    expect(mockComponent.write).toHaveBeenCalledTimes(2);
   });
 
   it('should not throw error if no components are registered', async () => {
@@ -254,7 +240,7 @@ describe('LilypadLogger', () => {
   });
 
   it('should never reject, even when errorLogging fails', async () => {
-    mockComponent.output = vi.fn(async () => {
+    mockComponent.write = vi.fn(async () => {
       throw new Error('Component error');
     });
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -273,10 +259,10 @@ describe('LilypadLogger', () => {
   });
 
   it('should report the error of every failing component', async () => {
-    mockComponent.output = vi.fn(async () => {
+    mockComponent.write = vi.fn(async () => {
       throw new Error('first');
     });
-    mockComponent2.output = vi.fn(async () => {
+    mockComponent2.write = vi.fn(async () => {
       throw new Error('second');
     });
     const errorLogging = vi.fn(async () => {});
@@ -315,7 +301,7 @@ describe('LilypadLogger', () => {
   describe('serverless support', () => {
     it('should hand every message being sent to platform.background', async () => {
       let resolveOutput!: () => void;
-      mockComponent.output = vi.fn(() => new Promise<void>((resolve) => (resolveOutput = resolve)));
+      mockComponent.write = vi.fn(() => new Promise<void>((resolve) => (resolveOutput = resolve)));
       const background = vi.fn();
       const logger = LilypadLogger.create<mockType>({
         components: { info: [mockComponent], error: [] },
@@ -347,12 +333,12 @@ describe('LilypadLogger', () => {
       });
 
       await expect(logger.info('message')).resolves.toBeUndefined();
-      expect(mockComponent.output).toHaveBeenCalledOnce();
+      expect(mockComponent.write).toHaveBeenCalledOnce();
     });
 
     it('should resolve flush once every pending message is sent', async () => {
       let resolveOutput!: () => void;
-      mockComponent.output = vi.fn(() => new Promise<void>((resolve) => (resolveOutput = resolve)));
+      mockComponent.write = vi.fn(() => new Promise<void>((resolve) => (resolveOutput = resolve)));
       const logger = LilypadLogger.create<mockType>({
         components: { info: [mockComponent], error: [] },
       });
@@ -379,13 +365,48 @@ describe('LilypadLogger', () => {
       requestId = 'req-2';
       await logged;
 
-      expect(mockComponent.output).toHaveBeenCalledWith(
-        'info',
-        'message',
-        expect.objectContaining({
-          record: expect.objectContaining({ context: { requestId: 'req-1' } }),
-        })
+      expect(mockComponent.write).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'message', context: { requestId: 'req-1' } })
       );
+    });
+
+    it('should redact the default keys in the messages and the context', async () => {
+      const logger = LilypadLogger.create<mockType>({
+        components: { info: [mockComponent], error: [] },
+        context: () => ({ requestId: 'req-1', session: { Cookie: 'sid=1' } }),
+      });
+      const error = Object.assign(new Error('request failed'), {
+        config: { headers: { Authorization: 'Bearer secret', Accept: 'json' } },
+      });
+
+      await logger.info('Failed:', error, { apiKey: 'k', tokenCount: 3 });
+
+      const record = vi.mocked(mockComponent.write).mock.calls[0]![0];
+      expect(record.message).toContain("Authorization: [Redacted], Accept: 'json'");
+      expect(record.message).toContain('apiKey: [Redacted], tokenCount: 3');
+      expect(record.message).not.toContain('Bearer secret');
+      expect(record.context).toEqual({ requestId: 'req-1', session: { Cookie: '[Redacted]' } });
+      // The raw parts are not redacted
+      expect(record.parts[1]).toBe(error);
+    });
+
+    it('should redact the keys given, or none with false', async () => {
+      const custom = LilypadLogger.create<mockType>({
+        components: { info: [mockComponent], error: [] },
+        redact: ['ssn'],
+      });
+      const none = LilypadLogger.create<mockType>({
+        components: { info: [mockComponent2], error: [] },
+        redact: false,
+      });
+
+      await custom.info({ ssn: '123', password: 'p' });
+      await none.info({ password: 'p' });
+
+      expect(vi.mocked(mockComponent.write).mock.calls[0]![0].message).toBe(
+        "{ ssn: [Redacted], password: 'p' }"
+      );
+      expect(vi.mocked(mockComponent2.write).mock.calls[0]![0].message).toBe("{ password: 'p' }");
     });
 
     it('should log without context when the context function throws', async () => {
@@ -397,7 +418,7 @@ describe('LilypadLogger', () => {
       });
 
       await expect(logger.info('message')).resolves.toBeUndefined();
-      expect(mockComponent.output).toHaveBeenCalledOnce();
+      expect(mockComponent.write).toHaveBeenCalledOnce();
     });
   });
 });

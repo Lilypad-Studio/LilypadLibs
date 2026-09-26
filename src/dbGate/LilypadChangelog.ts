@@ -14,8 +14,12 @@ export const LILYPAD_DEFAULT_NOTIFY_CHANNEL = 'cache_events';
  * The function carries it in its comment (`lilypad-changelog:<version>`), so that
  * `checkLilypadSchema` can tell an installation made by an older version of the library.
  */
-export const LILYPAD_CHANGELOG_VERSION = 3;
+export const LILYPAD_CHANGELOG_VERSION = 4;
 export const LILYPAD_CHANGELOG_VERSION_PREFIX = 'lilypad-changelog:';
+
+/** The transition tables of the statement triggers (version 4): the rows before and after. */
+export const LILYPAD_CHANGELOG_OLD_ROWS = 'lilypad_old';
+export const LILYPAD_CHANGELOG_NEW_ROWS = 'lilypad_new';
 
 /** Replaces the characters that are not allowed in the names derived from a table name. */
 function identifierPrefix(name: string): string {
@@ -39,10 +43,30 @@ export function triggerFunctionName(changelogTable: string): string {
   return `${identifierPrefix(changelogTable)}_record`;
 }
 
-/** The names of the row trigger and of the TRUNCATE trigger that record the changes of a table. */
-export function changelogTriggerNames(table: string): { row: string; truncate: string } {
+/**
+ * The names of the triggers that record the changes of a table: one statement trigger per event,
+ * and the row trigger that versions 3 and earlier installed instead of the first three.
+ */
+export function changelogTriggerNames(table: string): {
+  insert: string;
+  update: string;
+  delete: string;
+  truncate: string;
+  legacyRow: string;
+} {
   const prefix = identifierPrefix(table);
-  return { row: `${prefix}_lilypad_changes`, truncate: `${prefix}_lilypad_truncate` };
+  return {
+    insert: `${prefix}_lilypad_insert`,
+    update: `${prefix}_lilypad_update`,
+    delete: `${prefix}_lilypad_delete`,
+    truncate: `${prefix}_lilypad_truncate`,
+    legacyRow: `${prefix}_lilypad_changes`,
+  };
+}
+
+/** Escapes a string placed in the format string of the SQL `format()` function. */
+function escapeFormat(value: string): string {
+  return value.replace(/%/g, '%%');
 }
 
 export type LilypadChangelogSqlOptions = {
@@ -75,6 +99,22 @@ export function lilypadChangelogSql(options: LilypadChangelogSqlOptions = {}): s
       'xid', pg_current_xact_id()::text
     )::text);`;
   const functionName = quoteIdentifier(triggerFunctionName(table));
+  const oldRows = LILYPAD_CHANGELOG_OLD_ROWS;
+  const newRows = LILYPAD_CHANGELOG_NEW_ROWS;
+  // The changes of a statement trigger, recorded (and notified) in one query; $1 and $2 are the
+  // schema and the name of the table, %s the query of the changed rows
+  const recordChanged =
+    channel === false
+      ? `INSERT INTO ${escapeFormat(quotedTable)} (table_schema, table_name, row_id, op)
+      SELECT $1, $2, changed.row_id, changed.op FROM (%s) AS changed`
+      : `WITH recorded AS (
+        INSERT INTO ${escapeFormat(quotedTable)} (table_schema, table_name, row_id, op)
+        SELECT $1, $2, changed.row_id, changed.op FROM (%s) AS changed
+        RETURNING row_id, op
+      )
+      SELECT pg_notify(${escapeFormat(quoteLiteral(channel))}, json_build_object(
+        'schema', $1, 'table', $2, 'id', row_id, 'op', op, 'xid', pg_current_xact_id()::text
+      )::text) FROM recorded`;
 
   return `CREATE TABLE IF NOT EXISTS ${quotedTable} (
   id           bigserial   PRIMARY KEY,
@@ -94,11 +134,13 @@ CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${indexPrefix}_table_xid_idx`)}
 CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${indexPrefix}_changed_at_idx`)}
   ON ${quotedTable} (changed_at);
 
--- Records a change of a row, or a TRUNCATE of the table; the trigger argument is the primary key column.
+-- Records the changes of the rows of a statement, or a TRUNCATE of the table; the trigger argument
+-- is the primary key column.
 CREATE OR REPLACE FUNCTION ${functionName}() RETURNS trigger AS $$
 DECLARE
   new_id text;
   old_id text;
+  changed text;
 BEGIN
   IF TG_OP = 'TRUNCATE' THEN
     INSERT INTO ${quotedTable} (table_schema, table_name, row_id, op)
@@ -106,6 +148,30 @@ BEGIN
     RETURN NULL;
   END IF;
 
+  IF TG_LEVEL = 'STATEMENT' THEN
+    -- Statement triggers (version 4): every row of the statement in one query, from the transition
+    -- tables. Only the primary key column is read, instead of converting whole rows to JSON.
+    changed := CASE TG_OP
+      WHEN 'INSERT' THEN format(
+        'SELECT to_jsonb(n.%1$I) #>> ''{}'' AS row_id, ''INSERT'' AS op FROM ${newRows} n',
+        TG_ARGV[0])
+      WHEN 'DELETE' THEN format(
+        'SELECT to_jsonb(o.%1$I) #>> ''{}'' AS row_id, ''DELETE'' AS op FROM ${oldRows} o',
+        TG_ARGV[0])
+      -- An update that changes primary keys also deletes the old keys that no row has any more
+      ELSE format(
+        'SELECT to_jsonb(o.%1$I) #>> ''{}'' AS row_id, ''DELETE'' AS op FROM ${oldRows} o '
+        || 'WHERE NOT EXISTS (SELECT 1 FROM ${newRows} n WHERE n.%1$I = o.%1$I) '
+        || 'UNION ALL SELECT to_jsonb(n.%1$I) #>> ''{}'', ''UPDATE'' FROM ${newRows} n',
+        TG_ARGV[0])
+    END;
+    EXECUTE format($record$
+      ${recordChanged}
+    $record$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;
+    RETURN NULL;
+  END IF;
+
+  -- Row triggers, installed by version 3 and earlier: one change at a time
   IF TG_OP <> 'DELETE' THEN
     new_id := to_jsonb(NEW) ->> TG_ARGV[0];
   END IF;
@@ -129,9 +195,14 @@ COMMENT ON FUNCTION ${functionName}() IS ${quoteLiteral(`${LILYPAD_CHANGELOG_VER
 }
 
 /**
- * The SQL that attaches the changelog triggers to a cached table: one for the changes of its rows,
- * and one for `TRUNCATE`, which fires no row trigger. Run it once per table, in a migration, after
- * {@link lilypadChangelogSql}.
+ * The SQL that attaches the changelog triggers to a cached table: one statement trigger for each of
+ * INSERT, UPDATE and DELETE, which records all the rows of a statement in one query (through its
+ * transition tables), and one for `TRUNCATE`. It replaces the row trigger of the versions 3 and
+ * earlier. Run it once per table, in a migration (in one transaction, so that no write goes
+ * unrecorded), after {@link lilypadChangelogSql}.
+ *
+ * Transition tables are not supported on the partitions of a partitioned table, nor on tables with
+ * inheritance children: attach the triggers to the partitioned table itself.
  *
  * @param options.table - The cached table (as in its `LilypadDbSchema`).
  * @param options.primaryKey - Its primary key column.
@@ -146,10 +217,21 @@ export function lilypadChangelogTriggerSql(options: {
   const names = changelogTriggerNames(options.table);
   const table = quoteIdentifier(options.table);
   const execute = `EXECUTE FUNCTION ${quoteIdentifier(triggerFunctionName(changelogTable))}(${quoteLiteral(options.primaryKey)})`;
-  return `DROP TRIGGER IF EXISTS ${quoteIdentifier(names.row)} ON ${table};
-CREATE TRIGGER ${quoteIdentifier(names.row)}
-  AFTER INSERT OR UPDATE OR DELETE ON ${table}
-  FOR EACH ROW ${execute};
+  const oldRows = LILYPAD_CHANGELOG_OLD_ROWS;
+  const newRows = LILYPAD_CHANGELOG_NEW_ROWS;
+  return `DROP TRIGGER IF EXISTS ${quoteIdentifier(names.legacyRow)} ON ${table};
+DROP TRIGGER IF EXISTS ${quoteIdentifier(names.insert)} ON ${table};
+CREATE TRIGGER ${quoteIdentifier(names.insert)}
+  AFTER INSERT ON ${table} REFERENCING NEW TABLE AS ${newRows}
+  FOR EACH STATEMENT ${execute};
+DROP TRIGGER IF EXISTS ${quoteIdentifier(names.update)} ON ${table};
+CREATE TRIGGER ${quoteIdentifier(names.update)}
+  AFTER UPDATE ON ${table} REFERENCING OLD TABLE AS ${oldRows} NEW TABLE AS ${newRows}
+  FOR EACH STATEMENT ${execute};
+DROP TRIGGER IF EXISTS ${quoteIdentifier(names.delete)} ON ${table};
+CREATE TRIGGER ${quoteIdentifier(names.delete)}
+  AFTER DELETE ON ${table} REFERENCING OLD TABLE AS ${oldRows}
+  FOR EACH STATEMENT ${execute};
 DROP TRIGGER IF EXISTS ${quoteIdentifier(names.truncate)} ON ${table};
 CREATE TRIGGER ${quoteIdentifier(names.truncate)}
   AFTER TRUNCATE ON ${table}
@@ -290,7 +372,9 @@ export async function readLilypadChangesBatch(
 
   const changes: LilypadChange[][] = options.requests.map(() => []);
   for (const row of rows) {
-    if (row.id !== null) {
+    // A row change without a row id cannot be applied (e.g. recorded by a version 3 function
+    // called by a statement trigger)
+    if (row.id !== null && (row.row_id !== null || row.op === 'TRUNCATE')) {
       changes[row.request as number]?.push({
         id: row.id as string,
         xid: BigInt(row.xid as string),

@@ -115,11 +115,25 @@ function registryKeyOf(namespace: string, options: LilypadSingletonAble): string
   return options.singleton ? `${namespace}:${options.singletonIdentifier}` : undefined;
 }
 
-function releaseFor(registryKey: string | undefined): LilypadSingletonRelease {
+/** What a factory registered under a key: the instance, or the promise of it while it is created. */
+type LilypadSingletonOwner = { registered?: unknown; instance?: unknown };
+
+/**
+ * The release function of an instance: it removes the registry entry only if it still holds that
+ * instance, not one registered under the same key since (e.g. after a manual removal).
+ */
+function releaseFor(
+  registryKey: string | undefined,
+  owner: LilypadSingletonOwner
+): LilypadSingletonRelease {
   let released = registryKey === undefined;
   return () => {
-    if (!released) {
-      released = true;
+    if (released) {
+      return;
+    }
+    released = true;
+    const current = singletonMap.get(registryKey!);
+    if (current !== undefined && (current === owner.instance || current === owner.registered)) {
       removeLilypadSingletonInstance(registryKey!);
     }
   };
@@ -139,11 +153,16 @@ export function createLilypadSingletonAble<T>(
 ): T {
   const registryKey = registryKeyOf(namespace, options);
   if (registryKey === undefined) {
-    return createInstanceFn(releaseFor(undefined));
+    return createInstanceFn(releaseFor(undefined, {}));
   }
+  const owner: LilypadSingletonOwner = {};
   return getLilypadSingletonInstance(
     registryKey,
-    () => createInstanceFn(releaseFor(registryKey)),
+    () => {
+      const instance = createInstanceFn(releaseFor(registryKey, owner));
+      owner.instance = instance;
+      return instance;
+    },
     signature
   );
 }
@@ -162,11 +181,20 @@ export function createLilypadSingletonAbleAsync<T>(
 ): Promise<T> {
   const registryKey = registryKeyOf(namespace, options);
   if (registryKey === undefined) {
-    return createInstanceFn(releaseFor(undefined));
+    return createInstanceFn(releaseFor(undefined, {}));
   }
+  const owner: LilypadSingletonOwner = {};
   return getLilypadSingletonInstanceAsync(
     registryKey,
-    () => createInstanceFn(releaseFor(registryKey)),
+    () => {
+      const registered = createInstanceFn(releaseFor(registryKey, owner)).then((instance) => {
+        owner.instance = instance;
+        return instance;
+      });
+      // Registered as it is while the instance is created
+      owner.registered = registered;
+      return registered;
+    },
     signature
   );
 }

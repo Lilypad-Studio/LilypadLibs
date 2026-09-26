@@ -67,7 +67,7 @@ export const getGate = () =>
 
 - **Use the pooled connection string** (with Neon, the host that contains `-pooler`). Every instance opens its own pool, and a pooler lets many of them share few database connections. The gate already disables prepared statements (`prepare: false`), which transaction-mode poolers require.
 - **`lilypadServerlessPool`** keeps few connections per instance (`max: 3`) and closes them after 5 idle seconds, so a suspended instance does not hold connections. Raise `max` if a single request runs many queries in parallel.
-- **`statementTimeout`** makes Postgres stop queries that take too long, so that slow queries whose callers already gave up do not pile up. Keep it below the `maxDuration` of your functions.
+- **`statementTimeout`** (default: 30 s) makes Postgres stop queries that take too long, so that slow queries whose callers already gave up do not hold the few connections of the pool. Keep it below the `maxDuration` of your functions.
 - `listenerConnectionString` (a direct, non-pooled connection) is only needed by the `listen` strategy, which is not recommended on Vercel (see section 5).
 
 ## 3. Creating instances without connecting at build time
@@ -151,9 +151,9 @@ await sql.unsafe(lilypadChangelogTriggerSql({ table: 'users', primaryKey: 'id' }
 
 Or print the SQL and paste it into your migration tool: both functions return plain SQL strings. It needs PostgreSQL 13 or later.
 
-- The changelog table (`lilypad_cache_changes`) records the table, the primary key and the operation of every change. An update that changes the primary key is recorded as a delete of the old key and an update of the new one. `lilypadChangelogTriggerSql` also adds a trigger for `TRUNCATE`, which fires no row trigger.
+- The changelog table (`lilypad_cache_changes`) records the table, the primary key and the operation of every change. An update that changes the primary key is recorded as a delete of the old key and an update of the new one. `lilypadChangelogTriggerSql` also adds a trigger for `TRUNCATE`, which the other triggers do not see.
 - The trigger also sends a `NOTIFY` on `cache_events`, so `listen` and `changelog` can coexist (for example a long-running worker next to the Vercel app). Pass `{ notifyChannel: false }` to skip it.
-- If you installed the changelog with an earlier version of the library, run `lilypadChangelogSql()` and `lilypadChangelogTriggerSql()` again: they update the trigger function (version 3) and add the `TRUNCATE` trigger.
+- If you installed the changelog with an earlier version of the library, run `lilypadChangelogSql()` and `lilypadChangelogTriggerSql()` again: they update the trigger function (version 4) and replace the row trigger with statement triggers, which record a statement that changes many rows in one query. Run them in one transaction.
 - The cache checks the setup once, with its first read of the changelog, and logs a warning with the missing SQL (`verify: 'warn'`, the default). With `verify: 'throw'`, `create` rejects instead, but it then queries the database: keep the default for code that runs during `next build`. To check in a deployment script, call `checkLilypadSchema(gate, { tables: [{ table: 'users', primaryKey: 'id' }] })` (see the [README](../README.md#checking-the-database-setup)).
 
 ### Using it

@@ -18,6 +18,12 @@ const changelogRow: LilypadTriggerInfo = {
   source: '',
 };
 const changelogTruncate: LilypadTriggerInfo = { ...changelogRow, type: TRUNCATE_TRIGGER };
+/** The statement triggers installed by version 4, one per event, with their transition tables. */
+const changelogStatements: LilypadTriggerInfo[] = [
+  { ...changelogRow, type: 4, newTable: 'lilypad_new' },
+  { ...changelogRow, type: 16, oldTable: 'lilypad_old', newTable: 'lilypad_new' },
+  { ...changelogRow, type: 8, oldTable: 'lilypad_old' },
+];
 
 const notifySource = (channel: string) => `BEGIN PERFORM pg_notify('${channel}', payload); END`;
 
@@ -28,7 +34,7 @@ function facts(overrides: Partial<LilypadSchemaFacts> = {}): LilypadSchemaFacts 
       hasTable: true,
       hasSchemaColumn: true,
       hasFunction: true,
-      functionComment: 'lilypad-changelog:3',
+      functionComment: 'lilypad-changelog:4',
     },
     tables: [{ schema: 'public', triggers: [changelogRow, changelogTruncate] }],
     ...overrides,
@@ -108,6 +114,19 @@ describe('evaluateLilypadSchema', () => {
     ['no trigger', []],
     ['a disabled trigger', [{ ...changelogRow, enabled: false }, changelogTruncate]],
     ['a trigger without DELETE', [{ ...changelogRow, type: 1 | 4 | 16 }, changelogTruncate]],
+    [
+      'statement triggers without UPDATE',
+      [changelogStatements[0]!, changelogStatements[2]!, changelogTruncate],
+    ],
+    [
+      'a statement trigger without its transition tables',
+      [
+        changelogStatements[0]!,
+        { ...changelogStatements[1]!, oldTable: null },
+        changelogStatements[2]!,
+        changelogTruncate,
+      ],
+    ],
   ])('should report a missing changelog trigger with %s', (_case, triggers) => {
     const result = evaluateLilypadSchema(
       facts({ tables: [{ schema: 'public', triggers }] }),
@@ -115,7 +134,29 @@ describe('evaluateLilypadSchema', () => {
     );
 
     expect(codes(result)).toEqual(['missing-changelog-trigger']);
-    expect(result.problems[0]!.fix).toContain('CREATE TRIGGER "items_lilypad_changes"');
+    expect(result.problems[0]!.fix).toContain('CREATE TRIGGER "items_lilypad_update"');
+  });
+
+  it('should accept the statement triggers of version 4', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        tables: [{ schema: 'public', triggers: [...changelogStatements, changelogTruncate] }],
+      }),
+      changelogOptions
+    );
+
+    expect(result.ok).toBe(true);
+  });
+
+  it('should name the events that no changelog trigger records', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        tables: [{ schema: 'public', triggers: [changelogStatements[0]!, changelogTruncate] }],
+      }),
+      changelogOptions
+    );
+
+    expect(result.problems[0]!.message).toContain('do not record UPDATE, DELETE');
   });
 
   it('should report a changelog trigger that records another column', () => {
@@ -128,6 +169,21 @@ describe('evaluateLilypadSchema', () => {
           },
         ],
       }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['wrong-trigger-primary-key']);
+    expect(result.problems[0]!.message).toContain('"uuid"');
+  });
+
+  it('should report a statement trigger that records another column', () => {
+    const triggers = [
+      ...changelogStatements.slice(0, 2),
+      { ...changelogStatements[2]!, args: 'uuid\\000' },
+      changelogTruncate,
+    ];
+    const result = evaluateLilypadSchema(
+      facts({ tables: [{ schema: 'public', triggers }] }),
       changelogOptions
     );
 
@@ -180,6 +236,45 @@ describe('evaluateLilypadSchema', () => {
       );
 
       expect(result.ok).toBe(true);
+    });
+
+    it('should accept the statement triggers of a changelog that notifies', () => {
+      const notifying = (trigger: LilypadTriggerInfo) => ({
+        ...trigger,
+        source: notifySource('cache_events'),
+      });
+      const result = evaluateLilypadSchema(
+        facts({
+          tables: [
+            {
+              schema: 'public',
+              triggers: [...changelogStatements, changelogTruncate].map(notifying),
+            },
+          ],
+        }),
+        listenOptions
+      );
+
+      expect(result.ok).toBe(true);
+    });
+
+    it('should not count a statement trigger that is not a changelog trigger', () => {
+      const result = evaluateLilypadSchema(
+        facts({
+          tables: [
+            {
+              schema: 'public',
+              triggers: [
+                { ...notifier('cache_events', 4 | 8 | 16), newTable: 'lilypad_new' },
+                notifier('cache_events', TRUNCATE_TRIGGER),
+              ],
+            },
+          ],
+        }),
+        listenOptions
+      );
+
+      expect(codes(result)).toEqual(['missing-notify-trigger']);
     });
 
     it('should report the row events that no trigger notifies', () => {

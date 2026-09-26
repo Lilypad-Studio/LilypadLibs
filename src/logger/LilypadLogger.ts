@@ -3,7 +3,12 @@ import {
   type LilypadSingletonAble,
 } from '@/singleton/LilypadSingleton';
 import { LilypadLoggerComponent, type LilypadLogRecord } from '@/logger/LilypadLoggerComponent';
-import { formatLogValue } from '@/logger/formatLogValue';
+import {
+  formatLogValue,
+  LILYPAD_DEFAULT_REDACTED_KEYS,
+  lilypadRedaction,
+  redactLogValue,
+} from '@/logger/formatLogValue';
 import { runInBackground, type LilypadPlatform } from '@/platform/LilypadPlatform';
 import type { LilypadLibLogLevel } from '@/logger/LilypadLibLogger';
 
@@ -30,6 +35,14 @@ export type LilypadLoggerConstructorOptions<T extends string> = {
    * read from `AsyncLocalStorage`). If it throws, the message is logged without context.
    */
   context?: () => Record<string, unknown> | undefined;
+  /**
+   * The keys whose values are replaced with `[Redacted]` in the messages and in the context, at
+   * any depth (compared ignoring case, `-` and `_`). Defaults to
+   * {@link LILYPAD_DEFAULT_REDACTED_KEYS} (authorization headers, cookies, passwords, tokens...);
+   * extend it with `[...LILYPAD_DEFAULT_REDACTED_KEYS, 'ssn']`, or pass `false` to redact nothing.
+   * The `parts` of a record are never redacted.
+   */
+  redact?: readonly string[] | false;
 } & LilypadSingletonAble;
 
 // Define a utility type to map channel keys to method signatures
@@ -69,11 +82,8 @@ export class LilypadLogger<T extends string> {
     LilypadLoggerComponent<T>[]
   >;
 
-  // Optional logger name
-  private _name?: string;
-  get __name(): string | undefined {
-    return this._name;
-  }
+  /** The name given in the options, added to each record. */
+  readonly name?: string;
 
   /** The messages still being sent, awaited by `flush`. */
   private _pending: Set<Promise<void>> = new Set();
@@ -125,23 +135,17 @@ export class LilypadLogger<T extends string> {
     // (e.g. `constructor`, `toString`); fields are listed explicitly because, depending on the
     // compilation target, they may not be defined on the instance yet. `then` would make the logger
     // a thenable: returning it from an async function would call it instead of resolving to it.
-    const reservedKeys = new Set([
-      'components',
-      'register',
-      'flush',
-      '__name',
-      '_name',
-      '_pending',
-      'then',
-    ]);
+    const reservedKeys = new Set(['components', 'register', 'flush', 'name', '_pending', 'then']);
     for (const key of Object.keys(options.components)) {
       if (reservedKeys.has(key) || key in this) {
         throw new Error(`Logger type "${key}" is reserved and cannot be used as a log channel.`);
       }
     }
 
-    // Assign logger name if provided
-    this._name = options.name;
+    this.name = options.name;
+    const redaction = lilypadRedaction(
+      options.redact === false ? [] : (options.redact ?? LILYPAD_DEFAULT_REDACTED_KEYS)
+    );
 
     // Assign initial components
     for (const [type, comps] of Object.entries(options.components) as [
@@ -160,20 +164,15 @@ export class LilypadLogger<T extends string> {
           // Formatting stays inside the try: it must never make the returned promise reject
           const record: LilypadLogRecord<T> = {
             type,
-            message: message.map(formatLogValue).join(' '),
+            message: message.map((part) => formatLogValue(part, redaction)).join(' '),
             parts: message,
             timestamp: new Date(),
-            loggerName: this._name,
-            context,
+            loggerName: this.name,
+            context: redactLogValue(context, redaction) as Record<string, unknown> | undefined,
           };
           // allSettled: a failing component must neither stop nor hide the errors of the others
           const results = await Promise.allSettled(
-            this.components[type].map(async (component) =>
-              component.output(type, record.message, {
-                logger: this as LilypadLoggerType<T>,
-                record,
-              })
-            )
+            this.components[type].map(async (component) => component.write(record))
           );
           errors = results
             .filter((result) => result.status === 'rejected')

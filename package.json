@@ -1,6 +1,6 @@
 {
   "name": "@lilypad/libs",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "module": "./dist/index.mjs",
@@ -91,7 +91,7 @@
   ],
   "sideEffects": false,
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "author": {
     "name": "Lilypad Studio"
@@ -118,7 +118,7 @@
   "devDependencies": {
     "@edge-runtime/vm": "^5.0.0",
     "@testcontainers/postgresql": "^12.1.0",
-    "@types/node": "^20.19.43",
+    "@types/node": "^22.20.4",
     "@typescript-eslint/eslint-plugin": "^8.48.1",
     "@typescript-eslint/parser": "^8.48.1",
     "eslint": "^9",

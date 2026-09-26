@@ -95,6 +95,40 @@ describe('LilypadSingleton', () => {
     expect(third).toBe(second);
   });
 
+  it('should not remove, on release, an instance registered after a manual removal', async () => {
+    const options = { singleton: true as const, singletonIdentifier: uniqueId() };
+    let releaseFirst!: () => void;
+    await createLilypadSingletonAbleAsync('A', options, async (release) => {
+      releaseFirst = release;
+      return { value: 1 };
+    });
+    removeLilypadSingletonInstance(`A:${options.singletonIdentifier}`);
+    const second = await createLilypadSingletonAbleAsync('A', options, async () => ({ value: 2 }));
+
+    // The first instance is disposed only now: its release must leave the second one registered
+    releaseFirst();
+
+    expect(await createLilypadSingletonAbleAsync('A', options, async () => ({ value: 3 }))).toBe(
+      second
+    );
+  });
+
+  it('should release a synchronous singleton only while it is the registered one', () => {
+    const options = { singleton: true as const, singletonIdentifier: uniqueId() };
+    let releaseFirst!: () => void;
+    const first = createLilypadSingletonAble('S', options, (release) => {
+      releaseFirst = release;
+      return { value: 1 };
+    });
+    removeLilypadSingletonInstance(`S:${options.singletonIdentifier}`);
+    const second = createLilypadSingletonAble('S', options, () => ({ value: 2 }));
+
+    releaseFirst();
+
+    expect(second).not.toBe(first);
+    expect(createLilypadSingletonAble('S', options, () => ({ value: 3 }))).toBe(second);
+  });
+
   it('should give a no-op release function to instances that are not singletons', async () => {
     const identifier = uniqueId();
     const registered = getLilypadSingletonInstance(`A:${identifier}`, () => ({ value: 1 }));

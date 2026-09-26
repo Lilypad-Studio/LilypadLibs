@@ -1,6 +1,6 @@
-import { L as LilypadLibLogger } from './LilypadLibLogger-DPBngeVh.mjs';
-import { LilypadPlatform, LilypadSharedStore, LilypadInvalidationEvent } from './platform.mjs';
-import { LilypadFlowControl } from './flow.mjs';
+import { L as LilypadLibLogger } from './LilypadLibLogger-DPBngeVh.js';
+import { LilypadPlatform, LilypadSharedStore, LilypadInvalidationEvent } from './platform.js';
+import { LilypadFlowControl } from './flow.js';
 
 /**
  * The keys accepted by the cache. Keys are compared by their string form, so `42` and `'42'`
@@ -41,7 +41,10 @@ type LilypadCacheGetOptions<K extends LilypadCacheKey, V> = {
      * one fetch: the value is cached with the TTL of the call that started it.
      */
     ttl?: number;
-    /** If true, bypasses the cache and always calls `valueFn`. */
+    /**
+     * If true, skips the lookup (memory, shared level, stale value) and fetches with `valueFn`. A
+     * fetch of the key already in flight is joined instead of starting another one.
+     */
     skipCache?: boolean;
     /**
      * How long after its expiration a value is still returned at once, while it is refreshed in the
@@ -74,7 +77,8 @@ type LilypadCacheResult<V> = {
     refreshFailed: boolean;
 };
 /**
- * Converts values to and from what the shared store can hold (usually JSON).
+ * Converts values to and from what the shared store can hold (usually JSON). Either function may
+ * throw: a value that cannot be encoded is not shared, and one that cannot be decoded is ignored.
  */
 type LilypadSharedCodec<V> = {
     encode(value: V): unknown;
@@ -150,9 +154,10 @@ type LilypadCacheRead<K, V> = {
     store(key: K, value: LilypadCachedValueType<V>, ttl?: number): boolean;
     /**
      * Stores a value in this instance and in the shared level, and ends the failure cooldown of the
-     * key. @returns `true` if it was stored.
+     * key. The shared copy is kept through `staleWhileRevalidate` (at least the cache's).
+     * @returns `true` if it was stored.
      */
-    storeFetched(key: K, value: LilypadCachedValueType<V>, ttl?: number): boolean;
+    storeFetched(key: K, value: LilypadCachedValueType<V>, ttl?: number, staleWhileRevalidate?: number): boolean;
 };
 /**
  * What `peek` returns:
@@ -170,7 +175,7 @@ type LilypadCachePeek<V> = {
 type LilypadCacheSyncFn<K, V> = (signal: AbortSignal) => Promise<[K, LilypadCachedValueType<V>][]>;
 type LilypadCacheBulkSyncOptions<K, V> = {
     /**
-     * Loads every entry of the source, for `bulkSync` and `bulkAsyncGet`. It receives a signal that
+     * Loads every entry of the source, for `bulkSync` and `getAll`. It receives a signal that
      * is aborted when the sync times out. Without it, `bulkSync` resolves to `false`.
      */
     fn?: LilypadCacheSyncFn<K, V>;
@@ -219,7 +224,7 @@ type LilypadCacheOptions<K extends LilypadCacheKey, V> = {
     errorTtl?: number;
     /** Timeout of the fetches of `getOrSet`, in milliseconds. Defaults to 5 seconds. */
     fetchTimeout?: number;
-    /** Loading the whole source at once (`bulkSync`, `bulkAsyncGet`). */
+    /** Loading the whole source at once (`bulkSync`, `getAll`). */
     bulkSync?: LilypadCacheBulkSyncOptions<K, V>;
     logger?: LilypadLibLogger;
     /** Prefix of the tags of the invalidation events. Defaults to `lilypad`. */
@@ -260,6 +265,11 @@ declare abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
     protected readonly failureCooldown: number;
     private cleanupIntervalId?;
     protected protectedKeys: Set<string>;
+    /**
+     * With `maxEntries`, the stored keys that can be evicted (not protected), least recently used
+     * first. The protected keys stay out of it, so that an eviction never scans them.
+     */
+    private evictionOrder;
     protected logger?: LilypadLibLogger;
     protected platform?: LilypadPlatform;
     private shared?;
@@ -270,8 +280,8 @@ declare abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
     protected readonly flowControl: LilypadFlowControl;
     protected readonly bulkSyncFlowControl: LilypadFlowControl;
     /**
-     * When the last bulk sync stops counting as fresh. `bulkGet({})` returns every entry of the
-     * source only while it is fresh.
+     * When the last bulk sync stops counting as fresh. `entries()` returns every entry of the source
+     * only while it is fresh.
      */
     protected bulkSyncExpirationTime: number;
     protected bulkSyncFn?: LilypadCacheSyncFn<K, V>;
@@ -337,11 +347,11 @@ declare abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
     private dropEntry;
     /**
      * Removes the least recently used entries beyond `maxEntries`, sparing protected keys. An
-     * eviction forces the next bulk sync, since `bulkGet` would no longer return the evicted keys.
+     * eviction forces the next bulk sync, since `entries()` would no longer return the evicted keys.
      */
     private evictOverflow;
-    /** Marks an entry as recently used, for `maxEntries`. */
-    private touch;
+    /** Marks a stored key as the most recently used one, for `maxEntries`. */
+    private markUsed;
     /**
      * Writes to this instance only.
      *
@@ -450,7 +460,10 @@ declare abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
      * @returns `true` if the entry was copied.
      */
     private adoptShared;
-    /** Writes an entry to the shared level in the background, kept through the stale window. */
+    /**
+     * Writes an entry to the shared level in the background, kept through the stale window: the
+     * cache's, or a longer one asked by the read that fetched it.
+     */
     private writeShared;
     /** Removes a key from the shared level, in the background. */
     protected deleteShared(key: K): void;
@@ -479,25 +492,35 @@ declare abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
         throwOnError?: boolean;
     }): Promise<boolean>;
     private runBulkSync;
+    /**
+     * Replaces the content of the cache with a complete load of the source, started with `read`:
+     * the loaded entries are stored (unless written since), the others are removed (protected keys
+     * are only expired), and the reads of missing keys started before the load are discarded. The
+     * entries written after the load started are kept: they are newer than its data.
+     */
+    protected replaceEntries(read: LilypadCacheRead<K, V>, data: Iterable<readonly [K, LilypadCachedValueType<V>]>): void;
     /** Forces the next bulk sync to fetch fresh data, even if a sync is currently running. */
     protected forceNextBulkSync(): void;
     /**
-     * Returns the fresh values of `keys`, or, without keys, every fresh entry (keyed by the key it was
-     * stored with, e.g. a number stays a number). Missing and expired keys are left out.
+     * Returns the fresh values of `keys`, keyed as given. Missing and expired keys are left out.
      *
      * @throws If the cache is disposed.
      */
-    protected bulkGet(options?: {
-        keys?: K[];
-    }): Map<K, LilypadCachedValueType<V>>;
+    protected getMany(keys: Iterable<K>): Map<K, LilypadCachedValueType<V>>;
     /**
-     * Like `bulkGet`, after a `bulkSync` (unless `doSync` is false).
+     * Returns every fresh entry, keyed by the key it was stored with (e.g. a number stays a number).
+     * Expired entries are left out.
      *
      * @throws If the cache is disposed.
      */
-    protected bulkAsyncGet({ keys, doSync, }?: {
-        keys?: K[];
-        doSync?: boolean;
+    protected entries(): Map<K, LilypadCachedValueType<V>>;
+    /**
+     * Like `entries()`, after a `bulkSync` (unless `sync` is false).
+     *
+     * @throws If the cache is disposed.
+     */
+    protected getAllEntries({ sync }?: {
+        sync?: boolean;
     }): Promise<Map<K, LilypadCachedValueType<V>>>;
     /**
      * Stores several values at once, like `set` (so also in the shared level).
@@ -526,7 +549,7 @@ declare abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
      * `platform.onInvalidate` receives a `manual` event.
      *
      * @param options.invalidateBulkSync - If true (default), forces the next bulk sync. With false,
-     * `bulkGet({})` leaves the key out until the next bulk sync.
+     * `entries()` leaves the key out until the next bulk sync.
      * @throws If the cache is disposed.
      */
     invalidate(key: K, { invalidateBulkSync }?: {
@@ -603,4 +626,4 @@ declare abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
     dispose(): Promise<void>;
 }
 
-export { LilypadCacheCooldownError as L, type LilypadCacheBulkSyncOptions as a, type LilypadCacheEntry as b, type LilypadCacheEntryOrigin as c, type LilypadCacheErrorContext as d, type LilypadCacheErrorOptions as e, type LilypadCacheGetOptions as f, type LilypadCachedValueType as g, type LilypadCacheKey as h, type LilypadCacheOptions as i, type LilypadCachePeek as j, type LilypadCacheRead as k, type LilypadCacheResult as l, type LilypadCacheSharedOptions as m, type LilypadCacheStatus as n, type LilypadCacheSyncFn as o, type LilypadCacheValueFn as p, type LilypadSharedCodec as q, LilypadCacheCore as r };
+export { LilypadCacheCooldownError as L, type LilypadCacheBulkSyncOptions as a, type LilypadCacheEntryOrigin as b, type LilypadCacheErrorContext as c, type LilypadCacheErrorOptions as d, type LilypadCacheGetOptions as e, type LilypadCachedValueType as f, type LilypadCacheKey as g, type LilypadCacheOptions as h, type LilypadCachePeek as i, type LilypadCacheResult as j, type LilypadCacheSharedOptions as k, type LilypadCacheStatus as l, type LilypadCacheSyncFn as m, type LilypadCacheValueFn as n, type LilypadSharedCodec as o, LilypadCacheCore as p, type LilypadCacheEntry as q };

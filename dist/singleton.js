@@ -3,10 +3,10 @@
 
 
 
-var _chunkBQAYFDD3js = require('./chunks/chunk-BQAYFDD3.js');
+var _chunkCDQ4MAZLjs = require('./chunks/chunk-CDQ4MAZL.js');
 
 
 
 
-exports.getLilypadSingletonInstance = _chunkBQAYFDD3js.getLilypadSingletonInstance; exports.getLilypadSingletonInstanceAsync = _chunkBQAYFDD3js.getLilypadSingletonInstanceAsync; exports.removeLilypadSingletonInstance = _chunkBQAYFDD3js.removeLilypadSingletonInstance;
+exports.getLilypadSingletonInstance = _chunkCDQ4MAZLjs.getLilypadSingletonInstance; exports.getLilypadSingletonInstanceAsync = _chunkCDQ4MAZLjs.getLilypadSingletonInstanceAsync; exports.removeLilypadSingletonInstance = _chunkCDQ4MAZLjs.removeLilypadSingletonInstance;
 //# sourceMappingURL=singleton.js.map

@@ -135,6 +135,8 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
       this.backoff.succeed();
       host.emitInvalidation('changelog', changedKeys, { wholeCache: truncated });
     } catch (error) {
+      // The cursor is kept: the next read, after a backoff, returns these changes again
+      this.backoff.fail();
       host.log('error', 'Error applying the changelog:', error);
     }
   }

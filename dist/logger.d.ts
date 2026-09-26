@@ -9,37 +9,31 @@ export { L as LilypadLibLogger } from './LilypadLibLogger-DPBngeVh.js';
 type LilypadLogRecord<T extends string = string> = {
     /** The channel the message was logged on. */
     type: T;
-    /** The parts passed to the channel method, formatted and joined by spaces. */
+    /**
+     * The parts passed to the channel method, formatted and joined by spaces, with the values of the
+     * redacted keys replaced (see the logger's `redact` option).
+     */
     message: string;
-    /** The parts passed to the channel method, as they were. */
+    /** The parts passed to the channel method, as they were (not redacted). */
     parts: unknown[];
     timestamp: Date;
     loggerName?: string;
-    /** The result of the logger's `context` option when the message was logged. */
+    /** The result of the logger's `context` option when the message was logged, redacted. */
     context?: Record<string, unknown>;
 };
-interface LilypadLoggerComponentOptions<T extends string> {
-    logger: ReturnType<typeof LilypadLogger.create<T>>;
-    /**
-     * Set by the logger; components called directly build a minimal one. Typed with `string`, so
-     * that components typed with different channel unions stay assignable to each other.
-     */
-    record?: LilypadLogRecord;
-}
 /**
- * Abstract base class for logging components in the Lilypad library.
- *
- * Provides a template for implementing custom loggers with standardized message formatting.
- * Subclasses implement {@link send}, which receives the formatted text, or override
- * {@link sendRecord} to receive the structured record (e.g. to write JSON).
+ * Abstract base class of the outputs of a {@link LilypadLogger}: a component implements
+ * {@link write}, which receives each record of the channels it is registered on. Use
+ * {@link formatRecord} for a line of text.
  *
  * @template T - A string literal type representing the log message types (e.g., 'INFO', 'ERROR', 'WARN')
  *
  * @example
  * ```typescript
- * class ConsoleLogger extends LilypadLoggerComponent<'INFO' | 'ERROR' | 'WARN'> {
- *   protected async send(message: string): Promise<void> {
- *     console.log(message);
+ * class StderrLogger extends LilypadLoggerComponent<'info' | 'error'> {
+ *   async write(record: LilypadLogRecord<'info' | 'error'>): Promise<void> {
+ *     process.stderr.write(this.formatRecord(record) + '
+');
  *   }
  * }
  * ```
@@ -49,19 +43,10 @@ declare abstract class LilypadLoggerComponent<T extends string> {
      * Formats a record as `<ISO timestamp> - [name] [TYPE]: <message> <context as JSON>`.
      */
     protected formatRecord(record: LilypadLogRecord<T>): string;
-    output(type: T, message: string, options?: LilypadLoggerComponentOptions<T>): Promise<void>;
     /**
-     * Sends a record to the output. By default it formats the record with {@link formatRecord}
-     * and passes it to {@link send}.
+     * Sends a record to the output. A rejection is reported by the logger to its `errorLogging`.
      */
-    protected sendRecord(record: LilypadLogRecord<T>): Promise<void>;
-    /**
-     * Sends an already formatted message to the specific output channel.
-     *
-     * @param message - The formatted message.
-     * @param type - The log type of the message, for outputs that route messages by severity.
-     */
-    protected abstract send(message: string, type: T): Promise<void>;
+    abstract write(record: LilypadLogRecord<T>): Promise<void>;
 }
 
 /**
@@ -87,6 +72,14 @@ type LilypadLoggerConstructorOptions<T extends string> = {
      * read from `AsyncLocalStorage`). If it throws, the message is logged without context.
      */
     context?: () => Record<string, unknown> | undefined;
+    /**
+     * The keys whose values are replaced with `[Redacted]` in the messages and in the context, at
+     * any depth (compared ignoring case, `-` and `_`). Defaults to
+     * {@link LILYPAD_DEFAULT_REDACTED_KEYS} (authorization headers, cookies, passwords, tokens...);
+     * extend it with `[...LILYPAD_DEFAULT_REDACTED_KEYS, 'ssn']`, or pass `false` to redact nothing.
+     * The `parts` of a record are never redacted.
+     */
+    redact?: readonly string[] | false;
 } & LilypadSingletonAble;
 type ChannelMethodFunction = (...message: unknown[]) => Promise<void>;
 type ChannelMethods<T extends string> = {
@@ -119,8 +112,8 @@ type ChannelMethods<T extends string> = {
  */
 declare class LilypadLogger<T extends string> {
     private components;
-    private _name?;
-    get __name(): string | undefined;
+    /** The name given in the options, added to each record. */
+    readonly name?: string;
     /** The messages still being sent, awaited by `flush`. */
     private _pending;
     /**
@@ -164,6 +157,13 @@ declare class LilypadLogger<T extends string> {
 type LilypadLoggerType<T extends string> = LilypadLogger<T> & ChannelMethods<T>;
 
 /**
+ * The keys whose values the logger replaces with `[Redacted]` by default, wherever they appear in
+ * a logged value or in the context (e.g. the headers of the request of an HTTP client error).
+ * Keys are compared ignoring case, `-` and `_`: `apiKey`, `api_key` and `API-KEY` all match.
+ */
+declare const LILYPAD_DEFAULT_REDACTED_KEYS: readonly string[];
+
+/**
  * A logger component that outputs messages to the console.
  *
  * @template T - A string literal type representing the logger's category or name.
@@ -179,7 +179,7 @@ type LilypadLoggerType<T extends string> = LilypadLogger<T> & ChannelMethods<T>;
  * (case-insensitive), and every other message to `console.log`.
  */
 declare class LilypadConsoleLogger<T extends string> extends LilypadLoggerComponent<T> {
-    protected send(message: string, type: T): Promise<void>;
+    write(record: LilypadLogRecord<T>): Promise<void>;
 }
 
 /**
@@ -200,8 +200,7 @@ declare class LilypadConsoleLogger<T extends string> extends LilypadLoggerCompon
  * ```
  */
 declare class LilypadJsonConsoleLogger<T extends string> extends LilypadLoggerComponent<T> {
-    protected sendRecord(record: LilypadLogRecord<T>): Promise<void>;
-    protected send(message: string, type: T): Promise<void>;
+    write(record: LilypadLogRecord<T>): Promise<void>;
 }
 
 type LilypadDiscordLoggerOptions = {
@@ -210,11 +209,14 @@ type LilypadDiscordLoggerOptions = {
      * are sent together in the next request. Defaults to 1000.
      */
     minRequestInterval?: number;
-    /** How many times a request rate limited by Discord (429) is retried. Defaults to 1. */
+    /**
+     * How many times a request rate limited by Discord (429) is retried, after the `retry-after`
+     * time (when it is at most 30 seconds). Defaults to 1.
+     */
     rateLimitRetries?: number;
     /**
      * Maximum number of messages waiting to be sent. Beyond it the oldest are dropped (their
-     * `output` resolves), and the next request says how many were dropped. Defaults to 100.
+     * `write` resolves), and the next request says how many were dropped. Defaults to 100.
      */
     maxQueueSize?: number;
 };
@@ -240,11 +242,12 @@ type LilypadDiscordLoggerOptions = {
  * - Messages longer than 2000 characters are truncated.
  * - Requests are throttled (see {@link LilypadDiscordLoggerOptions}): messages logged while a request
  *   is pending or too recent are batched into one Discord message, up to 2000 characters.
- * - A rate limited request (429) is retried after the `retry-after` time given by Discord.
- * - A failed request makes `output` reject for every message of the batch, so the logger reports
- *   it through its `errorLogging` callback.
+ * - A rate limited request (429) is retried after the `retry-after` time given by Discord, when
+ *   it is at most 30 seconds.
+ * - A failed request makes `write` reject for one message of the batch (with the number of
+ *   messages lost), so the logger reports it once through its `errorLogging` callback.
  * - At most `maxQueueSize` messages wait to be sent: during a flood of messages the oldest are
- *   dropped, so that memory and the pending `output` promises stay bounded.
+ *   dropped, so that memory and the pending `write` promises stay bounded.
  */
 declare class LilypadDiscordLogger<T extends string> extends LilypadLoggerComponent<T> {
     private webhookUrl;
@@ -257,7 +260,8 @@ declare class LilypadDiscordLogger<T extends string> extends LilypadLoggerCompon
     private flushing;
     private nextRequestAt;
     constructor(webhookUrl: string, options?: LilypadDiscordLoggerOptions);
-    protected send(message: string): Promise<void>;
+    write(record: LilypadLogRecord<T>): Promise<void>;
+    private enqueue;
     /**
      * Sends the queued messages, one batch at a time. It never rejects: the outcome of each batch
      * settles the promises of its messages.
@@ -269,4 +273,4 @@ declare class LilypadDiscordLogger<T extends string> extends LilypadLoggerCompon
     private post;
 }
 
-export { LilypadConsoleLogger, LilypadDiscordLogger, type LilypadDiscordLoggerOptions, LilypadJsonConsoleLogger, LilypadLibLogLevel, type LilypadLogRecord, LilypadLogger, LilypadLoggerComponent, type LilypadLoggerComponentOptions, type LilypadLoggerConstructorOptions, type LilypadLoggerType };
+export { LILYPAD_DEFAULT_REDACTED_KEYS, LilypadConsoleLogger, LilypadDiscordLogger, type LilypadDiscordLoggerOptions, LilypadJsonConsoleLogger, LilypadLibLogLevel, type LilypadLogRecord, LilypadLogger, LilypadLoggerComponent, type LilypadLoggerConstructorOptions, type LilypadLoggerType };

@@ -1,5 +1,7 @@
 import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
 import {
+  LILYPAD_CHANGELOG_NEW_ROWS,
+  LILYPAD_CHANGELOG_OLD_ROWS,
   LILYPAD_CHANGELOG_VERSION,
   LILYPAD_CHANGELOG_VERSION_PREFIX,
   LILYPAD_DEFAULT_CHANGELOG_TABLE,
@@ -35,7 +37,10 @@ export type LilypadSchemaProblemCode =
   | 'missing-changelog'
   /** The changelog table or its trigger function was installed by an older version of the library. */
   | 'outdated-changelog'
-  /** The table has no enabled changelog trigger firing on each INSERT, UPDATE and DELETE row. */
+  /**
+   * The enabled changelog triggers of the table do not record each of INSERT, UPDATE and DELETE:
+   * row triggers, or statement triggers with their transition tables.
+   */
   | 'missing-changelog-trigger'
   /** The changelog trigger of the table records another column than the primary key. */
   | 'wrong-trigger-primary-key'
@@ -105,17 +110,54 @@ const ROW_EVENT_NAMES: [number, string][] = [
   [TRIGGER_TYPE_UPDATE, 'UPDATE'],
   [TRIGGER_TYPE_DELETE, 'DELETE'],
 ];
-const CHANGELOG_TRIGGER_TYPE = TRIGGER_TYPE_ROW | ROW_EVENTS;
-
 export type LilypadTriggerInfo = {
   /** Whether it calls the changelog trigger function. */
   changelog: boolean | null;
   /** Its arguments, as `encode(tgargs, 'escape')`: each one ends with `\000`. */
   args: string;
   type: number;
+  /** Whether it fires in normal operation (not disabled, nor `ENABLE REPLICA` only). */
   enabled: boolean;
   source: string;
+  /** The names of its transition tables (`REFERENCING OLD TABLE / NEW TABLE`), if any. */
+  oldTable?: string | null;
+  newTable?: string | null;
 };
+
+/**
+ * The row events whose changes a trigger of the changelog function records: all its events for a
+ * row trigger (versions 3 and earlier), and for a statement trigger the events whose transition
+ * tables it declares under the names the function reads.
+ */
+function recordedEvents(trigger: LilypadTriggerInfo): number {
+  if (!trigger.changelog || !trigger.enabled) {
+    return 0;
+  }
+  const events = trigger.type & ROW_EVENTS;
+  if ((trigger.type & TRIGGER_TYPE_ROW) !== 0) {
+    return events;
+  }
+  const hasOld = trigger.oldTable === LILYPAD_CHANGELOG_OLD_ROWS;
+  const hasNew = trigger.newTable === LILYPAD_CHANGELOG_NEW_ROWS;
+  let recorded = 0;
+  if ((events & TRIGGER_TYPE_INSERT) !== 0 && hasNew) {
+    recorded |= TRIGGER_TYPE_INSERT;
+  }
+  if ((events & TRIGGER_TYPE_UPDATE) !== 0 && hasOld && hasNew) {
+    recorded |= TRIGGER_TYPE_UPDATE;
+  }
+  if ((events & TRIGGER_TYPE_DELETE) !== 0 && hasOld) {
+    recorded |= TRIGGER_TYPE_DELETE;
+  }
+  return recorded;
+}
+
+/** The names of the row events, e.g. `INSERT, DELETE`. */
+function eventNames(events: number): string {
+  return ROW_EVENT_NAMES.filter(([bit]) => (events & bit) !== 0)
+    .map(([, name]) => name)
+    .join(', ');
+}
 
 /** An enabled statement-level trigger on TRUNCATE. */
 function firesOnTruncate(trigger: LilypadTriggerInfo): boolean {
@@ -198,8 +240,11 @@ export async function readLilypadSchemaFacts(
             'changelog', tr.tgfoid = to_regprocedure(${changelog.functionSignature}::text)::oid,
             'args', encode(tr.tgargs, 'escape'),
             'type', tr.tgtype,
-            'enabled', tr.tgenabled <> 'D',
-            'source', p.prosrc
+            -- 'R' (ENABLE REPLICA) triggers fire only with session_replication_role = replica
+            'enabled', tr.tgenabled IN ('O', 'A'),
+            'source', p.prosrc,
+            'oldTable', tr.tgoldtable,
+            'newTable', tr.tgnewtable
           )), '[]'::json)
           FROM pg_trigger tr JOIN pg_proc p ON p.oid = tr.tgfoid
           WHERE tr.tgrelid = t.oid AND NOT tr.tgisinternal
@@ -312,27 +357,25 @@ export function evaluateLilypadSchema(
         primaryKey,
         changelogTable: changelog.custom,
       });
-      const working = triggers.filter(
-        (trigger) =>
-          trigger.changelog &&
-          trigger.enabled &&
-          (trigger.type & CHANGELOG_TRIGGER_TYPE) === CHANGELOG_TRIGGER_TYPE
-      );
+      // The events may be split across several triggers (one statement trigger per event)
+      const working = triggers.filter((trigger) => recordedEvents(trigger) !== 0);
+      const recorded = working.reduce((events, trigger) => events | recordedEvents(trigger), 0);
       const recordedColumn = (trigger: LilypadTriggerInfo) => trigger.args.split('\\000')[0];
-      if (working.length === 0) {
+      const wrongColumn = working.find((trigger) => recordedColumn(trigger) !== primaryKey);
+      if (recorded !== ROW_EVENTS) {
         problems.push({
           code: 'missing-changelog-trigger',
           table,
           message: triggers.some((trigger) => trigger.changelog)
-            ? `The changelog trigger of "${table}" is disabled or does not fire on each INSERT, UPDATE and DELETE row.`
+            ? `The changelog triggers of "${table}" do not record ${eventNames(ROW_EVENTS & ~recorded)}: they are missing, disabled, or lack their transition tables.`
             : `The table "${table}" has no changelog trigger: its changes are not recorded.`,
           fix,
         });
-      } else if (!working.some((trigger) => recordedColumn(trigger) === primaryKey)) {
+      } else if (wrongColumn) {
         problems.push({
           code: 'wrong-trigger-primary-key',
           table,
-          message: `The changelog trigger of "${table}" records the column "${recordedColumn(working[0]!)}", not the primary key "${primaryKey}".`,
+          message: `The changelog trigger of "${table}" records the column "${recordedColumn(wrongColumn)}", not the primary key "${primaryKey}".`,
           fix,
         });
       } else if (!triggers.some((trigger) => trigger.changelog && firesOnTruncate(trigger))) {
@@ -350,15 +393,18 @@ export function evaluateLilypadSchema(
         `pg_notify\\s*\\(\\s*'${escapeRegExp(notifyChannel.replace(/'/g, "''"))}'`,
         'i'
       );
-      // The row events notified by any enabled trigger: they may be split across several triggers
+      // The row events notified by any enabled trigger: they may be split across several triggers.
+      // A statement trigger notifies each row only if it is a changelog trigger (version 4).
       const notifiedEvents = triggers
-        .filter(
-          (trigger) =>
-            trigger.enabled &&
-            (trigger.type & TRIGGER_TYPE_ROW) !== 0 &&
-            notifies.test(trigger.source)
-        )
-        .reduce((events, trigger) => events | (trigger.type & ROW_EVENTS), 0);
+        .filter((trigger) => trigger.enabled && notifies.test(trigger.source))
+        .reduce(
+          (events, trigger) =>
+            events |
+            ((trigger.type & TRIGGER_TYPE_ROW) !== 0
+              ? trigger.type & ROW_EVENTS
+              : recordedEvents(trigger)),
+          0
+        );
       const fix =
         lilypadChangelogSql({ table: changelog?.custom, notifyChannel }) +
         lilypadChangelogTriggerSql({ table, primaryKey, changelogTable: changelog?.custom });
@@ -370,14 +416,10 @@ export function evaluateLilypadSchema(
           fix,
         });
       } else if (notifiedEvents !== ROW_EVENTS) {
-        const names = (events: number) =>
-          ROW_EVENT_NAMES.filter(([bit]) => (events & bit) !== 0)
-            .map(([, name]) => name)
-            .join(', ');
         problems.push({
           code: 'missing-notify-trigger',
           table,
-          message: `The triggers of "${table}" send notifications on the "${notifyChannel}" channel only on ${names(notifiedEvents)}: the cache is not told about ${names(ROW_EVENTS & ~notifiedEvents)} made elsewhere.`,
+          message: `The triggers of "${table}" send notifications on the "${notifyChannel}" channel only on ${eventNames(notifiedEvents)}: the cache is not told about ${eventNames(ROW_EVENTS & ~notifiedEvents)} made elsewhere.`,
           fix,
         });
       } else if (

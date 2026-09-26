@@ -109,7 +109,7 @@ LilypadLogger, LilypadDbGate, LilypadDbCache ──register in──> the single
 
 Three observations help when reading the code:
 
-- **The two caches share one engine.** `LilypadCacheCore` holds the hard concurrency logic. Its public methods only read, expire or remove entries; the methods that write values (`set`, `bulkSet`, `getOrSet`, `getOrSetDetailed`, `bulkSync`, `bulkGet`, `bulkAsyncGet`) are `protected`. `LilypadCache` re-declares them as public; `LilypadDbCache` keeps them internal, so that its values always come from its table (a value written with a public `set` would otherwise be renewed past its TTL as if the database had returned it).
+- **The two caches share one engine.** `LilypadCacheCore` holds the hard concurrency logic. Its public methods only read, expire or remove entries; the methods that write values, and the bulk reads (`set`, `bulkSet`, `getOrSet`, `getOrSetDetailed`, `bulkSync`, `getMany`, `entries`, `getAllEntries`) are `protected`. `LilypadCache` re-declares them as public; `LilypadDbCache` keeps them internal, so that its values always come from its table (a value written with a public `set` would otherwise be renewed past its TTL as if the database had returned it).
 - **`LilypadDbCache` delegates how it follows the table to a strategy object.** The cache keeps the data logic (`applyChange`, `applyTruncate`, members, renewal); the strategy decides *when* changes arrive and *whether* the cache can trust that it sees them all. The two talk through small interfaces ([`LilypadDbSyncHost`, `LilypadDbSyncStrategy`](../src/cache/dbSync/LilypadDbSyncTypes.ts#L132)).
 - **Nothing in the lower layers knows about the upper ones.** `LilypadFlowControl` knows nothing about caches; `LilypadDbGate` knows nothing about caching; `LilypadCacheCore` knows nothing about databases.
 
@@ -243,7 +243,7 @@ An entry expires when `Date.now() >= entry.expirationTime` (`isStale`, [line 31]
 
 ### 3.6 Keys are compared by their string form
 
-Keys can be `string | number`, but the store is a `Map<string, entry>` keyed by `normalizeKey(key) = String(key)` ([line 199](../src/cache/LilypadCacheCore.ts#L199)). So `get(7)` and `get('7')` read the same entry. This matters for databases: a notification or a changelog row carries the primary key as text (`'7'`), while the application uses numbers. Each entry keeps the **original** key (`entry.key`), so that `bulkGet()` can return keys with the type they were stored with. `LilypadDbCache.resolveNotifiedKey` ([LilypadDbCache.ts:820](../src/cache/LilypadDbCache.ts#L820)) turns a text id back into the right type.
+Keys can be `string | number`, but the store is a `Map<string, entry>` keyed by `normalizeKey(key) = String(key)` ([line 199](../src/cache/LilypadCacheCore.ts#L199)). So `get(7)` and `get('7')` read the same entry. This matters for databases: a notification or a changelog row carries the primary key as text (`'7'`), while the application uses numbers. Each entry keeps the **original** key (`entry.key`), so that `entries()` can return keys with the type they were stored with. `LilypadDbCache.resolveNotifiedKey` ([LilypadDbCache.ts:820](../src/cache/LilypadDbCache.ts#L820)) turns a text id back into the right type.
 
 Inside the class, you will see pairs of methods such as `delete`/`removeEntry` and `expire`/`expireNormalized`: the public one takes a key, the private one takes an already normalized string, which is what internal loops have. The same split separates public methods that assert the cache is not disposed (`purgeExpired`, `clear`) from the internal ones the engine calls itself (`purgeEntries`, `clearEntries`).
 
@@ -321,7 +321,7 @@ There are two different things here, and it helps to keep them apart:
 1. Rejects channel names that would overwrite a property of the logger (line 128). `key in this` catches inherited names such as `constructor` or `toString`; the fields are listed by hand because, depending on the compilation target, class fields may not exist yet at that point of the constructor. `then` is reserved because an object with a `then` method is a "thenable": returning the logger from an `async` function would call it instead of resolving to the logger.
 2. Copies the component arrays (so that `register()` does not mutate the caller's arrays).
 3. For each channel, builds two closures and assigns the second one as a method of the instance (line 200):
-   - `send(message, context)` (line 157) builds a `LilypadLogRecord` (formatted message, raw parts, timestamp, logger name, context), calls every component's `output()` with `Promise.allSettled`, so that one failing component neither stops the others nor hides their errors, and passes each failure to `reportComponentError`. The formatting itself is inside the `try`, because even formatting must never make the promise reject.
+   - `send(message, context)` builds a `LilypadLogRecord` (formatted message, raw parts, timestamp, logger name, context), with the values of the redacted keys (the `redact` option, by default `LILYPAD_DEFAULT_REDACTED_KEYS`) replaced in the message and in a copy of the context. It calls every component's `write()` with `Promise.allSettled`, so that one failing component neither stops the others nor hides their errors, and passes each failure to `reportComponentError`. The formatting itself is inside the `try`, because even formatting must never make the promise reject.
    - `logFn(...message)` (line 189) is the channel method. It reads `context()` **synchronously**, before any `await`, so that an `AsyncLocalStorage` store of the caller's request is still active. It adds the task to `_pending` (for `flush()`), hands it to `runInBackground` (for `platform.background`), and returns it.
 
 `reportComponentError` ([line 246](../src/logger/LilypadLogger.ts#L246)) tries `errorLogging` (which may be synchronous or async), and falls back to `console.error` if there is none or if it fails too. This is the one place where the library writes to the console on its own, because there is nowhere else left to report.
@@ -330,51 +330,51 @@ There are two different things here, and it helps to keep them apart:
 
 #### Components
 
-[LilypadLoggerComponent.ts](../src/logger/LilypadLoggerComponent.ts). A component has a public `output()`, which builds a record if it was called directly (not through a logger) and calls `sendRecord()`. The default `sendRecord()` formats the record as `<ISO time> - [name] [TYPE]: <message> <context JSON>` and calls the abstract `send(text, type)`. So a subclass chooses its level of abstraction:
+[LilypadLoggerComponent.ts](../src/logger/LilypadLoggerComponent.ts). A component has one extension point, the abstract `write(record)`, and a helper, `formatRecord(record)`, which formats a record as `<ISO time> - [name] [TYPE]: <message> <context JSON>`:
 
-- implement `send()` to receive text: `LilypadConsoleLogger` routes it to `console.error`/`warn`/`log` by channel name;
-- override `sendRecord()` to receive the structured record: `LilypadJsonConsoleLogger` ([JsonConsoleLogger.ts:26](../src/logger/components/JsonConsoleLogger.ts#L26)) writes one JSON object per line, with the context fields at the top level and the `Error` parts under `errors`.
+- `LilypadConsoleLogger` writes `formatRecord(record)` to `console.error`/`warn`/`log` by channel name;
+- `LilypadJsonConsoleLogger` writes one JSON object per line, with the context fields at the top level and the `Error` parts under `errors`;
+- `LilypadDiscordLogger` queues `formatRecord(record)` (below).
 
 `safeJson` ([line 117](../src/logger/LilypadLoggerComponent.ts#L117)) converts the value to JSON-safe data before `JSON.stringify`: BigInts become `"10n"`, errors `{ name, message, stack }`, `toJSON` is honoured, and it returns `"[Unserializable]"` if it still throws. It tracks the **ancestors** of the current value (added on the way down, removed on the way back up), so only a reference to an ancestor prints `"[Circular]"`: an object referenced twice side by side is printed twice, as in `formatLogValue`.
 
 #### formatLogValue
 
-[formatLogValue.ts](../src/logger/formatLogValue.ts). Node's `util.inspect` is not available in edge runtimes, so this is a small re-implementation. Top-level strings are printed as is; everything else goes through `formatNested`, which recurses with a `depth` (abbreviating beyond 4 levels to `[Object]`/`[Array]`) and a `seen` set for cycles. The `seen` set is emptied on the way back up (`finally { seen.delete(value) }`), so an object that appears twice *side by side* is printed twice, and only a real cycle prints `[Circular]`. Errors print their stack, then their own enumerable properties (this is how the `code` and `detail` of a Postgres error show up), then `[cause]:` recursively. Each property read is in its own `try`, because a getter can throw.
+[formatLogValue.ts](../src/logger/formatLogValue.ts). Node's `util.inspect` is not available in edge runtimes, so this is a small re-implementation. Top-level strings are printed as is; everything else goes through `formatNested`, which recurses with a `depth` (abbreviating beyond 4 levels to `[Object]`/`[Array]`), a `seen` set for cycles, and the set of redacted keys (compared ignoring case, `-` and `_`), whose values print as `[Redacted]`. `redactLogValue` makes the same replacement in a copy of a value that is serialized later, the context. The `seen` set is emptied on the way back up (`finally { seen.delete(value) }`), so an object that appears twice *side by side* is printed twice, and only a real cycle prints `[Circular]`. Errors print their stack, then their own enumerable properties (this is how the `code` and `detail` of a Postgres error show up), then `[cause]:` recursively. Each property read is in its own `try`, because a getter can throw.
 
 #### LilypadDiscordLogger
 
 [DiscordLogger.ts](../src/logger/components/DiscordLogger.ts), 178 lines. Posting one HTTP request per log line would hit Discord's rate limit immediately, so the component is a small queue with batching:
 
-- `send()` ([line 81](../src/logger/components/DiscordLogger.ts#L81)) returns a promise that is resolved or rejected **later**, when the batch containing the message is sent. It pushes `{ content, resolve, reject }` onto the queue, drops the oldest messages beyond `maxQueueSize` (resolving them, since rejecting 100 dropped messages would flood `errorLogging`), and kicks `flush()`.
+- `write()` formats the record and `enqueue()` returns a promise that is resolved or rejected **later**, when the batch containing the message is sent. It pushes `{ content, resolve, reject }` onto the queue, drops the oldest messages beyond `maxQueueSize` (resolving them, since rejecting 100 dropped messages would flood `errorLogging`), and kicks `flush()`.
 - `flush()` ([line 97](../src/logger/components/DiscordLogger.ts#L97)) is guarded by a `flushing` flag, so only one loop runs. The loop waits until `nextRequestAt`, takes a batch and sends it, until the queue is empty.
 - `takeBatch()` ([line 116](../src/logger/components/DiscordLogger.ts#L116)) first prepends a notice if messages were dropped, then takes as many messages as fit in Discord's 2000 characters (always at least one).
-- `sendBatch()` ([line 134](../src/logger/components/DiscordLogger.ts#L134)) posts, sets `nextRequestAt = now + minRequestInterval`, cancels the unread response body (otherwise the connection stays busy until garbage collection), retries a `429` after `retry-after`, and finally resolves or rejects every message of the batch. A rejection flows back through the logger to `errorLogging`.
+- `sendBatch()` ([line 134](../src/logger/components/DiscordLogger.ts#L134)) posts, sets `nextRequestAt = now + minRequestInterval`, cancels the unread response body (otherwise the connection stays busy until garbage collection), retries a `429` after `retry-after` (unless it is longer than 30 s: the batch then fails at once, instead of holding the queue and `logger.flush()`), and finally resolves the messages of the batch. On a failure, it rejects only one of them, with an error that counts the messages lost and has the original error as `cause`: it flows back through the logger to `errorLogging` once per batch, not once per message.
 - `post()` sets `allowed_mentions: { parse: [] }` so that a logged `@everyone` pings no one, and a 5 s `AbortSignal.timeout`.
 
 ### 4.4 LilypadFlowControl
 
-[src/flow/LilypadFlowControl.ts](../src/flow/LilypadFlowControl.ts), 289 lines. Four independent tools, composed by `executeFn`. The class is **not generic**: each method takes the type of its own `fn`, so one instance can run executions of different types (the cache runs table loads and key queries through the same bulk flow control).
+[src/flow/LilypadFlowControl.ts](../src/flow/LilypadFlowControl.ts). Four independent tools, composed by `executeFn`. The constructor checks its numeric options with `assertNumberOption` (a `NaN` timeout would make every call time out at once). The class is **not generic**: each method takes the type of its own `fn`, so one instance can run executions of different types (the cache runs table loads and key queries through the same bulk flow control).
 
 - **`executeWithTimeout(fn, timeout)`** ([line 132](../src/flow/LilypadFlowControl.ts#L132)): creates an `AbortController`, and races `fn(signal)` against a timer. When the timer fires, it aborts the controller **with** the `LilypadTimeoutError` and rejects. JavaScript cannot stop a running promise, so the signal is how `fn` learns it should stop, and how the cache learns that a late result must not be stored (it checks `signal.aborted`).
-- **`executeWithRetries({ executionFn, retries, errorFn, backOffTime })`** ([line 167](../src/flow/LilypadFlowControl.ts#L167)): a `while (true)` loop that returns on success, and on failure either sleeps and retries (default backoff `2^attempt × 100` ms) or, after the last attempt, returns `errorFn(error)` or rethrows.
-- **`rateLimit(consumer, fn)`** ([line 209](../src/flow/LilypadFlowControl.ts#L209)): remembers the last execution time per `consumer#function` pair and throws `LilypadRateLimitError` if the new one comes too soon. The map is pruned when it passes 1000 pairs. It is deliberately **synchronous**, see below.
-- **Single-flight**: `singleFlightMap` from function identifier to the running promise.
+- **`executeWithRetries({ executionFn, retries, backOffTime })`**: a `while (true)` loop that returns on success, and on failure either sleeps and retries (default backoff `2^attempt × 100` ms) or, after the last attempt, rethrows.
+- **`rateLimit(key)`**: remembers the last execution time per key and throws `LilypadRateLimitError` if the new one comes too soon. The map is pruned when it passes 1000 keys. It is deliberately **synchronous**, see below.
+- **`singleFlight(key, fn)`**: returns the promise of the execution of `key` in flight, or calls `fn` and registers its promise (synchronously), removing it once settled.
 
-`executeFn` ([line 258](../src/flow/LilypadFlowControl.ts#L258)) chains them in this order:
+`executeFn` chains them in this order:
 
 ```ts
-const inFlight = this.singleFlightMap.get(id);   // 1. join a running execution
-if (inFlight) return inFlight;
-this.rateLimit(consumer, id);                      // 2. rate limit (sync, may go to errorFn)
-const executionPromise = this.executeWithRetries({ // 3. retries around timeouts
-  executionFn: () => this.executeWithTimeout(fn, timeout), ...
-}).finally(() => this.singleFlightMap.delete(id));
-this.singleFlightMap.set(id, executionPromise);    // 4. register
+if (!this.isInFlight(id)) this.rateLimit(`${consumer}#${id}`); // 1. rate limit a new execution only
+return this.singleFlight(id, () =>                               // 2. join, or start and register
+  this.executeWithRetries({                                      // 3. retries around timeouts
+    executionFn: () => this.executeWithTimeout(fn, timeout), ...
+  })
+);
 ```
 
-Between step 1 and step 4 there is **no `await`**. That is the whole correctness argument of single-flight: two calls cannot both see "nothing in flight" and both start, because JavaScript runs this block without interruption. It is also why `rateLimit` must stay synchronous.
+Between the lookup and the registration of the promise there is **no `await`**. That is the whole correctness argument of single-flight: two calls cannot both see "nothing in flight" and both start, because JavaScript runs this block without interruption. It is also why `rateLimit` must stay synchronous.
 
-A consequence the cache relies on: callers who join an execution share **everything** from the first caller, including its timeout and the result of its `errorFn`. That is why the cache's `errorFn` only logs and rethrows, and the per-caller fallback is chosen afterwards, outside the flight (see [4.6](#failures-errorreturn-and-the-cooldown)).
+A consequence the cache relies on: callers who join an execution share **everything** from the first caller, including its timeout and its outcome. That is why the cache calls `singleFlight` with a function that only logs a failure and rethrows it, and the per-caller fallback is chosen afterwards, outside the flight (see [4.6](#failures-errorreturn-and-the-cooldown)).
 
 ### 4.5 LilypadSerializer
 
@@ -394,7 +394,7 @@ The `@ts-expect-error` tests in `LilypadSerializer.test.ts` check these types; t
 
 [src/cache/LilypadCacheCore.ts](../src/cache/LilypadCacheCore.ts), about 1180 lines, with its types in [LilypadCacheTypes.ts](../src/cache/LilypadCacheTypes.ts) and the shared level in [LilypadSharedLevel.ts](../src/cache/LilypadSharedLevel.ts). This is the heart of the library. Read [3.4](#34-tickets-ordering-asynchronous-writes) and [3.5](#35-expirationtime-0-means-invalidated) first.
 
-[LilypadCache.ts](../src/cache/LilypadCache.ts) is only the public face of the engine: its constructor is public, and it re-declares the protected writes of the engine (`set`, `bulkSet`, `getOrSet`, `getOrSetDetailed`, `bulkSync`, `bulkGet`, `bulkAsyncGet`) as public, plus `invalidateBulkSync()`. TypeScript allows a subclass to widen the visibility of a member; each override is a one-line call to `super`.
+[LilypadCache.ts](../src/cache/LilypadCache.ts) is only the public face of the engine: its constructor is public, and it re-declares the protected methods of the engine (`set`, `bulkSet`, `getOrSet`, `getOrSetDetailed`, `bulkSync`, `getMany`, `entries`) as public, plus `getAll()` (the engine's `getAllEntries`, renamed because `LilypadDbCache.getAll` has another signature) and `invalidateBulkSync()`. TypeScript allows a subclass to widen the visibility of a member; each override is a one-line call to `super`.
 
 #### What the engine holds
 
@@ -445,8 +445,8 @@ expireNormalized ──(new ticket, exp=0)────────────�
 Four details:
 
 - **The disposed check.** A fetch that was in flight when `dispose()` was called will still complete and try to store its value. The `disposed` flag makes `writeEntry` a no-op, and since the shared level is written only for an entry that was stored (`setValue`, `storeFetched`), a disposed cache writes nothing to L2 either.
-- **LRU with a `Map`.** A JavaScript `Map` iterates in insertion order. Deleting and re-inserting a key moves it to the end, so the start of the map holds the least recently used entries. `touch()` does the same on reads. `evictOverflow()` ([line 294](../src/cache/LilypadCacheCore.ts#L294)) removes from the start until the size fits, skipping protected keys, through `dropEntry` so that a read in flight keeps its fence. Because of the re-insertion, any loop that writes while iterating must iterate a **copy** (`[...this.store]`), or it could revisit the same keys forever.
-- **Bulk sync consistency.** `bulkGet()` returns "everything in the cache" and trusts it to be the whole source while the bulk sync is fresh. So anything that makes an entry disappear or expire early while the sync is fresh must invalidate the sync: an entry written with a shorter TTL (here), an eviction, `clear()`.
+- **LRU with a `Set`.** With `maxEntries`, `evictionOrder` holds the keys that can be evicted (not protected), least recently used first: a JavaScript `Set` iterates in insertion order, and deleting and re-adding a key moves it to the end. `markUsed()` does that on writes and reads. `evictOverflow()` removes the first keys of `evictionOrder` until the size fits, through `dropEntry` so that a read in flight keeps its fence. Protected keys stay out of it (`addProtectedKeys` removes them, `removeProtectedKeys` puts them back), so an eviction never scans them. Loops that write while iterating still iterate a **copy** of the store (`[...this.store]`).
+- **Bulk sync consistency.** `entries()` returns "everything in the cache" and trusts it to be the whole source while the bulk sync is fresh. So anything that makes an entry disappear or expire early while the sync is fresh must invalidate the sync: an entry written with a shorter TTL (here), an eviction, `clear()`.
 - **One removal path.** `delete`, `clear`, `purgeExpired`, the bulk sync and `get(key, { removeExpired })` all remove through `removeEntry` ([line 1074](../src/cache/LilypadCacheCore.ts#L1074)), which checks the protected keys and calls `dropEntry`.
 
 `set` ([line 361](../src/cache/LilypadCacheCore.ts#L361)) asserts the cache is not disposed, then `setValue` ([line 348](../src/cache/LilypadCacheCore.ts#L348)) = `writeLocal` (new ticket, origin `source`) + `writeShared` (L2 in the background). `LilypadDbCache` calls `setValue` directly for its own writes. `writeLocal` alone is used for fallbacks, which must not be shared with other instances.
@@ -490,11 +490,10 @@ fn: async (signal) => {
   const read = this.beginRead();          // ticket at the real start of the fetch
   const value = await valueFn(signal);
   if (!signal.aborted) {                  // timed out: the caller already got an error
-    read.storeFetched(key, value, options.ttl);
+    read.storeFetched(key, value, options.ttl, options.staleWhileRevalidate);
   }
   return value;
-},
-errorFn: (error) => { libLog(...); this.recordFailure(key); throw error; },
+}).catch((error) => { libLog(...); this.recordFailure(key); throw error; }),
 ```
 
 `storeFetched` ([line 399](../src/cache/LilypadCacheCore.ts#L399)) does three things: clears the key's failure (and its L2 failure marker), stores the value with `setIfNewer`, and, only if it was stored, writes it to L2. Note that the fetch's result is returned to every caller even if it was not stored: the callers asked for the value *now*, and the value is correct for the moment it was read.
@@ -588,7 +587,7 @@ The constructor ([line 205](../src/dbGate/LilypadDbGate.ts#L205)) creates the ma
 this.sql = postgres(options.connectionString, {
   prepare: false,                           // works behind PgBouncer in transaction mode
   ...toPostgresPoolOptions(options.pool),   // ms → seconds, undefined keys removed
-  ...(statementTimeout !== undefined && { connection: { statement_timeout } }),
+  ...(statementTimeout !== undefined && { connection: { statement_timeout } }), // 30 s by default
 });
 ```
 
@@ -617,7 +616,8 @@ State: `listeners: Map<channel, { callbacks: Map<callbackId, ...>, ready, listen
 - The third argument of postgres.js `listen()` is `onlisten`, which postgres.js calls after the first `LISTEN` **and after every reconnection**. The `listening` flag tells them apart: the first call only sets it; later calls run each callback's `onReconnect`. The cache uses that hook to expire everything, since notifications sent while the connection was down are lost for good.
 - Each notification runs every callback of the channel through `runCallbackSafely`.
 - `removeListener` ([line 631](../src/dbGate/LilypadDbGate.ts#L631)) deletes the callback synchronously, and only when the channel has none left, awaits `ready` and `UNLISTEN`s. It never rejects: a `LISTEN` that had failed, or a failed `UNLISTEN`, is logged. When the last channel goes, the heartbeat stops.
-- `close()` clears the listeners, stops the heartbeat, releases the singleton, and ends the clients.
+- `close({ timeout })` clears the listeners, stops the heartbeat, releases the singleton, and ends the clients, waiting at most `timeout` (5 s) for the running queries. It keeps its promise, so a second call returns it, and `assertOpen()` makes the CRUD methods and `addListener` throw afterwards.
+- `startHeartbeat` starts the timer only if `heartbeatStop` still holds its own `LISTEN` when that `LISTEN` completes: a `removeListener` of the last channel (or `close()`) that ran meanwhile has already awaited it to `UNLISTEN`, and a timer started after it would ping the database until `close()`. A heartbeat that could not start is retried by `isListenHealthy()`, after a `LilypadBackoff`.
 
 #### The heartbeat
 
@@ -649,9 +649,9 @@ changed_at   timestamptz DEFAULT clock_timestamp()
 
 with indexes on `(table_name, xid)` (cursor reads) and `(changed_at)` (lookback reads and pruning).
 
-The trigger function (line 98) receives the primary key column name as its argument (`TG_ARGV[0]`), and reads it generically with `to_jsonb(NEW) ->> TG_ARGV[0]`, so one function serves every table. An `UPDATE` that changes the primary key is recorded as a `DELETE` of the old key plus an `UPDATE` of the new one. A statement-level trigger records `TRUNCATE`, which fires no row trigger. Unless `notifyChannel: false`, each change is also sent with `pg_notify('cache_events', json)`, so one trigger serves both strategies. The function's comment carries the version (`lilypad-changelog:3`), which the schema check reads to detect outdated installs. Everything is idempotent (`IF NOT EXISTS`, `CREATE OR REPLACE`, `DROP TRIGGER IF EXISTS`), so a migration can run it again.
+The trigger function receives the primary key column name as its argument (`TG_ARGV[0]`), so one function serves every table. Since version 4 it runs as a **statement** trigger, one per event, with transition tables (`REFERENCING OLD TABLE AS lilypad_old NEW TABLE AS lilypad_new`): it builds, with `format('%I')`, a query that reads only the primary key column of the changed rows (`to_jsonb(n.id) #>> '{}'`, the same text as before, without converting whole rows to JSON), and records every row of the statement with one `INSERT ... SELECT` in `EXECUTE`. An `UPDATE` that changes primary keys also records a `DELETE` for each old key that no row has any more. `TRUNCATE` has a statement trigger of its own. Unless `notifyChannel: false`, each change is also sent with `pg_notify('cache_events', json)` (from a data-modifying CTE over the inserted rows), so one trigger serves both strategies. The function keeps a row-level branch (`TG_LEVEL = 'ROW'`), so the row triggers of version 3 keep working between `lilypadChangelogSql()` and `lilypadChangelogTriggerSql()`. The function's comment carries the version (`lilypad-changelog:4`), which the schema check reads to detect outdated installs. Everything is idempotent (`IF NOT EXISTS`, `CREATE OR REPLACE`, `DROP TRIGGER IF EXISTS`), so a migration can run it again.
 
-`lilypadChangelogTriggerSql()` ([line 140](../src/dbGate/LilypadChangelog.ts#L140)) attaches the two triggers to one table.
+`lilypadChangelogTriggerSql()` ([line 140](../src/dbGate/LilypadChangelog.ts#L140)) attaches the four triggers to one table, and drops the row trigger of version 3.
 
 #### The cursor: the transactions a read could not see
 
@@ -720,7 +720,7 @@ The reset happens in a `.then` on the promise, not inside `run` itself: if the c
 4. **Trust and renewal**: while the strategy is known to see every change, entries don't need a query at their TTL.
 5. **The table as a whole**: `getAll()` returns every row, with as few queries as possible, by tracking which keys exist (`members`).
 
-What it does **not** have is as important: the public writes of `LilypadCache` (`set`, `bulkSet`, `getOrSet`, `bulkSync`, `bulkGet`) stay protected. Every value of the cache comes from the table (a fetch, a load, or the row a write returned), which is what makes renewing values past their TTL safe.
+What it does **not** have is as important: the public writes of `LilypadCache` (`set`, `bulkSet`, `getOrSet`, `bulkSync`) and its bulk reads stay protected. Every value of the cache comes from the table (a fetch, a load, or the row a write returned), which is what makes renewing values past their TTL safe.
 
 #### Types and construction
 
@@ -730,7 +730,7 @@ The constructor ([line 188](../src/cache/LilypadDbCache.ts#L188)):
 
 - takes `gate` and `schema` out of the options and calls `super` with the rest, `name` defaulting to the table name;
 - validates the numeric options of `sync`;
-- installs its own bulk sync function, `loadRows` ([line 264](../src/cache/LilypadDbCache.ts#L264)), which loads the whole table with `selectAllFromTable` (passing the timeout signal), and also updates `members` and hands the rows to anyone waiting in `tableLoadWaiters` (see [getAll](#members-and-getall));
+- sets no bulk sync function: the table is loaded by its own `loadTable` (see [getAll](#members-and-getall)), which calls the engine's `replaceEntries`;
 - takes the schema from a qualified `tableName` (`app.accounts` → `app`);
 - creates the `LilypadSchemaVerifier` and the strategy, giving the strategy a **host** object (`syncHost()`, [line 244](../src/cache/LilypadDbCache.ts#L244)): a few closures over the cache's own methods (`applyChange`, `applyTruncate`, `expireEverything`, `emitInvalidation`, ...), so that the strategy can act on the cache without reaching into it.
 
@@ -795,10 +795,10 @@ The two modes differ in **how much the cache trusts the change**. A changelog ro
 
 1. `resolveNotifiedKey(id)`: the key of the existing entry or member (so `'7'` becomes `7` if that is how it is cached), else a number if the schema says the primary key is a `number` and the conversion is exact, else the text.
 2. `isOwnWrite(key, xid)`: skip changes this instance made itself (next section).
-3. `DELETE` from the changelog (line 338): cache the key as `null`, even for keys not cached (the `null` entry blocks a fetch in flight from storing the deleted row), and even for protected keys.
+3. `DELETE` from the changelog: if the key is held (an entry, or a read in flight), cache it as `null` (the `null` entry also blocks a fetch in flight from storing the deleted row), even for a protected key. Otherwise, no entry: remove the key from `members` and from L2. A mass delete, or the lookback of a cold start, thus creates no entries, which would evict the rows the instance holds.
 4. Otherwise, `INSERT`/`UPDATE` note the key as a member of the table. Then:
-   - key **not held** (no entry, no read in flight): no query at all. Nobody asked for this row here. Remove it from L2 (other instances may have cached an old copy) and force the next bulk sync. An eager `DELETE` of such a key leaves it among the members: `getAll` will fetch it, and learn whether it is really gone.
-   - held, `eager` (notifications, including `DELETE`): `refreshKey` re-fetches it now (and expires it if the query fails). A forged `DELETE` thus costs one query and changes nothing; a real one caches `null`.
+   - key **not held** (no entry, no read in flight): no query at all. Nobody asked for this row here. Remove it from L2 (other instances may have cached an old copy). An eager `DELETE` of such a key leaves it among the members: `getAll` will fetch it, and learn whether it is really gone.
+   - held, `eager` (notifications, including `DELETE`): `refreshInBatch` re-fetches it now, together with the other keys notified meanwhile: the batch is sent a microtask later, once the notifications received in the same chunk have been handled, with one `selectFromTableByPrimaryKeys` (a statement that changes many rows notifies each of them, and one query per row would flood the pool). The keys of a failed batch are expired. `eagerReads` counts the keys of the pending and running batches, for `hasReadInFlight`. The query of a batch starts after the notifications of its keys, so it sees their changes even if an older read of the key is still running (the older result loses by its ticket). A forged `DELETE` thus costs part of one query and changes nothing; a real one caches `null`.
    - held, `lazy` (changelog): `markInvalid`, no query; the next read fetches it. The new ticket also discards a read in flight.
 
 Why lazy for the changelog? A changelog read can return hundreds of changes at once (on a lookback, for instance); re-fetching them all eagerly would turn a poll into hundreds of queries, most of them for rows no one will ask for again.
@@ -843,7 +843,7 @@ this.emitInvalidation('write', [key]);
 
 #### Members and getAll
 
-`getAll()` must return every row of the table. Loading the whole table each time is correct but expensive; returning `bulkGet()` is cheap but wrong (the cache may hold only some rows). The solution is to track **which keys exist** separately from their values:
+`getAll()` must return every row of the table. Loading the whole table each time is correct but expensive; returning the cached entries is cheap but wrong (the cache may hold only some rows). The solution is to track **which keys exist** separately from their values:
 
 - `members: Map<normalizedKey, { key, ticket }>` ([line 122](../src/cache/LilypadDbCache.ts#L122)), set by each table load (`replaceMembers`) and kept up to date afterwards by `onValueStored` (a row → member, `null` → removed; fallbacks ignored; an older ticket never overrides a newer one), `addMember` (INSERT/UPDATE of an uncached key) and `applyTruncate`. Evicting an entry does **not** remove its member: the row still exists.
 - `isTableLoaded()` ([line 487](../src/cache/LilypadDbCache.ts#L487)): the members are reliable if the last load happened after the sync became trusted, or, without a trusted sync, less than `bulkSync.ttl` ago.
@@ -861,8 +861,8 @@ return rowsOf(members, fetched, loaded)
 
 Two subtleties:
 
-- **With `maxEntries`**, a load may store more rows than the cache can hold; the evicted ones would then count as stale and be fetched again immediately. So `loadTable` does not rely on the store: it registers a waiter in `tableLoadWaiters`, and `loadRows` hands it the loaded rows directly ([line 272](../src/cache/LilypadDbCache.ts#L272)). `staleKeys` treats a key missing from the store but present in `loaded` as fresh, and `rowsOf` ([line 612](../src/cache/LilypadDbCache.ts#L612)) takes each value from, in order: the fresh entry, the rows just fetched, the rows just loaded, the expired entry.
-- **`loadTable` forces a load** even if the engine's bulk sync still counts as fresh (it invalidates it first): `getAll` decides freshness with `isTableLoaded`, not with the engine's timer.
+- **With `maxEntries`**, a load may store more rows than the cache can hold; the evicted ones would then count as stale and be fetched again immediately. So `loadTable` does not rely on the store: `loadRows` (with `beginRead`, `replaceMembers` and the engine's `replaceEntries`) returns the loaded rows, and concurrent callers share the promise of one load (`tableLoad`), bounded by `bulkSync.timeout`. `staleKeys` treats a key missing from the store but present in `loaded` as fresh, and `rowsOf` ([line 612](../src/cache/LilypadDbCache.ts#L612)) takes each value from, in order: the fresh entry, the rows just fetched, the rows just loaded, the expired entry.
+- **`loadTable` does not use the engine's bulk sync**: `getAll` decides freshness with `isTableLoaded`, not with the engine's timer.
 
 `fetchRows` ([line 544](../src/cache/LilypadDbCache.ts#L544)) is single-flight **per key**: keys already being fetched join those queries, the rest go into one new query (`queryRows`, [line 581](../src/cache/LilypadDbCache.ts#L581)), which stores each row with `read.store` (this instance only, not L2, like the table loads) and caches `null` for keys without a row.
 
@@ -954,7 +954,7 @@ Without `dropEntry`'s fence, the key would have no entry and no fence at this po
 
 Setup: an instance holds `accounts` row `7` (fresh from a fetch 30 s ago, ticket 40); `sync: changelog`, `pollInterval: 5000`, `shared` configured. Someone runs `UPDATE accounts SET plan = 'pro' WHERE id = 7;` in `psql`.
 
-**In the database.** The row trigger `accounts_lilypad_changes` fires `AFTER UPDATE FOR EACH ROW` and calls `lilypad_cache_changes_record('id')` ([Changelog 98](../src/dbGate/LilypadChangelog.ts#L98)). `new_id` and `old_id` are both `'7'`, so there is no extra `DELETE`. It inserts `(table_schema 'public', table_name 'accounts', row_id '7', op 'UPDATE')`; `xid` defaults to `pg_current_xact_id()`, say 9100. It also sends a `pg_notify`, which nobody hears on Vercel.
+**In the database.** The statement trigger `accounts_lilypad_update` fires `AFTER UPDATE FOR EACH STATEMENT` with the transition tables `lilypad_old` and `lilypad_new`, and calls `lilypad_cache_changes_record('id')`. The key `'7'` is in both, so there is no extra `DELETE`. It inserts `(table_schema 'public', table_name 'accounts', row_id '7', op 'UPDATE')`; `xid` defaults to `pg_current_xact_id()`, say 9100. It also sends a `pg_notify`, which nobody hears on Vercel.
 
 **On the instance**, the next request calls `accounts.getOrFetch(7)`:
 
@@ -975,7 +975,7 @@ The change reached the instance within `pollInterval`, with one changelog query 
 Same instance. The application calls `accounts.sqlUpdate({ id: 7, plan: 'team' })`.
 
 1. `sqlUpdate` ([930](../src/cache/LilypadDbCache.ts#L930)): not disposed; `key = 7`; `startTicket = nextTicket()` = 60.
-2. `gate.updateToTable` ([Gate 461](../src/dbGate/LilypadDbGate.ts#L461)) → `prepareWrite`: sanitization; primary key present; with `primaryKeyShouldAutoDetermine` the `id` is removed from the data (it only identifies the row); `columns = ['plan']` (only the declared columns that are not `undefined`).
+2. `gate.updateToTable` ([Gate 461](../src/dbGate/LilypadDbGate.ts#L461)) → `prepareWrite`: sanitization; primary key present; with `generatedPrimaryKey` the `id` is removed from the data (it only identifies the row); `columns = ['plan']` (only the declared columns that are not `undefined`).
 3. SQL: `UPDATE "accounts" SET "plan" = $1 WHERE "id" = $2 RETURNING "id", "email", "plan", pg_current_xact_id()::text AS "__lilypad_xid"`. `writeResult` strips `__lilypad_xid` and returns `{ row, xid: 9200n }`.
 4. `storeWritten(7, row, 60, 9200n)` ([880](../src/cache/LilypadDbCache.ts#L880)): the entry's ticket (say 58) is not greater than 60, so nothing interfered. `setValue(7, row)` → ticket 61, and the row is written to L2. `recordOwnWrite('7', 9200n, 61)`.
 5. `emitInvalidation('write', [7])`: `platform.onInvalidate` can call `revalidateTag('lilypad:accounts:7')`.

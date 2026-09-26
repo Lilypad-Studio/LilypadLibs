@@ -168,7 +168,17 @@ export class LilypadSharedLevel<V> {
       return { value: null, fetchedAt, expiresAt };
     }
     const codec = this.options.codec;
-    const value = codec ? codec.decode(envelope.value) : (envelope.value as V);
+    let value: V | null;
+    try {
+      value = codec ? codec.decode(envelope.value) : (envelope.value as V);
+    } catch (error) {
+      // A codec that throws (e.g. a schema `parse`) counts as a missing entry, like a failed read
+      this.options.warn(
+        `Ignoring a shared entry the codec could not decode: "${normalizedKey}"`,
+        error
+      );
+      return undefined;
+    }
     if (value === null) {
       this.options.warn(`Ignoring a shared entry rejected by the codec: "${normalizedKey}"`);
       return undefined;
@@ -185,14 +195,15 @@ export class LilypadSharedLevel<V> {
       return;
     }
     const { codec, checkBeforeWrite } = this.options;
-    const envelope: LilypadSharedEnvelope = {
-      lilypad: SHARED_FORMAT_VERSION,
-      value: entry.value === null || !codec ? entry.value : codec.encode(entry.value),
-      fetchedAt: entry.fetchedAt,
-      expiresAt: entry.expiresAt,
-    };
     const key = this.valueKey(normalizedKey);
     this.inBackground(`write of "${normalizedKey}"`, async (store) => {
+      // Encoded here, so that a codec that throws fails this write only, not the caller's
+      const envelope: LilypadSharedEnvelope = {
+        lilypad: SHARED_FORMAT_VERSION,
+        value: entry.value === null || !codec ? entry.value : codec.encode(entry.value),
+        fetchedAt: entry.fetchedAt,
+        expiresAt: entry.expiresAt,
+      };
       if (checkBeforeWrite) {
         const current = (await store.get(key)) as Partial<LilypadSharedEnvelope> | null | undefined;
         if (typeof current?.fetchedAt === 'number' && current.fetchedAt > envelope.fetchedAt) {

@@ -1,4 +1,4 @@
-// src/singleton/LilypadSingleton.ts
+"use strict";Object.defineProperty(exports, "__esModule", {value: true});// src/singleton/LilypadSingleton.ts
 var singletonMap = globalThis.__lilypadSingletonMap ??= /* @__PURE__ */ new Map();
 var signatureMap = globalThis.__lilypadSingletonSignatureMap ??= /* @__PURE__ */ new Map();
 function checkSignature(identifier, signature) {
@@ -58,11 +58,15 @@ async function getLilypadSingletonInstanceAsync(identifier, createInstanceFn, si
 function registryKeyOf(namespace, options) {
   return options.singleton ? `${namespace}:${options.singletonIdentifier}` : void 0;
 }
-function releaseFor(registryKey) {
+function releaseFor(registryKey, owner) {
   let released = registryKey === void 0;
   return () => {
-    if (!released) {
-      released = true;
+    if (released) {
+      return;
+    }
+    released = true;
+    const current = singletonMap.get(registryKey);
+    if (current !== void 0 && (current === owner.instance || current === owner.registered)) {
       removeLilypadSingletonInstance(registryKey);
     }
   };
@@ -70,31 +74,44 @@ function releaseFor(registryKey) {
 function createLilypadSingletonAble(namespace, options, createInstanceFn, signature) {
   const registryKey = registryKeyOf(namespace, options);
   if (registryKey === void 0) {
-    return createInstanceFn(releaseFor(void 0));
+    return createInstanceFn(releaseFor(void 0, {}));
   }
+  const owner = {};
   return getLilypadSingletonInstance(
     registryKey,
-    () => createInstanceFn(releaseFor(registryKey)),
+    () => {
+      const instance = createInstanceFn(releaseFor(registryKey, owner));
+      owner.instance = instance;
+      return instance;
+    },
     signature
   );
 }
 function createLilypadSingletonAbleAsync(namespace, options, createInstanceFn, signature) {
   const registryKey = registryKeyOf(namespace, options);
   if (registryKey === void 0) {
-    return createInstanceFn(releaseFor(void 0));
+    return createInstanceFn(releaseFor(void 0, {}));
   }
+  const owner = {};
   return getLilypadSingletonInstanceAsync(
     registryKey,
-    () => createInstanceFn(releaseFor(registryKey)),
+    () => {
+      const registered = createInstanceFn(releaseFor(registryKey, owner)).then((instance) => {
+        owner.instance = instance;
+        return instance;
+      });
+      owner.registered = registered;
+      return registered;
+    },
     signature
   );
 }
 
-export {
-  getLilypadSingletonInstance,
-  removeLilypadSingletonInstance,
-  getLilypadSingletonInstanceAsync,
-  createLilypadSingletonAble,
-  createLilypadSingletonAbleAsync
-};
-//# sourceMappingURL=chunk-3Y7IMWY6.mjs.map
+
+
+
+
+
+
+exports.getLilypadSingletonInstance = getLilypadSingletonInstance; exports.removeLilypadSingletonInstance = removeLilypadSingletonInstance; exports.getLilypadSingletonInstanceAsync = getLilypadSingletonInstanceAsync; exports.createLilypadSingletonAble = createLilypadSingletonAble; exports.createLilypadSingletonAbleAsync = createLilypadSingletonAbleAsync;
+//# sourceMappingURL=chunk-CDQ4MAZL.js.map

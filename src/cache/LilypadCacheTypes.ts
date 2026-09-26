@@ -44,7 +44,10 @@ export type LilypadCacheGetOptions<K extends LilypadCacheKey, V> = {
    * one fetch: the value is cached with the TTL of the call that started it.
    */
   ttl?: number;
-  /** If true, bypasses the cache and always calls `valueFn`. */
+  /**
+   * If true, skips the lookup (memory, shared level, stale value) and fetches with `valueFn`. A
+   * fetch of the key already in flight is joined instead of starting another one.
+   */
   skipCache?: boolean;
   /**
    * How long after its expiration a value is still returned at once, while it is refreshed in the
@@ -80,7 +83,8 @@ export type LilypadCacheResult<V> = {
 };
 
 /**
- * Converts values to and from what the shared store can hold (usually JSON).
+ * Converts values to and from what the shared store can hold (usually JSON). Either function may
+ * throw: a value that cannot be encoded is not shared, and one that cannot be decoded is ignored.
  */
 export type LilypadSharedCodec<V> = {
   encode(value: V): unknown;
@@ -164,9 +168,15 @@ export type LilypadCacheRead<K, V> = {
   store(key: K, value: LilypadCachedValueType<V>, ttl?: number): boolean;
   /**
    * Stores a value in this instance and in the shared level, and ends the failure cooldown of the
-   * key. @returns `true` if it was stored.
+   * key. The shared copy is kept through `staleWhileRevalidate` (at least the cache's).
+   * @returns `true` if it was stored.
    */
-  storeFetched(key: K, value: LilypadCachedValueType<V>, ttl?: number): boolean;
+  storeFetched(
+    key: K,
+    value: LilypadCachedValueType<V>,
+    ttl?: number,
+    staleWhileRevalidate?: number
+  ): boolean;
 };
 
 /**
@@ -185,7 +195,7 @@ export type LilypadCacheSyncFn<K, V> = (
 
 export type LilypadCacheBulkSyncOptions<K, V> = {
   /**
-   * Loads every entry of the source, for `bulkSync` and `bulkAsyncGet`. It receives a signal that
+   * Loads every entry of the source, for `bulkSync` and `getAll`. It receives a signal that
    * is aborted when the sync times out. Without it, `bulkSync` resolves to `false`.
    */
   fn?: LilypadCacheSyncFn<K, V>;
@@ -235,7 +245,7 @@ export type LilypadCacheOptions<K extends LilypadCacheKey, V> = {
   errorTtl?: number;
   /** Timeout of the fetches of `getOrSet`, in milliseconds. Defaults to 5 seconds. */
   fetchTimeout?: number;
-  /** Loading the whole source at once (`bulkSync`, `bulkAsyncGet`). */
+  /** Loading the whole source at once (`bulkSync`, `getAll`). */
   bulkSync?: LilypadCacheBulkSyncOptions<K, V>;
   logger?: LilypadLibLogger;
   /** Prefix of the tags of the invalidation events. Defaults to `lilypad`. */

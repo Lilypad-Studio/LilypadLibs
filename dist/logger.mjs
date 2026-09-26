@@ -1,13 +1,15 @@
 import {
+  LILYPAD_DEFAULT_REDACTED_KEYS,
   LilypadConsoleLogger,
   LilypadDiscordLogger,
   LilypadJsonConsoleLogger,
   LilypadLogger,
   LilypadLoggerComponent
-} from "./chunks/chunk-C7SX3YFM.mjs";
+} from "./chunks/chunk-GGHIN7GC.mjs";
 import "./chunks/chunk-3L5FE6KG.mjs";
-import "./chunks/chunk-3Y7IMWY6.mjs";
+import "./chunks/chunk-YUU6MHTP.mjs";
 export {
+  LILYPAD_DEFAULT_REDACTED_KEYS,
   LilypadConsoleLogger,
   LilypadDiscordLogger,
   LilypadJsonConsoleLogger,

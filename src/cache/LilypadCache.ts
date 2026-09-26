@@ -120,25 +120,31 @@ export class LilypadCache<K extends LilypadCacheKey, V> extends LilypadCacheCore
   }
 
   /**
-   * Returns the fresh values of `keys`, or, without keys, every fresh entry (keyed by the key it
-   * was stored with).
+   * Returns the fresh values of `keys`, keyed as given. Missing and expired keys are left out.
    *
    * @throws If the cache is disposed.
    */
-  public override bulkGet(options?: { keys?: K[] }): Map<K, LilypadCachedValueType<V>> {
-    return super.bulkGet(options);
+  public override getMany(keys: Iterable<K>): Map<K, LilypadCachedValueType<V>> {
+    return super.getMany(keys);
   }
 
   /**
-   * Like `bulkGet`, after a `bulkSync` (unless `doSync` is false).
+   * Returns every fresh entry, keyed by the key it was stored with. It is the whole source only
+   * while the last `bulkSync` is fresh: use `getAll` to sync first.
    *
    * @throws If the cache is disposed.
    */
-  public override bulkAsyncGet(options?: {
-    keys?: K[];
-    doSync?: boolean;
-  }): Promise<Map<K, LilypadCachedValueType<V>>> {
-    return super.bulkAsyncGet(options);
+  public override entries(): Map<K, LilypadCachedValueType<V>> {
+    return super.entries();
+  }
+
+  /**
+   * Like `entries()`, after a `bulkSync` (unless `sync` is false).
+   *
+   * @throws If the cache is disposed.
+   */
+  public getAll(options?: { sync?: boolean }): Promise<Map<K, LilypadCachedValueType<V>>> {
+    return this.getAllEntries(options);
   }
 
   /**

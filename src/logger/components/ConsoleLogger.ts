@@ -1,4 +1,8 @@
-import { LilypadLoggerComponent, writeToConsole } from '../LilypadLoggerComponent';
+import {
+  LilypadLoggerComponent,
+  writeToConsole,
+  type LilypadLogRecord,
+} from '../LilypadLoggerComponent';
 
 /**
  * A logger component that outputs messages to the console.
@@ -16,8 +20,8 @@ import { LilypadLoggerComponent, writeToConsole } from '../LilypadLoggerComponen
  * (case-insensitive), and every other message to `console.log`.
  */
 export class LilypadConsoleLogger<T extends string> extends LilypadLoggerComponent<T> {
-  protected send(message: string, type: T): Promise<void> {
-    writeToConsole(message, type);
+  write(record: LilypadLogRecord<T>): Promise<void> {
+    writeToConsole(this.formatRecord(record), record.type);
     return Promise.resolve();
   }
 }
