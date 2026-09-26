@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import LilypadLoggerComponent from './LilypadLoggerComponent';
+import { LilypadLoggerComponent } from './LilypadLoggerComponent';
 import { LilypadLogger } from './LilypadLogger';
 import {
   getLilypadSingletonInstanceAsync,

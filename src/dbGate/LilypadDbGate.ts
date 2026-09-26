@@ -1,9 +1,11 @@
 import { createHash } from 'node:crypto';
+import { LilypadListenHeartbeat } from '@/dbGate/LilypadListenHeartbeat';
+import { assertNumberOption } from '@/internal/LilypadValidation';
 import { libLog, type LilypadLibLogger } from '@/logger/LilypadLibLogger';
 import {
   createLilypadSingletonAbleAsync,
-  LilypadSingletonAble,
-  removeLilypadSingletonInstance,
+  type LilypadSingletonAble,
+  type LilypadSingletonRelease,
 } from '@/singleton/LilypadSingleton';
 import postgres from 'postgres';
 
@@ -21,6 +23,7 @@ export type ListenerCallbackIdentifier = {
 export type LilypadDbGateOptions = {
   logger?: LilypadLibLogger;
   connectionString: string;
+  /** The connection used for `LISTEN`, if not `connectionString` (e.g. a direct, unpooled one). */
   listenerConnectionString?: string;
   listen?: ListenerCallbackIdentifier[];
   /**
@@ -31,6 +34,12 @@ export type LilypadDbGateOptions = {
   statementTimeout?: number;
   /** Connection pool of the main client. Every duration is in milliseconds. */
   pool?: LilypadDbPoolOptions;
+  /**
+   * While channels are listened to, a notification is sent to a private channel every this many
+   * ms, to detect a `LISTEN` connection that stopped delivering notifications (see
+   * `isListenHealthy`). `false` disables it. Defaults to 15 seconds.
+   */
+  listenHeartbeat?: number | false;
 };
 
 export type LilypadDbPoolOptions = {
@@ -123,12 +132,32 @@ export type LilypadDbUpdateData<T, PK extends keyof T = keyof T> = Partial<T> & 
  */
 export type LilypadDbWriteResult<T> = { row: T | null; xid: bigint };
 
+/**
+ * The result of a delete: whether a row had this primary key, and the id of the transaction that
+ * deleted it.
+ */
+export type LilypadDbDeleteResult = { deleted: boolean; xid?: bigint };
+
+/** Thrown by `updateToTable` when no row has the primary key of the data. */
+export class LilypadDbNotFoundError extends Error {
+  readonly tableName: string;
+  readonly primaryKeyValue: unknown;
+
+  constructor(tableName: string, primaryKeyValue: unknown) {
+    super(`No row with primary key "${String(primaryKeyValue)}" found in table "${tableName}".`);
+    this.name = 'LilypadDbNotFoundError';
+    this.tableName = tableName;
+    this.primaryKeyValue = primaryKeyValue;
+  }
+}
+
 /** Rows read at a time by `selectAllFromTable`. */
 const SELECT_ALL_BATCH_SIZE = 1000;
 /** Primary keys per query of `selectFromTableByPrimaryKeys`. */
 const PRIMARY_KEYS_BATCH_SIZE = 1000;
 /** The column that carries the transaction id in the results of writes. */
 const XID_COLUMN = '__lilypad_xid';
+const DEFAULT_LISTEN_HEARTBEAT = 15_000;
 
 export function lilypadMissingPrimaryKeyError(
   schema: { primaryKey: PropertyKey; tableName: string },
@@ -148,38 +177,37 @@ type ChannelListener = {
 };
 
 /**
- * Provides a gateway for interacting with a PostgreSQL database, including CRUD operations and channel-based listeners.
- *
- * The `LilypadDbGate` class manages a database connection and allows for:
- * - Fetching all rows from a table with type safety.
- * - Inserting, updating, and deleting rows in a table.
- * - Listening to PostgreSQL channels for notifications and handling them with callbacks.
- * - Managing multiple listeners and cleaning up resources.
+ * A gateway to a PostgreSQL database: typed CRUD helpers over a {@link LilypadDbSchema}, and
+ * channel listeners (`LISTEN/NOTIFY`) with reconnection handling.
  *
  * @example
  * ```typescript
- * const dbGate = await LilypadDbGate.create({
+ * const gate = await LilypadDbGate.create({
  *   connectionString: 'postgres://user:pass@host:port/db',
  *   listen: [
  *     { channel: 'my_channel', callbackId: 'my_callback', callback: (payload) => console.log(payload) }
  *   ]
  * });
  * ```
- *
- * @public
  */
 export class LilypadDbGate {
   public readonly id = `LilypadDbGate-${globalThis.crypto.randomUUID()}`;
-  private listenerConnectionString: string;
   public readonly sql: postgres.Sql;
-  private listenerConnection: postgres.Sql | undefined;
+  /** Only when `listenerConnectionString` differs: otherwise `sql` listens. */
+  private readonly listenerClient?: postgres.Sql;
   protected logger?: LilypadLibLogger;
   private listeners: Map<string, ChannelListener> = new Map();
-  private singletonIdentifier?: string;
+  private releaseSingleton: LilypadSingletonRelease = () => {};
+  private readonly heartbeat?: LilypadListenHeartbeat;
+  private readonly heartbeatChannel = `lilypad_heartbeat_${this.id.slice(-36).replace(/-/g, '')}`;
+  private heartbeatStop?: Promise<() => Promise<void>>;
 
   private constructor(options: LilypadDbGateOptions) {
+    assertNumberOption('LilypadDbGate', 'statementTimeout', options.statementTimeout, 'positive');
+    if (options.listenHeartbeat !== false) {
+      assertNumberOption('LilypadDbGate', 'listenHeartbeat', options.listenHeartbeat, 'positive');
+    }
     this.logger = options.logger;
-    this.listenerConnectionString = options.listenerConnectionString || options.connectionString;
     this.sql = postgres(options.connectionString, {
       prepare: false,
       ...toPostgresPoolOptions(options.pool),
@@ -187,6 +215,18 @@ export class LilypadDbGate {
         connection: { statement_timeout: options.statementTimeout },
       }),
     });
+    const listenerConnectionString = options.listenerConnectionString;
+    if (listenerConnectionString && listenerConnectionString !== options.connectionString) {
+      // postgres.js opens its own single, long-lived connection for LISTEN: no pool options needed
+      this.listenerClient = postgres(listenerConnectionString);
+    }
+    if (options.listenHeartbeat !== false) {
+      this.heartbeat = new LilypadListenHeartbeat(
+        options.listenHeartbeat ?? DEFAULT_LISTEN_HEARTBEAT,
+        () => this.sql`SELECT pg_notify(${this.heartbeatChannel}, '')`,
+        (error) => libLog(this.logger, 'debug', this.id, 'LISTEN heartbeat failed:', error)
+      );
+    }
   }
 
   /**
@@ -200,9 +240,9 @@ export class LilypadDbGate {
     return createLilypadSingletonAbleAsync(
       'LilypadDbGate',
       options,
-      async (registryKey) => {
+      async (release) => {
         const instance = await LilypadDbGate.initializeNew(options);
-        instance.singletonIdentifier = registryKey;
+        instance.releaseSingleton = release;
         return instance;
       },
       {
@@ -214,6 +254,7 @@ export class LilypadDbGate {
               options.listenerConnectionString,
               options.statementTimeout,
               options.pool,
+              options.listenHeartbeat,
             ])
           )
           .digest('hex'),
@@ -221,7 +262,8 @@ export class LilypadDbGate {
           libLog(
             options.logger,
             'warn',
-            `LilypadDbGate singleton "${options.singleton ? options.singletonIdentifier : ''}" already exists with different connection options: the new options are ignored.`
+            'LilypadDbGate',
+            `Singleton "${options.singleton ? options.singletonIdentifier : ''}" already exists with different connection options: the new options are ignored.`
           ),
       }
     );
@@ -308,18 +350,26 @@ export class LilypadDbGate {
   /**
    * Selects every row of the table. Rows are read in batches through a cursor, so the raw result
    * of the whole table is never held in memory at once.
+   *
+   * @param options.signal - Stops reading (and closes the cursor) once aborted: the promise then
+   * rejects with the reason of the signal.
    */
   async selectAllFromTable<T, PK extends keyof T = keyof T>(
-    options: LilypadDbSchema<T, PK>
+    schema: LilypadDbSchema<T, PK>,
+    options: { signal?: AbortSignal } = {}
   ): Promise<T[]> {
+    const { signal } = options;
+    signal?.throwIfAborted();
     const typedResults: T[] = [];
     const cursor = this.sql`
-      SELECT ${this.selectedColumns(options)} FROM ${this.sql(options.tableName)}
+      SELECT ${this.selectedColumns(schema)} FROM ${this.sql(schema.tableName)}
     `.cursor(SELECT_ALL_BATCH_SIZE);
 
     for await (const rows of cursor) {
+      // Leaving the loop closes the cursor
+      signal?.throwIfAborted();
       for (const row of rows) {
-        const typedRow = this.mapRow(options, row);
+        const typedRow = this.mapRow(schema, row);
         if (typedRow !== null) {
           typedResults.push(typedRow);
         }
@@ -334,18 +384,18 @@ export class LilypadDbGate {
    * `selectSanitizationFn` discards.
    */
   async selectFromTableByPrimaryKeys<T, PK extends keyof T = keyof T>(
-    options: LilypadDbSchema<T, PK>,
+    schema: LilypadDbSchema<T, PK>,
     primaryKeyValues: T[PK][]
   ): Promise<T[]> {
     const typedRows: T[] = [];
     for (let start = 0; start < primaryKeyValues.length; start += PRIMARY_KEYS_BATCH_SIZE) {
       const batch = primaryKeyValues.slice(start, start + PRIMARY_KEYS_BATCH_SIZE);
       const results = await this.sql`
-        SELECT ${this.selectedColumns(options)} FROM ${this.sql(options.tableName)}
-        WHERE ${this.sql(String(options.primaryKey))} IN ${this.sql(batch as string[])}
+        SELECT ${this.selectedColumns(schema)} FROM ${this.sql(schema.tableName)}
+        WHERE ${this.sql(String(schema.primaryKey))} IN ${this.sql(batch as string[])}
       `;
       for (const row of results) {
-        const typedRow = this.mapRow(options, row);
+        const typedRow = this.mapRow(schema, row);
         if (typedRow !== null) {
           typedRows.push(typedRow);
         }
@@ -355,43 +405,36 @@ export class LilypadDbGate {
   }
 
   async selectFromTableByPrimaryKey<T, PK extends keyof T = keyof T>(
-    options: LilypadDbSchema<T, PK>,
+    schema: LilypadDbSchema<T, PK>,
     primaryKeyValue: T[PK]
   ): Promise<T | null> {
     const results = await this.sql`
-      SELECT ${this.selectedColumns(options)} FROM ${this.sql(options.tableName)}
-      WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue as string}
+      SELECT ${this.selectedColumns(schema)} FROM ${this.sql(schema.tableName)}
+      WHERE ${this.sql(String(schema.primaryKey))} = ${primaryKeyValue as string}
     `;
 
     const [row] = results;
-    return row ? this.mapRow(options, row) : null;
+    return row ? this.mapRow(schema, row) : null;
   }
 
   /**
    * Inserts a row.
    *
    * @returns The row as stored by the database, including generated columns such as an
-   * auto-determined primary key, or `null` if the `selectSanitizationFn` discards it.
+   * auto-determined primary key (`null` if the `selectSanitizationFn` discards it), and the id of
+   * the transaction that wrote it.
    */
   async insertToTable<T, PK extends keyof T = keyof T>(
-    options: LilypadDbSchema<T, PK>,
-    data: LilypadDbInsertData<T, PK>
-  ): Promise<T | null> {
-    return (await this.insertToTableDetailed(options, data)).row;
-  }
-
-  /** Like {@link insertToTable}, but also returns the id of the transaction that wrote the row. */
-  async insertToTableDetailed<T, PK extends keyof T = keyof T>(
-    options: LilypadDbSchema<T, PK>,
+    schema: LilypadDbSchema<T, PK>,
     data: LilypadDbInsertData<T, PK>
   ): Promise<LilypadDbWriteResult<T>> {
-    const { data: insertData, columns } = this.prepareWrite(options, data as Partial<T>, 'insert');
+    const { data: insertData, columns } = this.prepareWrite(schema, data as Partial<T>, 'insert');
 
     const results = await this.sql`
-      INSERT INTO ${this.sql(options.tableName)} ${this.sql(insertData, columns)}
-      RETURNING *, txid_current()::text AS ${this.sql(XID_COLUMN)}
+      INSERT INTO ${this.sql(schema.tableName)} ${this.sql(insertData, columns)}
+      RETURNING ${this.selectedColumns(schema)}, pg_current_xact_id()::text AS ${this.sql(XID_COLUMN)}
     `;
-    return this.writeResult(options, results);
+    return this.writeResult(schema, results);
   }
 
   /** Splits a row returned by a write into the row and the id of its transaction. */
@@ -411,87 +454,57 @@ export class LilypadDbGate {
    * Updates the row identified by the primary key contained in `data`. Only the columns present
    * in `data` are written.
    *
-   * @returns The row as stored by the database, or `null` if the `selectSanitizationFn` discards it.
-   * @throws If no row with that primary key exists.
+   * @returns The row as stored by the database (`null` if the `selectSanitizationFn` discards it),
+   * and the id of the transaction that wrote it.
+   * @throws {LilypadDbNotFoundError} If no row with that primary key exists.
    */
   async updateToTable<T, PK extends keyof T = keyof T>(
-    options: LilypadDbSchema<T, PK>,
-    data: LilypadDbUpdateData<T, PK>
-  ): Promise<T | null> {
-    return (await this.updateToTableDetailed(options, data)).row;
-  }
-
-  /** Like {@link updateToTable}, but also returns the id of the transaction that wrote the row. */
-  async updateToTableDetailed<T, PK extends keyof T = keyof T>(
-    options: LilypadDbSchema<T, PK>,
+    schema: LilypadDbSchema<T, PK>,
     data: LilypadDbUpdateData<T, PK>
   ): Promise<LilypadDbWriteResult<T>> {
     const {
       data: updateData,
       columns,
       primaryKeyValue,
-    } = this.prepareWrite(options, data, 'update');
+    } = this.prepareWrite(schema, data, 'update');
 
     const results = await this.sql`
-      UPDATE ${this.sql(options.tableName)}
+      UPDATE ${this.sql(schema.tableName)}
       SET ${this.sql(updateData, columns)}
-      WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue as string}
-      RETURNING *, txid_current()::text AS ${this.sql(XID_COLUMN)}
+      WHERE ${this.sql(String(schema.primaryKey))} = ${primaryKeyValue as string}
+      RETURNING ${this.selectedColumns(schema)}, pg_current_xact_id()::text AS ${this.sql(XID_COLUMN)}
     `;
     if (results.count === 0) {
-      throw new Error(
-        `No row with primary key "${String(primaryKeyValue)}" found in table "${options.tableName}".`
-      );
+      throw new LilypadDbNotFoundError(schema.tableName, primaryKeyValue);
     }
-    return this.writeResult(options, results);
-  }
-
-  async deleteFromTable<T, PK extends keyof T = keyof T>(
-    options: LilypadDbSchema<T, PK>,
-    primaryKeyValue: T[PK]
-  ): Promise<void> {
-    await this.deleteFromTableDetailed(options, primaryKeyValue);
+    return this.writeResult(schema, results);
   }
 
   /**
-   * Like {@link deleteFromTable}, but also returns the id of the transaction that deleted the row
-   * (`undefined` when no row had this primary key).
+   * Deletes the row with this primary key.
+   *
+   * @returns Whether a row had this primary key, and the id of the transaction that deleted it.
    */
-  async deleteFromTableDetailed<T, PK extends keyof T = keyof T>(
-    options: LilypadDbSchema<T, PK>,
+  async deleteFromTable<T, PK extends keyof T = keyof T>(
+    schema: LilypadDbSchema<T, PK>,
     primaryKeyValue: T[PK]
-  ): Promise<{ xid?: bigint }> {
+  ): Promise<LilypadDbDeleteResult> {
     const results = await this.sql`
-      DELETE FROM ${this.sql(options.tableName)}
-      WHERE ${this.sql(String(options.primaryKey))} = ${primaryKeyValue as string}
-      RETURNING txid_current()::text AS ${this.sql(XID_COLUMN)}
+      DELETE FROM ${this.sql(schema.tableName)}
+      WHERE ${this.sql(String(schema.primaryKey))} = ${primaryKeyValue as string}
+      RETURNING pg_current_xact_id()::text AS ${this.sql(XID_COLUMN)}
     `;
     const [deleted] = results;
-    return deleted ? { xid: BigInt(deleted[XID_COLUMN] as string) } : {};
+    return deleted
+      ? { deleted: true, xid: BigInt(deleted[XID_COLUMN] as string) }
+      : { deleted: false };
   }
 
   // LISTENER MANAGEMENT
 
-  /**
-   * Retrieves the singleton listener database connection.
-   *
-   * If the listener connection does not already exist, this method initializes it
-   * using the provided connection string and specific connection options:
-   * - `max`: Limits the pool to a single connection.
-   * - `idle_timeout`: Disables idle timeout for the connection.
-   * - `max_lifetime`: Disables maximum lifetime for the connection.
-   *
-   * @returns The singleton listener database connection instance.
-   */
-  private getListenerConnection() {
-    if (!this.listenerConnection) {
-      this.listenerConnection = postgres(this.listenerConnectionString, {
-        max: 1,
-        idle_timeout: 0,
-        max_lifetime: null,
-      });
-    }
-    return this.listenerConnection;
+  /** The client that listens: postgres.js keeps one dedicated connection per client for LISTEN. */
+  private listenClient(): postgres.Sql {
+    return this.listenerClient ?? this.sql;
   }
 
   /**
@@ -500,16 +513,13 @@ export class LilypadDbGate {
    * The listener entry is registered immediately, before LISTEN is active, so that concurrent
    * `addListener` calls for the same channel share it and await the same `ready` promise.
    * If LISTEN fails, the entry is removed, so that a later `addListener` call retries it.
-   *
-   * @param channel - The name of the channel to listen on.
-   * @returns The listener entry of the channel.
    */
   private initializeListener(channel: string): ChannelListener {
     libLog(this.logger, 'debug', this.id, `Initializing listener for channel "${channel}".`);
     const listener: ChannelListener = {
       callbacks: new Map(),
       listening: false,
-      ready: this.getListenerConnection()
+      ready: this.listenClient()
         .listen(
           channel,
           (payload) => this.executeAllListenerCallbacks(channel, payload),
@@ -555,12 +565,7 @@ export class LilypadDbGate {
       });
   }
 
-  /**
-   * Executes all registered listener callbacks for a given channel, passing the provided payload to each callback.
-   *
-   * @param channel - The name of the channel whose listener callbacks should be executed.
-   * @param payload - The data to pass to each listener callback.
-   */
+  /** Runs every callback of a channel with the payload of a notification. */
   private executeAllListenerCallbacks(channel: string, payload: unknown) {
     const listener = this.listeners.get(channel);
     if (!listener) {
@@ -586,17 +591,8 @@ export class LilypadDbGate {
   }
 
   /**
-   * Adds a listener callback for a specified channel.
-   *
-   * If the channel does not already have a listener, it initializes one.
-   * The callback is associated with the provided `callbackId`: adding a callback with an existing
-   * `callbackId` on the same channel replaces the previous one.
-   *
-   * @param params - An object containing:
-   *   @param params.channel - The name of the channel to listen to.
-   *   @param params.callbackId - A unique identifier for the callback.
-   *   @param params.callback - The callback function to be invoked for the channel.
-   *   @param params.onReconnect - Optional function called when LISTEN is re-established after a reconnection.
+   * Adds a listener callback for a channel. Adding a callback with an existing `callbackId` on the
+   * same channel replaces the previous one.
    *
    * @returns A promise that resolves once LISTEN is active on the channel.
    * @throws If LISTEN fails; in that case the callback is not registered.
@@ -612,6 +608,10 @@ export class LilypadDbGate {
     const listener = this.listeners.get(channel) ?? this.initializeListener(channel);
     listener.callbacks.set(callbackId, identifier);
     await listener.ready;
+    // Unless the callback was removed while LISTEN was starting
+    if (this.listeners.get(channel) === listener) {
+      await this.startHeartbeat();
+    }
 
     libLog(
       this.logger,
@@ -623,6 +623,8 @@ export class LilypadDbGate {
 
   /**
    * Removes a listener callback. When the channel has no callbacks left, it stops listening to it.
+   * It never rejects: a failed UNLISTEN is logged (the connection keeps the channel, whose
+   * notifications are then ignored).
    *
    * @returns `true` if the callback was registered.
    */
@@ -633,20 +635,72 @@ export class LilypadDbGate {
     }
     if (listener.callbacks.size === 0) {
       this.listeners.delete(channel);
-      const unlisten = await listener.ready;
-      await unlisten();
+      if (this.listeners.size === 0) {
+        await this.stopHeartbeat();
+      }
+      try {
+        const unlisten = await listener.ready;
+        await unlisten();
+      } catch (error) {
+        // LISTEN itself failed (nothing to undo), or UNLISTEN failed
+        libLog(this.logger, 'warn', this.id, `Could not stop listening on "${channel}":`, error);
+      }
     }
     return true;
   }
 
+  private async startHeartbeat() {
+    const heartbeat = this.heartbeat;
+    if (!heartbeat || this.heartbeatStop) {
+      return;
+    }
+    this.heartbeatStop = this.listenClient()
+      .listen(this.heartbeatChannel, () => heartbeat.beat())
+      .then((meta) => {
+        heartbeat.start();
+        return () => meta.unlisten();
+      });
+    try {
+      await this.heartbeatStop;
+    } catch (error) {
+      // Without a heartbeat, isListenHealthy() stays false: the caches just trust LISTEN less
+      this.heartbeatStop = undefined;
+      libLog(this.logger, 'warn', this.id, 'Could not start the LISTEN heartbeat:', error);
+    }
+  }
+
+  private async stopHeartbeat() {
+    const stop = this.heartbeatStop;
+    this.heartbeatStop = undefined;
+    this.heartbeat?.stop();
+    try {
+      await (
+        await stop
+      )?.();
+    } catch {
+      // The heartbeat is only a diagnostic
+    }
+  }
+
+  /**
+   * Whether the `LISTEN` connection is known to deliver notifications: a heartbeat came back
+   * recently. Without heartbeat (`listenHeartbeat: false`), `true` as soon as a channel is
+   * listened to. `false` while no channel is listened to.
+   */
+  isListenHealthy(): boolean {
+    if (!this.heartbeat) {
+      return this.listeners.size > 0;
+    }
+    return this.heartbeat.healthy();
+  }
+
   async close() {
     this.listeners.clear();
-    if (this.singletonIdentifier !== undefined) {
-      removeLilypadSingletonInstance(this.singletonIdentifier);
-      this.singletonIdentifier = undefined;
-    }
+    this.heartbeat?.stop();
+    this.heartbeatStop = undefined;
+    this.releaseSingleton();
 
-    await this.listenerConnection?.end();
+    await this.listenerClient?.end();
     await this.sql.end();
   }
 }

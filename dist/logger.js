@@ -4,14 +4,14 @@
 
 
 
-var _chunk5YJYMXFTjs = require('./chunks/chunk-5YJYMXFT.js');
+var _chunkSENRQZDWjs = require('./chunks/chunk-SENRQZDW.js');
 require('./chunks/chunk-LL3KVXOK.js');
-require('./chunks/chunk-GU4ZU4ST.js');
+require('./chunks/chunk-BQAYFDD3.js');
 
 
 
 
 
 
-exports.LilypadConsoleLogger = _chunk5YJYMXFTjs.LilypadConsoleLogger; exports.LilypadDiscordLogger = _chunk5YJYMXFTjs.LilypadDiscordLogger; exports.LilypadJsonConsoleLogger = _chunk5YJYMXFTjs.LilypadJsonConsoleLogger; exports.LilypadLogger = _chunk5YJYMXFTjs.LilypadLogger; exports.LilypadLoggerComponent = _chunk5YJYMXFTjs.LilypadLoggerComponent;
+exports.LilypadConsoleLogger = _chunkSENRQZDWjs.LilypadConsoleLogger; exports.LilypadDiscordLogger = _chunkSENRQZDWjs.LilypadDiscordLogger; exports.LilypadJsonConsoleLogger = _chunkSENRQZDWjs.LilypadJsonConsoleLogger; exports.LilypadLogger = _chunkSENRQZDWjs.LilypadLogger; exports.LilypadLoggerComponent = _chunkSENRQZDWjs.LilypadLoggerComponent;
 //# sourceMappingURL=logger.js.map

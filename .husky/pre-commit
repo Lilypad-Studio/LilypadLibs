@@ -1,3 +1,18 @@
+# The checks and the build run on what is being committed: the unstaged changes and the untracked
+# files are set aside meanwhile, so that dist/ is built from the committed sources only. dist/ is
+# left out of the stash: it is generated, and rebuilt below.
+stashed=0
+if ! git diff --quiet -- . ':(exclude)dist' || [ -n "$(git ls-files --others --exclude-standard -- . ':(exclude)dist')" ]; then
+  git stash push --keep-index --include-untracked --quiet -m "pre-commit: unstaged changes" -- . ':(exclude)dist'
+  stashed=1
+fi
+restore() {
+  if [ "$stashed" = 1 ]; then
+    git stash pop --quiet
+  fi
+}
+trap restore EXIT
+
 npm test -- --run
 npm run typecheck
 npx eslint . --max-warnings 0

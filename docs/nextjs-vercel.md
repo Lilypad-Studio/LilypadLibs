@@ -82,7 +82,7 @@ Even so, create instances on first use, through a function, rather than with a t
 ```ts
 // Good: nothing runs until a request calls getUsers()
 export const getUsers = async () =>
-  LilypadDbCache.create<number, User, 'id'>({ ttl: 60_000, singleton: true, singletonIdentifier: 'users', ... });
+  LilypadDbCache.create({ ttl: 60_000, singleton: true, singletonIdentifier: 'users', ... });
 
 // Avoid: runs when the module is imported, including during the build
 export const users = await LilypadDbCache.create(...);
@@ -120,10 +120,10 @@ The lookup order of `getOrSet` is: memory of the instance (**L1**), shared level
 - **`codec`**: the shared store keeps JSON. Without a codec, a `Date` comes back as a string. A codec converts the values and validates what comes back (`decode` returns `null` to reject an entry).
 - **`staleWhileRevalidate`**: an expired value is returned at once, and refreshed after the response (`afterResponse`). Choose it as the largest age you accept to show. An `invalidate()`d value is never served stale.
 - **`refreshLockTtl`**: prevents several instances from refreshing the same key at the same time. It is a soft lock (read and write are not atomic): rarely, two instances still refresh together, which is harmless.
-- **`failureCooldown`**: while a source is down, requests do not all retry it. The cooldown is shared through L2. During it, a stale value or the `errorFn`/`returnOldOnError` fallbacks are used, otherwise `LilypadCacheCooldownError` is thrown.
+- **`failureCooldown`**: while a source is down, requests do not all retry it. The cooldown is shared through L2. During it, a stale value or the `onError` fallback is used, otherwise `LilypadCacheCooldownError` is thrown.
 - **`cleanupOnAccessEvery`** replaces `autoCleanupInterval`, whose timer does not run while an instance is suspended.
 - **`status`** (`L1-HIT`, `L2-HIT`, `STALE`, `MISS`) and **`refreshFailed`** let you log the hit rate, or show "prices as of …" when the refresh failed. `refreshFailed` stays `true` while a fallback chosen after an error is cached; with `failureCooldown`, that fallback is refreshed in the background once the cooldown is over.
-- Per-call `timeout` overrides `flowControlTimeout`: keep the fetch within the remaining time of the request.
+- Per-call `timeout` overrides `fetchTimeout`: keep the fetch within the remaining time of the request.
 
 ## 5. Database caches: keeping every instance up to date
 
@@ -159,9 +159,10 @@ Or print the SQL and paste it into your migration tool: both functions return pl
 ### Using it
 
 ```ts
-const users = await LilypadDbCache.create<number, User, 'id'>({
+const users = await LilypadDbCache.create({
   ttl: 60_000,
-  dbGate: { gate: await getGate(), schema: usersSchema },
+  gate: await getGate(),
+  schema: usersSchema,
   platform,
   shared: { refreshLockTtl: 60_000 },
   sync: { strategy: 'changelog', pollInterval: 5_000 },
@@ -174,8 +175,8 @@ const users = await LilypadDbCache.create<number, User, 'id'>({
 - **`poll: 'await'`** (default): a read that falls due waits for the changelog, so it never returns data older than `pollInterval`. With `'background'` the request does not pay for the query, but may see data one interval older.
 - **`maxGap`** (default: 1 hour): an instance that has not read the changelog for this long stops trusting its memory, and expires it.
 - **`lookback`**: on its first read, or after `maxGap`, an instance applies the changes of this period, which also removes older copies from the shared level. The default (TTL + `staleWhileRevalidate` + 1 minute) covers the lifetime of any shared entry.
-- **No change is ever missed** because of the order in which transactions commit. The cursor is the oldest transaction still running, not the last row read.
-- `get()` is synchronous, so it cannot read the changelog. Use `getOrFetch`, `getOrSet` or `getAll`.
+- **No change is ever missed** because of the order in which transactions commit, and **none is read twice**. The cursor holds the transactions a read could not see yet (those still running, and those not started), not the last row read. A long-running transaction, such as a migration, does not make each read return again every change made since it started.
+- `get()` is synchronous, so it cannot read the changelog. Use `getOrFetch` or `getAll`.
 
 ### What it costs in queries
 
@@ -223,7 +224,7 @@ Every change that reaches a cache calls `platform.onInvalidate` with a `source`:
 | `notification` | A `LISTEN/NOTIFY` notification | Every listening instance |
 | `manual` | `invalidate()` | The instance that called it |
 
-Filter on `source` so that a change triggers your action (for example `revalidateTag`) only once. The tags are `lilypad:<table>` and `lilypad:<table>:<key>`; `tagPrefix` changes `lilypad`.
+Filter on `source` so that a change triggers your action (for example `revalidateTag`) only once. The tags are `lilypad:<table>` and `lilypad:<table>:<key>`, with the table and the key URI-encoded (`encodeURIComponent`); `tagPrefix` changes `lilypad`.
 
 ## 6. Logger
 
@@ -262,9 +263,9 @@ Import the subpaths, not the package root, in edge code:
 | --- | --- |
 | `@lilypad/libs/logger`, `/cache`, `/flow`, `/serializer`, `/singleton`, `/platform` | Yes |
 | `@lilypad/libs/db` (`LilypadDbGate`, `LilypadDbCache`, changelog) | No: it needs TCP connections |
-| `@lilypad/libs` (the root) | No: it includes `/db` |
+| `@lilypad/libs` (the root) | Yes: it leaves out `/db` |
 
-The subpaths also keep the bundles small, since `postgres` is only pulled in by `/db`.
+The subpaths also keep the bundles small, since `postgres` is only pulled in by `/db`. `postgres` is an optional peer dependency: install it in the application that uses `/db`.
 
 ## 8. Recommended options at a glance
 
@@ -314,7 +315,7 @@ Check that the changelog trigger is on the table (`lilypadChangelogTriggerSql`) 
 Pass `platform` to the logger. In scripts, `await logger.flush()` before exiting.
 
 **`LilypadCacheCooldownError`.**
-The source failed less than `failureCooldown` ago and there is no stale value or fallback. Look for the original error in the logs (`Error fetching cache key`), or add an `errorFn`.
+The source failed less than `failureCooldown` ago and there is no stale value or fallback. Look for the original error in the logs (`Error fetching cache key`), or add an `onError` fallback.
 
 **`refreshFailed: true` on a response.**
-The last fetch of the key failed: the value is the last one fetched successfully, or a fallback (`errorFn`, `returnOldOnError`). The error is in the logs.
+The last fetch of the key failed: the value is the last one fetched successfully, or a fallback (`onError`). The error is in the logs.

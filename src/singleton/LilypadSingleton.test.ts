@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
+  createLilypadSingletonAble,
   createLilypadSingletonAbleAsync,
   getLilypadSingletonInstance,
   getLilypadSingletonInstanceAsync,
@@ -76,18 +77,48 @@ describe('LilypadSingleton', () => {
     expect(b).toEqual({ kind: 'b' });
   });
 
-  it('should pass the registry key to the factory, or undefined without singleton', async () => {
+  it('should give the factory a release function that removes the singleton once', async () => {
+    const options = { singleton: true as const, singletonIdentifier: uniqueId() };
+    let release!: () => void;
+    const first = await createLilypadSingletonAbleAsync('A', options, async (r) => {
+      release = r;
+      return { value: 1 };
+    });
+
+    release();
+    const second = await createLilypadSingletonAbleAsync('A', options, async () => ({ value: 2 }));
+    // A second call must not remove the instance registered since
+    release();
+    const third = await createLilypadSingletonAbleAsync('A', options, async () => ({ value: 3 }));
+
+    expect(second).not.toBe(first);
+    expect(third).toBe(second);
+  });
+
+  it('should give a no-op release function to instances that are not singletons', async () => {
     const identifier = uniqueId();
-    const factory = vi.fn(async (registryKey: string | undefined) => ({ registryKey }));
+    const registered = getLilypadSingletonInstance(`A:${identifier}`, () => ({ value: 1 }));
+    const instance = await createLilypadSingletonAbleAsync('A', {}, async (release) => {
+      release();
+      return { value: 2 };
+    });
 
-    await createLilypadSingletonAbleAsync('A', {}, factory);
-    await createLilypadSingletonAbleAsync(
-      'A',
-      { singleton: true, singletonIdentifier: identifier },
-      factory
-    );
+    expect(instance).toEqual({ value: 2 });
+    expect(getLilypadSingletonInstance(`A:${identifier}`, () => ({ value: 3 }))).toBe(registered);
+  });
 
-    expect(factory.mock.calls).toEqual([[undefined], [`A:${identifier}`]]);
+  it('should create synchronous singletons with the same namespacing', () => {
+    const options = { singleton: true as const, singletonIdentifier: uniqueId() };
+    let release!: () => void;
+    const first = createLilypadSingletonAble('A', options, (r) => {
+      release = r;
+      return { value: 1 };
+    });
+
+    expect(createLilypadSingletonAble('A', options, () => ({ value: 2 }))).toBe(first);
+    expect(createLilypadSingletonAble('B', options, () => ({ value: 3 }))).not.toBe(first);
+    release();
+    expect(createLilypadSingletonAble('A', options, () => ({ value: 4 }))).toEqual({ value: 4 });
   });
 
   it('should report later calls with a different signature', () => {

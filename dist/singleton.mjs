@@ -3,7 +3,7 @@ import {
   getLilypadSingletonInstance,
   getLilypadSingletonInstanceAsync,
   removeLilypadSingletonInstance
-} from "./chunks/chunk-4263BVWE.mjs";
+} from "./chunks/chunk-3Y7IMWY6.mjs";
 export {
   getLilypadSingletonInstance,
   getLilypadSingletonInstanceAsync,

@@ -70,13 +70,13 @@ declare abstract class LilypadLoggerComponent<T extends string> {
  * @template T - A string literal type representing component names.
  *
  * @property {Record<T, LilypadLoggerComponent<T>[]>} components - A record mapping component names to arrays of logger components.
- * @property {(error: unknown) => Promise<void>} [errorLogging] - Optional callback function to handle logging errors.
+ * @property {(error: unknown) => void | Promise<void>} [errorLogging] - Optional callback function to handle logging errors.
  * It is called once for each failing component. If it fails as well, both errors are written to `console.error`.
  */
 type LilypadLoggerConstructorOptions<T extends string> = {
     components: Record<T, LilypadLoggerComponent<T>[]>;
     name?: string;
-    errorLogging?: (error: unknown) => Promise<void>;
+    errorLogging?: (error: unknown) => void | Promise<void>;
     /**
      * `platform.background` receives every message being sent, so that the instance stays alive
      * until it is sent even after the response (serverless platforms).

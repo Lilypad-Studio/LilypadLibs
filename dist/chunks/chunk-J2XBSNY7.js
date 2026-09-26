@@ -30,8 +30,7 @@ var LilypadFlowControl = (_class = class {
   /**
    * Executes an asynchronous function with a timeout constraint.
    *
-   * @template R The type of value returned by the execution function (the one of the instance by
-   * default).
+   * @template R The type of value returned by the execution function.
    * @param executionFn An asynchronous function to execute. It receives a signal that is aborted on timeout.
    * @param timeout The timeout, in milliseconds. Defaults to the instance's `timeout`.
    * @returns A promise that resolves with the result of `executionFn` if it completes before the timeout,
@@ -185,4 +184,4 @@ var LilypadFlowControl = (_class = class {
 
 
 exports.LilypadTimeoutError = LilypadTimeoutError; exports.LilypadRateLimitError = LilypadRateLimitError; exports.LilypadFlowControl = LilypadFlowControl;
-//# sourceMappingURL=chunk-UTHHG4QQ.js.map
+//# sourceMappingURL=chunk-J2XBSNY7.js.map

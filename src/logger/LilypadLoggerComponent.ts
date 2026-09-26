@@ -43,7 +43,7 @@ export interface LilypadLoggerComponentOptions<T extends string> {
  * }
  * ```
  */
-export default abstract class LilypadLoggerComponent<T extends string> {
+export abstract class LilypadLoggerComponent<T extends string> {
   /**
    * Formats a record as `<ISO timestamp> - [name] [TYPE]: <message> <context as JSON>`.
    */
@@ -110,26 +110,46 @@ export function writeToConsole(message: string, type: string): void {
   }
 }
 
-/** `JSON.stringify` that never throws (circular references, BigInts). */
+/**
+ * `JSON.stringify` that never throws (circular references, BigInts). Only a reference to one of
+ * its own ancestors prints as `[Circular]`: an object referenced twice side by side is printed twice.
+ */
 export function safeJson(value: unknown): string {
-  const seen = new WeakSet<object>();
   try {
-    return JSON.stringify(value, (_key, item: unknown) => {
-      if (typeof item === 'bigint') {
-        return `${item}n`;
-      }
-      if (item instanceof Error) {
-        return { name: item.name, message: item.message, stack: item.stack };
-      }
-      if (typeof item === 'object' && item !== null) {
-        if (seen.has(item)) {
-          return '[Circular]';
-        }
-        seen.add(item);
-      }
-      return item;
-    });
+    return JSON.stringify(toJsonSafe(value, new Set()));
   } catch {
     return '"[Unserializable]"';
+  }
+}
+
+function toJsonSafe(value: unknown, ancestors: Set<object>): unknown {
+  if (typeof value === 'bigint') {
+    return `${value}n`;
+  }
+  if (typeof value !== 'object' || value === null) {
+    return value;
+  }
+  if (ancestors.has(value)) {
+    return '[Circular]';
+  }
+  if (value instanceof Error) {
+    return { name: value.name, message: value.message, stack: value.stack };
+  }
+  const json = (value as { toJSON?: unknown }).toJSON;
+  if (typeof json === 'function') {
+    return toJsonSafe((json as () => unknown).call(value), ancestors);
+  }
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return value.map((item) => toJsonSafe(item, ancestors));
+    }
+    const result: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) {
+      result[key] = toJsonSafe(item, ancestors);
+    }
+    return result;
+  } finally {
+    ancestors.delete(value);
   }
 }

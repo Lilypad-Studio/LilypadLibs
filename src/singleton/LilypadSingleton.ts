@@ -104,27 +104,69 @@ export async function getLilypadSingletonInstanceAsync<T>(
 }
 
 /**
+ * Removes an instance from the registry, so that the next `create` call with the same identifier
+ * builds a fresh one. Idempotent, and a no-op for an instance that is not a singleton. Instances
+ * call it when they are closed or disposed.
+ */
+export type LilypadSingletonRelease = () => void;
+
+function registryKeyOf(namespace: string, options: LilypadSingletonAble): string | undefined {
+  // The namespace keeps singletons of different classes apart even when they share an identifier
+  return options.singleton ? `${namespace}:${options.singletonIdentifier}` : undefined;
+}
+
+function releaseFor(registryKey: string | undefined): LilypadSingletonRelease {
+  let released = registryKey === undefined;
+  return () => {
+    if (!released) {
+      released = true;
+      removeLilypadSingletonInstance(registryKey!);
+    }
+  };
+}
+
+/**
+ * Shared implementation of the synchronous `create` methods: builds a new instance, or returns the
+ * singleton registered under `namespace:singletonIdentifier`.
+ *
+ * @param createInstanceFn - Receives the function that removes the instance from the registry.
+ */
+export function createLilypadSingletonAble<T>(
+  namespace: string,
+  options: LilypadSingletonAble,
+  createInstanceFn: (release: LilypadSingletonRelease) => T,
+  signature?: LilypadSingletonSignature
+): T {
+  const registryKey = registryKeyOf(namespace, options);
+  if (registryKey === undefined) {
+    return createInstanceFn(releaseFor(undefined));
+  }
+  return getLilypadSingletonInstance(
+    registryKey,
+    () => createInstanceFn(releaseFor(registryKey)),
+    signature
+  );
+}
+
+/**
  * Shared implementation of the async `create` methods: builds a new instance, or returns the
  * singleton registered under `namespace:singletonIdentifier`.
- * The namespace keeps singletons of different classes apart even when they share an identifier.
  *
- * @param createInstanceFn - Receives the registry key of the singleton (undefined for a
- * non-singleton instance), which the instance must pass to `removeLilypadSingletonInstance`
- * when it is closed.
+ * @param createInstanceFn - Receives the function that removes the instance from the registry.
  */
 export function createLilypadSingletonAbleAsync<T>(
   namespace: string,
   options: LilypadSingletonAble,
-  createInstanceFn: (registryKey: string | undefined) => Promise<T>,
+  createInstanceFn: (release: LilypadSingletonRelease) => Promise<T>,
   signature?: LilypadSingletonSignature
 ): Promise<T> {
-  if (!options.singleton) {
-    return createInstanceFn(undefined);
+  const registryKey = registryKeyOf(namespace, options);
+  if (registryKey === undefined) {
+    return createInstanceFn(releaseFor(undefined));
   }
-  const registryKey = `${namespace}:${options.singletonIdentifier}`;
   return getLilypadSingletonInstanceAsync(
     registryKey,
-    () => createInstanceFn(registryKey),
+    () => createInstanceFn(releaseFor(registryKey)),
     signature
   );
 }

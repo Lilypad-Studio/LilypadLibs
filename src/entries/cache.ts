@@ -2,19 +2,24 @@
  * `@lilypad/libs/cache`: the in-memory cache, with its optional shared level. Runs in Node.js and
  * in edge runtimes. The database-backed cache is in `@lilypad/libs/db`.
  */
-export { default as LilypadCache, LilypadCacheCooldownError } from '../cache/LilypadCache';
+export { LilypadCache } from '../cache/LilypadCache';
+export { LilypadCacheCooldownError } from '../cache/LilypadCacheTypes';
 export type {
+  LilypadCacheBulkSyncOptions,
   LilypadCacheEntry,
   LilypadCacheEntryOrigin,
+  LilypadCacheErrorContext,
+  LilypadCacheErrorOptions,
   LilypadCacheGetOptions,
   LilypadCachedValueType,
   LilypadCacheKey,
   LilypadCacheOptions,
+  LilypadCachePeek,
   LilypadCacheRead,
   LilypadCacheResult,
   LilypadCacheSharedOptions,
   LilypadCacheStatus,
   LilypadCacheSyncFn,
-  LilypadCacheValueRetrieval,
+  LilypadCacheValueFn,
   LilypadSharedCodec,
-} from '../cache/LilypadCache';
+} from '../cache/LilypadCacheTypes';

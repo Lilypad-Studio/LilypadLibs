@@ -1,9 +1,9 @@
 import { L as LilypadLibLogger } from './LilypadLibLogger-DPBngeVh.mjs';
 import { LilypadSingletonAble } from './singleton.mjs';
 import postgres from 'postgres';
-import { LilypadCacheKey, LilypadCache, LilypadCacheOptions, LilypadCacheEntry, LilypadCachedValueType, LilypadCacheGetOptions, LilypadCacheResult } from './cache.mjs';
-import './flow.mjs';
+import { h as LilypadCacheKey, r as LilypadCacheCore, i as LilypadCacheOptions, a as LilypadCacheBulkSyncOptions, b as LilypadCacheEntry, g as LilypadCachedValueType, f as LilypadCacheGetOptions, l as LilypadCacheResult } from './LilypadCacheCore-CwC0ToZN.mjs';
 import './platform.mjs';
+import './flow.mjs';
 
 type ListenerCallback = (payload: unknown) => void | Promise<void>;
 type ListenerCallbackIdentifier = {
@@ -19,6 +19,7 @@ type ListenerCallbackIdentifier = {
 type LilypadDbGateOptions = {
     logger?: LilypadLibLogger;
     connectionString: string;
+    /** The connection used for `LISTEN`, if not `connectionString` (e.g. a direct, unpooled one). */
     listenerConnectionString?: string;
     listen?: ListenerCallbackIdentifier[];
     /**
@@ -29,6 +30,12 @@ type LilypadDbGateOptions = {
     statementTimeout?: number;
     /** Connection pool of the main client. Every duration is in milliseconds. */
     pool?: LilypadDbPoolOptions;
+    /**
+     * While channels are listened to, a notification is sent to a private channel every this many
+     * ms, to detect a `LISTEN` connection that stopped delivering notifications (see
+     * `isListenHealthy`). `false` disables it. Defaults to 15 seconds.
+     */
+    listenHeartbeat?: number | false;
 };
 type LilypadDbPoolOptions = {
     /** Maximum number of connections (postgres.js default: 10). */
@@ -99,34 +106,44 @@ type LilypadDbWriteResult<T> = {
     xid: bigint;
 };
 /**
- * Provides a gateway for interacting with a PostgreSQL database, including CRUD operations and channel-based listeners.
- *
- * The `LilypadDbGate` class manages a database connection and allows for:
- * - Fetching all rows from a table with type safety.
- * - Inserting, updating, and deleting rows in a table.
- * - Listening to PostgreSQL channels for notifications and handling them with callbacks.
- * - Managing multiple listeners and cleaning up resources.
+ * The result of a delete: whether a row had this primary key, and the id of the transaction that
+ * deleted it.
+ */
+type LilypadDbDeleteResult = {
+    deleted: boolean;
+    xid?: bigint;
+};
+/** Thrown by `updateToTable` when no row has the primary key of the data. */
+declare class LilypadDbNotFoundError extends Error {
+    readonly tableName: string;
+    readonly primaryKeyValue: unknown;
+    constructor(tableName: string, primaryKeyValue: unknown);
+}
+/**
+ * A gateway to a PostgreSQL database: typed CRUD helpers over a {@link LilypadDbSchema}, and
+ * channel listeners (`LISTEN/NOTIFY`) with reconnection handling.
  *
  * @example
  * ```typescript
- * const dbGate = await LilypadDbGate.create({
+ * const gate = await LilypadDbGate.create({
  *   connectionString: 'postgres://user:pass@host:port/db',
  *   listen: [
  *     { channel: 'my_channel', callbackId: 'my_callback', callback: (payload) => console.log(payload) }
  *   ]
  * });
  * ```
- *
- * @public
  */
 declare class LilypadDbGate {
     readonly id: string;
-    private listenerConnectionString;
     readonly sql: postgres.Sql;
-    private listenerConnection;
+    /** Only when `listenerConnectionString` differs: otherwise `sql` listens. */
+    private readonly listenerClient?;
     protected logger?: LilypadLibLogger;
     private listeners;
-    private singletonIdentifier?;
+    private releaseSingleton;
+    private readonly heartbeat?;
+    private readonly heartbeatChannel;
+    private heartbeatStop?;
     private constructor();
     /**
      * Creates a gate and registers the listeners of `options.listen`.
@@ -159,65 +176,53 @@ declare class LilypadDbGate {
     /**
      * Selects every row of the table. Rows are read in batches through a cursor, so the raw result
      * of the whole table is never held in memory at once.
+     *
+     * @param options.signal - Stops reading (and closes the cursor) once aborted: the promise then
+     * rejects with the reason of the signal.
      */
-    selectAllFromTable<T, PK extends keyof T = keyof T>(options: LilypadDbSchema<T, PK>): Promise<T[]>;
+    selectAllFromTable<T, PK extends keyof T = keyof T>(schema: LilypadDbSchema<T, PK>, options?: {
+        signal?: AbortSignal;
+    }): Promise<T[]>;
     /**
      * Selects the rows with these primary keys, in one query per batch of 1000 keys (Postgres limits
      * the parameters of a query). Keys without a row are left out of the result, as are the rows the
      * `selectSanitizationFn` discards.
      */
-    selectFromTableByPrimaryKeys<T, PK extends keyof T = keyof T>(options: LilypadDbSchema<T, PK>, primaryKeyValues: T[PK][]): Promise<T[]>;
-    selectFromTableByPrimaryKey<T, PK extends keyof T = keyof T>(options: LilypadDbSchema<T, PK>, primaryKeyValue: T[PK]): Promise<T | null>;
+    selectFromTableByPrimaryKeys<T, PK extends keyof T = keyof T>(schema: LilypadDbSchema<T, PK>, primaryKeyValues: T[PK][]): Promise<T[]>;
+    selectFromTableByPrimaryKey<T, PK extends keyof T = keyof T>(schema: LilypadDbSchema<T, PK>, primaryKeyValue: T[PK]): Promise<T | null>;
     /**
      * Inserts a row.
      *
      * @returns The row as stored by the database, including generated columns such as an
-     * auto-determined primary key, or `null` if the `selectSanitizationFn` discards it.
+     * auto-determined primary key (`null` if the `selectSanitizationFn` discards it), and the id of
+     * the transaction that wrote it.
      */
-    insertToTable<T, PK extends keyof T = keyof T>(options: LilypadDbSchema<T, PK>, data: LilypadDbInsertData<T, PK>): Promise<T | null>;
-    /** Like {@link insertToTable}, but also returns the id of the transaction that wrote the row. */
-    insertToTableDetailed<T, PK extends keyof T = keyof T>(options: LilypadDbSchema<T, PK>, data: LilypadDbInsertData<T, PK>): Promise<LilypadDbWriteResult<T>>;
+    insertToTable<T, PK extends keyof T = keyof T>(schema: LilypadDbSchema<T, PK>, data: LilypadDbInsertData<T, PK>): Promise<LilypadDbWriteResult<T>>;
     /** Splits a row returned by a write into the row and the id of its transaction. */
     private writeResult;
     /**
      * Updates the row identified by the primary key contained in `data`. Only the columns present
      * in `data` are written.
      *
-     * @returns The row as stored by the database, or `null` if the `selectSanitizationFn` discards it.
-     * @throws If no row with that primary key exists.
+     * @returns The row as stored by the database (`null` if the `selectSanitizationFn` discards it),
+     * and the id of the transaction that wrote it.
+     * @throws {LilypadDbNotFoundError} If no row with that primary key exists.
      */
-    updateToTable<T, PK extends keyof T = keyof T>(options: LilypadDbSchema<T, PK>, data: LilypadDbUpdateData<T, PK>): Promise<T | null>;
-    /** Like {@link updateToTable}, but also returns the id of the transaction that wrote the row. */
-    updateToTableDetailed<T, PK extends keyof T = keyof T>(options: LilypadDbSchema<T, PK>, data: LilypadDbUpdateData<T, PK>): Promise<LilypadDbWriteResult<T>>;
-    deleteFromTable<T, PK extends keyof T = keyof T>(options: LilypadDbSchema<T, PK>, primaryKeyValue: T[PK]): Promise<void>;
+    updateToTable<T, PK extends keyof T = keyof T>(schema: LilypadDbSchema<T, PK>, data: LilypadDbUpdateData<T, PK>): Promise<LilypadDbWriteResult<T>>;
     /**
-     * Like {@link deleteFromTable}, but also returns the id of the transaction that deleted the row
-     * (`undefined` when no row had this primary key).
-     */
-    deleteFromTableDetailed<T, PK extends keyof T = keyof T>(options: LilypadDbSchema<T, PK>, primaryKeyValue: T[PK]): Promise<{
-        xid?: bigint;
-    }>;
-    /**
-     * Retrieves the singleton listener database connection.
+     * Deletes the row with this primary key.
      *
-     * If the listener connection does not already exist, this method initializes it
-     * using the provided connection string and specific connection options:
-     * - `max`: Limits the pool to a single connection.
-     * - `idle_timeout`: Disables idle timeout for the connection.
-     * - `max_lifetime`: Disables maximum lifetime for the connection.
-     *
-     * @returns The singleton listener database connection instance.
+     * @returns Whether a row had this primary key, and the id of the transaction that deleted it.
      */
-    private getListenerConnection;
+    deleteFromTable<T, PK extends keyof T = keyof T>(schema: LilypadDbSchema<T, PK>, primaryKeyValue: T[PK]): Promise<LilypadDbDeleteResult>;
+    /** The client that listens: postgres.js keeps one dedicated connection per client for LISTEN. */
+    private listenClient;
     /**
      * Starts listening on the specified channel.
      *
      * The listener entry is registered immediately, before LISTEN is active, so that concurrent
      * `addListener` calls for the same channel share it and await the same `ready` promise.
      * If LISTEN fails, the entry is removed, so that a later `addListener` call retries it.
-     *
-     * @param channel - The name of the channel to listen on.
-     * @returns The listener entry of the channel.
      */
     private initializeListener;
     /**
@@ -225,26 +230,12 @@ declare class LilypadDbGate {
      * so a failing callback can neither affect the others nor cause an unhandled rejection.
      */
     private runCallbackSafely;
-    /**
-     * Executes all registered listener callbacks for a given channel, passing the provided payload to each callback.
-     *
-     * @param channel - The name of the channel whose listener callbacks should be executed.
-     * @param payload - The data to pass to each listener callback.
-     */
+    /** Runs every callback of a channel with the payload of a notification. */
     private executeAllListenerCallbacks;
     private executeReconnectCallbacks;
     /**
-     * Adds a listener callback for a specified channel.
-     *
-     * If the channel does not already have a listener, it initializes one.
-     * The callback is associated with the provided `callbackId`: adding a callback with an existing
-     * `callbackId` on the same channel replaces the previous one.
-     *
-     * @param params - An object containing:
-     *   @param params.channel - The name of the channel to listen to.
-     *   @param params.callbackId - A unique identifier for the callback.
-     *   @param params.callback - The callback function to be invoked for the channel.
-     *   @param params.onReconnect - Optional function called when LISTEN is re-established after a reconnection.
+     * Adds a listener callback for a channel. Adding a callback with an existing `callbackId` on the
+     * same channel replaces the previous one.
      *
      * @returns A promise that resolves once LISTEN is active on the channel.
      * @throws If LISTEN fails; in that case the callback is not registered.
@@ -252,455 +243,21 @@ declare class LilypadDbGate {
     addListener(identifier: ListenerCallbackIdentifier): Promise<void>;
     /**
      * Removes a listener callback. When the channel has no callbacks left, it stops listening to it.
+     * It never rejects: a failed UNLISTEN is logged (the connection keeps the channel, whose
+     * notifications are then ignored).
      *
      * @returns `true` if the callback was registered.
      */
     removeListener(channel: string, callbackId: string): Promise<boolean>;
+    private startHeartbeat;
+    private stopHeartbeat;
+    /**
+     * Whether the `LISTEN` connection is known to deliver notifications: a heartbeat came back
+     * recently. Without heartbeat (`listenHeartbeat: false`), `true` as soon as a channel is
+     * listened to. `false` while no channel is listened to.
+     */
+    isListenHealthy(): boolean;
     close(): Promise<void>;
-}
-
-type LilypadDbCacheDefaultNotificationPayload = {
-    /**
-     * The schema of the table. Notifications without it match the table in any schema (the triggers
-     * of version 1 of the changelog, and custom triggers that do not send it).
-     */
-    schema?: string;
-    table?: string;
-    /**
-     * A number when the trigger serializes a numeric primary key as such (e.g. `json_build_object`).
-     * Absent for `TRUNCATE`.
-     */
-    id?: string | number;
-    op: 'UPDATE' | 'DELETE' | 'INSERT' | 'TRUNCATE';
-    /**
-     * The id of the transaction that made the change (sent by the triggers of version 3). It lets
-     * the instance that made the change skip its own writes.
-     */
-    xid?: string;
-};
-/** The options shared by the strategies that see every change of the table. */
-type LilypadDbCacheTrustedSyncOptions = {
-    verify?: LilypadDbCacheSchemaVerification;
-    /**
-     * While the sync is trusted, an entry read from the database (not a copy from the shared
-     * level, nor a fallback after an error) that reaches its TTL with no change of its row is
-     * kept, without a query, until it is this old (ms). It bounds how long a change the triggers
-     * do not see (disabled triggers, `session_replication_role = replica`) goes unnoticed. The TTL
-     * still bounds the shared level. `0` queries the row again at each TTL. Defaults to 1 hour.
-     */
-    maxAge?: number;
-};
-/**
- * How the cache learns about the changes made by other instances and other programs.
- *
- * - `listen`: `LISTEN/NOTIFY` on a dedicated connection. Near real-time, for long-running servers.
- *   Not suited to serverless platforms: the connection must stay open, it does not work through a
- *   pooler in transaction mode, and notifications sent while an instance is suspended are lost.
- * - `changelog`: each instance reads the changelog table (see `lilypadChangelogSql`) at most once
- *   per `pollInterval`, when the cache is used. The caches of a gate read their tables together,
- *   in one query. No long-lived connection: suited to serverless platforms. Changes are seen
- *   within `pollInterval`.
- * - `none`: only the writes of this instance and the TTL keep the cache up to date.
- *
- * `listen` and `changelog` rely on triggers that the library does not install (see
- * `lilypadChangelogSql`). Their `verify` option checks that they exist (`checkLilypadSchema`):
- * - `warn` (default): once, when the cache first uses the database (`LISTEN`, or the first read
- *   of the changelog), without delaying changelog reads; problems are logged as a warning, with the
- *   SQL that fixes them (on `console.warn` without a logger).
- * - `throw`: in `create`, which rejects with a `LilypadSchemaCheckError`. `create` then queries
- *   the database, whatever the strategy.
- * - `off`: no check. With `listen`, notifications of a table of the same name in another schema
- *   are then told apart only if `tableName` is qualified (`schema.table`).
- *
- * While `listen` or `changelog` is trusted (`LISTEN` active, changelog read within `maxGap`), the
- * cache sees every change of the table, so the TTL no longer needs a query: an entry that reaches
- * its TTL without a change of its row is kept until `maxAge`.
- *
- * When `LISTEN` or a read of the changelog fails, the next attempts back off exponentially (up to
- * one minute), instead of retrying at every read.
- */
-type LilypadDbCacheSync = (LilypadDbCacheTrustedSyncOptions & {
-    strategy: 'listen';
-    /**
-     * `eager` (default): `create` resolves once `LISTEN` is active, and rejects if it fails.
-     * `lazy`: `LISTEN` starts on the first read, so creating the cache opens no connection.
-     */
-    connect?: 'eager' | 'lazy';
-    /**
-     * If false, the cache does not apply the notifications: keeping it up to date is then up to
-     * `onNotification`, and entries are never kept past their TTL. Defaults to true.
-     */
-    applyChanges?: boolean;
-    /** Called with every notification of the table, after the cache has applied it. */
-    onNotification?: (payload: LilypadDbCacheDefaultNotificationPayload) => Promise<void> | void;
-}) | (LilypadDbCacheTrustedSyncOptions & {
-    strategy: 'changelog';
-    /** Minimum time between two reads of the changelog, in ms. Changes are seen within it. */
-    pollInterval: number;
-    /**
-     * `await` (default): a read that is due waits for the changelog, so it never returns data
-     * older than `pollInterval`. `background`: the read does not wait, and may return data one
-     * interval older.
-     */
-    poll?: 'await' | 'background';
-    /**
-     * If the changelog has not been read for this long (ms), the instance no longer trusts it:
-     * every entry is expired instead. It must be much shorter than the retention of the
-     * changelog (see `pruneLilypadChangelog`). Defaults to 1 hour.
-     */
-    maxGap?: number;
-    /**
-     * On the first read, or after `maxGap`, the changes of this many ms are applied, so that
-     * copies in the shared level older than those changes are removed too. It must cover the
-     * lifetime of a shared entry. Defaults to the TTL plus `staleWhileRevalidate`, plus 1 minute.
-     */
-    lookback?: number;
-    /** The changelog table, if not `lilypad_cache_changes`. */
-    table?: string;
-}) | {
-    strategy: 'none';
-};
-/** How the cache checks that the database has the triggers it needs (see {@link LilypadDbCacheSync}). */
-type LilypadDbCacheSchemaVerification = 'warn' | 'throw' | 'off';
-type LilypadDbCacheOptions<K extends LilypadCacheKey, V, PK extends keyof V> = LilypadCacheOptions<K, V> & {
-    dbGate: {
-        gate: LilypadDbGate;
-        schema: LilypadDbSchema<V, PK>;
-    };
-    /** Defaults to `{ strategy: 'listen' }`. */
-    sync?: LilypadDbCacheSync;
-};
-type LilypadDbCacheListenSync = Extract<LilypadDbCacheSync, {
-    strategy: 'listen';
-}>;
-/**
- * A cache class that synchronizes with a database table using a provided database gateway and schema.
- *
- * `LilypadDbCache` extends `LilypadCache` to provide automatic cache population and invalidation
- * by fetching data from a database. It supports bulk synchronization and per-key updates from the database.
- *
- * @typeParam K - The type of the cache key: the type of the primary key column.
- * @typeParam V - The type of the cached value, constrained to object.
- * @typeParam PK - The primary key column of `V` (see {@link LilypadDbSchema}).
- *
- * @example
- * ```typescript
- * const users = await LilypadDbCache.create<number, User, 'id'>({
- *   ttl: 60_000,
- *   dbGate: { gate, schema: usersSchema },
- *   logger,
- * });
- * const user = await users.getOrFetch(42); // User, or null when there is no such row
- * await users.dispose();
- * ```
- *
- * @remarks
- * - `get` reads memory only. `getOrFetch` queries the database on a miss; `refresh` always
- *   re-fetches the key; `getAll` loads the whole table once, then fetches only the rows it does
- *   not hold up to date.
- * - `sqlCreate`/`sqlUpdate`/`sqlDelete` write through to the database, then cache the result.
- * - Changes made elsewhere reach the cache through the `sync` strategy ({@link LilypadDbCacheSync}).
- *   Only keys the cache holds (or is fetching) are re-fetched or expired; for other keys it only
- *   notes that the row exists, and `getAll` fetches it.
- * - The name of the cache (shared level keys, invalidation events, logs) defaults to the table name.
- */
-declare class LilypadDbCache<K extends LilypadCacheKey & V[PK], V extends object, PK extends keyof V = keyof V> extends LilypadCache<K, V> {
-    private readonly dbGate;
-    private readonly sync;
-    private readonly defaultDbListener?;
-    /** Whether the default listener updates the cache (not only `onNotification`). */
-    private readonly listenAppliesChanges;
-    private listening?;
-    private listenFailures;
-    private listenRetryAt;
-    private singletonIdentifier?;
-    /**
-     * The schema of the table: from `tableName` when it is qualified, otherwise as resolved by the
-     * schema check. Notifications from another schema are ignored; while it is unknown, notifications
-     * of the table in any schema are applied.
-     */
-    private tableSchema?;
-    /** The schema check, once it has run or while it runs; reset when it could not run. */
-    private schemaCheck?;
-    private schemaCheckFailures;
-    private schemaCheckRetryAt;
-    /**
-     * The keys of the rows of the table, as far as this instance knows. Each load of the table sets
-     * them; the writes, the fetches and the changes keep them up to date. `getAll` returns these
-     * rows, fetching only those it does not hold up to date. Tracked once the table has been loaded.
-     */
-    private members;
-    /** When the last load of the table started, if one completed. */
-    private membersLoadedAt?;
-    /** Loads started before this ticket (before a `TRUNCATE`) no longer tell which rows exist. */
-    private membersFloor;
-    /** Receive the rows of the next load of the table (see `loadTable`). */
-    private tableLoadWaiters;
-    /** The queries of `fetchRows` in flight, by normalized key. */
-    private rowFetches;
-    /** The refreshes of `refresh` in flight, and the one queued after each (normalized keys). */
-    private refreshes;
-    /** Since when `LISTEN` delivers every change to this instance. */
-    private listenTrustedSince?;
-    /** Since when the chain of changelog reads is unbroken. */
-    private changelogTrustedSince?;
-    /**
-     * The writes of this instance, by normalized key: their transaction ids, and the ticket of the
-     * entry the last one stored. While the entry holds it, the changes of these writes are already
-     * reflected in it.
-     */
-    private ownWrites;
-    private changelogReader?;
-    private changelogSubscriber?;
-    private unsubscribeChangelog?;
-    private changelogCursor?;
-    /** Changes already applied, by id, with their transaction id, until the cursor passes them. */
-    private appliedChanges;
-    private lastChangelogRead;
-    private changelogFailures;
-    private changelogRetryAt;
-    /**
-     * Creates a cache and, with the `listen` strategy (unless `connect: 'lazy'`), registers its
-     * database listener.
-     * With `singleton: true`, a later call with the same identifier returns the existing cache and
-     * ignores its own options (a warning is logged if the table or the TTL differ).
-     *
-     * @throws If the database listener cannot be registered (e.g. the database is unreachable).
-     */
-    static create<K extends LilypadCacheKey & V[PK], V extends object, PK extends keyof V = keyof V>(options: LilypadDbCacheOptions<K, V, PK> & LilypadSingletonAble): Promise<LilypadDbCache<K, V, PK>>;
-    private static initializeNew;
-    private constructor();
-    private schemaVerification;
-    /**
-     * Checks once that the database has the triggers the sync strategy needs, and resolves the schema
-     * of the table. With `verify: 'warn'` it never rejects: problems and failures are logged. A check
-     * that could not run (e.g. the database was unreachable) is forgotten, so that a later read runs
-     * it again (see {@link checkSchemaInBackground}); a check that found problems is not repeated.
-     *
-     * @throws A `LilypadSchemaCheckError` with `verify: 'throw'`, or the error of the check.
-     */
-    private verifySchema;
-    /**
-     * Runs the schema check in the background, unless it has already run, is running, or failed less
-     * than a backoff ago. Reads call it to retry a check that could not run.
-     */
-    private checkSchemaInBackground;
-    /** @returns `false` if the check could not run (with `verify: 'warn'`; `throw` rejects). */
-    private runSchemaCheck;
-    /**
-     * Registers the listener once, after the schema check (which resolves the schema of the table,
-     * to ignore the notifications of other schemas). A failed registration is retried by the next
-     * call, after a backoff for the lazy `LISTEN` of the reads.
-     */
-    private startListening;
-    /**
-     * Since when this instance sees every change of the table, or `undefined` if it may miss some:
-     * no sync, `LISTEN` not active (or it does not update the cache), or changelog not read for
-     * longer than `maxGap`.
-     */
-    private syncTrustedSince;
-    private maxAge;
-    /**
-     * Keeps, without a query, an entry that reached its TTL while it is known to be up to date: its
-     * value was read from the database (or written by this instance) after the sync became trusted,
-     * and any change of its row since would have expired it. It is kept until `maxAge`.
-     */
-    private renew;
-    /**
-     * Brings the cache up to date with the changes made elsewhere before a read: starts a lazy
-     * `LISTEN`, or reads the changelog when it is due. It never throws: a failure is logged, and
-     * the read goes on with the cache as it is.
-     *
-     * @returns A promise to await, or `undefined` when there is nothing to wait for: the read then
-     * goes on synchronously, as without synchronization.
-     */
-    protected syncBeforeRead(): Promise<void> | undefined;
-    /**
-     * Reads the changelog (with the other caches of the gate); errors are logged, and the next read
-     * waits for a backoff.
-     */
-    private readChangelog;
-    /** What to read for this cache: the changes since its cursor, or a lookback if it lost it. */
-    private changelogRequest;
-    /**
-     * Applies a read of the changelog. Its errors are logged: the other caches read with it must not
-     * be affected.
-     *
-     * @param trusted - Whether the read started from the cursor of this cache.
-     */
-    private applyChangelog;
-    /**
-     * Applies a change of a row made elsewhere.
-     * - A change made by a write of this instance whose result the entry still holds: nothing to do.
-     * - DELETE: the key is cached as `null`.
-     * - INSERT/UPDATE of a key held (or being read) by this instance: `eager` re-fetches it at once;
-     *   `lazy` expires it with no query, which also discards a read in flight (it may predate the
-     *   change): the next read fetches it.
-     * - INSERT/UPDATE of any other key: no query. The shared level entry is removed.
-     * In every INSERT/UPDATE case, the key is noted as a row of the table, which `getAll` returns.
-     *
-     * @param xid - The transaction that made the change, when known.
-     * @returns The key of the changed row.
-     */
-    private applyChange;
-    /**
-     * Applies a `TRUNCATE` of the table: every entry is expired, the reads started before are
-     * discarded, the copies of the shared level produced before are ignored, and the table is known
-     * to be empty (until the changes that follow).
-     *
-     * @returns The keys that were cached.
-     */
-    private applyTruncate;
-    /**
-     * Whether a change is the one of a write of this instance, and the entry still holds the result
-     * of the last write of this instance (nothing else replaced it since): that result is at least
-     * as recent as the change. The write is forgotten either way.
-     */
-    private isOwnWrite;
-    private recordOwnWrite;
-    /** Follows the values stored in the cache: a row is a row of the table, `null` is not. */
-    protected onValueStored(entry: LilypadCacheEntry<K, V>): void;
-    /** Notes a row that exists in the table, without fetching it. */
-    private addMember;
-    /**
-     * Replaces the rows of the table with the result of a load, keeping what changed after the load
-     * started: rows added since, rows deleted since.
-     */
-    private replaceMembers;
-    /**
-     * Whether the rows of the table are known: loaded since the sync became trusted, or, without a
-     * trusted sync, less than `defaultBulkSyncTtl` ago.
-     */
-    private isTableLoaded;
-    /**
-     * Loads the whole table, even if the bulk sync of the base class still counts as fresh.
-     *
-     * @returns The rows loaded, by normalized key: with `maxEntries`, the cache may not hold them all.
-     */
-    private loadTable;
-    /**
-     * The keys whose entry is missing or expired (after renewing the entries still up to date). A
-     * missing entry whose row was just loaded is not stale: `maxEntries` evicted it.
-     */
-    private staleKeys;
-    /**
-     * Fetches rows by primary key and caches them in this instance only (`null` for the keys without
-     * a row). A key already being fetched shares that query.
-     *
-     * @returns The values read, by normalized key: with `maxEntries`, the cache may not hold them all.
-     * @throws If a query fails.
-     */
-    private fetchRows;
-    /** One read of `fetchRows`, bounded by `bulkSyncTimeout`. */
-    private queryRows;
-    /**
-     * The rows of these keys, leaving out the keys without a row: the fresh entry, else the value
-     * read by `sources` (in order), else the expired entry.
-     */
-    private rowsOf;
-    get(key: K, options?: {
-        removeExpired?: boolean;
-    }): LilypadCachedValueType<V> | undefined;
-    getOrSetDetailed(key: K, valueFn: (signal: AbortSignal) => Promise<LilypadCachedValueType<V>>, options?: LilypadCacheGetOptions<K, V>): Promise<LilypadCacheResult<V>>;
-    /**
-     * Retrieves a cached value by key, or fetches it from the database if not found in cache.
-     * Concurrent calls for the same key share a single database query.
-     *
-     * @param key - The cache key to retrieve or fetch.
-     * @param options - The `getOrSet` options (e.g. `staleWhileRevalidate`, `timeout`, `errorFn`).
-     * @returns The row, or `null` if it does not exist.
-     * @throws If the query fails and the options give no fallback value (see `getOrSet`).
-     */
-    getOrFetch(key: K, options?: LilypadCacheGetOptions<K, V>): Promise<LilypadCachedValueType<V>>;
-    /**
-     * Like {@link getOrFetch}, but also tells where the value comes from and whether the last fetch
-     * failed (see `getOrSetDetailed`).
-     */
-    getOrFetchDetailed(key: K, options?: LilypadCacheGetOptions<K, V>): Promise<LilypadCacheResult<V>>;
-    /**
-     * Fetches the row of the key from the database and caches it (`null` if it does not exist),
-     * here and in the shared level. Concurrent calls share the query; a call made while a query is
-     * running waits for one more query, which sees every change made before the call.
-     * If a write that started later completes first, the fetched value is returned but not cached.
-     *
-     * @returns The row read from the database.
-     * @throws If the query fails or exceeds `flowControlTimeout`.
-     */
-    refresh(key: K): Promise<LilypadCachedValueType<V>>;
-    private fetchRow;
-    /** Re-fetches a key; if the query fails, expires it instead. */
-    private refreshKey;
-    protected hasReadInFlight(normalizedKey: string): boolean;
-    /**
-     * Returns every row of the table, or the rows of `keys`.
-     *
-     * The whole table is loaded once (again after the sync lost changes, or, with the `none`
-     * strategy, after `defaultBulkSyncTtl`). Then only the rows the cache does not hold up to date
-     * are queried, by primary key: those changed elsewhere, inserted elsewhere, or expired. When
-     * they are more than a quarter of the table, the whole table is loaded instead.
-     * Rows are cached in the memory of this instance only, not in the shared level. With
-     * `maxEntries` smaller than the table, the result is still complete, but most rows are queried
-     * again at each call.
-     *
-     * @throws If the rows cannot be loaded, or the cache is disposed.
-     */
-    getAll(keys?: K[]): Promise<V[]>;
-    private memberKeys;
-    /**
-     * The key of a notified id: the key of the cached entry or of the known row, so that it keeps
-     * its original type (a notification may carry a numeric key as a string, or the other way
-     * around), or else the id converted to a number when the schema declares the primary key as a
-     * `number` column.
-     */
-    private resolveNotifiedKey;
-    /**
-     * Caches the key as "does not exist", here and in the shared level. It also applies to protected
-     * keys: they are protected from removal, not from reflecting a deleted row.
-     */
-    private markDeleted;
-    protected getDefaultDbListener(options: LilypadDbCacheListenSync): ListenerCallbackIdentifier;
-    private static parseXid;
-    /**
-     * Whether a notification is about the table of this cache. `table` is the name without its
-     * schema; `schema`, when the trigger sends it and the schema of the table is known, must match.
-     */
-    private isNotificationForTable;
-    /**
-     * Disposes of the cache: stops its database listener and its changelog reads, removes it from
-     * the singleton registry (if it was created as a singleton) and clears it.
-     */
-    dispose(): Promise<void>;
-    private getItemPrimaryKeyValue;
-    /**
-     * Caches the row returned by a write of this instance, and remembers the write, so that its
-     * change is not applied again when it comes back through the sync.
-     * If the entry changed while the write was running (a change applied meanwhile, or a fetch that
-     * may have read the row before the write), it is expired instead: the next read fetches the row.
-     *
-     * @param startTicket - A ticket taken before the write.
-     * @param xid - The transaction of the write, if it changed a row.
-     */
-    private storeWritten;
-    /**
-     * Inserts the item in the database and caches the row returned by the database.
-     * With `primaryKeyShouldAutoDetermine`, the primary key of `item` can be omitted: the cached row
-     * holds the one generated by the database.
-     *
-     * @returns The created row, or `null` if the schema's `selectSanitizationFn` discards it.
-     */
-    sqlCreate(item: LilypadDbInsertData<V, PK>): Promise<V | null>;
-    /**
-     * Updates the item in the database and caches the row returned by the database.
-     * Only the columns present in `item` are written.
-     *
-     * @returns The updated row, or `null` if the schema's `selectSanitizationFn` discards it.
-     * @throws If no row with the item's primary key exists.
-     */
-    sqlUpdate(item: LilypadDbUpdateData<V, PK>): Promise<V | null>;
-    /**
-     * Deletes the row in the database, and caches the key as `null` (also for a protected key).
-     */
-    sqlDelete(key: K): Promise<void>;
 }
 
 /**
@@ -756,22 +313,40 @@ type LilypadChange = {
     rowId: null;
     op: 'TRUNCATE';
 });
+/**
+ * Where the next read of the changelog starts: the transactions that a read could not see yet.
+ * They are the ones still running when it read (`xip`) and the ones that had not started
+ * (`xid >= xmax`): every other transaction had already committed or aborted, so its changes were
+ * visible to that read.
+ */
+type LilypadChangelogCursor = {
+    /** The first transaction id not yet assigned when the read took its snapshot. */
+    xmax: bigint;
+    /** The transactions running when the read took its snapshot. */
+    xip: bigint[];
+};
 /** What to read of a table: the changes since a cursor, or those of the last `lookback` ms. */
 type LilypadChangesRequest = {
     tableName: string;
     since: {
-        cursor: bigint;
+        cursor: LilypadChangelogCursor;
     } | {
         lookback: number;
     };
 };
 /**
+ * Whether the changes of the transaction `xid` were visible to the read that produced `cursor`:
+ * a later read from this cursor does not return them.
+ */
+declare function lilypadCursorCovers(cursor: LilypadChangelogCursor, xid: bigint): boolean;
+/**
  * Reads the changes of a table since `cursor`, and the cursor for the next read.
  *
- * The cursor is the oldest transaction still running at the time of the read: the next read
- * returns every change of that transaction or of later ones, so a transaction that commits after
- * a read is never missed, whatever the order of the commits. A change can therefore be returned
- * by several reads: callers skip the ids they have already processed.
+ * The cursor holds the transactions the read could not see yet (see
+ * {@link LilypadChangelogCursor}): the next read returns exactly the changes of those
+ * transactions that are visible to it, whatever the order of the commits. Each change is thus
+ * returned once, and a long-running transaction does not make every read return again all the
+ * changes made since it started.
  *
  * Without a cursor (first read, or a cursor no longer trusted), `since.lookback` returns the
  * changes recorded in the last `lookback` milliseconds instead.
@@ -784,7 +359,7 @@ declare function readLilypadChanges(gate: LilypadDbGate, options: LilypadChanges
     changelogTable?: string;
 }): Promise<{
     changes: LilypadChange[];
-    cursor: bigint;
+    cursor: LilypadChangelogCursor;
 }>;
 /**
  * Like {@link readLilypadChanges}, for several tables in one query: `changes[i]` holds the changes
@@ -795,7 +370,7 @@ declare function readLilypadChangesBatch(gate: LilypadDbGate, options: {
     changelogTable?: string;
 }): Promise<{
     changes: LilypadChange[][];
-    cursor: bigint;
+    cursor: LilypadChangelogCursor;
 }>;
 /**
  * Deletes the changelog rows older than `olderThan` milliseconds. Call it periodically (e.g. from
@@ -808,6 +383,392 @@ declare function pruneLilypadChangelog(gate: LilypadDbGate, options: {
     olderThan: number;
     changelogTable?: string;
 }): Promise<number>;
+
+type LilypadDbCacheDefaultNotificationPayload = {
+    /**
+     * The schema of the table. Notifications without it match the table in any schema (the triggers
+     * of version 1 of the changelog, and custom triggers that do not send it).
+     */
+    schema?: string;
+    table: string;
+    /**
+     * A number when the trigger serializes a numeric primary key as such (e.g. `json_build_object`).
+     * Absent for `TRUNCATE`.
+     */
+    id?: string | number;
+    op: 'UPDATE' | 'DELETE' | 'INSERT' | 'TRUNCATE';
+    /**
+     * The id of the transaction that made the change (sent by the triggers of version 3). It lets
+     * the instance that made the change skip its own writes.
+     */
+    xid?: string;
+};
+/** How the cache checks that the database has the triggers it needs (see {@link LilypadDbCacheSync}). */
+type LilypadDbCacheSchemaVerification = 'warn' | 'throw' | 'off';
+/** The options shared by the strategies that see every change of the table. */
+type LilypadDbCacheTrustedSyncOptions = {
+    verify?: LilypadDbCacheSchemaVerification;
+    /**
+     * While the sync is trusted, an entry read from the database (not a copy from the shared
+     * level, nor a fallback after an error) that reaches its TTL with no change of its row is
+     * kept, without a query, until it is this old (ms). It bounds how long a change the triggers
+     * do not see (disabled triggers, `session_replication_role = replica`) goes unnoticed. The TTL
+     * still bounds the shared level. `0` queries the row again at each TTL. Defaults to 1 hour.
+     */
+    maxAge?: number;
+};
+type LilypadDbCacheListenSync = LilypadDbCacheTrustedSyncOptions & {
+    strategy: 'listen';
+    /**
+     * `eager` (default): `create` resolves once `LISTEN` is active, and rejects if it fails.
+     * `lazy`: `LISTEN` starts on the first read, so creating the cache opens no connection.
+     */
+    connect?: 'eager' | 'lazy';
+    /**
+     * If false, the cache does not apply the notifications: keeping it up to date is then up to
+     * `onNotification`, and entries are never kept past their TTL. Defaults to true.
+     */
+    applyChanges?: boolean;
+    /** Called with every notification of the table, after the cache has applied it. */
+    onNotification?: (payload: LilypadDbCacheDefaultNotificationPayload) => Promise<void> | void;
+};
+type LilypadDbCacheChangelogSync = LilypadDbCacheTrustedSyncOptions & {
+    strategy: 'changelog';
+    /** Minimum time between two reads of the changelog, in ms. Changes are seen within it. */
+    pollInterval: number;
+    /**
+     * `await` (default): a read that is due waits for the changelog, so it never returns data
+     * older than `pollInterval`. `background`: the read does not wait, and may return data one
+     * interval older.
+     */
+    poll?: 'await' | 'background';
+    /**
+     * If the changelog has not been read for this long (ms), the instance no longer trusts it:
+     * every entry is expired instead. It must be much shorter than the retention of the
+     * changelog (see `pruneLilypadChangelog`). Defaults to 1 hour.
+     */
+    maxGap?: number;
+    /**
+     * On the first read, or after `maxGap`, the changes of this many ms are applied, so that
+     * copies in the shared level older than those changes are removed too. It must cover the
+     * lifetime of a shared entry. Defaults to the TTL plus `staleWhileRevalidate`, plus 1 minute.
+     */
+    lookback?: number;
+    /** The changelog table, if not `lilypad_cache_changes`. */
+    table?: string;
+};
+/**
+ * How the cache learns about the changes made by other instances and other programs.
+ *
+ * - `listen`: `LISTEN/NOTIFY` on a dedicated connection. Near real-time, for long-running servers.
+ *   Not suited to serverless platforms: the connection must stay open, it does not work through a
+ *   pooler in transaction mode, and notifications sent while an instance is suspended are lost.
+ *   Notifications are only hints (any role can send them): the cache reads the rows again, it
+ *   never trusts the content of a notification.
+ * - `changelog`: each instance reads the changelog table (see `lilypadChangelogSql`) at most once
+ *   per `pollInterval`, when the cache is used. The caches of a gate read their tables together,
+ *   in one query. No long-lived connection: suited to serverless platforms. Changes are seen
+ *   within `pollInterval`.
+ * - `none`: only the writes of this instance and the TTL keep the cache up to date.
+ *
+ * `listen` and `changelog` rely on triggers that the library does not install (see
+ * `lilypadChangelogSql`). Their `verify` option checks that they exist (`checkLilypadSchema`):
+ * - `warn` (default): once, when the cache first uses the database (`LISTEN`, or the first read
+ *   of the changelog), without delaying changelog reads; problems are logged as a warning, with the
+ *   SQL that fixes them (on `console.warn` without a logger).
+ * - `throw`: in `create`, which rejects with a `LilypadSchemaCheckError`. `create` then queries
+ *   the database, whatever the strategy.
+ * - `off`: no check. With `listen`, notifications of a table of the same name in another schema
+ *   are then told apart only if `tableName` is qualified (`schema.table`).
+ *
+ * While `listen` or `changelog` is trusted (`LISTEN` active and its heartbeat recent, changelog
+ * read within `maxGap`), the cache sees every change of the table, so the TTL no longer needs a
+ * query: an entry that reaches its TTL without a change of its row is kept until `maxAge`.
+ *
+ * When `LISTEN` or a read of the changelog fails, the next attempts back off exponentially (up to
+ * one minute), instead of retrying at every read.
+ */
+type LilypadDbCacheSync = LilypadDbCacheListenSync | LilypadDbCacheChangelogSync | {
+    strategy: 'none';
+};
+
+/** The key type of a table: the type of its primary key column. */
+type LilypadDbKey<V, PK extends keyof V> = V[PK] & LilypadCacheKey;
+type LilypadDbCacheOptions<V extends object, PK extends keyof V = keyof V> = Omit<LilypadCacheOptions<LilypadDbKey<V, PK>, V>, 'bulkSync'> & {
+    gate: LilypadDbGate;
+    schema: LilypadDbSchema<V, PK>;
+    /** Defaults to `{ strategy: 'listen' }`. */
+    sync?: LilypadDbCacheSync;
+    /**
+     * Loading the whole table (`getAll`): `timeout` bounds each load and each query by primary keys
+     * (defaults to 30 seconds); with the `none` strategy, a load stays valid for `ttl` (defaults to
+     * the TTL).
+     */
+    bulkSync?: Omit<LilypadCacheBulkSyncOptions<LilypadDbKey<V, PK>, V>, 'fn'>;
+};
+/**
+ * A cache of the rows of one table, kept up to date with the changes made elsewhere.
+ *
+ * Its values always come from the table: it reads rows on a miss (`getOrFetch`), loads the whole
+ * table once (`getAll`), and writes through to the database (`sqlCreate`, `sqlUpdate`,
+ * `sqlDelete`). Unlike `LilypadCache`, it has no `set` or `getOrSet`: a value that does not come
+ * from the table could be kept past its TTL as if it did.
+ *
+ * @typeParam V - The row type.
+ * @typeParam PK - The primary key column; the keys of the cache are its values.
+ *
+ * @example
+ * ```typescript
+ * const users = await LilypadDbCache.create({ ttl: 60_000, gate, schema: usersSchema, logger });
+ * const user = await users.getOrFetch(42); // User, or null when there is no such row
+ * await users.dispose();
+ * ```
+ *
+ * @remarks
+ * - `get` reads memory only. `getOrFetch` queries the database on a miss; `refresh` always
+ *   re-fetches the key; `getAll` loads the whole table once, then fetches only the rows it does
+ *   not hold up to date.
+ * - Changes made elsewhere reach the cache through the `sync` strategy ({@link LilypadDbCacheSync}).
+ *   Only keys the cache holds (or is fetching) are re-fetched or expired; for other keys it only
+ *   notes that the row exists, and `getAll` fetches it.
+ * - The name of the cache (shared level keys, invalidation events, logs) defaults to the table name.
+ */
+declare class LilypadDbCache<V extends object, PK extends keyof V = keyof V, K extends LilypadDbKey<V, PK> = LilypadDbKey<V, PK>> extends LilypadCacheCore<K, V> {
+    private readonly gate;
+    private readonly schema;
+    private readonly sync;
+    private readonly maxAge;
+    private readonly verifier;
+    private releaseSingleton;
+    /**
+     * The schema of the table: from `tableName` when it is qualified, otherwise as resolved by the
+     * schema check. Notifications from another schema are ignored; while it is unknown, notifications
+     * of the table in any schema are applied.
+     */
+    private tableSchema?;
+    /**
+     * The keys of the rows of the table, as far as this instance knows. Each load of the table sets
+     * them; the writes, the fetches and the changes keep them up to date. `getAll` returns these
+     * rows, fetching only those it does not hold up to date. Tracked once the table has been loaded.
+     */
+    private members;
+    /** When the last load of the table started, if one completed (and nothing voided it since). */
+    private membersLoadedAt?;
+    /** Loads started before this ticket (before a `TRUNCATE`) no longer tell which rows exist. */
+    private membersFloor;
+    /** Receive the rows of the next load of the table (see `loadTable`). */
+    private tableLoadWaiters;
+    /** The queries of `fetchRows` in flight, by normalized key. */
+    private rowFetches;
+    /** The refreshes of `refresh` in flight, and the one queued after each (normalized keys). */
+    private refreshes;
+    /**
+     * The writes of this instance, by normalized key: their transaction ids, and the ticket of the
+     * entry the last one stored. While the entry holds it, the changes of these writes are already
+     * reflected in it.
+     */
+    private ownWrites;
+    /**
+     * Creates a cache and, with the `listen` strategy (unless `connect: 'lazy'`), registers its
+     * database listener. The row type and the primary key are inferred from `schema`.
+     * With `singleton: true`, a later call with the same identifier returns the existing cache and
+     * ignores its own options (a warning is logged if the table or the TTL differ).
+     *
+     * @throws If the database listener cannot be registered (e.g. the database is unreachable), or,
+     * with `verify: 'throw'`, if the database is not set up.
+     */
+    static create<V extends object, PK extends keyof V = keyof V>(options: LilypadDbCacheOptions<V, PK> & LilypadSingletonAble): Promise<LilypadDbCache<V, PK>>;
+    private constructor();
+    /** What the sync strategy may use of this cache. */
+    private syncHost;
+    /** Loads every row of the table, for the bulk sync of the base class. */
+    private loadRows;
+    /**
+     * Keeps, without a query, an entry that reached its TTL while it is known to be up to date: its
+     * value was read from the database (or written by this instance) after the sync became trusted,
+     * and any change of its row since would have expired it. It is kept until `maxAge`.
+     */
+    private renew;
+    /**
+     * Applies a change of a row made elsewhere.
+     * - A change made by a write of this instance whose result the entry still holds: nothing to do.
+     * - A change of a key held (or being read) by this instance: `eager` re-fetches it at once;
+     *   `lazy` expires it with no query, which also discards a read in flight (it may predate the
+     *   change): the next read fetches it. A `lazy` DELETE caches the key as `null` at once.
+     * - A change of any other key: no query. The shared level entry is removed.
+     * INSERT and UPDATE note the key as a row of the table, which `getAll` returns. An `eager`
+     * DELETE of a key not held leaves it there: `getAll` reads it again, and learns whether it is
+     * gone. A notification is thus never trusted without a query (any role can send one).
+     *
+     * @param xid - The transaction that made the change, when known.
+     * @returns The key of the changed row.
+     */
+    private applyChange;
+    /**
+     * Applies a `TRUNCATE` of the table: every entry is expired, the reads started before are
+     * discarded, and the copies of the shared level produced before are ignored. From the changelog
+     * (`lazy`) the table is known to be empty; from a notification (`eager`), which anyone can send,
+     * the next `getAll` loads the table again instead.
+     *
+     * @returns The keys that were cached.
+     */
+    private applyTruncate;
+    /**
+     * Whether a change is the one of a write of this instance, and the entry still holds the result
+     * of the last write of this instance (nothing else replaced it since): that result is at least
+     * as recent as the change. The write is forgotten either way.
+     */
+    private isOwnWrite;
+    private recordOwnWrite;
+    /** Forgets the own writes whose changes a read from this cursor no longer returns. */
+    private forgetOwnWritesCoveredBy;
+    /** Follows the values stored in the cache: a row is a row of the table, `null` is not. */
+    protected onValueStored(entry: LilypadCacheEntry<K, V>): void;
+    /** Notes a row that exists in the table, without fetching it. */
+    private addMember;
+    /**
+     * Replaces the rows of the table with the result of a load, keeping what changed after the load
+     * started: rows added since, rows deleted since.
+     */
+    private replaceMembers;
+    /**
+     * Whether the rows of the table are known: loaded since the sync became trusted, or, without a
+     * trusted sync, less than `bulkSync.ttl` ago.
+     */
+    private isTableLoaded;
+    /**
+     * Loads the whole table, even if the bulk sync of the base class still counts as fresh.
+     *
+     * @returns The rows loaded, by normalized key: with `maxEntries`, the cache may not hold them all.
+     */
+    private loadTable;
+    /**
+     * The keys whose entry is missing or expired (after renewing the entries still up to date). A
+     * missing entry whose row was just loaded is not stale: `maxEntries` evicted it.
+     */
+    private staleKeys;
+    /**
+     * Fetches rows by primary key and caches them in this instance only (`null` for the keys without
+     * a row). A key already being fetched shares that query.
+     *
+     * @returns The values read, by normalized key: with `maxEntries`, the cache may not hold them all.
+     * @throws If a query fails.
+     */
+    private fetchRows;
+    /** One read of `fetchRows`, bounded by `bulkSync.timeout`. */
+    private queryRows;
+    /**
+     * The rows of these keys, leaving out the keys without a row: the fresh entry, else the value
+     * read by `sources` (in order), else the expired entry.
+     */
+    private rowsOf;
+    private memberKeys;
+    /**
+     * Returns the row of the key if it is cached and up to date, otherwise `undefined`. It reads the
+     * memory of this instance only, with no query: `getOrFetch` queries the database on a miss.
+     *
+     * @throws If the cache is disposed.
+     */
+    get(key: K, options?: {
+        removeExpired?: boolean;
+    }): LilypadCachedValueType<V> | undefined;
+    /**
+     * Returns the row of the key, from the cache or else from the database. Concurrent calls for the
+     * same key share a single query.
+     *
+     * @param options - The read options (e.g. `staleWhileRevalidate`, `timeout`, `onError`).
+     * @returns The row, or `null` if it does not exist.
+     * @throws If the query fails and `onError` gives no fallback value, or if the cache is disposed.
+     */
+    getOrFetch(key: K, options?: LilypadCacheGetOptions<K, V>): Promise<LilypadCachedValueType<V>>;
+    /**
+     * Like {@link getOrFetch}, but also tells where the value comes from and whether the last fetch
+     * failed.
+     */
+    getOrFetchDetailed(key: K, options?: LilypadCacheGetOptions<K, V>): Promise<LilypadCacheResult<V>>;
+    /**
+     * Fetches the row of the key from the database and caches it (`null` if it does not exist),
+     * here and in the shared level. Concurrent calls share the query; a call made while a query is
+     * running waits for one more query, which sees every change made before the call.
+     * If a write that started later completes first, the fetched value is returned but not cached.
+     *
+     * @returns The row read from the database.
+     * @throws If the query fails or exceeds `fetchTimeout`, or if the cache is disposed.
+     */
+    refresh(key: K): Promise<LilypadCachedValueType<V>>;
+    private refreshRow;
+    private fetchRow;
+    /** Re-fetches a key; if the query fails, expires it instead. */
+    private refreshKey;
+    protected hasReadInFlight(normalizedKey: string): boolean;
+    /**
+     * Returns every row of the table, or the rows of `keys`.
+     *
+     * The whole table is loaded once (again after the sync lost changes, or, with the `none`
+     * strategy, after `bulkSync.ttl`). Then only the rows the cache does not hold up to date are
+     * queried, by primary key: those changed elsewhere, inserted elsewhere, or expired. When they
+     * are more than a quarter of the table, the whole table is loaded instead.
+     * Rows are cached in the memory of this instance only, not in the shared level. With
+     * `maxEntries` smaller than the table, the result is still complete, but most rows are queried
+     * again at each call.
+     *
+     * @throws If the rows cannot be loaded, or the cache is disposed.
+     */
+    getAll(keys?: K[]): Promise<V[]>;
+    /**
+     * The key of a notified id: the key of the cached entry or of the known row, so that it keeps
+     * its original type (a notification may carry a numeric key as a string, or the other way
+     * around), or else the id converted to a number when the schema declares the primary key as a
+     * `number` column.
+     */
+    private resolveNotifiedKey;
+    /**
+     * Caches the key as "does not exist", here and in the shared level. It also applies to protected
+     * keys: they are protected from removal, not from reflecting a deleted row.
+     */
+    private markDeleted;
+    /**
+     * Disposes of the cache: stops its database listener and its changelog reads, removes it from
+     * the singleton registry (if it was created as a singleton) and clears it. A `LISTEN` still
+     * starting is awaited, so that its listener is removed too.
+     */
+    dispose(): Promise<void>;
+    private getItemPrimaryKeyValue;
+    /**
+     * Caches the row returned by a write of this instance, and remembers the write, so that its
+     * change is not applied again when it comes back through the sync.
+     * If the entry changed while the write was running (a change applied meanwhile, or a fetch that
+     * may have read the row before the write), it is expired instead: the next read fetches the row.
+     *
+     * @param startTicket - A ticket taken before the write.
+     * @param xid - The transaction of the write, if it changed a row.
+     */
+    private storeWritten;
+    /**
+     * Inserts the item in the database and caches the row returned by the database.
+     * With `primaryKeyShouldAutoDetermine`, the primary key of `item` can be omitted: the cached row
+     * holds the one generated by the database.
+     *
+     * @returns The created row, or `null` if the schema's `selectSanitizationFn` discards it.
+     * @throws If the cache is disposed.
+     */
+    sqlCreate(item: LilypadDbInsertData<V, PK>): Promise<V | null>;
+    /**
+     * Updates the item in the database and caches the row returned by the database.
+     * Only the columns present in `item` are written.
+     *
+     * @returns The updated row, or `null` if the schema's `selectSanitizationFn` discards it.
+     * @throws {LilypadDbNotFoundError} If no row with the item's primary key exists.
+     * @throws If the cache is disposed.
+     */
+    sqlUpdate(item: LilypadDbUpdateData<V, PK>): Promise<V | null>;
+    /**
+     * Deletes the row in the database, and caches the key as `null` (also for a protected key).
+     *
+     * @throws If the cache is disposed.
+     */
+    sqlDelete(key: K): Promise<void>;
+}
 
 type LilypadSchemaCheckOptions = {
     /** The cached tables, as in their `LilypadDbSchema` (`tableName`, `primaryKey`). */
@@ -886,4 +847,4 @@ declare class LilypadSchemaCheckError extends Error {
  */
 declare function checkLilypadSchema(gate: LilypadDbGate, options: LilypadSchemaCheckOptions): Promise<LilypadSchemaCheckResult>;
 
-export { LILYPAD_DEFAULT_CHANGELOG_TABLE, type LilypadChange, type LilypadChangelogSqlOptions, type LilypadChangesRequest, LilypadDbCache, type LilypadDbCacheDefaultNotificationPayload, type LilypadDbCacheOptions, type LilypadDbCacheSchemaVerification, type LilypadDbCacheSync, type LilypadDbCacheTrustedSyncOptions, type LilypadDbColumn, type LilypadDbColumnType, LilypadDbGate, type LilypadDbGateOptions, type LilypadDbInsertData, type LilypadDbPoolOptions, type LilypadDbSchema, type LilypadDbUpdateData, type LilypadDbWriteResult, LilypadSchemaCheckError, type LilypadSchemaCheckOptions, type LilypadSchemaCheckResult, type LilypadSchemaProblem, type LilypadSchemaProblemCode, type ListenerCallbackIdentifier, checkLilypadSchema, lilypadChangelogSql, lilypadChangelogTriggerSql, lilypadServerlessPool, pruneLilypadChangelog, readLilypadChanges, readLilypadChangesBatch };
+export { LILYPAD_DEFAULT_CHANGELOG_TABLE, type LilypadChange, type LilypadChangelogCursor, type LilypadChangelogSqlOptions, type LilypadChangesRequest, LilypadDbCache, type LilypadDbCacheChangelogSync, type LilypadDbCacheDefaultNotificationPayload, type LilypadDbCacheListenSync, type LilypadDbCacheOptions, type LilypadDbCacheSchemaVerification, type LilypadDbCacheSync, type LilypadDbCacheTrustedSyncOptions, type LilypadDbColumn, type LilypadDbColumnType, type LilypadDbDeleteResult, LilypadDbGate, type LilypadDbGateOptions, type LilypadDbInsertData, type LilypadDbKey, LilypadDbNotFoundError, type LilypadDbPoolOptions, type LilypadDbSchema, type LilypadDbUpdateData, type LilypadDbWriteResult, LilypadSchemaCheckError, type LilypadSchemaCheckOptions, type LilypadSchemaCheckResult, type LilypadSchemaProblem, type LilypadSchemaProblemCode, type ListenerCallbackIdentifier, checkLilypadSchema, lilypadChangelogSql, lilypadChangelogTriggerSql, lilypadCursorCovers, lilypadServerlessPool, pruneLilypadChangelog, readLilypadChanges, readLilypadChangesBatch };

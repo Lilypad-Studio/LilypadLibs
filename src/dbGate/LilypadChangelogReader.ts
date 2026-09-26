@@ -3,6 +3,7 @@ import {
   LILYPAD_DEFAULT_CHANGELOG_TABLE,
   readLilypadChangesBatch,
   type LilypadChange,
+  type LilypadChangelogCursor,
   type LilypadChangesRequest,
 } from '@/dbGate/LilypadChangelog';
 
@@ -10,7 +11,7 @@ import {
 export type LilypadChangelogReadResult = {
   changes: LilypadChange[];
   /** The cursor for the next read. */
-  cursor: bigint;
+  cursor: LilypadChangelogCursor;
   /** When the read started. */
   readAt: number;
 };

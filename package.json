@@ -1,6 +1,6 @@
 {
   "name": "@lilypad/libs",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "module": "./dist/index.mjs",
@@ -107,8 +107,13 @@
     "test:integration": "vitest run --project integration",
     "prepare": "husky"
   },
-  "dependencies": {
+  "peerDependencies": {
     "postgres": "^3.4.7"
+  },
+  "peerDependenciesMeta": {
+    "postgres": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@edge-runtime/vm": "^5.0.0",
@@ -120,6 +125,7 @@
     "eslint-plugin-import": "^2.31.0",
     "eslint-plugin-prettier": "^5.2.1",
     "husky": "^9.1.7",
+    "postgres": "^3.4.7",
     "prettier": "^3.4.2",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",

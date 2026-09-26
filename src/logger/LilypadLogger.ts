@@ -1,5 +1,8 @@
-import { getLilypadSingletonInstance, LilypadSingletonAble } from '@/singleton/LilypadSingleton';
-import LilypadLoggerComponent, { type LilypadLogRecord } from '@/logger/LilypadLoggerComponent';
+import {
+  createLilypadSingletonAble,
+  type LilypadSingletonAble,
+} from '@/singleton/LilypadSingleton';
+import { LilypadLoggerComponent, type LilypadLogRecord } from '@/logger/LilypadLoggerComponent';
 import { formatLogValue } from '@/logger/formatLogValue';
 import { runInBackground, type LilypadPlatform } from '@/platform/LilypadPlatform';
 import type { LilypadLibLogLevel } from '@/logger/LilypadLibLogger';
@@ -10,13 +13,13 @@ import type { LilypadLibLogLevel } from '@/logger/LilypadLibLogger';
  * @template T - A string literal type representing component names.
  *
  * @property {Record<T, LilypadLoggerComponent<T>[]>} components - A record mapping component names to arrays of logger components.
- * @property {(error: unknown) => Promise<void>} [errorLogging] - Optional callback function to handle logging errors.
+ * @property {(error: unknown) => void | Promise<void>} [errorLogging] - Optional callback function to handle logging errors.
  * It is called once for each failing component. If it fails as well, both errors are written to `console.error`.
  */
 export type LilypadLoggerConstructorOptions<T extends string> = {
   components: Record<T, LilypadLoggerComponent<T>[]>;
   name?: string;
-  errorLogging?: (error: unknown) => Promise<void>;
+  errorLogging?: (error: unknown) => void | Promise<void>;
   /**
    * `platform.background` receives every message being sent, so that the instance stays alive
    * until it is sent even after the response (serverless platforms).
@@ -102,19 +105,19 @@ export class LilypadLogger<T extends string> {
   public static create<T extends string = LilypadLibLogLevel>(
     options: LilypadLoggerConstructorOptions<T>
   ): LilypadLoggerType<T> {
-    if (options.singleton) {
-      const registryKey = `LilypadLogger:${options.singletonIdentifier}`;
-      return getLilypadSingletonInstance(registryKey, () => new LilypadLogger<T>(options), {
+    return createLilypadSingletonAble(
+      'LilypadLogger',
+      options,
+      () => new LilypadLogger<T>(options) as LilypadLoggerType<T>,
+      {
         // No secrets in these options: the signature can stay in clear text
         value: JSON.stringify([options.name, Object.keys(options.components).sort()]),
         onMismatch: () =>
           console.warn(
-            `LilypadLogger singleton "${options.singletonIdentifier}" already exists with different options: the new options are ignored.`
+            `LilypadLogger singleton "${options.singleton ? options.singletonIdentifier : ''}" already exists with different options: the new options are ignored.`
           ),
-      }) as LilypadLoggerType<T>;
-    }
-
-    return new LilypadLogger<T>(options) as LilypadLoggerType<T>;
+      }
+    );
   }
 
   private constructor(options: LilypadLoggerConstructorOptions<T>) {
@@ -243,7 +246,7 @@ function readContext(
 async function reportComponentError(
   type: string,
   error: unknown,
-  errorLogging?: (error: unknown) => Promise<void>
+  errorLogging?: (error: unknown) => void | Promise<void>
 ): Promise<void> {
   if (errorLogging) {
     try {

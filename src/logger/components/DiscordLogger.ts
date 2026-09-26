@@ -1,4 +1,4 @@
-import LilypadLoggerComponent from '../LilypadLoggerComponent';
+import { LilypadLoggerComponent } from '../LilypadLoggerComponent';
 
 /** Maximum length of the content of a Discord message. */
 const DISCORD_MAX_CONTENT_LENGTH = 2000;
@@ -58,7 +58,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
  * - At most `maxQueueSize` messages wait to be sent: during a flood of messages the oldest are
  *   dropped, so that memory and the pending `output` promises stay bounded.
  */
-export default class LilypadDiscordLogger<T extends string> extends LilypadLoggerComponent<T> {
+export class LilypadDiscordLogger<T extends string> extends LilypadLoggerComponent<T> {
   private webhookUrl: string;
   private minRequestInterval: number;
   private rateLimitRetries: number;

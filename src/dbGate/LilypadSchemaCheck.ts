@@ -107,7 +107,7 @@ const ROW_EVENT_NAMES: [number, string][] = [
 ];
 const CHANGELOG_TRIGGER_TYPE = TRIGGER_TYPE_ROW | ROW_EVENTS;
 
-type TriggerInfo = {
+export type LilypadTriggerInfo = {
   /** Whether it calls the changelog trigger function. */
   changelog: boolean | null;
   /** Its arguments, as `encode(tgargs, 'escape')`: each one ends with `\000`. */
@@ -118,7 +118,7 @@ type TriggerInfo = {
 };
 
 /** An enabled statement-level trigger on TRUNCATE. */
-function firesOnTruncate(trigger: TriggerInfo): boolean {
+function firesOnTruncate(trigger: LilypadTriggerInfo): boolean {
   return (
     trigger.enabled &&
     (trigger.type & TRIGGER_TYPE_ROW) === 0 &&
@@ -128,6 +128,107 @@ function firesOnTruncate(trigger: TriggerInfo): boolean {
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** What `checkLilypadSchema` reads from the catalogs, before it evaluates it. */
+export type LilypadSchemaFacts = {
+  /** `server_version_num`, e.g. `160002`. */
+  version: number;
+  changelog: {
+    hasTable: boolean;
+    hasSchemaColumn: boolean;
+    hasFunction: boolean;
+    functionComment: string | null;
+  };
+  /** For each table of the options, in order: `schema` is `null` if the table does not exist. */
+  tables: { schema: string | null; triggers: LilypadTriggerInfo[] }[];
+};
+
+/** The changelog table and trigger function the options designate, or `undefined` if not checked. */
+function changelogTarget(options: LilypadSchemaCheckOptions) {
+  if (options.changelog === false) {
+    return undefined;
+  }
+  const table = options.changelog?.table ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
+  return {
+    table,
+    // The changelog table's name when it is not the default, for the generated SQL
+    custom: table === LILYPAD_DEFAULT_CHANGELOG_TABLE ? undefined : table,
+    functionSignature: `${quoteIdentifier(triggerFunctionName(table))}()`,
+  };
+}
+
+/**
+ * Reads from the catalogs what {@link evaluateLilypadSchema} needs. It changes nothing.
+ *
+ * @throws If the catalogs cannot be read (e.g. the database is unreachable).
+ */
+export async function readLilypadSchemaFacts(
+  gate: LilypadDbGate,
+  options: LilypadSchemaCheckOptions
+): Promise<LilypadSchemaFacts> {
+  const sql = gate.sql;
+  // Without a changelog to check, the default one is read anyway: its facts are then ignored
+  const changelog = changelogTarget(options) ?? changelogTarget({ tables: [] })!;
+  const quotedChangelog = quoteIdentifier(changelog.table);
+
+  const [database] = await sql`
+    SELECT
+      current_setting('server_version_num')::int AS version,
+      to_regclass(${quotedChangelog}::text) IS NOT NULL AS has_changelog_table,
+      EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = to_regclass(${quotedChangelog}::text)
+          AND attname = 'table_schema' AND NOT attisdropped
+      ) AS has_schema_column,
+      to_regprocedure(${changelog.functionSignature}::text) IS NOT NULL AS has_function,
+      obj_description(to_regprocedure(${changelog.functionSignature}::text), 'pg_proc') AS function_comment
+  `;
+  if (!database) {
+    throw new Error('Reading the database settings returned no row.');
+  }
+
+  const tables: LilypadSchemaFacts['tables'] = [];
+  for (const { table } of options.tables) {
+    const [found] = await sql`
+      SELECT
+        n.nspname AS schema_name,
+        (
+          SELECT coalesce(json_agg(json_build_object(
+            'changelog', tr.tgfoid = to_regprocedure(${changelog.functionSignature}::text)::oid,
+            'args', encode(tr.tgargs, 'escape'),
+            'type', tr.tgtype,
+            'enabled', tr.tgenabled <> 'D',
+            'source', p.prosrc
+          )), '[]'::json)
+          FROM pg_trigger tr JOIN pg_proc p ON p.oid = tr.tgfoid
+          WHERE tr.tgrelid = t.oid AND NOT tr.tgisinternal
+        ) AS triggers
+      FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace
+      WHERE t.oid = to_regclass(${quoteIdentifier(table)}::text)
+    `;
+    tables.push(
+      found
+        ? {
+            schema: found.schema_name as string,
+            triggers: (typeof found.triggers === 'string'
+              ? JSON.parse(found.triggers)
+              : found.triggers) as LilypadTriggerInfo[],
+          }
+        : { schema: null, triggers: [] }
+    );
+  }
+
+  return {
+    version: database.version as number,
+    changelog: {
+      hasTable: database.has_changelog_table as boolean,
+      hasSchemaColumn: database.has_schema_column as boolean,
+      hasFunction: database.has_function as boolean,
+      functionComment: database.function_comment as string | null,
+    },
+    tables,
+  };
 }
 
 /**
@@ -143,109 +244,73 @@ export async function checkLilypadSchema(
   gate: LilypadDbGate,
   options: LilypadSchemaCheckOptions
 ): Promise<LilypadSchemaCheckResult> {
-  const sql = gate.sql;
-  const changelogTable =
-    options.changelog === false
-      ? undefined
-      : (options.changelog?.table ?? LILYPAD_DEFAULT_CHANGELOG_TABLE);
+  return evaluateLilypadSchema(await readLilypadSchemaFacts(gate, options), options);
+}
+
+/**
+ * The problems of the facts read by {@link readLilypadSchemaFacts}, for these options. It is pure:
+ * it reads no database.
+ */
+export function evaluateLilypadSchema(
+  facts: LilypadSchemaFacts,
+  options: LilypadSchemaCheckOptions
+): LilypadSchemaCheckResult {
+  const changelog = changelogTarget(options);
   const notifyChannel = options.notifyChannel ?? false;
-  // The changelog table's name when it is not the default, for the generated SQL
-  const customChangelogTable =
-    changelogTable === LILYPAD_DEFAULT_CHANGELOG_TABLE ? undefined : changelogTable;
-  const functionSignature = `${quoteIdentifier(
-    triggerFunctionName(changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE)
-  )}()`;
   const problems: LilypadSchemaProblem[] = [];
 
-  const [database] = await sql`
-    SELECT
-      current_setting('server_version_num')::int AS version,
-      to_regclass(${quoteIdentifier(changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE)}::text)
-        IS NOT NULL AS has_changelog_table,
-      EXISTS (
-        SELECT 1 FROM pg_attribute
-        WHERE attrelid = to_regclass(${quoteIdentifier(changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE)}::text)
-          AND attname = 'table_schema' AND NOT attisdropped
-      ) AS has_schema_column,
-      to_regprocedure(${functionSignature}::text) IS NOT NULL AS has_function,
-      obj_description(to_regprocedure(${functionSignature}::text), 'pg_proc') AS function_comment
-  `;
-  if (!database) {
-    throw new Error('Reading the database settings returned no row.');
-  }
-
-  if ((database.version as number) < 130000) {
+  if (facts.version < 130000) {
     problems.push({
       code: 'unsupported-version',
-      message: `PostgreSQL ${database.version} is too old: the changelog needs PostgreSQL 13 or later.`,
+      message: `PostgreSQL ${facts.version} is too old: the changelog needs PostgreSQL 13 or later.`,
     });
   }
 
-  if (changelogTable !== undefined) {
-    const changelogSql = lilypadChangelogSql({ table: customChangelogTable });
-    if (!database.has_changelog_table || !database.has_function) {
+  if (changelog) {
+    const changelogSql = lilypadChangelogSql({ table: changelog.custom });
+    const { hasTable, hasSchemaColumn, hasFunction, functionComment } = facts.changelog;
+    if (!hasTable || !hasFunction) {
       problems.push({
         code: 'missing-changelog',
-        message: !database.has_changelog_table
-          ? `The changelog table "${changelogTable}" does not exist.`
-          : `The changelog trigger function ${functionSignature} does not exist.`,
+        message: !hasTable
+          ? `The changelog table "${changelog.table}" does not exist.`
+          : `The changelog trigger function ${changelog.functionSignature} does not exist.`,
         fix: changelogSql,
       });
     }
-    const comment = (database.function_comment as string | null) ?? '';
+    const comment = functionComment ?? '';
     const version = comment.startsWith(LILYPAD_CHANGELOG_VERSION_PREFIX)
       ? Number(comment.slice(LILYPAD_CHANGELOG_VERSION_PREFIX.length))
       : 1;
-    if (
-      (database.has_changelog_table && !database.has_schema_column) ||
-      (database.has_function && version < LILYPAD_CHANGELOG_VERSION)
-    ) {
+    if ((hasTable && !hasSchemaColumn) || (hasFunction && version < LILYPAD_CHANGELOG_VERSION)) {
       problems.push({
         code: 'outdated-changelog',
-        message: `The changelog "${changelogTable}" was installed by an older version of the library (version ${version}, expected ${LILYPAD_CHANGELOG_VERSION}).`,
+        message: `The changelog "${changelog.table}" was installed by an older version of the library (version ${version}, expected ${LILYPAD_CHANGELOG_VERSION}).`,
         fix: changelogSql,
       });
     }
   }
 
   const tables: LilypadSchemaCheckResult['tables'] = [];
-  for (const { table, primaryKey } of options.tables) {
-    const [found] = await sql`
-      SELECT
-        n.nspname AS schema_name,
-        (
-          SELECT coalesce(json_agg(json_build_object(
-            'changelog', tr.tgfoid = to_regprocedure(${functionSignature}::text)::oid,
-            'args', encode(tr.tgargs, 'escape'),
-            'type', tr.tgtype,
-            'enabled', tr.tgenabled <> 'D',
-            'source', p.prosrc
-          )), '[]'::json)
-          FROM pg_trigger tr JOIN pg_proc p ON p.oid = tr.tgfoid
-          WHERE tr.tgrelid = t.oid AND NOT tr.tgisinternal
-        ) AS triggers
-      FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace
-      WHERE t.oid = to_regclass(${quoteIdentifier(table)}::text)
-    `;
-    if (!found) {
+  options.tables.forEach(({ table, primaryKey }, index) => {
+    const found = facts.tables[index];
+    if (!found || found.schema === null) {
       tables.push({ table, schema: null });
       problems.push({
         code: 'missing-table',
         table,
         message: `The table "${table}" does not exist.`,
       });
-      continue;
+      return;
     }
-    tables.push({ table, schema: found.schema_name as string });
-    const triggers = (
-      typeof found.triggers === 'string' ? JSON.parse(found.triggers) : found.triggers
-    ) as TriggerInfo[];
+    tables.push({ table, schema: found.schema });
+    const triggers = found.triggers;
 
-    if (changelogTable !== undefined) {
+    if (changelog) {
       const fix = lilypadChangelogTriggerSql({
         table,
         primaryKey,
-        changelogTable: customChangelogTable,
+        changelogTable: changelog.custom,
       });
       const working = triggers.filter(
         (trigger) =>
@@ -253,6 +318,7 @@ export async function checkLilypadSchema(
           trigger.enabled &&
           (trigger.type & CHANGELOG_TRIGGER_TYPE) === CHANGELOG_TRIGGER_TYPE
       );
+      const recordedColumn = (trigger: LilypadTriggerInfo) => trigger.args.split('\\000')[0];
       if (working.length === 0) {
         problems.push({
           code: 'missing-changelog-trigger',
@@ -262,11 +328,11 @@ export async function checkLilypadSchema(
             : `The table "${table}" has no changelog trigger: its changes are not recorded.`,
           fix,
         });
-      } else if (!working.some((trigger) => trigger.args.split('\\000')[0] === primaryKey)) {
+      } else if (!working.some((trigger) => recordedColumn(trigger) === primaryKey)) {
         problems.push({
           code: 'wrong-trigger-primary-key',
           table,
-          message: `The changelog trigger of "${table}" records the column "${working[0]?.args.split('\\000')[0]}", not the primary key "${primaryKey}".`,
+          message: `The changelog trigger of "${table}" records the column "${recordedColumn(working[0]!)}", not the primary key "${primaryKey}".`,
           fix,
         });
       } else if (!triggers.some((trigger) => trigger.changelog && firesOnTruncate(trigger))) {
@@ -294,8 +360,8 @@ export async function checkLilypadSchema(
         )
         .reduce((events, trigger) => events | (trigger.type & ROW_EVENTS), 0);
       const fix =
-        lilypadChangelogSql({ table: customChangelogTable, notifyChannel }) +
-        lilypadChangelogTriggerSql({ table, primaryKey, changelogTable: customChangelogTable });
+        lilypadChangelogSql({ table: changelog?.custom, notifyChannel }) +
+        lilypadChangelogTriggerSql({ table, primaryKey, changelogTable: changelog?.custom });
       if (notifiedEvents === 0) {
         problems.push({
           code: 'missing-notify-trigger',
@@ -325,7 +391,7 @@ export async function checkLilypadSchema(
         });
       }
     }
-  }
+  });
 
   return { ok: problems.length === 0, problems, tables };
 }

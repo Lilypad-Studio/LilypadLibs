@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import LilypadDbCache from './LilypadDbCache';
+import { LilypadDbCache } from './LilypadDbCache';
 import type {
   LilypadDbGate,
   LilypadDbSchema,
@@ -21,7 +21,7 @@ const changelog = vi.hoisted(() => {
         options.requests.map((request) =>
           read(gate, { ...request, changelogTable: options.changelogTable })
         )
-      )) as { changes: unknown[]; cursor: bigint }[];
+      )) as { changes: unknown[]; cursor: { xmax: bigint; xip: bigint[] } }[];
       return { changes: results.map((result) => result.changes), cursor: results[0]?.cursor };
     }
   );
@@ -39,6 +39,9 @@ vi.mock('@/dbGate/LilypadSchemaCheck', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/dbGate/LilypadSchemaCheck')>()),
   checkLilypadSchema: schemaCheck.check,
 }));
+
+/** The cursor of a read that saw every transaction below `xmax`. */
+const at = (xmax: bigint, xip: bigint[] = []) => ({ xmax, xip });
 
 const schemaOk = (schemaName: string | null = 'public') => ({
   ok: true,
@@ -71,18 +74,18 @@ function createFakeGate(initialRows: Item[] = []) {
     selectFromTableByPrimaryKeys: vi.fn(async (_schema: unknown, keys: string[]) =>
       keys.flatMap((key) => rows.get(String(key)) ?? [])
     ),
-    insertToTableDetailed: vi.fn(async (_schema: unknown, item: Partial<Item>) => {
+    insertToTable: vi.fn(async (_schema: unknown, item: Partial<Item>) => {
       const row = { ...item, id: item.id ?? `generated-${++generatedIds}` } as Item;
       rows.set(row.id, row);
       return { row, xid: ++lastXid };
     }),
-    updateToTableDetailed: vi.fn(async (_schema: unknown, item: Item) => {
+    updateToTable: vi.fn(async (_schema: unknown, item: Item) => {
       rows.set(item.id, item);
       return { row: item as Item | null, xid: ++lastXid };
     }),
-    deleteFromTableDetailed: vi.fn(async (_schema: unknown, key: string) => {
-      rows.delete(key);
-      return { xid: ++lastXid };
+    deleteFromTable: vi.fn(async (_schema: unknown, key: string) => {
+      const deleted = rows.delete(key);
+      return { deleted, xid: ++lastXid };
     }),
     addListener: vi.fn(async (listener: ListenerCallbackIdentifier) => {
       listeners.set(listener.callbackId, listener);
@@ -90,6 +93,7 @@ function createFakeGate(initialRows: Item[] = []) {
     removeListener: vi.fn(async (_channel: string, callbackId: string) =>
       listeners.delete(callbackId)
     ),
+    isListenHealthy: vi.fn(() => listeners.size > 0),
   };
 
   /** Delivers a notification to every registered listener, as LilypadDbGate would. */
@@ -118,9 +122,10 @@ describe('LilypadDbCache', () => {
   });
 
   const createCache = (options: Record<string, unknown> = {}) =>
-    LilypadDbCache.create<string, Item>({
+    LilypadDbCache.create({
       ttl: 60000,
-      dbGate: { gate: fake.gate, schema },
+      gate: fake.gate,
+      schema,
       ...options,
     });
 
@@ -195,6 +200,7 @@ describe('LilypadDbCache', () => {
       const cache = await createCache();
       await cache.getOrFetch('1');
 
+      fake.rows.delete('1');
       await fake.notify({ table: 'items', id: '1', op: 'DELETE' });
 
       expect(cache.get('1')).toBeNull();
@@ -219,7 +225,7 @@ describe('LilypadDbCache', () => {
       await fake.notify({ table: 'items', id: '1', op: 'UPDATE' });
 
       expect(callback).toHaveBeenCalledWith({ table: 'items', id: '1', op: 'UPDATE' });
-      expect(cache.getComprehensive('1').type).toBe('miss');
+      expect(cache.peek('1').type).toBe('miss');
     });
 
     it('should update the entry before onNotification by default', async () => {
@@ -245,6 +251,7 @@ describe('LilypadDbCache', () => {
     it('should return all rows, excluding the deleted ones', async () => {
       const cache = await createCache();
       await cache.getAll();
+      fake.rows.delete('2');
       await fake.notify({ table: 'items', id: '2', op: 'DELETE' });
 
       const items = await cache.getAll();
@@ -277,11 +284,11 @@ describe('LilypadDbCache', () => {
       await expect(cache.getOrFetch('1')).rejects.toThrow('query failed');
     });
 
-    it('should return the fallback of errorFn when the fetch fails', async () => {
+    it('should return the fallback of onError when the fetch fails', async () => {
       const cache = await createCache();
       fake.mocks.selectFromTableByPrimaryKey.mockRejectedValueOnce(new Error('query failed'));
 
-      const result = await cache.getOrFetchDetailed('1', { errorFn: () => null });
+      const result = await cache.getOrFetchDetailed('1', { onError: { fallback: () => null } });
 
       expect(result).toEqual({ value: null, status: 'MISS', refreshFailed: true });
     });
@@ -292,7 +299,7 @@ describe('LilypadDbCache', () => {
 
       cache.invalidate('1');
 
-      expect(cache.getComprehensive('1').type).toBe('expired');
+      expect(cache.peek('1').type).toBe('expired');
       expect(fake.mocks.selectFromTableByPrimaryKey).toHaveBeenCalledOnce();
     });
 
@@ -325,12 +332,12 @@ describe('LilypadDbCache', () => {
 
       await cache.sqlUpdate({ id: '1', name: 'one' });
 
-      expect(fake.mocks.updateToTableDetailed).toHaveBeenCalledOnce();
+      expect(fake.mocks.updateToTable).toHaveBeenCalledOnce();
     });
 
     it('should cache the row returned by the database after an update', async () => {
       const cache = await createCache();
-      fake.mocks.updateToTableDetailed.mockResolvedValueOnce({
+      fake.mocks.updateToTable.mockResolvedValueOnce({
         row: { id: '1', name: 'sanitized' },
         xid: 1n,
       });
@@ -346,7 +353,7 @@ describe('LilypadDbCache', () => {
 
       await cache.sqlDelete('1');
 
-      expect(fake.mocks.deleteFromTableDetailed).toHaveBeenCalledWith(schema, '1');
+      expect(fake.mocks.deleteFromTable).toHaveBeenCalledWith(schema, '1');
       expect(cache.get('1')).toBeNull();
     });
   });
@@ -417,6 +424,7 @@ describe('LilypadDbCache', () => {
       await cache.getOrFetch('2');
       cache.addProtectedKeys(['1', '2']);
 
+      fake.rows.delete('1');
       await fake.notify({ table: 'items', id: '1', op: 'DELETE' });
       await cache.sqlDelete('2');
 
@@ -431,7 +439,7 @@ describe('LilypadDbCache', () => {
 
       await listener.onReconnect?.();
 
-      expect(cache.getComprehensive('1').type).toBe('expired');
+      expect(cache.peek('1').type).toBe('expired');
       await cache.getAll();
       expect(fake.mocks.selectAllFromTable).toHaveBeenCalledTimes(2);
     });
@@ -444,7 +452,7 @@ describe('LilypadDbCache', () => {
       await fake.notify({ table: 'items', id: 1, op: 'UPDATE' });
 
       expect(cache.get('1')).toEqual({ id: '1', name: 'ONE' });
-      expect([...cache.bulkGet({}).keys()]).toEqual(['1']);
+      expect([...cache['bulkGet']().keys()]).toEqual(['1']);
     });
 
     it('should ignore payloads that are not objects', async () => {
@@ -479,9 +487,10 @@ describe('LilypadDbCache', () => {
   describe('typing and singletons', () => {
     it('should require the primary key to update, with a declared primary key', async () => {
       const typedSchema: LilypadDbSchema<Item, 'id'> = { ...schema, primaryKey: 'id' };
-      const cache = await LilypadDbCache.create<string, Item, 'id'>({
+      const cache = await LilypadDbCache.create({
         ttl: 60000,
-        dbGate: { gate: fake.gate, schema: typedSchema },
+        gate: fake.gate,
+        schema: typedSchema,
       });
 
       await cache.sqlUpdate({ id: '1', name: 'renamed' }); // partial update: no full item needed
@@ -496,9 +505,10 @@ describe('LilypadDbCache', () => {
       const options = { singleton: true, singletonIdentifier: 'LilypadDbCache.test-mismatch' };
       const first = await createCache(options);
 
-      const second = await LilypadDbCache.create<string, Item>({
+      const second = await LilypadDbCache.create({
         ttl: 30000,
-        dbGate: { gate: fake.gate, schema },
+        gate: fake.gate,
+        schema,
         logger: logger as unknown as LilypadLibLogger,
         ...(options as { singleton: true; singletonIdentifier: string }),
       });
@@ -518,7 +528,7 @@ describe('LilypadDbCache', () => {
     beforeEach(() => {
       vi.useFakeTimers();
       changelog.read.mockReset();
-      changelog.read.mockResolvedValue({ changes: [], cursor: 100n });
+      changelog.read.mockResolvedValue({ changes: [], cursor: at(100n) });
     });
 
     afterEach(() => {
@@ -548,7 +558,7 @@ describe('LilypadDbCache', () => {
       await cache.getOrFetch('1');
       expect(changelog.read).toHaveBeenLastCalledWith(
         fake.gate,
-        expect.objectContaining({ since: { cursor: 100n } })
+        expect.objectContaining({ since: { cursor: at(100n) } })
       );
     });
 
@@ -558,7 +568,7 @@ describe('LilypadDbCache', () => {
       fake.rows.set('1', { id: '1', name: 'ONE' });
       changelog.read.mockResolvedValueOnce({
         changes: [{ id: '5', xid: 100n, rowId: '1', op: 'UPDATE' }],
-        cursor: 101n,
+        cursor: at(101n),
       });
 
       await vi.advanceTimersByTimeAsync(1000);
@@ -574,7 +584,7 @@ describe('LilypadDbCache', () => {
       fake.rows.set('3', { id: '3', name: 'three' });
       changelog.read.mockResolvedValueOnce({
         changes: [{ id: '6', xid: 100n, rowId: '3', op: 'INSERT' }],
-        cursor: 101n,
+        cursor: at(101n),
       });
 
       await vi.advanceTimersByTimeAsync(1000);
@@ -594,7 +604,7 @@ describe('LilypadDbCache', () => {
       await writer.sqlUpdate({ id: '1', name: 'renamed' });
       changelog.read.mockResolvedValue({
         changes: [{ id: '9', xid: 100n, rowId: '1', op: 'UPDATE' }],
-        cursor: 101n,
+        cursor: at(101n),
       });
       await vi.advanceTimersByTimeAsync(1000);
 
@@ -612,7 +622,7 @@ describe('LilypadDbCache', () => {
       fake.rows.set('3', { id: '3', name: 'three' });
       changelog.read.mockResolvedValueOnce({
         changes: [{ id: '10', xid: 100n, rowId: '3', op: 'INSERT' }],
-        cursor: 101n,
+        cursor: at(101n),
       });
       let resolveLoad!: (rows: Item[]) => void;
       fake.mocks.selectAllFromTable.mockReturnValueOnce(
@@ -627,7 +637,7 @@ describe('LilypadDbCache', () => {
       fake.rows.set('1', { id: '1', name: 'ONE' });
       changelog.read.mockResolvedValueOnce({
         changes: [{ id: '11', xid: 101n, rowId: '1', op: 'UPDATE' }],
-        cursor: 102n,
+        cursor: at(102n),
       });
       await vi.advanceTimersByTimeAsync(1000);
       await cache.getOrFetch('2');
@@ -643,7 +653,7 @@ describe('LilypadDbCache', () => {
       await cache.getOrFetch('1');
       changelog.read.mockResolvedValueOnce({
         changes: [{ id: '7', xid: 100n, rowId: '1', op: 'DELETE' }],
-        cursor: 101n,
+        cursor: at(101n),
       });
 
       await vi.advanceTimersByTimeAsync(1000);
@@ -651,33 +661,21 @@ describe('LilypadDbCache', () => {
       expect(await cache.getOrFetch('1')).toBeNull();
     });
 
-    it('should apply each change once, even when a later read returns it again', async () => {
-      const onInvalidate = vi.fn();
-      const cache = await createChangelogCache({}, { platform: { onInvalidate } });
+    it('should read again from the transactions still running at the previous read', async () => {
+      const cache = await createChangelogCache();
       await cache.getOrFetch('1');
-      const change = { id: '8', xid: 100n, rowId: '1', op: 'UPDATE' as const };
-      // The cursor stays at 100: an older transaction is still running
-      changelog.read.mockResolvedValue({ changes: [change], cursor: 100n });
+      // Transaction 95 was still running: the next read must include it
+      changelog.read.mockResolvedValueOnce({ changes: [], cursor: at(101n, [95n]) });
 
       await vi.advanceTimersByTimeAsync(1000);
       await cache.getOrFetch('2');
       await vi.advanceTimersByTimeAsync(1000);
       await cache.getOrFetch('2');
-      await vi.advanceTimersByTimeAsync(0);
 
-      const changelogEvents = onInvalidate.mock.calls.filter(
-        ([event]) => event.source === 'changelog'
+      expect(changelog.read).toHaveBeenLastCalledWith(
+        fake.gate,
+        expect.objectContaining({ since: { cursor: at(101n, [95n]) } })
       );
-      expect(changelogEvents).toEqual([
-        [
-          {
-            source: 'changelog',
-            cache: 'items',
-            keys: ['1'],
-            tags: ['lilypad:items', 'lilypad:items:1'],
-          },
-        ],
-      ]);
     });
 
     it('should stop trusting the cursor after maxGap', async () => {
@@ -726,7 +724,7 @@ describe('LilypadDbCache', () => {
       sync: Record<string, unknown> = {},
       options: Record<string, unknown> = {}
     ) => createCache({ sync: { strategy: 'changelog', pollInterval: 1000, ...sync }, ...options });
-    const noChanges = { changes: [], cursor: 100n };
+    const noChanges = { changes: [], cursor: at(100n) };
     /** How many rows each kind of query has read. */
     const queries = () => ({
       table: fake.mocks.selectAllFromTable.mock.calls.length,
@@ -752,10 +750,10 @@ describe('LilypadDbCache', () => {
       await reader.getAll();
 
       await writer.sqlUpdate({ id: '1', name: 'renamed' });
-      const { xid } = await fake.mocks.updateToTableDetailed.mock.results[0]!.value;
+      const { xid } = await fake.mocks.updateToTable.mock.results[0]!.value;
       changelog.read.mockResolvedValue({
         changes: [{ id: '9', xid, rowId: '1', op: 'UPDATE' }],
-        cursor: 100n,
+        cursor: at(100n),
       });
       await vi.advanceTimersByTimeAsync(1000);
 
@@ -773,7 +771,7 @@ describe('LilypadDbCache', () => {
       fake.rows.set('9', { id: '9', name: 'new' });
       changelog.read.mockResolvedValueOnce({
         changes: [{ id: '10', xid: 100n, rowId: '9', op: 'INSERT' }],
-        cursor: 101n,
+        cursor: at(101n),
       });
 
       await vi.advanceTimersByTimeAsync(1000);
@@ -821,7 +819,7 @@ describe('LilypadDbCache', () => {
     it('should return a row cached with a shorter TTL, fetching only that row', async () => {
       const cache = await createCache({ sync: { strategy: 'none' } });
       await cache.getAll();
-      cache.set('1', { id: '1', name: 'short-lived' }, 1000);
+      cache['setValue']('1', { id: '1', name: 'short-lived' }, 1000);
 
       await vi.advanceTimersByTimeAsync(2000);
       const items = await cache.getAll();
@@ -852,7 +850,7 @@ describe('LilypadDbCache', () => {
       await vi.advanceTimersByTimeAsync(0);
 
       const fetchOne = () => fake.mocks.selectFromTableByPrimaryKey(schema, '1');
-      expect((await second.getOrSetDetailed('1', fetchOne)).status).toBe('L2-HIT');
+      expect((await second['getOrSetDetailed']('1', fetchOne)).status).toBe('L2-HIT');
       await vi.advanceTimersByTimeAsync(61_000);
       await second.getOrFetch('1');
 
@@ -868,7 +866,7 @@ describe('LilypadDbCache', () => {
         fake.rows.clear();
         changelog.read.mockResolvedValueOnce({
           changes: [{ id: '11', xid: 100n, rowId: null, op: 'TRUNCATE' }],
-          cursor: 101n,
+          cursor: at(101n),
         });
 
         await vi.advanceTimersByTimeAsync(1000);
@@ -895,7 +893,7 @@ describe('LilypadDbCache', () => {
             { id: '11', xid: 100n, rowId: null, op: 'TRUNCATE' },
             { id: '12', xid: 101n, rowId: '20', op: 'INSERT' },
           ],
-          cursor: 102n,
+          cursor: at(102n),
         });
 
         await vi.advanceTimersByTimeAsync(1000);
@@ -934,7 +932,7 @@ describe('LilypadDbCache', () => {
       it('should not fetch again a row it wrote when its notification arrives', async () => {
         const cache = await createCache();
         await cache.sqlUpdate({ id: '1', name: 'renamed' });
-        const { xid } = await fake.mocks.updateToTableDetailed.mock.results[0]!.value;
+        const { xid } = await fake.mocks.updateToTable.mock.results[0]!.value;
 
         await fake.notify({ table: 'items', id: '1', op: 'UPDATE', xid: String(xid) });
 
@@ -948,15 +946,15 @@ describe('LilypadDbCache', () => {
         await cache.sqlCreate({ id: '9', name: 'new' });
         await cache.sqlUpdate({ id: '9', name: 'renamed' });
         const [created, updated] = await Promise.all([
-          fake.mocks.insertToTableDetailed.mock.results[0]!.value,
-          fake.mocks.updateToTableDetailed.mock.results[0]!.value,
+          fake.mocks.insertToTable.mock.results[0]!.value,
+          fake.mocks.updateToTable.mock.results[0]!.value,
         ]);
         changelog.read.mockResolvedValueOnce({
           changes: [
             { id: '20', xid: created.xid, rowId: '9', op: 'INSERT' },
             { id: '21', xid: updated.xid, rowId: '9', op: 'UPDATE' },
           ],
-          cursor: 100n,
+          cursor: at(100n),
         });
 
         await vi.advanceTimersByTimeAsync(1000);
@@ -978,7 +976,7 @@ describe('LilypadDbCache', () => {
       it('should not cache a written row when the entry changed during the write', async () => {
         const cache = await createCache({ sync: { strategy: 'none' } });
         let resolveWrite!: (result: { row: Item; xid: bigint }) => void;
-        fake.mocks.updateToTableDetailed.mockReturnValueOnce(
+        fake.mocks.updateToTable.mockReturnValueOnce(
           new Promise((resolve) => (resolveWrite = resolve))
         );
         const writing = cache.sqlUpdate({ id: '1', name: 'renamed' });
@@ -1026,7 +1024,7 @@ describe('LilypadDbCache', () => {
 
     beforeEach(() => {
       changelog.read.mockReset();
-      changelog.read.mockResolvedValue({ changes: [], cursor: 100n });
+      changelog.read.mockResolvedValue({ changes: [], cursor: at(100n) });
     });
 
     it('should check the notification trigger before LISTEN with the listen strategy', async () => {
@@ -1201,6 +1199,7 @@ describe('LilypadDbCache', () => {
       await fake.notify({ schema: 'archive', table: 'items', id: '1', op: 'DELETE' });
       expect(cache.get('1')).toEqual({ id: '1', name: 'one' });
 
+      fake.rows.delete('1');
       await fake.notify({ schema: 'public', table: 'items', id: '1', op: 'DELETE' });
       expect(cache.get('1')).toBeNull();
     });
@@ -1209,15 +1208,17 @@ describe('LilypadDbCache', () => {
       const cache = await createCache();
       await cache.getOrFetch('1');
 
+      fake.rows.delete('1');
       await fake.notify({ table: 'items', id: '1', op: 'DELETE' });
 
       expect(cache.get('1')).toBeNull();
     });
 
     it('should take the schema from a qualified table name, even without a check', async () => {
-      const cache = await LilypadDbCache.create<string, Item>({
+      const cache = await LilypadDbCache.create({
         ttl: 60000,
-        dbGate: { gate: fake.gate, schema: { ...schema, tableName: 'app.items' } },
+        gate: fake.gate,
+        schema: { ...schema, tableName: 'app.items' },
         sync: { strategy: 'listen', verify: 'off' },
       });
       await cache.getOrFetch('1');
@@ -1225,14 +1226,16 @@ describe('LilypadDbCache', () => {
       await fake.notify({ schema: 'public', table: 'items', id: '1', op: 'DELETE' });
       expect(cache.get('1')).toEqual({ id: '1', name: 'one' });
 
+      fake.rows.delete('1');
       await fake.notify({ schema: 'app', table: 'items', id: '1', op: 'DELETE' });
       expect(cache.get('1')).toBeNull();
     });
 
     it('should read the changelog of the qualified table name', async () => {
-      const cache = await LilypadDbCache.create<string, Item>({
+      const cache = await LilypadDbCache.create({
         ttl: 60000,
-        dbGate: { gate: fake.gate, schema: { ...schema, tableName: 'app.items' } },
+        gate: fake.gate,
+        schema: { ...schema, tableName: 'app.items' },
         sync: { strategy: 'changelog', pollInterval: 0 },
       });
 
@@ -1340,7 +1343,7 @@ describe('LilypadDbCache', () => {
     beforeEach(() => {
       vi.useFakeTimers();
       changelog.read.mockReset();
-      changelog.read.mockResolvedValue({ changes: [], cursor: 100n });
+      changelog.read.mockResolvedValue({ changes: [], cursor: at(100n) });
       changelog.batch.mockClear();
     });
 
@@ -1377,7 +1380,7 @@ describe('LilypadDbCache', () => {
       const pending = cache.getOrFetch('1');
       changelog.read.mockResolvedValueOnce({
         changes: [{ id: '1', xid: 100n, rowId: '1', op: 'UPDATE' }],
-        cursor: 101n,
+        cursor: at(101n),
       });
 
       // The changelog read of a later read applies the change while the fetch is in flight
@@ -1386,16 +1389,17 @@ describe('LilypadDbCache', () => {
       release({ id: '1', name: 'before the change' });
       await pending;
 
-      expect(cache.getComprehensive('1').type).toBe('miss');
+      expect(cache.peek('1').type).toBe('miss');
       expect(fake.mocks.selectFromTableByPrimaryKey).toHaveBeenCalledOnce();
     });
 
     it('should read the changelog of every cache of the gate in one query', async () => {
       const first = await createChangelogCache();
-      const second = await LilypadDbCache.create<string, Item>({
+      const second = await LilypadDbCache.create({
         ttl: 60000,
         name: 'items-2',
-        dbGate: { gate: fake.gate, schema },
+        gate: fake.gate,
+        schema,
         sync: { strategy: 'changelog', pollInterval: 1000 },
       });
 
@@ -1417,24 +1421,199 @@ describe('LilypadDbCache', () => {
     };
 
     it('should convert the ids of notifications to numbers for a number column', async () => {
-      const cache = await LilypadDbCache.create<number, NumericItem, 'id'>({
-        dbGate: { gate: fake.gate, schema: numericSchema },
+      const cache = await LilypadDbCache.create({
+        gate: fake.gate,
+        schema: numericSchema,
       });
+      await cache.getAll();
 
-      await fake.notify({ table: 'items', id: '42', op: 'DELETE' });
+      await fake.notify({ table: 'items', id: '42', op: 'INSERT' });
 
-      expect([...cache.bulkGet({}).keys()]).toEqual([42]);
+      expect([...cache['members'].values()].map((member) => member.key)).toContain(42);
       await cache.dispose();
     });
   });
 
   describe('disposed cache', () => {
-    it('should reject reads', async () => {
+    it('should reject reads and writes', async () => {
       const cache = await createCache();
       await cache.dispose();
 
       await expect(cache.getAll()).rejects.toThrow('is disposed');
       await expect(cache.getOrFetch('1')).rejects.toThrow('is disposed');
+      expect(() => cache.get('1')).toThrow('is disposed');
+      expect(() => cache.refresh('1')).toThrow('is disposed');
+      await expect(cache.sqlCreate({ id: '3', name: 'three' })).rejects.toThrow('is disposed');
+      await expect(cache.sqlDelete('1')).rejects.toThrow('is disposed');
+      expect(fake.mocks.insertToTable).not.toHaveBeenCalled();
+    });
+
+    it('should not cache the result of a write that completes after dispose', async () => {
+      const cache = await createCache();
+      let finishWrite!: () => void;
+      fake.mocks.updateToTable.mockImplementationOnce(async (_schema, item) => {
+        await new Promise<void>((resolve) => (finishWrite = resolve));
+        return { row: item, xid: 2000n };
+      });
+      const writing = cache.sqlUpdate({ id: '1', name: 'renamed' });
+
+      await cache.dispose();
+      finishWrite();
+
+      await expect(writing).resolves.toEqual({ id: '1', name: 'renamed' });
+      expect(cache['store'].size).toBe(0);
+    });
+
+    it('should remove the listener of a lazy LISTEN still starting when disposed', async () => {
+      const cache = await createCache({ sync: { strategy: 'listen', connect: 'lazy' } });
+      const reading = cache.getOrFetch('1').catch(() => null);
+
+      await cache.dispose();
+      await reading;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(fake.listeners.size).toBe(0);
+    });
+
+    it('should ignore the notifications received after dispose', async () => {
+      const cache = await createCache();
+      const listener = [...fake.listeners.values()][0]!;
+      await cache.dispose();
+
+      await listener.callback(JSON.stringify({ table: 'items', id: '1', op: 'UPDATE' }));
+
+      expect(fake.mocks.selectFromTableByPrimaryKey).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('public API', () => {
+    it('should not expose the writes of LilypadCache, whose values would not come from the table', async () => {
+      const cache = await createCache();
+      const typeChecks = () => {
+        // @ts-expect-error a DbCache has no public set
+        cache.set('1', { id: '1', name: 'not in the table' });
+        // @ts-expect-error a DbCache has no public getOrSet
+        void cache.getOrSet('1', async () => null);
+        // @ts-expect-error a DbCache has no public bulkSet
+        cache.bulkSet([]);
+        // @ts-expect-error a DbCache has no public bulkSync
+        void cache.bulkSync();
+      };
+
+      expect(typeChecks).toBeTypeOf('function');
+      expect(cache.name).toBe('items');
+    });
+  });
+
+  describe('untrusted notifications', () => {
+    it('should read the row again on a DELETE notification, instead of trusting it', async () => {
+      const cache = await createCache();
+      await cache.getOrFetch('1');
+
+      // Anyone can NOTIFY: the row still exists
+      await fake.notify({ table: 'items', id: '1', op: 'DELETE' });
+
+      expect(cache.get('1')).toEqual({ id: '1', name: 'one' });
+      expect(fake.mocks.selectFromTableByPrimaryKey).toHaveBeenCalledTimes(2);
+    });
+
+    it('should not cache anything for a DELETE notification of a key it does not hold', async () => {
+      const cache = await createCache();
+
+      await fake.notify({ table: 'items', id: '1', op: 'DELETE' });
+
+      expect(cache.peek('1').type).toBe('miss');
+      await expect(cache.getOrFetch('1')).resolves.toEqual({ id: '1', name: 'one' });
+    });
+
+    it('should load the table again after a TRUNCATE notification, instead of trusting it', async () => {
+      const cache = await createCache();
+      await cache.getAll();
+
+      await fake.notify({ table: 'items', op: 'TRUNCATE' });
+
+      await expect(cache.getAll()).resolves.toHaveLength(2);
+      expect(fake.mocks.selectAllFromTable).toHaveBeenCalledTimes(2);
+    });
+
+    it('should ignore notifications with an unknown operation or malformed fields', async () => {
+      const logger = { warn: vi.fn() };
+      const cache = await createCache({ logger });
+      await cache.getOrFetch('1');
+
+      await fake.notify({ table: 'items', id: '1', op: 'MERGE' });
+      await fake.notify({ table: 'items', id: '1', op: 'UPDATE', xid: 42 });
+      await fake.notify({ table: 'items', id: { nested: true }, op: 'UPDATE' });
+
+      expect(fake.mocks.selectFromTableByPrimaryKey).toHaveBeenCalledOnce();
+      expect(logger.warn).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  describe('trust in LISTEN', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('should query a row again after its TTL while the LISTEN heartbeat is missing', async () => {
+      const cache = await createCache();
+      await cache.getOrFetch('1');
+      fake.mocks.isListenHealthy.mockReturnValue(false);
+
+      await vi.advanceTimersByTimeAsync(61_000);
+      await cache.getOrFetch('1');
+
+      expect(fake.mocks.selectFromTableByPrimaryKey).toHaveBeenCalledTimes(2);
+    });
+
+    it('should keep a row past its TTL without a query while the heartbeat is recent', async () => {
+      const cache = await createCache();
+      await cache.getOrFetch('1');
+
+      await vi.advanceTimersByTimeAsync(61_000);
+      await cache.getOrFetch('1');
+
+      expect(fake.mocks.selectFromTableByPrimaryKey).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe('own writes and the changelog cursor', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      changelog.read.mockReset();
+      changelog.read.mockResolvedValue({ changes: [], cursor: at(100n) });
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('should still recognize a write whose transaction was running at the previous read', async () => {
+      const onInvalidate = vi.fn();
+      const cache = await createCache({
+        sync: { strategy: 'changelog', pollInterval: 1000 },
+        platform: { onInvalidate },
+      });
+      await cache.getOrFetch('1');
+      await cache.sqlUpdate({ id: '1', name: 'renamed' }); // transaction 1001
+
+      // A read that still sees transaction 1001 running, then the read that returns its change
+      changelog.read.mockResolvedValueOnce({ changes: [], cursor: at(1002n, [1001n]) });
+      await vi.advanceTimersByTimeAsync(1000);
+      await cache.getOrFetch('2');
+      changelog.read.mockResolvedValueOnce({
+        changes: [{ id: '9', xid: 1001n, rowId: '1', op: 'UPDATE' }],
+        cursor: at(1003n),
+      });
+      await vi.advanceTimersByTimeAsync(1000);
+      await cache.getOrFetch('2');
+
+      expect(cache.get('1')).toEqual({ id: '1', name: 'renamed' });
+      expect(fake.mocks.selectFromTableByPrimaryKey).toHaveBeenCalledTimes(2); // '1' and '2' only
     });
   });
 });

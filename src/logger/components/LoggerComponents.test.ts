@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import LilypadConsoleLogger from './ConsoleLogger';
-import LilypadDiscordLogger from './DiscordLogger';
-import LilypadJsonConsoleLogger from './JsonConsoleLogger';
+import { LilypadConsoleLogger } from './ConsoleLogger';
+import { LilypadDiscordLogger } from './DiscordLogger';
+import { LilypadJsonConsoleLogger } from './JsonConsoleLogger';
+import { safeJson } from '../LilypadLoggerComponent';
 
 describe('LilypadConsoleLogger', () => {
   afterEach(() => {
@@ -244,5 +245,35 @@ describe('LilypadDiscordLogger queue limit', () => {
     await new LilypadDiscordLogger<'info'>(webhookUrl).output('info', 'message');
 
     expect(cancel).toHaveBeenCalledOnce();
+  });
+});
+
+describe('safeJson', () => {
+  it('should print an object referenced twice side by side, not as circular', () => {
+    const shared = { id: 1 };
+
+    expect(JSON.parse(safeJson({ a: shared, b: shared }))).toEqual({ a: { id: 1 }, b: { id: 1 } });
+  });
+
+  it('should mark only a reference to an ancestor as circular', () => {
+    const node: Record<string, unknown> = { name: 'root' };
+    node.self = node;
+    node.list = [node];
+
+    expect(JSON.parse(safeJson(node))).toEqual({
+      name: 'root',
+      self: '[Circular]',
+      list: ['[Circular]'],
+    });
+  });
+
+  it('should keep toJSON, BigInts and errors', () => {
+    const parsed = JSON.parse(
+      safeJson({ at: new Date(0), big: 10n, error: new Error('boom') })
+    ) as Record<string, Record<string, unknown>>;
+
+    expect(parsed.at).toBe('1970-01-01T00:00:00.000Z');
+    expect(parsed.big).toBe('10n');
+    expect(parsed.error).toMatchObject({ name: 'Error', message: 'boom' });
   });
 });

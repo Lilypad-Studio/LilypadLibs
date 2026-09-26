@@ -63,11 +63,11 @@ const RATE_MAP_PRUNE_THRESHOLD = 1000;
  * A flow control utility class that manages execution of asynchronous operations with support for
  * rate limiting, retries, timeouts, and single-flight request deduplication.
  *
- * @template T - The type of value resolved by the executed operations.
+ * The class is not generic: each execution is typed by its own `fn`.
  *
  * @example
  * ```typescript
- * const flowControl = new LilypadFlowControl<string>({
+ * const flowControl = new LilypadFlowControl({
  *   rate: 1000,
  *   timeout: 5000,
  *   retries: 3,
@@ -98,13 +98,13 @@ const RATE_MAP_PRUNE_THRESHOLD = 1000;
  * @property retries - Maximum number of retry attempts for failed operations
  * @property logger - Optional logger instance for error, warning, info, and debug messages
  */
-export class LilypadFlowControl<T> {
+export class LilypadFlowControl {
   private rate?: number;
   private timeout?: number;
   private retries?: number;
   private logger?: LilypadLibLogger;
 
-  private singleFlightMap: Map<string, Promise<T>> = new Map();
+  private singleFlightMap: Map<string, Promise<unknown>> = new Map();
   private rateMap: Map<string, number> = new Map();
 
   constructor(options?: LilypadFlowControlOptions) {
@@ -117,8 +117,7 @@ export class LilypadFlowControl<T> {
   /**
    * Executes an asynchronous function with a timeout constraint.
    *
-   * @template R The type of value returned by the execution function (the one of the instance by
-   * default).
+   * @template R The type of value returned by the execution function.
    * @param executionFn An asynchronous function to execute. It receives a signal that is aborted on timeout.
    * @param timeout The timeout, in milliseconds. Defaults to the instance's `timeout`.
    * @returns A promise that resolves with the result of `executionFn` if it completes before the timeout,
@@ -130,7 +129,7 @@ export class LilypadFlowControl<T> {
    * to ensure no memory leaks occur regardless of whether the operation succeeds or times out.
    * JavaScript cannot forcibly stop a running promise: `executionFn` should observe the signal to stop its work.
    */
-  async executeWithTimeout<R = T>(
+  async executeWithTimeout<R>(
     executionFn: (signal: AbortSignal) => Promise<R>,
     timeout: number | undefined = this.timeout
   ): Promise<R> {
@@ -165,7 +164,7 @@ export class LilypadFlowControl<T> {
    * @returns A promise that resolves with the result of `executionFn`, or with the result of `errorFn` if retries are exhausted.
    * @throws The error thrown by `executionFn` if all retries are exhausted and no `errorFn` is provided.
    */
-  async executeWithRetries(options: {
+  async executeWithRetries<T>(options: {
     executionFn: () => Promise<T>;
     retries?: number;
     errorFn?: (error: unknown) => T;
@@ -256,8 +255,9 @@ export class LilypadFlowControl<T> {
    *   - backOffTime: Optional backoff time between retries.
    * @returns A promise that resolves with the result of the executed function.
    */
-  async executeFn(options: LilypadExecuteFnOptions<T>): Promise<T> {
-    const inFlight = this.singleFlightMap.get(options.functionIdentifier);
+  async executeFn<T>(options: LilypadExecuteFnOptions<T>): Promise<T> {
+    // The caller that joins a flight is responsible for using the same type as the one that started it
+    const inFlight = this.singleFlightMap.get(options.functionIdentifier) as Promise<T> | undefined;
     if (inFlight) {
       return inFlight;
     }
@@ -273,7 +273,7 @@ export class LilypadFlowControl<T> {
     }
 
     // Execution Pipeline (Retries and Timeout)
-    const executionPromise = this.executeWithRetries({
+    const executionPromise = this.executeWithRetries<T>({
       executionFn: () => this.executeWithTimeout(options.fn, options.timeout ?? this.timeout),
       retries: options.retries ?? this.retries ?? 0,
       errorFn: options.errorFn,

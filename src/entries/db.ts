@@ -1,39 +1,49 @@
 /**
  * `@lilypad/libs/db`: the PostgreSQL gateway and the database-backed cache. Node.js only: it needs
- * TCP connections (postgres.js).
+ * TCP connections (postgres.js), which must be installed next to the library.
  */
-export { LilypadDbGate, lilypadServerlessPool } from '../dbGate/LilypadDbGate';
+export {
+  LilypadDbGate,
+  LilypadDbNotFoundError,
+  lilypadServerlessPool,
+} from '../dbGate/LilypadDbGate';
 export type {
-  LilypadDbGateOptions,
-  LilypadDbPoolOptions,
-  LilypadDbSchema,
   LilypadDbColumn,
   LilypadDbColumnType,
+  LilypadDbDeleteResult,
+  LilypadDbGateOptions,
   LilypadDbInsertData,
+  LilypadDbPoolOptions,
+  LilypadDbSchema,
   LilypadDbUpdateData,
   LilypadDbWriteResult,
   ListenerCallbackIdentifier,
 } from '../dbGate/LilypadDbGate';
 
-export { default as LilypadDbCache } from '../cache/LilypadDbCache';
+export { LilypadDbCache } from '../cache/LilypadDbCache';
 export type {
+  LilypadDbCacheChangelogSync,
   LilypadDbCacheDefaultNotificationPayload,
+  LilypadDbCacheListenSync,
   LilypadDbCacheOptions,
+  LilypadDbCacheSchemaVerification,
   LilypadDbCacheSync,
   LilypadDbCacheTrustedSyncOptions,
-  LilypadDbCacheSchemaVerification,
+  LilypadDbKey,
 } from '../cache/LilypadDbCache';
 
 export {
   LILYPAD_DEFAULT_CHANGELOG_TABLE,
   lilypadChangelogSql,
   lilypadChangelogTriggerSql,
+  lilypadCursorCovers,
   pruneLilypadChangelog,
   readLilypadChanges,
   readLilypadChangesBatch,
 } from '../dbGate/LilypadChangelog';
 export type {
   LilypadChange,
+  LilypadChangelogCursor,
   LilypadChangelogSqlOptions,
   LilypadChangesRequest,
 } from '../dbGate/LilypadChangelog';

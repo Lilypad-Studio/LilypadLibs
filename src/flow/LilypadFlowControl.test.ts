@@ -19,10 +19,10 @@ async function withFakeTimers<T>(run: () => Promise<T>): Promise<T> {
 }
 
 describe('LilypadFlowControl', () => {
-  let flowControl: LilypadFlowControl<string>;
+  let flowControl: LilypadFlowControl;
 
   beforeEach(() => {
-    flowControl = new LilypadFlowControl<string>();
+    flowControl = new LilypadFlowControl();
   });
 
   afterEach(() => {
@@ -31,12 +31,12 @@ describe('LilypadFlowControl', () => {
 
   describe('constructor', () => {
     it('should initialize with default options', () => {
-      const fc = new LilypadFlowControl<string>();
+      const fc = new LilypadFlowControl();
       expect(fc).toBeDefined();
     });
 
     it('should initialize with provided options', () => {
-      const fc = new LilypadFlowControl<string>({
+      const fc = new LilypadFlowControl({
         rate: 1000,
         timeout: 5000,
         retries: 3,
@@ -47,13 +47,13 @@ describe('LilypadFlowControl', () => {
 
   describe('executeWithTimeout', () => {
     it('should return result when execution completes before timeout', async () => {
-      flowControl = new LilypadFlowControl<string>({ timeout: 1000 });
+      flowControl = new LilypadFlowControl({ timeout: 1000 });
       const result = await flowControl.executeWithTimeout(() => Promise.resolve('success'));
       expect(result).toBe('success');
     });
 
     it('should throw timeout error when execution exceeds timeout', async () => {
-      flowControl = new LilypadFlowControl<string>({ timeout: 100 });
+      flowControl = new LilypadFlowControl({ timeout: 100 });
       await expect(
         withFakeTimers(() =>
           flowControl.executeWithTimeout(
@@ -64,7 +64,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should abort the signal passed to the function on timeout', async () => {
-      flowControl = new LilypadFlowControl<string>({ timeout: 100 });
+      flowControl = new LilypadFlowControl({ timeout: 100 });
       let receivedSignal: AbortSignal | undefined;
       await expect(
         withFakeTimers(() =>
@@ -78,7 +78,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should not abort the signal when execution completes in time', async () => {
-      flowControl = new LilypadFlowControl<string>({ timeout: 1000 });
+      flowControl = new LilypadFlowControl({ timeout: 1000 });
       let receivedSignal: AbortSignal | undefined;
       await flowControl.executeWithTimeout((signal) => {
         receivedSignal = signal;
@@ -88,7 +88,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should not timeout when no timeout is configured', async () => {
-      flowControl = new LilypadFlowControl<string>();
+      flowControl = new LilypadFlowControl();
       const result = await flowControl.executeWithTimeout(() => Promise.resolve('success'));
       expect(result).toBe('success');
     });
@@ -96,7 +96,7 @@ describe('LilypadFlowControl', () => {
 
   describe('executeWithRetries', () => {
     it('should return result on first success', async () => {
-      flowControl = new LilypadFlowControl<string>({ retries: 3 });
+      flowControl = new LilypadFlowControl({ retries: 3 });
       const result = await flowControl.executeWithRetries({
         executionFn: () => Promise.resolve('success'),
       });
@@ -104,7 +104,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should retry on failure and return result', async () => {
-      flowControl = new LilypadFlowControl<string>({ retries: 3 });
+      flowControl = new LilypadFlowControl({ retries: 3 });
       let attempts = 0;
       const result = await withFakeTimers(() =>
         flowControl.executeWithRetries({
@@ -122,7 +122,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should throw error after exhausting retries', async () => {
-      flowControl = new LilypadFlowControl<string>({ retries: 2 });
+      flowControl = new LilypadFlowControl({ retries: 2 });
       await expect(
         withFakeTimers(() =>
           flowControl.executeWithRetries({
@@ -135,7 +135,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should use errorFn when provided and retries exhausted', async () => {
-      flowControl = new LilypadFlowControl<string>({ retries: 1 });
+      flowControl = new LilypadFlowControl({ retries: 1 });
       const result = await withFakeTimers(() =>
         flowControl.executeWithRetries({
           executionFn: () => Promise.reject(new Error('fail')),
@@ -146,7 +146,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should use custom backoff time', async () => {
-      flowControl = new LilypadFlowControl<string>({ retries: 2 });
+      flowControl = new LilypadFlowControl({ retries: 2 });
       const backoffSpy = vi.fn((attempt) => attempt * 10);
       let attempts = 0;
 
@@ -170,17 +170,17 @@ describe('LilypadFlowControl', () => {
 
   describe('rateLimit', () => {
     it('should allow execution when rate limit is not set', () => {
-      flowControl = new LilypadFlowControl<string>();
+      flowControl = new LilypadFlowControl();
       expect(() => flowControl.rateLimit('user1', 'func1')).not.toThrow();
     });
 
     it('should allow first execution when rate limit is set', () => {
-      flowControl = new LilypadFlowControl<string>({ rate: 1000 });
+      flowControl = new LilypadFlowControl({ rate: 1000 });
       expect(() => flowControl.rateLimit('user1', 'func1')).not.toThrow();
     });
 
     it('should reject execution when rate limit is exceeded', () => {
-      flowControl = new LilypadFlowControl<string>({ rate: 1000 });
+      flowControl = new LilypadFlowControl({ rate: 1000 });
       flowControl.rateLimit('user1', 'func1');
       expect(() => flowControl.rateLimit('user1', 'func1')).toThrow(
         'Rate limit exceeded for user1#func1'
@@ -189,21 +189,21 @@ describe('LilypadFlowControl', () => {
 
     it('should allow execution after rate limit expires', () => {
       vi.useFakeTimers();
-      flowControl = new LilypadFlowControl<string>({ rate: 100 });
+      flowControl = new LilypadFlowControl({ rate: 100 });
       flowControl.rateLimit('user1', 'func1');
       vi.advanceTimersByTime(150);
       expect(() => flowControl.rateLimit('user1', 'func1')).not.toThrow();
     });
 
     it('should track rate limits per consumer/function pair', () => {
-      flowControl = new LilypadFlowControl<string>({ rate: 1000 });
+      flowControl = new LilypadFlowControl({ rate: 1000 });
       flowControl.rateLimit('user1', 'func1');
       expect(() => flowControl.rateLimit('user2', 'func1')).not.toThrow();
     });
 
     it('should prune expired rate limit entries once the map grows large', () => {
       vi.useFakeTimers();
-      flowControl = new LilypadFlowControl<string>({ rate: 100 });
+      flowControl = new LilypadFlowControl({ rate: 100 });
       for (let i = 0; i < 1000; i++) {
         flowControl.rateLimit(`user${i}`, 'func1');
       }
@@ -213,7 +213,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should not prune entries that are still limiting', () => {
-      flowControl = new LilypadFlowControl<string>({ rate: 60000 });
+      flowControl = new LilypadFlowControl({ rate: 60000 });
       for (let i = 0; i <= 1000; i++) {
         flowControl.rateLimit(`user${i}`, 'func1');
       }
@@ -233,7 +233,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should apply rate limiting', async () => {
-      flowControl = new LilypadFlowControl<string>({ rate: 1000 });
+      flowControl = new LilypadFlowControl({ rate: 1000 });
       await flowControl.executeFn({
         functionIdentifier: 'func1',
         consumerIdentifier: 'user1',
@@ -249,7 +249,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should not rate limit calls that join an in-flight execution', async () => {
-      flowControl = new LilypadFlowControl<string>({ rate: 1000 });
+      flowControl = new LilypadFlowControl({ rate: 1000 });
       const fnSpy = vi.fn(() => Promise.resolve('success'));
 
       const [result1, result2] = await Promise.all([
@@ -272,7 +272,7 @@ describe('LilypadFlowControl', () => {
 
     it('should implement single-flight deduplication', async () => {
       const fnSpy = vi.fn(() => Promise.resolve('success'));
-      flowControl = new LilypadFlowControl<string>();
+      flowControl = new LilypadFlowControl();
 
       const promise1 = flowControl.executeFn({
         functionIdentifier: 'func1',
@@ -294,7 +294,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should apply timeout', async () => {
-      flowControl = new LilypadFlowControl<string>({ timeout: 100 });
+      flowControl = new LilypadFlowControl({ timeout: 100 });
       await expect(
         withFakeTimers(() =>
           flowControl.executeFn({
@@ -307,7 +307,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should apply retries with exponential backoff', async () => {
-      flowControl = new LilypadFlowControl<string>({ retries: 3 });
+      flowControl = new LilypadFlowControl({ retries: 3 });
       let attempts = 0;
 
       const result = await withFakeTimers(() =>
@@ -329,7 +329,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should use errorFn when provided', async () => {
-      flowControl = new LilypadFlowControl<string>({ retries: 1 });
+      flowControl = new LilypadFlowControl({ retries: 1 });
       const result = await withFakeTimers(() =>
         flowControl.executeFn({
           functionIdentifier: 'func1',
@@ -354,7 +354,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should clear single-flight map after execution', async () => {
-      flowControl = new LilypadFlowControl<string>();
+      flowControl = new LilypadFlowControl();
       await flowControl.executeFn({
         functionIdentifier: 'func1',
         consumerIdentifier: 'user1',
@@ -393,7 +393,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should execute with retries when retries are 0 (no retries)', async () => {
-      flowControl = new LilypadFlowControl<string>({ retries: 0 });
+      flowControl = new LilypadFlowControl({ retries: 0 });
       let attempts = 0;
 
       await expect(
@@ -412,7 +412,7 @@ describe('LilypadFlowControl', () => {
 
     it('should handle single-flight with promise rejection', async () => {
       const fnSpy = vi.fn(() => Promise.reject(new Error('execution failed')));
-      flowControl = new LilypadFlowControl<string>();
+      flowControl = new LilypadFlowControl();
 
       const promise1 = flowControl.executeFn({
         functionIdentifier: 'func1',
@@ -442,7 +442,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should apply timeout and retries together', async () => {
-      flowControl = new LilypadFlowControl<string>({ timeout: 200, retries: 2 });
+      flowControl = new LilypadFlowControl({ timeout: 200, retries: 2 });
       let attempts = 0;
 
       const result = await withFakeTimers(() =>
@@ -464,7 +464,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should throw timeout error even with retries configured', async () => {
-      flowControl = new LilypadFlowControl<string>({ timeout: 100, retries: 3 });
+      flowControl = new LilypadFlowControl({ timeout: 100, retries: 3 });
 
       await expect(
         withFakeTimers(() =>
@@ -478,7 +478,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should propagate the error when errorFn rethrows it', async () => {
-      flowControl = new LilypadFlowControl<string>({ retries: 1 });
+      flowControl = new LilypadFlowControl({ retries: 1 });
 
       await expect(
         withFakeTimers(() =>
@@ -495,7 +495,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should resolve with undefined when errorFn handles the error of a void execution', async () => {
-      const voidFlowControl = new LilypadFlowControl<void>();
+      const voidFlowControl = new LilypadFlowControl();
       const errorFn = vi.fn();
 
       await expect(
@@ -510,7 +510,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should allow different consumers for different function identifier', async () => {
-      flowControl = new LilypadFlowControl<string>({ rate: 1000 });
+      flowControl = new LilypadFlowControl({ rate: 1000 });
       const fnSpy1 = vi.fn(() => Promise.resolve('user1'));
       const fnSpy2 = vi.fn(() => Promise.resolve('user2'));
 
@@ -532,7 +532,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should use instance retries when option retries is not provided', async () => {
-      flowControl = new LilypadFlowControl<string>({ retries: 2 });
+      flowControl = new LilypadFlowControl({ retries: 2 });
       let attempts = 0;
 
       const result = await withFakeTimers(() =>
@@ -552,7 +552,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should prefer option retries over instance retries', async () => {
-      flowControl = new LilypadFlowControl<string>({ retries: 5 });
+      flowControl = new LilypadFlowControl({ retries: 5 });
       let attempts = 0;
 
       const result = await withFakeTimers(() =>
@@ -573,7 +573,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should handle concurrent executions with different function identifiers and rate limiting', async () => {
-      flowControl = new LilypadFlowControl<string>({ rate: 1000 });
+      flowControl = new LilypadFlowControl({ rate: 1000 });
       const fnSpy1 = vi.fn(() => Promise.resolve('func1'));
       const fnSpy2 = vi.fn(() => Promise.resolve('func2'));
 
@@ -597,7 +597,7 @@ describe('LilypadFlowControl', () => {
     });
 
     it('should apply retries at executeFn level with custom backoff', async () => {
-      flowControl = new LilypadFlowControl<string>({ retries: 3 });
+      flowControl = new LilypadFlowControl({ retries: 3 });
       const backoffSpy = vi.fn((_attempt) => 50);
       let attempts = 0;
 
@@ -628,7 +628,7 @@ describe('LilypadFlowControl errors', () => {
   });
 
   it('should fail a timed out attempt with a LilypadTimeoutError', async () => {
-    const flowControl = new LilypadFlowControl<string>({ timeout: 100 });
+    const flowControl = new LilypadFlowControl({ timeout: 100 });
 
     const result = withFakeTimers(() =>
       flowControl.executeWithTimeout(() => new Promise<string>(() => {}))
@@ -639,7 +639,7 @@ describe('LilypadFlowControl errors', () => {
   });
 
   it('should pass an execution refused by the rate limit to errorFn', async () => {
-    const flowControl = new LilypadFlowControl<string>({ rate: 1000 });
+    const flowControl = new LilypadFlowControl({ rate: 1000 });
     const run = () =>
       flowControl.executeFn({
         functionIdentifier: 'fn',
@@ -653,7 +653,7 @@ describe('LilypadFlowControl errors', () => {
   });
 
   it('should type executeWithTimeout per call', async () => {
-    const flowControl = new LilypadFlowControl<string>();
+    const flowControl = new LilypadFlowControl();
 
     const value: number = await flowControl.executeWithTimeout(async () => 42);
 

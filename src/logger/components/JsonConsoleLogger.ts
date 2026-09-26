@@ -1,4 +1,5 @@
-import LilypadLoggerComponent, {
+import {
+  LilypadLoggerComponent,
   safeJson,
   writeToConsole,
   type LilypadLogRecord,
@@ -21,7 +22,7 @@ import LilypadLoggerComponent, {
  * // {"time":"2026-09-24T10:00:00.000Z","level":"info","msg":"Invoice created { id: 'inv_1' }"}
  * ```
  */
-export default class LilypadJsonConsoleLogger<T extends string> extends LilypadLoggerComponent<T> {
+export class LilypadJsonConsoleLogger<T extends string> extends LilypadLoggerComponent<T> {
   protected override async sendRecord(record: LilypadLogRecord<T>): Promise<void> {
     const errors = record.parts.filter((part): part is Error => part instanceof Error);
     const line = safeJson({

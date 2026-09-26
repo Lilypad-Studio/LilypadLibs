@@ -46,11 +46,11 @@ declare class LilypadRateLimitError extends Error {
  * A flow control utility class that manages execution of asynchronous operations with support for
  * rate limiting, retries, timeouts, and single-flight request deduplication.
  *
- * @template T - The type of value resolved by the executed operations.
+ * The class is not generic: each execution is typed by its own `fn`.
  *
  * @example
  * ```typescript
- * const flowControl = new LilypadFlowControl<string>({
+ * const flowControl = new LilypadFlowControl({
  *   rate: 1000,
  *   timeout: 5000,
  *   retries: 3,
@@ -81,7 +81,7 @@ declare class LilypadRateLimitError extends Error {
  * @property retries - Maximum number of retry attempts for failed operations
  * @property logger - Optional logger instance for error, warning, info, and debug messages
  */
-declare class LilypadFlowControl<T> {
+declare class LilypadFlowControl {
     private rate?;
     private timeout?;
     private retries?;
@@ -92,8 +92,7 @@ declare class LilypadFlowControl<T> {
     /**
      * Executes an asynchronous function with a timeout constraint.
      *
-     * @template R The type of value returned by the execution function (the one of the instance by
-     * default).
+     * @template R The type of value returned by the execution function.
      * @param executionFn An asynchronous function to execute. It receives a signal that is aborted on timeout.
      * @param timeout The timeout, in milliseconds. Defaults to the instance's `timeout`.
      * @returns A promise that resolves with the result of `executionFn` if it completes before the timeout,
@@ -105,7 +104,7 @@ declare class LilypadFlowControl<T> {
      * to ensure no memory leaks occur regardless of whether the operation succeeds or times out.
      * JavaScript cannot forcibly stop a running promise: `executionFn` should observe the signal to stop its work.
      */
-    executeWithTimeout<R = T>(executionFn: (signal: AbortSignal) => Promise<R>, timeout?: number | undefined): Promise<R>;
+    executeWithTimeout<R>(executionFn: (signal: AbortSignal) => Promise<R>, timeout?: number | undefined): Promise<R>;
     /**
      * Executes a given asynchronous function with retry logic and optional exponential backoff.
      *
@@ -118,7 +117,7 @@ declare class LilypadFlowControl<T> {
      * @returns A promise that resolves with the result of `executionFn`, or with the result of `errorFn` if retries are exhausted.
      * @throws The error thrown by `executionFn` if all retries are exhausted and no `errorFn` is provided.
      */
-    executeWithRetries(options: {
+    executeWithRetries<T>(options: {
         executionFn: () => Promise<T>;
         retries?: number;
         errorFn?: (error: unknown) => T;
@@ -164,7 +163,7 @@ declare class LilypadFlowControl<T> {
      *   - backOffTime: Optional backoff time between retries.
      * @returns A promise that resolves with the result of the executed function.
      */
-    executeFn(options: LilypadExecuteFnOptions<T>): Promise<T>;
+    executeFn<T>(options: LilypadExecuteFnOptions<T>): Promise<T>;
 }
 
 export { type LilypadExecuteFnOptions, LilypadFlowControl, type LilypadFlowControlOptions, LilypadRateLimitError, LilypadTimeoutError };

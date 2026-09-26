@@ -30,6 +30,7 @@ export default defineConfig({
           include: [
             'src/cache/LilypadCache*.test.ts',
             'src/flow/**/*.test.ts',
+            'src/internal/**/*.test.ts',
             'src/logger/**/*.test.ts',
             'src/platform/**/*.test.ts',
             'src/serializer/**/*.test.ts',

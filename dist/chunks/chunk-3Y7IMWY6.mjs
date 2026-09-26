@@ -1,4 +1,4 @@
-"use strict";Object.defineProperty(exports, "__esModule", {value: true});// src/singleton/LilypadSingleton.ts
+// src/singleton/LilypadSingleton.ts
 var singletonMap = globalThis.__lilypadSingletonMap ??= /* @__PURE__ */ new Map();
 var signatureMap = globalThis.__lilypadSingletonSignatureMap ??= /* @__PURE__ */ new Map();
 function checkSignature(identifier, signature) {
@@ -55,22 +55,46 @@ async function getLilypadSingletonInstanceAsync(identifier, createInstanceFn, si
     throw error;
   }
 }
-function createLilypadSingletonAbleAsync(namespace, options, createInstanceFn, signature) {
-  if (!options.singleton) {
-    return createInstanceFn(void 0);
+function registryKeyOf(namespace, options) {
+  return options.singleton ? `${namespace}:${options.singletonIdentifier}` : void 0;
+}
+function releaseFor(registryKey) {
+  let released = registryKey === void 0;
+  return () => {
+    if (!released) {
+      released = true;
+      removeLilypadSingletonInstance(registryKey);
+    }
+  };
+}
+function createLilypadSingletonAble(namespace, options, createInstanceFn, signature) {
+  const registryKey = registryKeyOf(namespace, options);
+  if (registryKey === void 0) {
+    return createInstanceFn(releaseFor(void 0));
   }
-  const registryKey = `${namespace}:${options.singletonIdentifier}`;
+  return getLilypadSingletonInstance(
+    registryKey,
+    () => createInstanceFn(releaseFor(registryKey)),
+    signature
+  );
+}
+function createLilypadSingletonAbleAsync(namespace, options, createInstanceFn, signature) {
+  const registryKey = registryKeyOf(namespace, options);
+  if (registryKey === void 0) {
+    return createInstanceFn(releaseFor(void 0));
+  }
   return getLilypadSingletonInstanceAsync(
     registryKey,
-    () => createInstanceFn(registryKey),
+    () => createInstanceFn(releaseFor(registryKey)),
     signature
   );
 }
 
-
-
-
-
-
-exports.getLilypadSingletonInstance = getLilypadSingletonInstance; exports.removeLilypadSingletonInstance = removeLilypadSingletonInstance; exports.getLilypadSingletonInstanceAsync = getLilypadSingletonInstanceAsync; exports.createLilypadSingletonAbleAsync = createLilypadSingletonAbleAsync;
-//# sourceMappingURL=chunk-GU4ZU4ST.js.map
+export {
+  getLilypadSingletonInstance,
+  removeLilypadSingletonInstance,
+  getLilypadSingletonInstanceAsync,
+  createLilypadSingletonAble,
+  createLilypadSingletonAbleAsync
+};
+//# sourceMappingURL=chunk-3Y7IMWY6.mjs.map

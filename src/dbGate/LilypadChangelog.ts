@@ -17,6 +17,11 @@ export const LILYPAD_DEFAULT_NOTIFY_CHANNEL = 'cache_events';
 export const LILYPAD_CHANGELOG_VERSION = 3;
 export const LILYPAD_CHANGELOG_VERSION_PREFIX = 'lilypad-changelog:';
 
+/** Replaces the characters that are not allowed in the names derived from a table name. */
+function identifierPrefix(name: string): string {
+  return name.replace(/\W/g, '_');
+}
+
 /** Quotes an identifier; `schema.table` is quoted part by part. */
 export function quoteIdentifier(identifier: string): string {
   return identifier
@@ -31,12 +36,12 @@ function quoteLiteral(value: string): string {
 
 /** The trigger function name for a changelog table. */
 export function triggerFunctionName(changelogTable: string): string {
-  return `${changelogTable.replace(/\W/g, '_')}_record`;
+  return `${identifierPrefix(changelogTable)}_record`;
 }
 
 /** The names of the row trigger and of the TRUNCATE trigger that record the changes of a table. */
 export function changelogTriggerNames(table: string): { row: string; truncate: string } {
-  const prefix = table.replace(/\W/g, '_');
+  const prefix = identifierPrefix(table);
   return { row: `${prefix}_lilypad_changes`, truncate: `${prefix}_lilypad_truncate` };
 }
 
@@ -60,7 +65,7 @@ export function lilypadChangelogSql(options: LilypadChangelogSqlOptions = {}): s
   const table = options.table ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
   const channel = options.notifyChannel ?? LILYPAD_DEFAULT_NOTIFY_CHANNEL;
   const quotedTable = quoteIdentifier(table);
-  const indexPrefix = table.replace(/\W/g, '_');
+  const indexPrefix = identifierPrefix(table);
   const notify = (idExpression: string, opExpression: string) =>
     channel === false
       ? ''
@@ -163,19 +168,41 @@ export type LilypadChange = {
   xid: bigint;
 } & ({ rowId: string; op: 'INSERT' | 'UPDATE' | 'DELETE' } | { rowId: null; op: 'TRUNCATE' });
 
+/**
+ * Where the next read of the changelog starts: the transactions that a read could not see yet.
+ * They are the ones still running when it read (`xip`) and the ones that had not started
+ * (`xid >= xmax`): every other transaction had already committed or aborted, so its changes were
+ * visible to that read.
+ */
+export type LilypadChangelogCursor = {
+  /** The first transaction id not yet assigned when the read took its snapshot. */
+  xmax: bigint;
+  /** The transactions running when the read took its snapshot. */
+  xip: bigint[];
+};
+
 /** What to read of a table: the changes since a cursor, or those of the last `lookback` ms. */
 export type LilypadChangesRequest = {
   tableName: string;
-  since: { cursor: bigint } | { lookback: number };
+  since: { cursor: LilypadChangelogCursor } | { lookback: number };
 };
+
+/**
+ * Whether the changes of the transaction `xid` were visible to the read that produced `cursor`:
+ * a later read from this cursor does not return them.
+ */
+export function lilypadCursorCovers(cursor: LilypadChangelogCursor, xid: bigint): boolean {
+  return xid < cursor.xmax && !cursor.xip.includes(xid);
+}
 
 /**
  * Reads the changes of a table since `cursor`, and the cursor for the next read.
  *
- * The cursor is the oldest transaction still running at the time of the read: the next read
- * returns every change of that transaction or of later ones, so a transaction that commits after
- * a read is never missed, whatever the order of the commits. A change can therefore be returned
- * by several reads: callers skip the ids they have already processed.
+ * The cursor holds the transactions the read could not see yet (see
+ * {@link LilypadChangelogCursor}): the next read returns exactly the changes of those
+ * transactions that are visible to it, whatever the order of the commits. Each change is thus
+ * returned once, and a long-running transaction does not make every read return again all the
+ * changes made since it started.
  *
  * Without a cursor (first read, or a cursor no longer trusted), `since.lookback` returns the
  * changes recorded in the last `lookback` milliseconds instead.
@@ -187,7 +214,7 @@ export type LilypadChangesRequest = {
 export async function readLilypadChanges(
   gate: LilypadDbGate,
   options: LilypadChangesRequest & { changelogTable?: string }
-): Promise<{ changes: LilypadChange[]; cursor: bigint }> {
+): Promise<{ changes: LilypadChange[]; cursor: LilypadChangelogCursor }> {
   const { changes, cursor } = await readLilypadChangesBatch(gate, {
     requests: [{ tableName: options.tableName, since: options.since }],
     changelogTable: options.changelogTable,
@@ -202,28 +229,38 @@ export async function readLilypadChanges(
 export async function readLilypadChangesBatch(
   gate: LilypadDbGate,
   options: { requests: LilypadChangesRequest[]; changelogTable?: string }
-): Promise<{ changes: LilypadChange[][]; cursor: bigint }> {
+): Promise<{ changes: LilypadChange[][]; cursor: LilypadChangelogCursor }> {
   const sql = gate.sql;
   const changelogTable = sql(options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE);
-  // Passed as text arrays; an empty cursor selects the lookback of the request
+  // Passed as text arrays: an empty xmax selects the lookback of the request, and the running
+  // transactions of each cursor are joined by commas
   const tableRefs = options.requests.map((request) => quoteIdentifier(request.tableName));
   const cursors = options.requests.map((request) =>
-    'cursor' in request.since ? request.since.cursor.toString() : ''
+    'cursor' in request.since ? request.since.cursor : undefined
   );
+  const xmaxes = cursors.map((cursor) => cursor?.xmax.toString() ?? '');
+  const xips = cursors.map((cursor) => cursor?.xip.join(',') ?? '');
   const lookbacks = options.requests.map((request) =>
     'lookback' in request.since ? String(request.since.lookback / 1000) : '0'
   );
 
-  // One statement, so the snapshot and the rows are read together even through a pooler. Each
-  // branch of the lateral subquery can use its own index: (table_name, xid) or (changed_at).
+  // One statement, so the snapshot and the rows are read together even through a pooler: the
+  // snapshot functions return the snapshot the statement reads with.
   const rows = await sql`
-    WITH snapshot AS (SELECT pg_snapshot_xmin(pg_current_snapshot())::text AS next_cursor),
+    WITH snapshot AS (
+      SELECT pg_snapshot_xmax(current.s)::text AS next_xmax,
+        (SELECT coalesce(string_agg(x::text, ','), '') FROM pg_snapshot_xip(current.s) AS x) AS next_xip
+      FROM (SELECT pg_current_snapshot() AS s) AS current
+    ),
     requests AS (
       SELECT (r.ordinality - 1)::int AS request, r.table_ref,
-        NULLIF(r.since_cursor, '')::xid8 AS since_cursor, r.lookback_secs::float8 AS lookback_secs
+        NULLIF(r.since_xmax, '')::xid8 AS since_xmax,
+        string_to_array(NULLIF(r.since_xip, ''), ',')::xid8[] AS since_xip,
+        r.lookback_secs::float8 AS lookback_secs
       FROM unnest(
-        ${sql.array(tableRefs)}::text[], ${sql.array(cursors)}::text[], ${sql.array(lookbacks)}::text[]
-      ) WITH ORDINALITY AS r(table_ref, since_cursor, lookback_secs, ordinality)
+        ${sql.array(tableRefs)}::text[], ${sql.array(xmaxes)}::text[],
+        ${sql.array(xips)}::text[], ${sql.array(lookbacks)}::text[]
+      ) WITH ORDINALITY AS r(table_ref, since_xmax, since_xip, lookback_secs, ordinality)
     ),
     targets AS (
       SELECT requests.*, n.nspname AS schema_name, t.relname AS rel_name
@@ -231,18 +268,19 @@ export async function readLilypadChangesBatch(
       JOIN pg_class t ON t.oid = to_regclass(requests.table_ref)
       JOIN pg_namespace n ON n.oid = t.relnamespace
     )
-    SELECT snapshot.next_cursor, targets.request, c.id::text AS id, c.xid::text AS xid, c.row_id, c.op
+    SELECT snapshot.next_xmax, snapshot.next_xip, targets.request,
+      c.id::text AS id, c.xid::text AS xid, c.row_id, c.op
     FROM snapshot
     LEFT JOIN targets ON true
     LEFT JOIN LATERAL (
       SELECT c.id, c.xid, c.row_id, c.op FROM ${changelogTable} c
-      WHERE targets.since_cursor IS NOT NULL
+      WHERE targets.since_xmax IS NOT NULL
         AND c.table_name = targets.rel_name
         AND (c.table_schema = targets.schema_name OR c.table_schema IS NULL)
-        AND c.xid >= targets.since_cursor
+        AND (c.xid >= targets.since_xmax OR c.xid = ANY(targets.since_xip))
       UNION ALL
       SELECT c.id, c.xid, c.row_id, c.op FROM ${changelogTable} c
-      WHERE targets.since_cursor IS NULL
+      WHERE targets.since_xmax IS NULL
         AND c.table_name = targets.rel_name
         AND (c.table_schema = targets.schema_name OR c.table_schema IS NULL)
         AND c.changed_at >= clock_timestamp() - make_interval(secs => targets.lookback_secs)
@@ -261,11 +299,16 @@ export async function readLilypadChangesBatch(
       } as LilypadChange);
     }
   }
-  const nextCursor: unknown = rows[0]?.next_cursor;
-  if (typeof nextCursor !== 'string') {
+  const nextXmax: unknown = rows[0]?.next_xmax;
+  const nextXip: unknown = rows[0]?.next_xip;
+  if (typeof nextXmax !== 'string' || typeof nextXip !== 'string') {
     throw new Error('Reading the changelog returned no snapshot.');
   }
-  return { changes, cursor: BigInt(nextCursor) };
+  const cursor: LilypadChangelogCursor = {
+    xmax: BigInt(nextXmax),
+    xip: nextXip === '' ? [] : nextXip.split(',').map((xid) => BigInt(xid)),
+  };
+  return { changes, cursor };
 }
 
 /**
