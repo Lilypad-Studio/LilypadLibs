@@ -1,8 +1,8 @@
 {
   "name": "@lilypad/libs",
   "version": "0.4.0",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "dist/index.cjs",
+  "types": "dist/index.d.cts",
   "module": "./dist/index.mjs",
   "exports": {
     ".": {
@@ -11,8 +11,8 @@
         "default": "./dist/index.mjs"
       },
       "require": {
-        "types": "./dist/index.d.ts",
-        "default": "./dist/index.js"
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
       }
     },
     "./cache": {
@@ -21,8 +21,8 @@
         "default": "./dist/cache.mjs"
       },
       "require": {
-        "types": "./dist/cache.d.ts",
-        "default": "./dist/cache.js"
+        "types": "./dist/cache.d.cts",
+        "default": "./dist/cache.cjs"
       }
     },
     "./db": {
@@ -31,8 +31,8 @@
         "default": "./dist/db.mjs"
       },
       "require": {
-        "types": "./dist/db.d.ts",
-        "default": "./dist/db.js"
+        "types": "./dist/db.d.cts",
+        "default": "./dist/db.cjs"
       }
     },
     "./flow": {
@@ -41,8 +41,8 @@
         "default": "./dist/flow.mjs"
       },
       "require": {
-        "types": "./dist/flow.d.ts",
-        "default": "./dist/flow.js"
+        "types": "./dist/flow.d.cts",
+        "default": "./dist/flow.cjs"
       }
     },
     "./logger": {
@@ -51,8 +51,8 @@
         "default": "./dist/logger.mjs"
       },
       "require": {
-        "types": "./dist/logger.d.ts",
-        "default": "./dist/logger.js"
+        "types": "./dist/logger.d.cts",
+        "default": "./dist/logger.cjs"
       }
     },
     "./platform": {
@@ -61,8 +61,8 @@
         "default": "./dist/platform.mjs"
       },
       "require": {
-        "types": "./dist/platform.d.ts",
-        "default": "./dist/platform.js"
+        "types": "./dist/platform.d.cts",
+        "default": "./dist/platform.cjs"
       }
     },
     "./serializer": {
@@ -71,8 +71,8 @@
         "default": "./dist/serializer.mjs"
       },
       "require": {
-        "types": "./dist/serializer.d.ts",
-        "default": "./dist/serializer.js"
+        "types": "./dist/serializer.d.cts",
+        "default": "./dist/serializer.cjs"
       }
     },
     "./singleton": {
@@ -81,8 +81,8 @@
         "default": "./dist/singleton.mjs"
       },
       "require": {
-        "types": "./dist/singleton.d.ts",
-        "default": "./dist/singleton.js"
+        "types": "./dist/singleton.d.cts",
+        "default": "./dist/singleton.cjs"
       }
     }
   },
@@ -100,7 +100,7 @@
     "Lorenzo Pierro"
   ],
   "scripts": {
-    "build": "tsup --dts",
+    "build": "tsdown --config-loader unrun",
     "typecheck": "tsc --noEmit",
     "lint": "eslint --fix",
     "test": "vitest --project unit --project edge",
@@ -127,8 +127,9 @@
     "husky": "^9.1.7",
     "postgres": "^3.4.7",
     "prettier": "^3.4.2",
-    "tsup": "^8.5.1",
+    "tsdown": "^0.23.0",
     "typescript": "^5.9.3",
+    "unrun": "^0.3.1",
     "vitest": "^4.0.15"
   }
 }

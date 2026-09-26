@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-- `npm run build`: tsup bundles the entries (`src/index.ts` and `src/entries/*.ts`) into `dist/`, as CJS and ESM, with `.d.ts`/`.d.mts` and sourcemaps.
+- `npm run build`: tsdown (rolldown) bundles the entries (`src/index.ts` and `src/entries/*.ts`) into `dist/`, as CJS (`.cjs`, `.d.cts`) and ESM (`.mjs`, `.d.mts`), with sourcemaps; the shared chunks go to `dist/chunks/`. The CJS output is forced strict (`outputOptions.strict`). The config is loaded with `unrun` (`--config-loader unrun`), whatever the Node.js version. `dist/` must be byte-identical on every OS: check a build change against a Linux build (e.g. in a `node:22` container).
 - `npm test`: vitest projects `unit` and `edge`. `edge` runs the tests of the edge-compatible modules again in the `edge-runtime` environment. Watch mode in a TTY, so use `npm test -- --run` for a single pass.
 - `npm run test:integration`: `*.integration.test.ts` files (vitest project `integration`). They start a PostgreSQL container with testcontainers, so **Docker must be running**. They are not part of `npm test` or of the pre-commit hook.
 - Single file: `npx vitest run src/cache/LilypadCache.test.ts`
@@ -29,7 +29,7 @@ Files are LF: when a script rewrites a file on Windows, write it with `newline='
 ## Architecture
 
 ### Public surface
-- Each module has an entry in `src/entries/` (`logger`, `cache`, `flow`, `serializer`, `singleton`, `platform`, `db`), published as a subpath (`@lilypad/libs/logger`, ...). `src/index.ts` re-exports every entry **except `db`**, so that the root entry never pulls in postgres.js. A new class or type must be exported from its entry, or it will not ship. An entry also needs its line in `tsup.config.ts` and in the `exports` of `package.json`.
+- Each module has an entry in `src/entries/` (`logger`, `cache`, `flow`, `serializer`, `singleton`, `platform`, `db`), published as a subpath (`@lilypad/libs/logger`, ...). `src/index.ts` re-exports every entry **except `db`**, so that the root entry never pulls in postgres.js. A new class or type must be exported from its entry, or it will not ship. An entry also needs its line in `tsdown.config.ts` and in the `exports` of `package.json`.
 - Exported classes keep the `Lilypad` prefix. Everything is exported by name: no default exports.
 - **Edge compatibility**: every entry except `db` must not reach Node.js APIs (`node:*`) or `postgres`. `src/entries/entries.test.ts` follows the value imports of each entry and fails otherwise, and the `edge` vitest project runs their tests in an edge runtime (its `include` list must name the test folders of new edge modules, e.g. `src/internal/`). Use `globalThis.crypto` rather than `node:crypto`; `LilypadDbCache` lives in `db`, since it imports the gate.
 

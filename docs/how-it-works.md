@@ -124,7 +124,7 @@ This rule is enforced twice:
 - [src/entries/entries.test.ts](../src/entries/entries.test.ts) reads the source of each entry, follows every *value* import (`import type` is skipped, since it disappears at build time) and fails if an edge entry reaches any external module. The `db` entry may reach exactly `postgres` and `node:crypto`.
 - The `edge` project of [vitest.config.ts](../vitest.config.ts) runs the tests of the edge modules a second time inside the `edge-runtime` environment, where Node.js globals do not exist. This is why the cache uses `globalThis.crypto.randomUUID()` and never `node:crypto`.
 
-The build ([tsup.config.ts](../tsup.config.ts)) bundles each entry as CJS and ESM with type declarations. `splitting: true` puts the modules shared by several entries in common chunks, so that there is **one copy of each class** no matter which subpath imported it. Without that, `error instanceof LilypadCacheCooldownError` could fail when the error was thrown by a class from another bundle copy.
+The build ([tsdown.config.ts](../tsdown.config.ts)) bundles each entry as CJS (`.cjs`) and ESM (`.mjs`) with type declarations and source maps. Rolldown puts the modules shared by several entries in common chunks (`dist/chunks/`), in both formats, so that there is **one copy of each class** no matter which subpath imported it. Without that, `error instanceof LilypadCacheCooldownError` could fail when the error was thrown by a class from another bundle copy.
 
 `dist/` is committed, because the package is installed straight from git. The pre-commit hook stashes the unstaged changes, runs the checks and the build on what is being committed, and stages `dist/`; CI checks that the committed `dist/` matches the sources.
 
