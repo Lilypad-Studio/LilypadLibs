@@ -5,6 +5,7 @@ import {
   checkLilypadSchema,
   formatLilypadSchemaProblems,
   LilypadSchemaCheckError,
+  type LilypadChangelogPruning,
 } from '@/dbGate/LilypadSchemaCheck';
 import { LilypadBackoff } from '@/internal/LilypadBackoff';
 import type { LilypadLibLogLevel } from '@/logger/LilypadLibLogger';
@@ -17,6 +18,10 @@ export type LilypadSchemaVerifierOptions = {
   strategy: 'listen' | 'changelog' | 'none';
   /** The changelog table, with the `changelog` strategy. */
   changelogTable?: string;
+  /** How the changelog is pruned, with the `changelog` strategy. */
+  pruning?: LilypadChangelogPruning;
+  /** The shortest retention of the changelog the cache accepts: its `maxGap` and `lookback`. */
+  minRetention?: number;
   mode: LilypadDbCacheSchemaVerification;
   platform?: LilypadPlatform;
   log: (level: LilypadLibLogLevel, ...message: unknown[]) => void;
@@ -28,7 +33,8 @@ export type LilypadSchemaVerifierOptions = {
 
 /**
  * Checks once that the database has the triggers a sync strategy needs, and resolves the schema of
- * the table. With `warn` it never rejects: problems and failures are logged. A check that could not
+ * the table. With `warn` it never rejects: problems and failures are logged. With `throw` it rejects
+ * if the check found errors; warnings (e.g. a changelog that nothing prunes) are logged. A check that could not
  * run (e.g. the database was unreachable) is forgotten, so that a later read runs it again after a
  * backoff; a check that found problems is not repeated.
  */
@@ -74,12 +80,14 @@ export class LilypadSchemaVerifier {
 
   /** @returns `false` if the check could not run (with `warn`; `throw` rejects). */
   private async run(mode: 'warn' | 'throw'): Promise<boolean> {
-    const { gate, tableName, primaryKey, strategy, changelogTable, log } = this.options;
+    const { gate, tableName, primaryKey, strategy, changelogTable, pruning, minRetention, log } =
+      this.options;
     const subject = `LilypadDbCache "${tableName}" (sync: ${strategy})`;
     try {
       const result = await checkLilypadSchema(gate, {
         tables: [{ table: tableName, primaryKey }],
-        changelog: strategy === 'changelog' ? { table: changelogTable } : false,
+        changelog:
+          strategy === 'changelog' ? { table: changelogTable, pruning, minRetention } : false,
         notifyChannel: strategy === 'listen' ? LILYPAD_DEFAULT_NOTIFY_CHANNEL : false,
       });
       const schema = result.tables[0]?.schema;
@@ -87,10 +95,10 @@ export class LilypadSchemaVerifier {
         this.options.onSchema(schema);
       }
       this.backoff.succeed();
-      if (result.ok) {
+      if (result.problems.length === 0) {
         return true;
       }
-      if (mode === 'throw') {
+      if (mode === 'throw' && !result.ok) {
         throw new LilypadSchemaCheckError(subject, result.problems);
       }
       const message = formatLilypadSchemaProblems(subject, result.problems);

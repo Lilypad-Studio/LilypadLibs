@@ -812,6 +812,7 @@ The options of the `changelog` strategy:
 | `lookback` | TTL + `staleWhileRevalidate` + 1 min | On the first read, or after `maxGap`, the changes of this period are applied, which also removes older copies from the shared level |
 | `maxAge` | 1 hour | How long a row can be kept past its TTL while the sync is trusted: see [The TTL while the cache is in sync](#the-ttl-while-the-cache-is-in-sync). `listen` accepts it too |
 | `table` | `lilypad_cache_changes` | The changelog table, if you renamed it |
+| `pruning` | `'detect'` | How the old changelog rows are deleted, for the check: `'detect'` looks for the pruning and suggests one if it finds none; `'external'` if a job it cannot see deletes them (e.g. `pruneLilypadChangelog` from a scheduled function). See [Checking the pruning of the changelog](#checking-the-pruning-of-the-changelog) |
 | `verify` | `'warn'` | Checks that the changelog and the trigger are installed: see [Checking the database setup](#checking-the-database-setup) |
 
 The caches of a gate that use the same changelog table read it together, in one query per poll. A failed read of the changelog is logged, and the read of the cache goes on with its current content; the next attempt waits for a backoff (from `pollInterval`, doubling up to one minute) instead of retrying at every read. A failed lazy `LISTEN` backs off the same way, from one second. The [Next.js guide](docs/nextjs-vercel.md#5-database-caches-keeping-every-instance-up-to-date) explains how to choose these values.
@@ -823,7 +824,7 @@ The library does not create the changelog or the triggers itself: without them, 
 | `verify` | When | If something is missing |
 | --- | --- | --- |
 | `'warn'` (default) | Once, when the cache first uses the database: before `LISTEN`, or with the first read of the changelog (which does not wait for it). If the check cannot run (e.g. the database is unreachable), a later read runs it again, after a backoff | A warning on the logger (on `console.warn` without a logger), with the SQL that fixes it |
-| `'throw'` | In `create`, which then queries the database whatever the strategy | `create` rejects with a `LilypadSchemaCheckError`, whose `problems` list what is missing |
+| `'throw'` | In `create`, which then queries the database whatever the strategy | `create` rejects with a `LilypadSchemaCheckError`, whose `problems` list what is missing. Problems of severity `warning` (see below) are only logged |
 | `'off'` | Never | |
 
 With `changelog`, the check looks for the changelog table, its trigger function (installed by this version of the library) and the changelog trigger on the table, recording its primary key. With `listen`, it looks for triggers of the table whose function calls `pg_notify('cache_events', ...)` (yours or the library's), firing on each `INSERT`, `UPDATE` and `DELETE` row. If you send notifications another way, set `verify: 'off'`.
@@ -840,13 +841,35 @@ const { ok, problems, tables } = await checkLilypadSchema(gate, {
   changelog: {}, // the default; `{ table }` if you renamed it, `false` to skip
   notifyChannel: 'cache_events', // also check the notifications (default: false)
 });
-for (const { code, table, message, fix } of problems) {
-  console.log(code, table, message); // e.g. 'missing-changelog-trigger' 'accounts' ...
+for (const { code, severity, table, message, fix } of problems) {
+  console.log(severity, code, table, message); // e.g. 'error' 'missing-changelog-trigger' 'accounts' ...
   if (fix) console.log(fix); // the SQL to run in a migration
 }
 ```
 
-`tables` gives the schema each table resolves to (`null` if it does not exist). The codes are `unsupported-version`, `missing-table`, `missing-changelog`, `outdated-changelog` (installed by an older version of the library: run `lilypadChangelogSql()` again, with the same `notifyChannel`; the suggested SQL keeps the channel of the installed function, or the one the check requires), `missing-changelog-trigger` (missing, disabled or not on every `INSERT`, `UPDATE` and `DELETE`), `wrong-trigger-primary-key`, `missing-notify-trigger` (no trigger notifies on the channel, or not on each of `INSERT`, `UPDATE` and `DELETE`) and `missing-truncate-trigger` (`TRUNCATE` is not recorded, or, with `notifyChannel`, not notified: add it with `lilypadChangelogTriggerSql`, or handle `TG_OP = 'TRUNCATE'` in your own trigger).
+Each problem has a `severity`. `error`: the caches can serve stale data; `ok` is `false`, and `verify: 'throw'` rejects. `warning`: they work, but something needs attention (only the pruning checks below report warnings); `ok` stays `true`.
+
+`tables` gives the schema each table resolves to (`null` if it does not exist). The codes are `unsupported-version`, `missing-table`, `missing-changelog`, `outdated-changelog` (installed by an older version of the library: run `lilypadChangelogSql()` again, with the same `notifyChannel`; the suggested SQL keeps the channel of the installed function, or the one the check requires), `missing-changelog-trigger` (missing, disabled or not on every `INSERT`, `UPDATE` and `DELETE`), `wrong-trigger-primary-key`, `missing-notify-trigger` (no trigger notifies on the channel, or not on each of `INSERT`, `UPDATE` and `DELETE`) `missing-truncate-trigger` (`TRUNCATE` is not recorded, or, with `notifyChannel`, not notified: add it with `lilypadChangelogTriggerSql`, or handle `TG_OP = 'TRUNCATE'` in your own trigger), and the pruning codes below.
+
+#### Checking the pruning of the changelog
+
+When it checks the changelog, the check also looks at how its old rows are deleted, and suggests the best way for your database when it finds none:
+
+| It finds | How |
+| --- | --- |
+| The `prune` option of the trigger | The `lilypad-prune:` comment in the trigger function, which also gives its retention |
+| A pg_cron job | A job of `cron.job` (in this database) whose command is a `DELETE FROM` the changelog table. The retention is read from `make_interval(secs => ...)` (the SQL of the library) or an interval literal (`interval '7 days'`). Row-level security hides the jobs of the other roles, except from a superuser: create the job with the role of the check |
+| That something deletes rows | `pg_stat_user_tables.n_tup_del` of the changelog is not zero: a job it cannot see, such as `pruneLilypadChangelog` from a scheduled function, prunes it |
+
+It cannot see a pg_cron job in another database (pg_cron often runs in `postgres`), nor a job of your application until it has deleted rows. Set `pruning: 'external'` (in the `changelog` options of the check, or in `sync` for a cache) to tell it that you prune the changelog yourself.
+
+| Code | Severity | When | The fix |
+| --- | --- | --- | --- |
+| `short-changelog-retention` | error | A pruning found deletes rows that are not older than `minRetention`: a cache could miss changes without knowing it | The same pruning (same `every`/`batchSize`, or same job name and schedule), with a retention of 4 × `minRetention`, at least 24 hours |
+| `no-changelog-pruning` | warning | None of the above, and `pruning` is not `'external'` | The best pruning for the database: a pg_cron job where pg_cron is installed, or known to run in this database; a job scheduled from the database pg_cron runs in, if that is another one (`cron.database_name`, if the role can read it); otherwise the `prune` option of the trigger, which needs nothing (the message mentions pg_cron if the server has it). If the changelog is missing or outdated too, its fix installs it with that option, in one SQL |
+| `unpruned-changelog` | warning | The oldest row of the changelog is older than the retention found (24 hours if unknown) plus 7 days: the pruning does not run, or does not keep up. Checked whatever `pruning` says | A `DELETE` of the old rows, once |
+
+`minRetention` is the retention the caches need: a cache passes the larger of its `maxGap` and its `lookback`; `checkLilypadSchema` defaults to 1 hour (the default `maxGap`). With the `listen` strategy, the check does not look at the changelog, nor at its pruning.
 
 #### Custom notification triggers and callbacks
 

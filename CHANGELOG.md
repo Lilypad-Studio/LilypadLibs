@@ -5,6 +5,12 @@
 ### Added
 
 - **Changelog pruning without an application job**: `lilypadChangelogPruneScheduleSql({ olderThan })` returns the SQL that schedules a pg_cron job deleting the old changelog rows, and `lilypadChangelogSql({ prune: { olderThan } })` makes the trigger delete a batch of old rows as it records changes. `lilypadChangelogSql()` without `prune` also drops the prune function, and the schema check keeps the prune options of an installed changelog in the SQL it suggests. The changelog stays at version 4: nothing to run again.
+- **The schema check looks at the pruning of the changelog**: it finds the `prune` option of the trigger and the pg_cron jobs of the database that delete from the changelog, reports a retention not longer than the `maxGap` and `lookback` of the caches as an error (`short-changelog-retention`), and otherwise warns with the best pruning for the database (`no-changelog-pruning`: a pg_cron job where pg_cron runs, else the `prune` option). It also warns when the oldest row is older than the retention plus 7 days (`unpruned-changelog`). Set `pruning: 'external'` (cache `sync` options, or the `changelog` options of `checkLilypadSchema`) if a job it cannot see prunes it.
+- **Schema problems have a `severity`**: `error` or `warning`. `ok` is `false` only with errors, and `verify: 'throw'` rejects only for errors; warnings are logged.
+
+### Changed
+
+- `LilypadSchemaFacts` has new required fields (`database`, `cron`, and `schema`, `hasPruneFunction`, `oldestRowAge`, `deletedRows` in `changelog`): code that builds facts for `evaluateLilypadSchema` must set them. A changelog cache's first check now also reads `pg_available_extensions`, `pg_stat_user_tables`, the age of the oldest changelog row and `cron.job` (when it exists).
 
 ## 0.4.0
 

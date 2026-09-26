@@ -45,7 +45,7 @@ export function triggerFunctionName(changelogTable: string): string {
 }
 
 /** The name of the function that deletes the old rows of a changelog table (`prune` option). */
-function pruneFunctionName(changelogTable: string): string {
+export function pruneFunctionName(changelogTable: string): string {
   return `${identifierPrefix(changelogTable)}_prune`;
 }
 
@@ -155,7 +155,7 @@ export function installedLilypadChangelogPrune(
 }
 
 /** The SQL condition on `changed_at` of the rows older than `olderThan` milliseconds. */
-function olderThanCondition(olderThan: number): string {
+export function olderThanCondition(olderThan: number): string {
   return `changed_at < clock_timestamp() - make_interval(secs => ${olderThan / 1000})`;
 }
 

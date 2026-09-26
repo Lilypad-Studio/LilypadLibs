@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import postgres from 'postgres';
 import { LilypadDbGate, LilypadDbNotFoundError, type LilypadDbSchema } from './LilypadDbGate';
@@ -11,7 +11,11 @@ import {
   readLilypadChanges,
   readLilypadChangesBatch,
 } from './LilypadChangelog';
-import { checkLilypadSchema } from './LilypadSchemaCheck';
+import {
+  checkLilypadSchema,
+  readLilypadSchemaFacts,
+  type LilypadSchemaCheckOptions,
+} from './LilypadSchemaCheck';
 import type { LilypadLoggerType } from '@/logger/LilypadLogger';
 
 type User = { id: number; name: string; role: string };
@@ -775,6 +779,163 @@ describe('LilypadDbGate (integration)', () => {
           await admin`DROP SCHEMA cron CASCADE`;
         }
       });
+
+      describe('detected by the schema check', () => {
+        const DAY = 24 * 60 * 60_000;
+        // A changelog of its own, created for each test: its deletion statistics start at zero
+        const changes = 'detected_changes';
+        const options = (changelog: { pruning?: 'external' } = {}) => ({
+          tables: [],
+          changelog: { table: changes, ...changelog },
+        });
+        const codes = (result: Awaited<ReturnType<typeof checkLilypadSchema>>) =>
+          result.problems.map((problem) => problem.code);
+        const recordChange = (age: string) =>
+          admin.unsafe(`
+            INSERT INTO ${changes} (table_name, row_id, op, changed_at)
+            VALUES ('users', '1', 'INSERT', now() - interval '${age}')
+          `);
+
+        beforeEach(async () => {
+          await admin.unsafe(lilypadChangelogSql({ table: changes, notifyChannel: false }));
+        });
+
+        afterEach(async () => {
+          await admin.unsafe(`
+            DROP TABLE ${changes};
+            DROP FUNCTION detected_changes_record();
+            DROP FUNCTION IF EXISTS detected_changes_prune();
+            DROP SCHEMA IF EXISTS cron CASCADE;
+          `);
+        });
+
+        it('should read that the server has no pg_cron', async () => {
+          const facts = await readLilypadSchemaFacts(gate, options());
+
+          expect(facts.cron).toEqual({
+            available: false,
+            installed: false,
+            database: null,
+            jobs: null,
+          });
+          expect(facts.changelog).toMatchObject({
+            schema: 'public',
+            hasPruneFunction: false,
+            oldestRowAge: null,
+            deletedRows: 0,
+          });
+        });
+
+        it('should suggest the prune option of the trigger without pg_cron, as a warning', async () => {
+          const result = await checkLilypadSchema(gate, options());
+
+          expect(result.ok).toBe(true);
+          expect(codes(result)).toEqual(['no-changelog-pruning']);
+          expect(result.problems[0]!.severity).toBe('warning');
+
+          await admin.unsafe(result.problems[0]!.fix!);
+
+          expect((await readLilypadSchemaFacts(gate, options())).changelog.hasPruneFunction).toBe(
+            true
+          );
+          expect(await checkLilypadSchema(gate, options())).toMatchObject({
+            ok: true,
+            problems: [],
+          });
+        });
+
+        it('should report a trigger that prunes rows the caches still need, as an error', async () => {
+          await admin.unsafe(
+            lilypadChangelogSql({
+              table: changes,
+              notifyChannel: false,
+              prune: { olderThan: 30 * 60_000 },
+            })
+          );
+
+          const result = await checkLilypadSchema(gate, options());
+          expect(result.ok).toBe(false);
+          expect(codes(result)).toEqual(['short-changelog-retention']);
+
+          await admin.unsafe(result.problems[0]!.fix!);
+
+          expect((await checkLilypadSchema(gate, options())).problems).toEqual([]);
+        });
+
+        it('should find a pg_cron job that deletes from the changelog, and read its retention', async () => {
+          // pg_cron is not in the image: a stand-in cron.job with the columns of pg_cron 1.6
+          await admin.unsafe(`
+            CREATE SCHEMA cron;
+            CREATE TABLE cron.job (
+              jobid bigserial PRIMARY KEY, schedule text, command text, nodename text,
+              nodeport int, database text, username text, active boolean DEFAULT true,
+              jobname text
+            );
+            INSERT INTO cron.job (schedule, command, database, username, jobname) VALUES (
+              '0 3 * * *',
+              'DELETE FROM public.${changes} WHERE changed_at < now() - interval ''2 days''',
+              current_database(), current_user, 'prune_changes'
+            );
+          `);
+
+          const facts = await readLilypadSchemaFacts(gate, options());
+          expect(facts.cron.jobs).toEqual([
+            {
+              id: 1,
+              name: 'prune_changes',
+              schedule: '0 3 * * *',
+              command: `DELETE FROM public.${changes} WHERE changed_at < now() - interval '2 days'`,
+              active: true,
+              database: facts.database,
+            },
+          ]);
+          expect((await checkLilypadSchema(gate, options())).problems).toEqual([]);
+
+          await admin`UPDATE cron.job SET command = replace(command, '2 days', '1 hour')`;
+          const short = await checkLilypadSchema(gate, options());
+          expect(codes(short)).toEqual(['short-changelog-retention']);
+          expect(short.problems[0]!.fix).toContain(
+            "SELECT cron.schedule('prune_changes', '0 3 * * *', format("
+          );
+
+          await admin`UPDATE cron.job SET active = false`;
+          const inactive = await checkLilypadSchema(gate, options());
+          expect(codes(inactive)).toEqual(['no-changelog-pruning']);
+          expect(inactive.problems[0]!.message).toContain('"prune_changes" deletes them');
+        });
+
+        it('should report a changelog whose oldest row is too old, whatever prunes it', async () => {
+          await recordChange('30 days');
+
+          const facts = await readLilypadSchemaFacts(gate, options({ pruning: 'external' }));
+          expect(facts.changelog.oldestRowAge).toBeGreaterThan(30 * DAY - 60_000);
+          const result = await checkLilypadSchema(gate, options({ pruning: 'external' }));
+          expect(codes(result)).toEqual(['unpruned-changelog']);
+
+          await admin.unsafe(result.problems[0]!.fix!);
+
+          expect(
+            (await checkLilypadSchema(gate, options({ pruning: 'external' }))).problems
+          ).toEqual([]);
+        });
+
+        it('should suggest nothing once rows were deleted from the changelog, by a job it cannot see', async () => {
+          await recordChange('2 days');
+          const connection = await admin.reserve();
+          try {
+            await connection.unsafe(`DELETE FROM ${changes}`);
+            // The session flushes its statistics when it goes idle next, instead of up to 10 s later
+            await connection`SELECT pg_stat_force_next_flush()`;
+          } finally {
+            connection.release();
+          }
+
+          await vi.waitFor(
+            async () => expect((await checkLilypadSchema(gate, options())).problems).toEqual([]),
+            { timeout: 15_000, interval: 200 }
+          );
+        });
+      });
     });
 
     it('should keep a LilypadDbCache in sync without LISTEN', async () => {
@@ -844,9 +1005,17 @@ describe('LilypadDbGate (integration)', () => {
     const users = { table: 'users', primaryKey: 'id' };
     const codes = (result: Awaited<ReturnType<typeof checkLilypadSchema>>) =>
       result.problems.map((problem) => problem.code);
+    // The pruning has its own tests: here it is declared external, so that the deletions of the
+    // other tests (whose statistics are flushed at any time) change no result
+    const check = (options: LilypadSchemaCheckOptions) =>
+      checkLilypadSchema(gate, {
+        ...options,
+        changelog:
+          options.changelog === false ? false : { pruning: 'external', ...options.changelog },
+      });
 
     it('should find nothing to fix in a database set up with the library SQL', async () => {
-      const result = await checkLilypadSchema(gate, {
+      const result = await check({
         tables: [users],
         notifyChannel: 'cache_events', // sent by the custom trigger of the test table
       });
@@ -859,7 +1028,7 @@ describe('LilypadDbGate (integration)', () => {
     });
 
     it('should report a missing table', async () => {
-      const result = await checkLilypadSchema(gate, {
+      const result = await check({
         tables: [{ table: 'missing', primaryKey: 'id' }],
       });
 
@@ -871,12 +1040,12 @@ describe('LilypadDbGate (integration)', () => {
       await admin`CREATE TABLE unwatched (id int PRIMARY KEY)`;
       try {
         const options = { tables: [{ table: 'unwatched', primaryKey: 'id' }] };
-        const result = await checkLilypadSchema(gate, options);
+        const result = await check(options);
         expect(codes(result)).toEqual(['missing-changelog-trigger']);
 
         await admin.unsafe(result.problems[0]!.fix!);
 
-        expect((await checkLilypadSchema(gate, options)).ok).toBe(true);
+        expect((await check(options)).ok).toBe(true);
       } finally {
         await admin`DROP TABLE unwatched`;
       }
@@ -885,7 +1054,7 @@ describe('LilypadDbGate (integration)', () => {
     it('should report a disabled changelog trigger', async () => {
       await admin`ALTER TABLE users DISABLE TRIGGER users_lilypad_update`;
       try {
-        const result = await checkLilypadSchema(gate, { tables: [users] });
+        const result = await check({ tables: [users] });
 
         expect(codes(result)).toEqual(['missing-changelog-trigger']);
         expect(result.problems[0]!.message).toContain('do not record UPDATE');
@@ -898,7 +1067,7 @@ describe('LilypadDbGate (integration)', () => {
     it('should report a changelog trigger that fires only on replicas', async () => {
       await admin`ALTER TABLE users ENABLE REPLICA TRIGGER users_lilypad_delete`;
       try {
-        const result = await checkLilypadSchema(gate, { tables: [users] });
+        const result = await check({ tables: [users] });
 
         expect(codes(result)).toEqual(['missing-changelog-trigger']);
         expect(result.problems[0]!.message).toContain('do not record DELETE');
@@ -919,7 +1088,7 @@ describe('LilypadDbGate (integration)', () => {
       `;
       try {
         const options = { tables: [{ table: 'legacy', primaryKey: 'id' }] };
-        expect((await checkLilypadSchema(gate, options)).ok).toBe(true);
+        expect((await check(options)).ok).toBe(true);
         await admin`INSERT INTO legacy VALUES (1), (2)`;
 
         await admin.unsafe(lilypadChangelogTriggerSql({ table: 'legacy', primaryKey: 'id' }));
@@ -935,7 +1104,7 @@ describe('LilypadDbGate (integration)', () => {
           WHERE tgrelid = 'legacy'::regclass AND tgname = 'legacy_lilypad_changes'
         `;
         expect(trigger!.count).toBe(0);
-        expect((await checkLilypadSchema(gate, options)).ok).toBe(true);
+        expect((await check(options)).ok).toBe(true);
       } finally {
         await admin`DROP TABLE legacy`;
       }
@@ -950,12 +1119,12 @@ describe('LilypadDbGate (integration)', () => {
       `;
       try {
         const options = { tables: [{ table: 'unwatched', primaryKey: 'id' }] };
-        const result = await checkLilypadSchema(gate, options);
+        const result = await check(options);
         expect(codes(result)).toEqual(['missing-truncate-trigger']);
 
         await admin.unsafe(result.problems[0]!.fix!);
 
-        expect((await checkLilypadSchema(gate, options)).ok).toBe(true);
+        expect((await check(options)).ok).toBe(true);
       } finally {
         await admin`DROP TABLE unwatched`;
       }
@@ -964,7 +1133,7 @@ describe('LilypadDbGate (integration)', () => {
     it('should report a changelog installed by version 2', async () => {
       await admin`COMMENT ON FUNCTION lilypad_cache_changes_record() IS 'lilypad-changelog:2'`;
       try {
-        const result = await checkLilypadSchema(gate, { tables: [] });
+        const result = await check({ tables: [] });
 
         expect(codes(result)).toEqual(['outdated-changelog']);
         expect(result.problems[0]!.message).toContain('version 2');
@@ -979,7 +1148,7 @@ describe('LilypadDbGate (integration)', () => {
       await admin.unsafe(lilypadChangelogSql({ notifyChannel: "app'events" }));
       await admin`COMMENT ON FUNCTION lilypad_cache_changes_record() IS 'lilypad-changelog:3'`;
       try {
-        const result = await checkLilypadSchema(gate, { tables: [] });
+        const result = await check({ tables: [] });
 
         expect(codes(result)).toEqual(['outdated-changelog']);
         expect(result.problems[0]!.fix).toBe(lilypadChangelogSql({ notifyChannel: "app'events" }));
@@ -989,7 +1158,7 @@ describe('LilypadDbGate (integration)', () => {
     });
 
     it('should report a trigger that records another column than the primary key', async () => {
-      const result = await checkLilypadSchema(gate, {
+      const result = await check({
         tables: [{ table: 'users', primaryKey: 'name' }],
       });
 
@@ -1002,7 +1171,7 @@ describe('LilypadDbGate (integration)', () => {
       await admin`CREATE TABLE unwatched (id int PRIMARY KEY)`;
       await admin.unsafe(lilypadChangelogTriggerSql({ table: 'unwatched', primaryKey: 'id' }));
       try {
-        const result = await checkLilypadSchema(gate, {
+        const result = await check({
           tables: [{ table: 'unwatched', primaryKey: 'id' }],
           changelog: false,
           notifyChannel: 'cache_events',
@@ -1021,7 +1190,7 @@ describe('LilypadDbGate (integration)', () => {
         FOR EACH ROW EXECUTE FUNCTION notify_cache_events()
       `;
       try {
-        const result = await checkLilypadSchema(gate, {
+        const result = await check({
           tables: [{ table: 'unwatched', primaryKey: 'id' }],
           changelog: false,
           notifyChannel: 'cache_events',
@@ -1050,7 +1219,7 @@ describe('LilypadDbGate (integration)', () => {
         FOR EACH STATEMENT EXECUTE FUNCTION notify_cache_events()
       `;
       try {
-        const result = await checkLilypadSchema(gate, {
+        const result = await check({
           tables: [{ table: 'unwatched', primaryKey: 'id' }],
           changelog: false,
           notifyChannel: 'cache_events',
@@ -1063,7 +1232,7 @@ describe('LilypadDbGate (integration)', () => {
     });
 
     it('should report a missing changelog', async () => {
-      const result = await checkLilypadSchema(gate, {
+      const result = await check({
         tables: [users],
         changelog: { table: 'other_changes' },
       });
@@ -1080,13 +1249,13 @@ describe('LilypadDbGate (integration)', () => {
       await admin`COMMENT ON FUNCTION legacy_changes_record() IS NULL`;
       try {
         const options = { tables: [], changelog: { table: 'legacy_changes' } };
-        const result = await checkLilypadSchema(gate, options);
+        const result = await check(options);
         expect(codes(result)).toEqual(['outdated-changelog']);
         expect(result.problems[0]!.message).toContain('version 1');
 
         await admin.unsafe(result.problems[0]!.fix!);
 
-        expect((await checkLilypadSchema(gate, options)).ok).toBe(true);
+        expect((await check(options)).ok).toBe(true);
       } finally {
         await admin`DROP TABLE legacy_changes`;
         await admin`DROP FUNCTION legacy_changes_record()`;

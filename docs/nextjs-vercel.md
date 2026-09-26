@@ -210,7 +210,9 @@ The changelog keeps one row per change until it is pruned. The database can prun
 
   On about one statement in `every` (default 20), it deletes up to `batchSize` (default 1000) rows older than `olderThan`, in the writing transaction. The table then grows only with writes, and the writes prune it. The cost falls on the writes: an indexed lookup on one statement in 20, and a few milliseconds when it finds a batch. A `SECURITY DEFINER` function deletes the rows, so the roles that write need no `DELETE` privilege on the changelog. It prunes only in `READ COMMITTED` transactions (the default): in a stricter isolation, deleting rows that a concurrent prune deleted would fail the write. `batchSize / every` (50 rows per statement by default) must stay above the number of rows your statements change on average, or the table keeps growing. Running `lilypadChangelogSql()` without `prune` turns it off again.
 
-Or delete the rows from the application, for example daily with Vercel Cron:
+The schema check of the caches looks for these two, reports a retention shorter than their `maxGap` or `lookback` as an error, and warns with the best one for your database if it finds neither (see [Checking the pruning of the changelog](../README.md#checking-the-pruning-of-the-changelog)).
+
+Or delete the rows from the application, for example daily with Vercel Cron. The check cannot see such a job until it has deleted rows: set `pruning: 'external'` in the `sync` options of the caches to tell it.
 
 ```ts
 // app/api/cron/lilypad-changelog/route.ts

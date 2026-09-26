@@ -15,7 +15,7 @@ import {
 import { LilypadBackoff } from '@/internal/LilypadBackoff';
 import { runInBackground } from '@/platform/LilypadPlatform';
 
-const DEFAULT_MAX_GAP = 60 * 60 * 1000; // 1 hour
+export const DEFAULT_MAX_GAP = 60 * 60 * 1000; // 1 hour
 
 /**
  * The `changelog` strategy: before a read, at most once per `pollInterval`, the cache reads the

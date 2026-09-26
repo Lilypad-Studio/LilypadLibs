@@ -1124,6 +1124,7 @@ describe('LilypadDbCache', () => {
       problems: [
         {
           code: 'missing-changelog-trigger',
+          severity: 'error',
           table: 'items',
           message: 'The table "items" has no changelog trigger: its changes are not recorded.',
           fix: 'CREATE TRIGGER items_lilypad_changes ...',
@@ -1163,9 +1164,61 @@ describe('LilypadDbCache', () => {
       expect(schemaCheck.check).toHaveBeenCalledOnce();
       expect(schemaCheck.check).toHaveBeenCalledWith(fake.gate, {
         tables: [{ table: 'items', primaryKey: 'id' }],
-        changelog: { table: 'my_changes' },
+        // The default maxGap (1 hour) is longer than the default lookback (TTL + 1 minute)
+        changelog: { table: 'my_changes', pruning: undefined, minRetention: 3_600_000 },
         notifyChannel: false,
       });
+    });
+
+    it.each<[string, { maxGap: number; lookback?: number; staleWhileRevalidate?: number }, number]>(
+      [
+        ['maxGap', { maxGap: 7_200_000, lookback: 60_000 }, 7_200_000],
+        ['lookback', { maxGap: 60_000, lookback: 10_800_000 }, 10_800_000],
+        ['default lookback', { maxGap: 60_000, staleWhileRevalidate: 600_000 }, 720_000],
+      ]
+    )(
+      'should check the pruning of the changelog against the %s',
+      async (_case, { staleWhileRevalidate, ...sync }, minRetention) => {
+        const cache = await createCache({
+          staleWhileRevalidate,
+          sync: { strategy: 'changelog', pollInterval: 0, pruning: 'external', ...sync },
+        });
+        await cache.getOrFetch('1');
+
+        expect(schemaCheck.check).toHaveBeenCalledWith(fake.gate, {
+          tables: [{ table: 'items', primaryKey: 'id' }],
+          changelog: { table: undefined, pruning: 'external', minRetention },
+          notifyChannel: false,
+        });
+      }
+    );
+
+    it('should log the warnings of the check, without rejecting create with verify: throw', async () => {
+      const unpruned = {
+        ok: true,
+        problems: [
+          {
+            code: 'no-changelog-pruning',
+            severity: 'warning',
+            message: 'Nothing deletes the old rows of the changelog.',
+            fix: 'SELECT cron.schedule(...)',
+          },
+        ],
+        tables: [{ table: 'items', schema: 'public' }],
+      };
+      schemaCheck.check.mockResolvedValue(unpruned);
+      const logger = createLogger();
+
+      await createCache({
+        sync: { strategy: 'changelog', pollInterval: 0, verify: 'throw' },
+        logger,
+      });
+
+      expect(logger.warn).toHaveBeenCalledOnce();
+      const [, message] = logger.warn.mock.calls[0]!;
+      expect(message).toContain('the database is set up, with warnings');
+      expect(message).toContain('- Warning: Nothing deletes the old rows');
+      expect(message).toContain('SELECT cron.schedule(...)');
     });
 
     it('should not delay changelog reads for the check', async () => {

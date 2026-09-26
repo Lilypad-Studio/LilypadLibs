@@ -51,8 +51,10 @@ export type {
 
 export { checkLilypadSchema, LilypadSchemaCheckError } from '../dbGate/LilypadSchemaCheck';
 export type {
+  LilypadChangelogPruning,
   LilypadSchemaCheckOptions,
   LilypadSchemaCheckResult,
   LilypadSchemaProblem,
   LilypadSchemaProblemCode,
+  LilypadSchemaProblemSeverity,
 } from '../dbGate/LilypadSchemaCheck';

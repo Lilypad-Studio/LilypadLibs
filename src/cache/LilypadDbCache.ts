@@ -1,4 +1,4 @@
-import { LilypadChangelogSync } from '@/cache/dbSync/LilypadChangelogSync';
+import { DEFAULT_MAX_GAP, LilypadChangelogSync } from '@/cache/dbSync/LilypadChangelogSync';
 import {
   lilypadNoSync,
   type LilypadDbCacheSync,
@@ -220,6 +220,12 @@ export class LilypadDbCache<
       primaryKey: String(schema.primaryKey),
       strategy: sync.strategy,
       changelogTable: sync.strategy === 'changelog' ? sync.table : undefined,
+      pruning: sync.strategy === 'changelog' ? sync.pruning : undefined,
+      // A changelog read needs every row since the last read (maxGap) or of the lookback
+      minRetention:
+        sync.strategy === 'changelog'
+          ? Math.max(sync.maxGap ?? DEFAULT_MAX_GAP, sync.lookback ?? this.defaultLookback())
+          : undefined,
       mode: sync.strategy === 'none' ? 'off' : (sync.verify ?? 'warn'),
       platform: this.platform,
       log: (level, ...message) => libLog(this.logger, level, this.name, ...message),
@@ -260,8 +266,13 @@ export class LilypadDbCache<
       emitInvalidation: (source, keys, options) => this.emitInvalidation(source, keys, options),
       forgetOwnWritesCoveredBy: (cursor) => this.forgetOwnWritesCoveredBy(cursor),
       tableSchema: () => this.tableSchema,
-      defaultLookback: () => this.defaultTtl + this.defaultStaleWhileRevalidate + 60_000,
+      defaultLookback: () => this.defaultLookback(),
     };
+  }
+
+  /** The default `lookback` of the changelog: the lifetime of a shared copy, plus 1 minute. */
+  private defaultLookback(): number {
+    return this.defaultTtl + this.defaultStaleWhileRevalidate + 60_000;
   }
 
   /**

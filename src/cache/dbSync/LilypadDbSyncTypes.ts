@@ -1,6 +1,7 @@
 import type { LilypadCacheKey } from '@/cache/LilypadCacheTypes';
 import type { LilypadChangelogCursor } from '@/dbGate/LilypadChangelog';
 import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
+import type { LilypadChangelogPruning } from '@/dbGate/LilypadSchemaCheck';
 import type { LilypadLibLogLevel } from '@/logger/LilypadLibLogger';
 import type { LilypadInvalidationEvent, LilypadPlatform } from '@/platform/LilypadPlatform';
 
@@ -69,7 +70,8 @@ export type LilypadDbCacheChangelogSync = LilypadDbCacheTrustedSyncOptions & {
   /**
    * If the changelog has not been read for this long (ms), the instance no longer trusts it:
    * every entry is expired instead. It must be much shorter than the retention of the
-   * changelog (see `pruneLilypadChangelog`). Defaults to 1 hour.
+   * changelog (see `pruneLilypadChangelog`): the schema check reports a pruning it finds with a
+   * shorter one. Defaults to 1 hour.
    */
   maxGap?: number;
   /**
@@ -80,6 +82,13 @@ export type LilypadDbCacheChangelogSync = LilypadDbCacheTrustedSyncOptions & {
   lookback?: number;
   /** The changelog table, if not `lilypad_cache_changes`. */
   table?: string;
+  /**
+   * How the old changelog rows are deleted, for the schema check. `detect` (default): it looks for
+   * the `prune` option of the trigger and for a pg_cron job, and warns with the best one for the
+   * database if it finds neither. `external`: a job it cannot see deletes them (e.g.
+   * `pruneLilypadChangelog` from a scheduled function), so it suggests nothing.
+   */
+  pruning?: LilypadChangelogPruning;
 };
 
 /**

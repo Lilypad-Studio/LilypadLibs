@@ -983,9 +983,6 @@ function getLilypadChangelogReader(gate, changelogTable = LILYPAD_DEFAULT_CHANGE
 	}
 	return reader;
 }
-//#endregion
-//#region src/cache/dbSync/LilypadChangelogSync.ts
-const DEFAULT_MAX_GAP = 36e5;
 /**
 * The `changelog` strategy: before a read, at most once per `pollInterval`, the cache reads the
 * changes of its table (with the other caches of the gate, see `LilypadChangelogReader`) and
@@ -1011,7 +1008,7 @@ var LilypadChangelogSync = class {
 		this.unsubscribe = this.reader.subscribe(this.subscriber);
 	}
 	get maxGap() {
-		return this.options.maxGap ?? DEFAULT_MAX_GAP;
+		return this.options.maxGap ?? 36e5;
 	}
 	start() {
 		return Promise.resolve();
@@ -1230,7 +1227,10 @@ var LilypadListenSync = class {
 };
 //#endregion
 //#region src/dbGate/LilypadSchemaCheck.ts
-/** Thrown by `LilypadDbCache.create` with `verify: 'throw'` when the database is not set up. */
+/**
+* Thrown by `LilypadDbCache.create` with `verify: 'throw'` when the database is not set up (the
+* check found errors). Its `problems` include the warnings.
+*/
 var LilypadSchemaCheckError = class extends Error {
 	constructor(subject, problems) {
 		super(formatLilypadSchemaProblems(subject, problems));
@@ -1240,8 +1240,8 @@ var LilypadSchemaCheckError = class extends Error {
 };
 /** A readable report of the problems, followed by the SQL that fixes them. */
 function formatLilypadSchemaProblems(subject, problems) {
-	const lines = [`${subject}: the database is not set up.`];
-	for (const problem of problems) lines.push(`- ${problem.message}`);
+	const lines = [problems.some((problem) => problem.severity === "error") ? `${subject}: the database is not set up.` : `${subject}: the database is set up, with warnings.`];
+	for (const problem of problems) lines.push(`- ${problem.severity === "warning" ? "Warning: " : ""}${problem.message}`);
 	const fixes = [...new Set(problems.flatMap((problem) => problem.fix ? [problem.fix] : []))];
 	if (fixes.length > 0) lines.push("Run this SQL in a migration to fix it:", ...fixes);
 	return lines.join("\n");
@@ -1294,6 +1294,10 @@ function installedNotifyChannel(source) {
 	const match = source ? /pg_notify\s*\(\s*'((?:[^']|'')*)'/i.exec(source) : null;
 	return match?.[1] !== void 0 ? match[1].replace(/''/g, "'") : false;
 }
+/** A `json` column: postgres.js parses it, unless the type is not registered yet. */
+function parseJsonColumn(value) {
+	return typeof value === "string" ? JSON.parse(value) : value;
+}
 /** The changelog table and trigger function the options designate, or `undefined` if not checked. */
 function changelogTarget(options) {
 	if (options.changelog === false) return;
@@ -1302,6 +1306,190 @@ function changelogTarget(options) {
 		table,
 		custom: table === "lilypad_cache_changes" ? void 0 : table,
 		functionSignature: `${quoteIdentifier(triggerFunctionName(table))}()`
+	};
+}
+const MINUTE = 6e4;
+const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
+/** The default `minRetention`: the default `maxGap` of the caches. */
+const DEFAULT_MIN_RETENTION = HOUR;
+/**
+* How much older than the retention the oldest row may be before it is reported: a job that runs
+* daily, or even weekly, leaves rows up to one period older than its retention.
+*/
+const UNPRUNED_MARGIN = 7 * DAY;
+/** A duration for a message, e.g. `36 hours`, `2.5 days`. */
+function formatDuration(ms) {
+	const units = [
+		[DAY, "day"],
+		[HOUR, "hour"],
+		[MINUTE, "minute"],
+		[1e3, "second"]
+	];
+	for (const [size, name] of units) if (ms >= size * (size === DAY ? 2 : 1)) {
+		const amount = Math.round(ms / size * 10) / 10;
+		return `${amount} ${name}${amount === 1 ? "" : "s"}`;
+	}
+	return `${Math.round(ms)} ms`;
+}
+const INTERVAL_UNITS = [
+	[/^(w|weeks?)$/, 7 * DAY],
+	[/^(d|days?)$/, DAY],
+	[/^(h|hrs?|hours?)$/, HOUR],
+	[/^(mons?|months?)$/, 30 * DAY],
+	[/^(m|mins?|minutes?)$/, MINUTE],
+	[/^(s|secs?|seconds?)$/, 1e3]
+];
+/** The duration of an interval literal (`24 hours`, `1 day 12:00:00`), or `undefined`. */
+function parseInterval(text) {
+	let total = 0;
+	let matched = false;
+	for (const [, hours, minutes, seconds] of text.matchAll(/(\d+):(\d{2})(?::(\d{2}))?/g)) {
+		total += Number(hours) * HOUR + Number(minutes) * MINUTE + Number(seconds ?? 0) * 1e3;
+		matched = true;
+	}
+	for (const [, amount, unit] of text.matchAll(/(\d+(?:\.\d+)?)\s*([a-z]+)/gi)) {
+		const size = INTERVAL_UNITS.find(([pattern]) => pattern.test(unit.toLowerCase()))?.[1];
+		if (size !== void 0) {
+			total += Number(amount) * size;
+			matched = true;
+		}
+	}
+	return matched ? total : void 0;
+}
+/**
+* The retention of a pruning command, from `make_interval(secs => ...)` (the SQL of the library)
+* or an interval literal (`interval '7 days'`, `'1 day'::interval`); `undefined` if not found.
+*/
+function lilypadPruneCommandRetention(command) {
+	const seconds = /make_interval\s*\(\s*secs\s*=>\s*'?(\d+(?:\.\d+)?)'?\s*\)/i.exec(command);
+	if (seconds) return Number(seconds[1]) * 1e3;
+	const literal = /interval\s*'([^']*)'|'([^']*)'\s*::\s*interval/i.exec(command);
+	const text = literal?.[1] ?? literal?.[2];
+	return text === void 0 ? void 0 : parseInterval(text);
+}
+/**
+* Whether a command deletes rows from the changelog table: a `DELETE FROM` of the same table name,
+* in the same schema when both name one. Case and quotes are ignored.
+*/
+function lilypadCommandDeletesFrom(command, changelogTable) {
+	const target = changelogTable.replace(/"/g, "").toLowerCase().split(".");
+	for (const [, name] of command.matchAll(/\bdelete\s+from\s+(?:only\s+)?([\w$."]+)/gi)) {
+		const parts = name.replace(/"/g, "").toLowerCase().split(".");
+		if (parts.at(-1) === target.at(-1) && (parts.length === 1 || target.length === 1 || parts.at(-2) === target.at(-2))) return true;
+	}
+	return false;
+}
+/**
+* The pruning problems of the changelog, and the `prune` option that the SQL fixing the changelog
+* must install: the installed one, or the one suggested when the trigger is the best pruning.
+*/
+function evaluatePruning(facts, changelog, options, changelogSql) {
+	const minRetention = options?.minRetention ?? DEFAULT_MIN_RETENTION;
+	assertNumberOption("checkLilypadSchema", "changelog.minRetention", minRetention, "positive");
+	const recommended = Math.max(DAY, 4 * minRetention);
+	const installed = installedLilypadChangelogPrune(facts.changelog.functionSource);
+	const problems = [];
+	const detected = [];
+	if (installed && facts.changelog.hasFunction) {
+		if (!facts.changelog.hasPruneFunction) problems.push({
+			code: "missing-changelog",
+			severity: "error",
+			message: `The changelog trigger function prunes with ${pruneFunctionName(changelog.table)}(), which does not exist: the writes that prune fail.`,
+			fix: changelogSql(installed)
+		});
+		detected.push({
+			by: "the prune option of the changelog trigger",
+			retention: installed.olderThan,
+			fixWith: (olderThan) => changelogSql({
+				...installed,
+				olderThan
+			})
+		});
+	}
+	const cronJobs = (facts.cron.jobs ?? []).filter((job) => (job.database === null || job.database === facts.database) && lilypadCommandDeletesFrom(job.command, changelog.table));
+	for (const job of cronJobs.filter((job) => job.active)) {
+		const by = job.name !== null ? `the pg_cron job "${job.name}"` : `the pg_cron job ${job.id ?? ""}`;
+		detected.push({
+			by,
+			retention: lilypadPruneCommandRetention(job.command),
+			fixWith: (olderThan) => (job.name === null && job.id !== null ? `SELECT cron.unschedule(${job.id});\n` : "") + lilypadChangelogPruneScheduleSql({
+				olderThan,
+				schedule: job.schedule || void 0,
+				changelogTable: changelog.custom,
+				jobName: job.name ?? void 0
+			})
+		});
+	}
+	for (const { by, retention, fixWith } of detected) if (retention !== void 0 && retention <= minRetention) problems.push({
+		code: "short-changelog-retention",
+		severity: "error",
+		message: `${capitalize(by)} deletes the changelog rows older than ${formatDuration(retention)}, but the caches need them for ${formatDuration(minRetention)} (their maxGap and lookback): a cache could miss changes without knowing it. Keep them far longer, e.g. ${formatDuration(recommended)}.`,
+		fix: fixWith(recommended)
+	});
+	const age = facts.changelog.oldestRowAge;
+	const external = options?.pruning === "external" || facts.changelog.deletedRows > 0;
+	let prune = installed;
+	if (detected.length === 0 && !external) {
+		const suggestion = suggestPruning(facts, changelog, recommended, changelogSql);
+		const inactive = cronJobs.find((job) => !job.active);
+		problems.push({
+			code: "no-changelog-pruning",
+			severity: "warning",
+			message: `Nothing deletes the old rows of the changelog "${changelog.table}"` + (age !== null && age > DAY ? ` (the oldest is ${formatDuration(age)} old)` : "") + `: it grows with every change. ` + (inactive ? `The pg_cron job "${inactive.name ?? inactive.id ?? ""}" deletes them, but is inactive. ` : "") + `${suggestion.message} If a job of your own deletes them (e.g. pruneLilypadChangelog from a scheduled function), set pruning: 'external'.`,
+			fix: suggestion.fix
+		});
+		prune = suggestion.prune ?? installed;
+	} else if (age !== null) {
+		const retentions = detected.flatMap(({ retention }) => retention !== void 0 ? [retention] : []);
+		const retention = retentions.length > 0 ? Math.max(...retentions) : recommended;
+		if (age > retention + UNPRUNED_MARGIN) {
+			const by = detected.map((pruning) => pruning.by).join(" and ");
+			problems.push({
+				code: "unpruned-changelog",
+				severity: "warning",
+				message: `The oldest row of the changelog "${changelog.table}" is ${formatDuration(age)} old: ` + (by ? `${by} does not run, or does not keep up.` : `its pruning does not run, or does not keep up.`) + (installed ? " The trigger deletes at most batchSize rows on one statement in every: raise batchSize or lower every if the statements change more rows on average." : "") + " The fix deletes the old rows once.",
+				fix: `DELETE FROM ${quoteIdentifier(changelog.table)} WHERE ${olderThanCondition(Math.max(retention, recommended))};\n`
+			});
+		}
+	}
+	return {
+		problems,
+		prune
+	};
+}
+function capitalize(text) {
+	return text.charAt(0).toUpperCase() + text.slice(1);
+}
+/**
+* The best pruning for the database: a pg_cron job, which keeps the deletions out of the writes,
+* when pg_cron is known to run; otherwise the `prune` option of the trigger, which needs nothing.
+*/
+function suggestPruning(facts, changelog, olderThan, changelogSql) {
+	const { cron } = facts;
+	const retention = formatDuration(olderThan);
+	if (cron.installed || cron.database === facts.database) return {
+		message: cron.installed ? `pg_cron is installed, with no job of this role that deletes them (the jobs of the other roles are not visible): the fix schedules a daily one, which deletes the rows older than ${retention}.` : `pg_cron runs in this database: the fix installs it and schedules a daily job that deletes the rows older than ${retention}.`,
+		fix: (cron.installed ? "" : "CREATE EXTENSION IF NOT EXISTS pg_cron;\n") + lilypadChangelogPruneScheduleSql({
+			olderThan,
+			changelogTable: changelog.custom
+		})
+	};
+	const schema = changelog.table.includes(".") ? void 0 : facts.changelog.schema;
+	if (cron.database !== null && (schema || changelog.table.includes("."))) return {
+		message: `pg_cron runs in the database "${cron.database}": the fix, to run there, schedules a daily job that deletes the rows older than ${retention} in this one.`,
+		fix: `-- Run in the database "${cron.database}", where pg_cron runs:\nCREATE EXTENSION IF NOT EXISTS pg_cron;
+` + lilypadChangelogPruneScheduleSql({
+			olderThan,
+			changelogTable: schema ? `${schema}.${changelog.table}` : changelog.table,
+			database: facts.database
+		})
+	};
+	const prune = { olderThan };
+	return {
+		message: `The fix makes the changelog trigger delete the rows older than ${retention} as it records changes (the prune option of lilypadChangelogSql).` + (cron.available ? ` pg_cron is available on this server: if it is enabled (shared_preload_libraries), a pg_cron job keeps the deletions out of the writes: lilypadChangelogPruneScheduleSql({ olderThan: ${olderThan} }).` : ""),
+		fix: changelogSql(prune),
+		prune
 	};
 }
 /**
@@ -1316,7 +1504,20 @@ async function readLilypadSchemaFacts(gate, options) {
 	const [database] = await sql`
     SELECT
       current_setting('server_version_num')::int AS version,
+      current_database() AS database,
       to_regclass(${quotedChangelog}::text) IS NOT NULL AS has_changelog_table,
+      (
+        SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.oid = to_regclass(${quotedChangelog}::text)
+      ) AS changelog_schema,
+      to_regprocedure(${`${quoteIdentifier(pruneFunctionName(changelog.table))}()`}::text) IS NOT NULL AS has_prune_function,
+      coalesce((
+        SELECT n_tup_del FROM pg_stat_user_tables WHERE relid = to_regclass(${quotedChangelog}::text)
+      ), 0)::float8 AS deleted_rows,
+      EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_cron') AS cron_available,
+      EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') AS cron_installed,
+      (SELECT setting FROM pg_settings WHERE name = 'cron.database_name') AS cron_database,
+      to_regclass('cron.job') IS NOT NULL AS has_cron_jobs,
       EXISTS (
         SELECT 1 FROM pg_attribute
         WHERE attrelid = to_regclass(${quotedChangelog}::text)
@@ -1353,23 +1554,64 @@ async function readLilypadSchemaFacts(gate, options) {
     `;
 		tables.push(found ? {
 			schema: found.schema_name,
-			triggers: typeof found.triggers === "string" ? JSON.parse(found.triggers) : found.triggers
+			triggers: parseJsonColumn(found.triggers)
 		} : {
 			schema: null,
 			triggers: []
 		});
 	}
+	let oldestRowAge = null;
+	let jobs = null;
+	if (options.changelog !== false) {
+		if (database.has_changelog_table) oldestRowAge = await sql`
+        SELECT (extract(epoch FROM clock_timestamp() - min(changed_at)) * 1000)::float8 AS age
+        FROM ${sql(changelog.table)}
+      `.then(([row]) => row?.age ?? null, () => null);
+		if (database.has_cron_jobs) jobs = await readCronJobs(gate);
+	}
 	return {
 		version: database.version,
+		database: database.database,
 		changelog: {
 			hasTable: database.has_changelog_table,
 			hasSchemaColumn: database.has_schema_column,
 			hasFunction: database.has_function,
 			functionComment: database.function_comment,
-			functionSource: database.function_source
+			functionSource: database.function_source,
+			schema: database.changelog_schema,
+			hasPruneFunction: database.has_prune_function,
+			oldestRowAge,
+			deletedRows: database.deleted_rows
+		},
+		cron: {
+			available: database.cron_available,
+			installed: database.cron_installed,
+			database: database.cron_database,
+			jobs
 		},
 		tables
 	};
+}
+/**
+* The jobs of `cron.job`, or `null` if they cannot be read. Read as JSON, so that the columns
+* that older versions of pg_cron lack (`jobname`, `database`) are simply absent.
+*/
+async function readCronJobs(gate) {
+	try {
+		const [row] = await gate.sql`
+      SELECT coalesce(json_agg(row_to_json(j)), '[]'::json) AS jobs FROM cron.job j
+    `;
+		return (parseJsonColumn(row?.jobs) ?? []).map((job) => ({
+			id: typeof job.jobid === "number" ? job.jobid : null,
+			name: typeof job.jobname === "string" ? job.jobname : null,
+			schedule: typeof job.schedule === "string" ? job.schedule : "",
+			command: typeof job.command === "string" ? job.command : "",
+			active: job.active !== false,
+			database: typeof job.database === "string" ? job.database : null
+		}));
+	} catch {
+		return null;
+	}
 }
 /**
 * Checks that the database has what `LilypadDbCache` needs to learn about changes: the changelog
@@ -1390,21 +1632,28 @@ async function checkLilypadSchema(gate, options) {
 function evaluateLilypadSchema(facts, options) {
 	const changelog = changelogTarget(options);
 	const notifyChannel = options.notifyChannel ?? false;
-	const prune = installedLilypadChangelogPrune(facts.changelog.functionSource);
+	const installedPrune = installedLilypadChangelogPrune(facts.changelog.functionSource);
 	const problems = [];
 	if (facts.version < 13e4) problems.push({
 		code: "unsupported-version",
+		severity: "error",
 		message: `PostgreSQL ${facts.version} is too old: the changelog needs PostgreSQL 13 or later.`
 	});
+	let pruningProblems = [];
 	if (changelog) {
-		const changelogSql = lilypadChangelogSql({
+		const channel = notifyChannel !== false ? notifyChannel : installedNotifyChannel(facts.changelog.functionSource);
+		const sqlWith = (prune) => lilypadChangelogSql({
 			table: changelog.custom,
-			notifyChannel: notifyChannel !== false ? notifyChannel : installedNotifyChannel(facts.changelog.functionSource),
+			notifyChannel: channel,
 			prune
 		});
+		const pruning = evaluatePruning(facts, changelog, options.changelog || void 0, sqlWith);
+		pruningProblems = pruning.problems;
+		const changelogSql = sqlWith(pruning.prune);
 		const { hasTable, hasSchemaColumn, hasFunction, functionComment } = facts.changelog;
 		if (!hasTable || !hasFunction) problems.push({
 			code: "missing-changelog",
+			severity: "error",
 			message: !hasTable ? `The changelog table "${changelog.table}" does not exist.` : `The changelog trigger function ${changelog.functionSignature} does not exist.`,
 			fix: changelogSql
 		});
@@ -1412,6 +1661,7 @@ function evaluateLilypadSchema(facts, options) {
 		const version = comment.startsWith("lilypad-changelog:") ? Number(comment.slice(18)) : 1;
 		if (hasTable && !hasSchemaColumn || hasFunction && version < 4) problems.push({
 			code: "outdated-changelog",
+			severity: "error",
 			message: `The changelog "${changelog.table}" was installed by an older version of the library (version ${version}, expected 4).`,
 			fix: changelogSql
 		});
@@ -1426,6 +1676,7 @@ function evaluateLilypadSchema(facts, options) {
 			});
 			problems.push({
 				code: "missing-table",
+				severity: "error",
 				table,
 				message: `The table "${table}" does not exist.`
 			});
@@ -1448,18 +1699,21 @@ function evaluateLilypadSchema(facts, options) {
 			const wrongColumn = working.find((trigger) => recordedColumn(trigger) !== primaryKey);
 			if (recorded !== ROW_EVENTS) problems.push({
 				code: "missing-changelog-trigger",
+				severity: "error",
 				table,
 				message: triggers.some((trigger) => trigger.changelog) ? `The changelog triggers of "${table}" do not record ${eventNames(ROW_EVENTS & ~recorded)}: they are missing, disabled, or lack their transition tables.` : `The table "${table}" has no changelog trigger: its changes are not recorded.`,
 				fix
 			});
 			else if (wrongColumn) problems.push({
 				code: "wrong-trigger-primary-key",
+				severity: "error",
 				table,
 				message: `The changelog trigger of "${table}" records the column "${recordedColumn(wrongColumn)}", not the primary key "${primaryKey}".`,
 				fix
 			});
 			else if (!triggers.some((trigger) => trigger.changelog && firesOnTruncate(trigger))) problems.push({
 				code: "missing-truncate-trigger",
+				severity: "error",
 				table,
 				message: `The changelog does not record TRUNCATE of "${table}": the caches would keep the removed rows.`,
 				fix
@@ -1471,7 +1725,7 @@ function evaluateLilypadSchema(facts, options) {
 			const fix = lilypadChangelogSql({
 				table: changelog?.custom,
 				notifyChannel,
-				prune
+				prune: installedPrune
 			}) + lilypadChangelogTriggerSql({
 				table,
 				primaryKey,
@@ -1479,26 +1733,30 @@ function evaluateLilypadSchema(facts, options) {
 			});
 			if (notifiedEvents === 0) problems.push({
 				code: "missing-notify-trigger",
+				severity: "error",
 				table,
 				message: `No trigger of "${table}" sends notifications on the "${notifyChannel}" channel: the cache is not told about changes made elsewhere.`,
 				fix
 			});
 			else if (notifiedEvents !== ROW_EVENTS) problems.push({
 				code: "missing-notify-trigger",
+				severity: "error",
 				table,
 				message: `The triggers of "${table}" send notifications on the "${notifyChannel}" channel only on ${eventNames(notifiedEvents)}: the cache is not told about ${eventNames(ROW_EVENTS & ~notifiedEvents)} made elsewhere.`,
 				fix
 			});
 			else if (!triggers.some((trigger) => firesOnTruncate(trigger) && notifies.test(trigger.source))) problems.push({
 				code: "missing-truncate-trigger",
+				severity: "error",
 				table,
 				message: `No trigger of "${table}" sends a notification on the "${notifyChannel}" channel for TRUNCATE: the caches would keep the removed rows.`,
 				fix
 			});
 		}
 	});
+	problems.push(...pruningProblems);
 	return {
-		ok: problems.length === 0,
+		ok: !problems.some((problem) => problem.severity === "error"),
 		problems,
 		tables
 	};
@@ -1507,7 +1765,8 @@ function evaluateLilypadSchema(facts, options) {
 //#region src/cache/dbSync/LilypadSchemaVerifier.ts
 /**
 * Checks once that the database has the triggers a sync strategy needs, and resolves the schema of
-* the table. With `warn` it never rejects: problems and failures are logged. A check that could not
+* the table. With `warn` it never rejects: problems and failures are logged. With `throw` it rejects
+* if the check found errors; warnings (e.g. a changelog that nothing prunes) are logged. A check that could not
 * run (e.g. the database was unreachable) is forgotten, so that a later read runs it again after a
 * backoff; a check that found problems is not repeated.
 */
@@ -1541,7 +1800,7 @@ var LilypadSchemaVerifier = class {
 	}
 	/** @returns `false` if the check could not run (with `warn`; `throw` rejects). */
 	async run(mode) {
-		const { gate, tableName, primaryKey, strategy, changelogTable, log } = this.options;
+		const { gate, tableName, primaryKey, strategy, changelogTable, pruning, minRetention, log } = this.options;
 		const subject = `LilypadDbCache "${tableName}" (sync: ${strategy})`;
 		try {
 			const result = await checkLilypadSchema(gate, {
@@ -1549,14 +1808,18 @@ var LilypadSchemaVerifier = class {
 					table: tableName,
 					primaryKey
 				}],
-				changelog: strategy === "changelog" ? { table: changelogTable } : false,
+				changelog: strategy === "changelog" ? {
+					table: changelogTable,
+					pruning,
+					minRetention
+				} : false,
 				notifyChannel: strategy === "listen" ? LILYPAD_DEFAULT_NOTIFY_CHANNEL : false
 			});
 			const schema = result.tables[0]?.schema;
 			if (schema) this.options.onSchema(schema);
 			this.backoff.succeed();
-			if (result.ok) return true;
-			if (mode === "throw") throw new LilypadSchemaCheckError(subject, result.problems);
+			if (result.problems.length === 0) return true;
+			if (mode === "throw" && !result.ok) throw new LilypadSchemaCheckError(subject, result.problems);
 			const message = formatLilypadSchemaProblems(subject, result.problems);
 			if (this.options.canWarn()) log("warn", message);
 			else console.warn(message);
@@ -1663,6 +1926,8 @@ var LilypadDbCache = class LilypadDbCache extends LilypadCacheCore {
 			primaryKey: String(schema.primaryKey),
 			strategy: sync.strategy,
 			changelogTable: sync.strategy === "changelog" ? sync.table : void 0,
+			pruning: sync.strategy === "changelog" ? sync.pruning : void 0,
+			minRetention: sync.strategy === "changelog" ? Math.max(sync.maxGap ?? 36e5, sync.lookback ?? this.defaultLookback()) : void 0,
 			mode: sync.strategy === "none" ? "off" : sync.verify ?? "warn",
 			platform: this.platform,
 			log: (level, ...message) => libLog(this.logger, level, this.name, ...message),
@@ -1691,8 +1956,12 @@ var LilypadDbCache = class LilypadDbCache extends LilypadCacheCore {
 			emitInvalidation: (source, keys, options) => this.emitInvalidation(source, keys, options),
 			forgetOwnWritesCoveredBy: (cursor) => this.forgetOwnWritesCoveredBy(cursor),
 			tableSchema: () => this.tableSchema,
-			defaultLookback: () => this.defaultTtl + this.defaultStaleWhileRevalidate + 6e4
+			defaultLookback: () => this.defaultLookback()
 		};
+	}
+	/** The default `lookback` of the changelog: the lifetime of a shared copy, plus 1 minute. */
+	defaultLookback() {
+		return this.defaultTtl + this.defaultStaleWhileRevalidate + 6e4;
 	}
 	/**
 	* Loads every row of the table and replaces the content of the cache with them.
