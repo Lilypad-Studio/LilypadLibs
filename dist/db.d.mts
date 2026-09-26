@@ -302,6 +302,28 @@ type LilypadChangelogSqlOptions = {
    * send none. Defaults to `cache_events`.
    */
   notifyChannel?: string | false;
+  /**
+   * Makes the trigger delete the old changelog rows itself, so that no scheduled job is needed:
+   * on about one statement in `every`, it deletes up to `batchSize` rows older than `olderThan`,
+   * in the writing transaction. `false` (the default) leaves the pruning to
+   * {@link pruneLilypadChangelog} or {@link lilypadChangelogPruneScheduleSql}.
+   */
+  prune?: LilypadChangelogPruneOptions | false;
+};
+type LilypadChangelogPruneOptions = {
+  /**
+   * The retention, in milliseconds: the rows older than this are deleted. It must be much longer
+   * than the `maxGap` and the `lookback` of the caches, and than the longest transaction (e.g. 24 h).
+   */
+  olderThan: number;
+  /**
+   * The trigger prunes on about one call in `every` (one call per statement). Defaults to 20.
+   * `batchSize / every` is the average number of rows pruned per statement: it must stay above the
+   * average number of rows a statement records, or the table keeps growing.
+   */
+  every?: number;
+  /** The most rows one prune deletes. Defaults to 1000. */
+  batchSize?: number;
 };
 /**
  * The SQL that creates the changelog table and its trigger function. Run it once, in a migration.
@@ -310,6 +332,32 @@ type LilypadChangelogSqlOptions = {
  * Then attach the trigger to every cached table with {@link lilypadChangelogTriggerSql}.
  */
 export declare function lilypadChangelogSql(options?: LilypadChangelogSqlOptions): string;
+type LilypadChangelogPruneScheduleOptions = {
+  /**
+   * The retention, in milliseconds: the rows older than this are deleted. It must be much longer
+   * than the `maxGap` and the `lookback` of the caches, and than the longest transaction (e.g. 24 h).
+   */
+  olderThan: number;
+  /** When the job runs, in cron syntax (pg_cron uses UTC). Defaults to `0 3 * * *`: daily at 3:00. */
+  schedule?: string;
+  /** Name of the changelog table, if not the default one. */
+  changelogTable?: string;
+  /** Name of the job. Defaults to `<changelog table>_prune`. Scheduling it again replaces it. */
+  jobName?: string;
+  /**
+   * The database of the changelog table, when pg_cron is installed in another one (see
+   * `cron.database_name`): the SQL then runs in the pg_cron database, and the job resolves
+   * `changelogTable` with the search_path of its role, so qualify it with its schema. Without it,
+   * the SQL runs in the database of the changelog, which must be the pg_cron one.
+   */
+  database?: string;
+};
+/**
+ * The SQL that schedules a pg_cron job deleting the changelog rows older than `olderThan`: the
+ * database then prunes its changelog itself. Run it once, in a migration, with pg_cron installed
+ * (`CREATE EXTENSION pg_cron`). Running it again updates the job.
+ */
+export declare function lilypadChangelogPruneScheduleSql(options: LilypadChangelogPruneScheduleOptions): string;
 /**
  * The SQL that attaches the changelog triggers to a cached table: one statement trigger for each of
  * INSERT, UPDATE and DELETE, which records all the rows of a statement in one query (through its
@@ -906,5 +954,5 @@ export declare class LilypadSchemaCheckError extends Error {
  */
 export declare function checkLilypadSchema(gate: LilypadDbGate, options: LilypadSchemaCheckOptions): Promise<LilypadSchemaCheckResult>;
 //#endregion
-export type { LilypadChange, LilypadChangelogCursor, LilypadChangelogSqlOptions, LilypadChangesRequest, LilypadDbCacheChangelogSync, LilypadDbCacheListenSync, LilypadDbCacheOptions, LilypadDbCacheSchemaVerification, LilypadDbCacheSync, LilypadDbCacheTrustedSyncOptions, LilypadDbColumn, LilypadDbColumnType, LilypadDbDeleteResult, LilypadDbGateOptions, LilypadDbInsertData, LilypadDbKey, LilypadDbListener, LilypadDbNotification, LilypadDbPoolOptions, LilypadDbSchema, LilypadDbUpdateData, LilypadDbWriteResult, LilypadSchemaCheckOptions, LilypadSchemaCheckResult, LilypadSchemaProblem, LilypadSchemaProblemCode };
+export type { LilypadChange, LilypadChangelogCursor, LilypadChangelogPruneOptions, LilypadChangelogPruneScheduleOptions, LilypadChangelogSqlOptions, LilypadChangesRequest, LilypadDbCacheChangelogSync, LilypadDbCacheListenSync, LilypadDbCacheOptions, LilypadDbCacheSchemaVerification, LilypadDbCacheSync, LilypadDbCacheTrustedSyncOptions, LilypadDbColumn, LilypadDbColumnType, LilypadDbDeleteResult, LilypadDbGateOptions, LilypadDbInsertData, LilypadDbKey, LilypadDbListener, LilypadDbNotification, LilypadDbPoolOptions, LilypadDbSchema, LilypadDbUpdateData, LilypadDbWriteResult, LilypadSchemaCheckOptions, LilypadSchemaCheckResult, LilypadSchemaProblem, LilypadSchemaProblemCode };
 //# sourceMappingURL=db.d.mts.map

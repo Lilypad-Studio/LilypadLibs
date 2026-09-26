@@ -1,4 +1,5 @@
 import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
+import { assertNumberOption } from '@/internal/LilypadValidation';
 
 /**
  * The changelog records every change of the cached tables in a table, so that each instance can
@@ -43,6 +44,11 @@ export function triggerFunctionName(changelogTable: string): string {
   return `${identifierPrefix(changelogTable)}_record`;
 }
 
+/** The name of the function that deletes the old rows of a changelog table (`prune` option). */
+function pruneFunctionName(changelogTable: string): string {
+  return `${identifierPrefix(changelogTable)}_prune`;
+}
+
 /**
  * The names of the triggers that record the changes of a table: one statement trigger per event,
  * and the row trigger that versions 3 and earlier installed instead of the first three.
@@ -77,7 +83,81 @@ export type LilypadChangelogSqlOptions = {
    * send none. Defaults to `cache_events`.
    */
   notifyChannel?: string | false;
+  /**
+   * Makes the trigger delete the old changelog rows itself, so that no scheduled job is needed:
+   * on about one statement in `every`, it deletes up to `batchSize` rows older than `olderThan`,
+   * in the writing transaction. `false` (the default) leaves the pruning to
+   * {@link pruneLilypadChangelog} or {@link lilypadChangelogPruneScheduleSql}.
+   */
+  prune?: LilypadChangelogPruneOptions | false;
 };
+
+export type LilypadChangelogPruneOptions = {
+  /**
+   * The retention, in milliseconds: the rows older than this are deleted. It must be much longer
+   * than the `maxGap` and the `lookback` of the caches, and than the longest transaction (e.g. 24 h).
+   */
+  olderThan: number;
+  /**
+   * The trigger prunes on about one call in `every` (one call per statement). Defaults to 20.
+   * `batchSize / every` is the average number of rows pruned per statement: it must stay above the
+   * average number of rows a statement records, or the table keeps growing.
+   */
+  every?: number;
+  /** The most rows one prune deletes. Defaults to 1000. */
+  batchSize?: number;
+};
+
+/** The comment of the trigger function that records its prune options (read back by the schema check). */
+const PRUNE_MARKER = 'lilypad-prune:';
+
+function resolvePruneOptions(
+  owner: string,
+  prune: LilypadChangelogPruneOptions | false | undefined
+): Required<LilypadChangelogPruneOptions> | undefined {
+  if (!prune) {
+    return undefined;
+  }
+  assertNumberOption(owner, 'prune.olderThan', prune.olderThan, 'positive');
+  assertNumberOption(owner, 'prune.every', prune.every, 'positive-integer');
+  assertNumberOption(owner, 'prune.batchSize', prune.batchSize, 'positive-integer');
+  return {
+    olderThan: prune.olderThan,
+    every: prune.every ?? 20,
+    batchSize: prune.batchSize ?? 1000,
+  };
+}
+
+/**
+ * The `prune` options of an installed trigger function, from its source, or `false` if it does not
+ * prune: the SQL that fixes an outdated changelog keeps them.
+ */
+export function installedLilypadChangelogPrune(
+  source: string | null
+): LilypadChangelogPruneOptions | false {
+  const match = source
+    ? new RegExp(`${PRUNE_MARKER} olderThan=(\\S+) every=(\\d+) batchSize=(\\d+)`).exec(source)
+    : null;
+  if (!match) {
+    return false;
+  }
+  const prune = {
+    olderThan: Number(match[1]),
+    every: Number(match[2]),
+    batchSize: Number(match[3]),
+  };
+  return Number.isFinite(prune.olderThan) &&
+    prune.olderThan > 0 &&
+    prune.every > 0 &&
+    prune.batchSize > 0
+    ? prune
+    : false;
+}
+
+/** The SQL condition on `changed_at` of the rows older than `olderThan` milliseconds. */
+function olderThanCondition(olderThan: number): string {
+  return `changed_at < clock_timestamp() - make_interval(secs => ${olderThan / 1000})`;
+}
 
 /**
  * The SQL that creates the changelog table and its trigger function. Run it once, in a migration.
@@ -88,8 +168,19 @@ export type LilypadChangelogSqlOptions = {
 export function lilypadChangelogSql(options: LilypadChangelogSqlOptions = {}): string {
   const table = options.table ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
   const channel = options.notifyChannel ?? LILYPAD_DEFAULT_NOTIFY_CHANNEL;
+  const prune = resolvePruneOptions('lilypadChangelogSql', options.prune);
   const quotedTable = quoteIdentifier(table);
   const indexPrefix = identifierPrefix(table);
+  const pruneFunction = quoteIdentifier(pruneFunctionName(table));
+  // Before each RETURN of the trigger function. Only in READ COMMITTED: in a stricter isolation,
+  // deleting a row that a concurrent prune deleted would fail the write (serialization failure).
+  const pruneCall = (indent: string) =>
+    prune
+      ? `
+${indent}IF random() * ${prune.every} < 1 AND current_setting('transaction_isolation') = 'read committed' THEN
+${indent}  PERFORM ${pruneFunction}();
+${indent}END IF;`
+      : '';
   const notify = (idExpression: string, opExpression: string) =>
     channel === false
       ? ''
@@ -133,7 +224,25 @@ CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${indexPrefix}_table_xid_idx`)}
   ON ${quotedTable} (table_name, xid);
 CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${indexPrefix}_changed_at_idx`)}
   ON ${quotedTable} (changed_at);
-
+${
+  prune
+    ? `
+-- Deletes up to ${prune.batchSize} changelog rows older than the retention, for the trigger function.
+-- SECURITY DEFINER, so that the writing roles need no DELETE privilege on the changelog, with the
+-- search_path of this migration, where the changelog table is. SKIP LOCKED: concurrent prunes
+-- delete different rows and never wait for each other.
+CREATE OR REPLACE FUNCTION ${pruneFunction}() RETURNS void AS $$
+  DELETE FROM ${quotedTable} WHERE id IN (
+    SELECT id FROM ${quotedTable}
+    WHERE ${olderThanCondition(prune.olderThan)}
+    ORDER BY changed_at
+    LIMIT ${prune.batchSize}
+    FOR UPDATE SKIP LOCKED
+  );
+$$ LANGUAGE sql SECURITY DEFINER SET search_path FROM CURRENT;
+`
+    : ''
+}
 -- Records the changes of the rows of a statement, or a TRUNCATE of the table; the trigger argument
 -- is the primary key column.
 CREATE OR REPLACE FUNCTION ${functionName}() RETURNS trigger AS $$
@@ -141,10 +250,15 @@ DECLARE
   new_id text;
   old_id text;
   changed text;
-BEGIN
+BEGIN${
+    prune
+      ? `
+  -- ${PRUNE_MARKER} olderThan=${prune.olderThan} every=${prune.every} batchSize=${prune.batchSize}`
+      : ''
+  }
   IF TG_OP = 'TRUNCATE' THEN
     INSERT INTO ${quotedTable} (table_schema, table_name, row_id, op)
-      VALUES (TG_TABLE_SCHEMA, TG_TABLE_NAME, NULL, 'TRUNCATE');${notify('NULL', `'TRUNCATE'`)}
+      VALUES (TG_TABLE_SCHEMA, TG_TABLE_NAME, NULL, 'TRUNCATE');${notify('NULL', `'TRUNCATE'`)}${pruneCall('    ')}
     RETURN NULL;
   END IF;
 
@@ -167,7 +281,7 @@ BEGIN
     END;
     EXECUTE format($record$
       ${recordChanged}
-    $record$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;
+    $record$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;${pruneCall('    ')}
     RETURN NULL;
   END IF;
 
@@ -186,11 +300,65 @@ BEGIN
   END IF;
 
   INSERT INTO ${quotedTable} (table_schema, table_name, row_id, op)
-    VALUES (TG_TABLE_SCHEMA, TG_TABLE_NAME, COALESCE(new_id, old_id), TG_OP);${notify('COALESCE(new_id, old_id)', 'TG_OP')}
+    VALUES (TG_TABLE_SCHEMA, TG_TABLE_NAME, COALESCE(new_id, old_id), TG_OP);${notify('COALESCE(new_id, old_id)', 'TG_OP')}${pruneCall('  ')}
   RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 COMMENT ON FUNCTION ${functionName}() IS ${quoteLiteral(`${LILYPAD_CHANGELOG_VERSION_PREFIX}${LILYPAD_CHANGELOG_VERSION}`)};
+${prune ? '' : `DROP FUNCTION IF EXISTS ${pruneFunction}();\n`}`;
+}
+
+export type LilypadChangelogPruneScheduleOptions = {
+  /**
+   * The retention, in milliseconds: the rows older than this are deleted. It must be much longer
+   * than the `maxGap` and the `lookback` of the caches, and than the longest transaction (e.g. 24 h).
+   */
+  olderThan: number;
+  /** When the job runs, in cron syntax (pg_cron uses UTC). Defaults to `0 3 * * *`: daily at 3:00. */
+  schedule?: string;
+  /** Name of the changelog table, if not the default one. */
+  changelogTable?: string;
+  /** Name of the job. Defaults to `<changelog table>_prune`. Scheduling it again replaces it. */
+  jobName?: string;
+  /**
+   * The database of the changelog table, when pg_cron is installed in another one (see
+   * `cron.database_name`): the SQL then runs in the pg_cron database, and the job resolves
+   * `changelogTable` with the search_path of its role, so qualify it with its schema. Without it,
+   * the SQL runs in the database of the changelog, which must be the pg_cron one.
+   */
+  database?: string;
+};
+
+/**
+ * The SQL that schedules a pg_cron job deleting the changelog rows older than `olderThan`: the
+ * database then prunes its changelog itself. Run it once, in a migration, with pg_cron installed
+ * (`CREATE EXTENSION pg_cron`). Running it again updates the job.
+ */
+export function lilypadChangelogPruneScheduleSql(
+  options: LilypadChangelogPruneScheduleOptions
+): string {
+  assertNumberOption(
+    'lilypadChangelogPruneScheduleSql',
+    'olderThan',
+    options.olderThan,
+    'positive'
+  );
+  const table = options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
+  const jobName = quoteLiteral(options.jobName ?? pruneFunctionName(table));
+  const schedule = quoteLiteral(options.schedule ?? '0 3 * * *');
+  const condition = olderThanCondition(options.olderThan);
+  if (options.database !== undefined) {
+    const command = `DELETE FROM ${quoteIdentifier(table)} WHERE ${condition}`;
+    return `SELECT cron.schedule_in_database(${jobName}, ${schedule}, ${quoteLiteral(command)}, ${quoteLiteral(options.database)});
+`;
+  }
+  // The table is qualified with its schema now: the job runs with the search_path of its role
+  return `SELECT cron.schedule(${jobName}, ${schedule}, format(
+  'DELETE FROM %I.%I WHERE ${condition}',
+  n.nspname, c.relname
+))
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.oid = ${quoteLiteral(quoteIdentifier(table))}::regclass;
 `;
 }
 

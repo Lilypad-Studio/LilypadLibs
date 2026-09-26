@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Changelog pruning without an application job**: `lilypadChangelogPruneScheduleSql({ olderThan })` returns the SQL that schedules a pg_cron job deleting the old changelog rows, and `lilypadChangelogSql({ prune: { olderThan } })` makes the trigger delete a batch of old rows as it records changes. `lilypadChangelogSql()` without `prune` also drops the prune function, and the schema check keeps the prune options of an installed changelog in the SQL it suggests. The changelog stays at version 4: nothing to run again.
+
 ## 0.4.0
 
 ### Upgrading from 0.3.0

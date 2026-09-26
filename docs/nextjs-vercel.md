@@ -190,7 +190,27 @@ The traffic between the application and the database stays proportional to the c
 
 ### Deleting old changelog rows
 
-Delete the rows older than the retention periodically, for example daily with Vercel Cron:
+The changelog keeps one row per change until it is pruned. The database can prune it itself, in two ways; pick one (or both):
+
+- **pg_cron**, if your provider offers it (Supabase, Neon, RDS, Cloud SQL, Azure): a nightly job in the database. Run this once, in a migration, after `CREATE EXTENSION pg_cron`:
+
+  ```ts
+  import { lilypadChangelogPruneScheduleSql } from '@lilypad/libs/db';
+
+  await sql.unsafe(lilypadChangelogPruneScheduleSql({ olderThan: 24 * 60 * 60_000 })); // daily at 3:00 UTC
+  ```
+
+  Running it again replaces the job (`schedule` changes when it runs). pg_cron runs its jobs in one database (`cron.database_name`, often `postgres`): if your tables are in another one, run the SQL in the pg_cron database with `database: '<your database>'`, and a changelog table qualified with its schema (`changelogTable: 'public.lilypad_cache_changes'`). To remove the job: `SELECT cron.unschedule('lilypad_cache_changes_prune')`.
+
+- **The trigger itself**, anywhere: pass `prune` to `lilypadChangelogSql`, and the trigger deletes a batch of old rows while it records a change:
+
+  ```ts
+  await sql.unsafe(lilypadChangelogSql({ prune: { olderThan: 24 * 60 * 60_000 } }));
+  ```
+
+  On about one statement in `every` (default 20), it deletes up to `batchSize` (default 1000) rows older than `olderThan`, in the writing transaction. The table then grows only with writes, and the writes prune it. The cost falls on the writes: an indexed lookup on one statement in 20, and a few milliseconds when it finds a batch. A `SECURITY DEFINER` function deletes the rows, so the roles that write need no `DELETE` privilege on the changelog. It prunes only in `READ COMMITTED` transactions (the default): in a stricter isolation, deleting rows that a concurrent prune deleted would fail the write. `batchSize / every` (50 rows per statement by default) must stay above the number of rows your statements change on average, or the table keeps growing. Running `lilypadChangelogSql()` without `prune` turns it off again.
+
+Or delete the rows from the application, for example daily with Vercel Cron:
 
 ```ts
 // app/api/cron/lilypad-changelog/route.ts
@@ -285,7 +305,7 @@ The subpaths also keep the bundles small, since `postgres` is only pulled in by 
 | | `maxEntries` | According to the memory of your functions | Bounded memory on long-lived instances |
 | `LilypadDbCache` | `sync` | `{ strategy: 'changelog', pollInterval: 5_000 }` | Works without long-lived connections, sees external changes |
 | | TTL (with `shared`) | ≤ `60_000` | Bounds the rare race described in section 9 |
-| Changelog | Retention | `pruneLilypadChangelog`, 24 h, daily | Keeps the table small; much longer than `maxGap` |
+| Changelog | Retention | 24 h: `lilypadChangelogPruneScheduleSql` (pg_cron), or the `prune` option of `lilypadChangelogSql` | Keeps the table small, with no job in the application; much longer than `maxGap` |
 | `LilypadLogger` | `platform`, `context` | The adapter; your request context | Logs are not lost and can be correlated |
 | | Components | `LilypadJsonConsoleLogger` | Structured, filterable logs |
 

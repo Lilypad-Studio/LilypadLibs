@@ -34,6 +34,7 @@ export type {
 
 export {
   LILYPAD_DEFAULT_CHANGELOG_TABLE,
+  lilypadChangelogPruneScheduleSql,
   lilypadChangelogSql,
   lilypadChangelogTriggerSql,
   pruneLilypadChangelog,
@@ -42,6 +43,8 @@ export {
 export type {
   LilypadChange,
   LilypadChangelogCursor,
+  LilypadChangelogPruneOptions,
+  LilypadChangelogPruneScheduleOptions,
   LilypadChangelogSqlOptions,
   LilypadChangesRequest,
 } from '../dbGate/LilypadChangelog';

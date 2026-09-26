@@ -680,7 +680,7 @@ A caveat of the transaction ids: `pg_current_xact_id()` returns the id of the **
 
 `readLilypadChangesBatch` ([line 229](../src/dbGate/LilypadChangelog.ts#L229)) reads several tables in **one statement**. One statement matters: behind a transaction-mode pooler, two separate statements could run on different backends, and the snapshot would not match the rows. The query ([line 249](../src/dbGate/LilypadChangelog.ts#L249)) is explained clause by clause in [5.5](#55-the-changelog-query-clause-by-clause).
 
-Each request is either `{ cursor }` (trusted: continue from where I stopped) or `{ lookback }` (untrusted: give me everything from the last N ms). `readLilypadChanges` is the one-table wrapper; `pruneLilypadChangelog` deletes rows older than a retention.
+Each request is either `{ cursor }` (trusted: continue from where I stopped) or `{ lookback }` (untrusted: give me everything from the last N ms). `readLilypadChanges` is the one-table wrapper; `pruneLilypadChangelog` deletes rows older than a retention, as do the pg_cron job of `lilypadChangelogPruneScheduleSql` and the trigger itself with the `prune` option of `lilypadChangelogSql` (see [What it costs](#what-it-costs)).
 
 #### The reader: one query for all the caches of a gate
 
@@ -907,7 +907,7 @@ Three properties shape everything else:
 
 - **The change is recorded in the same transaction as the write.** The trigger runs inside the writing transaction, so its changelog row becomes visible exactly when the write does, and disappears with it on a rollback. A reader never sees a new row version without also being able to see its changelog row.
 - **Nothing is pushed.** Instances pull, and only when their cache is read: no timer, no connection kept open. An idle or suspended instance costs the database nothing, and loses nothing either: the changes wait in the table.
-- **The database does not know its readers.** Each instance keeps its own cursor in memory. The changelog is shared by every instance and every cached table, and rows leave it only through retention (`pruneLilypadChangelog`).
+- **The database does not know its readers.** Each instance keeps its own cursor in memory. The changelog is shared by every instance and every cached table, and rows leave it only through retention (`pruneLilypadChangelog`, a pg_cron job, or the trigger's `prune` option).
 
 #### What each side keeps
 
@@ -1038,7 +1038,7 @@ t = 3 h     getOrFetch(7): 3 h > maxGap. Untrusted: lookback read, expireEveryth
 | --- | --- | --- | --- |
 | `pollInterval` | required | How old the data served by a polling read can be, for changes made elsewhere; at most one changelog query per interval per instance (for all its cached tables) | Well below `maxGap`: otherwise every poll is a lookback and the chain never holds |
 | `poll` | `'await'` | Whether a read that falls due waits for the poll | `'background'` only if the latency of one small query matters more than freshness (see [Caveats](#caveats)) |
-| `maxGap` | 1 h | How long the chain is trusted without an applied read | Far below the retention of `pruneLilypadChangelog` |
+| `maxGap` | 1 h | How long the chain is trusted without an applied read | Far below the retention of the changelog (`olderThan`) |
 | `lookback` | TTL + SWR + 1 min | How far back an untrusted read looks | At least the lifetime of an L2 copy (TTL + SWR), and far below the retention |
 | `maxAge` | 1 h | How long a trusted entry can outlive its TTL | Low if the triggers are sometimes bypassed (`0` disables renewal) |
 | `table` | `lilypad_cache_changes` | Which changelog table | The one installed |
@@ -1073,7 +1073,8 @@ Why the inequalities:
 
 - **Database, on each write:** the statement trigger adds one `INSERT ... SELECT` per statement (not per row) to the writing transaction, plus the maintenance of two indexes. With `notifyChannel` left on, it also sends one `pg_notify` per row.
 - **Database, on reads:** one indexed query per instance per `pollInterval`, only while the instance is used, for all its cached tables. The row queries are made only for held keys that changed and are then read again. The instance that wrote a row queries nothing afterwards ([5.4](#54-sqlupdate-and-its-echo)).
-- **Storage:** one row per changed row, bounded by the retention of `pruneLilypadChangelog`.
+- **Database, on each write, with the `prune` option:** on about one statement in `every`, an indexed lookup of the rows older than the retention, and the deletion of up to `batchSize` of them (`FOR UPDATE SKIP LOCKED`, so concurrent prunes never wait for each other). It runs in the writing transaction, only in `READ COMMITTED`: in `REPEATABLE READ` or `SERIALIZABLE`, deleting a row that a concurrent prune deleted raises a serialization failure, which would fail the write. The deletion is a `SECURITY DEFINER` function without parameters, so the writing roles need no `DELETE` privilege, and calling it by hand does nothing the trigger would not do. The trigger function records the options in a comment (`lilypad-prune: ...`), which the schema check reads to keep them in the SQL it suggests.
+- **Storage:** one row per changed row, bounded by the retention (`olderThan`).
 
 The tests of the strategy are the `changelog sync`, `database traffic`, `changelog failures and reads in flight` and `own writes and the changelog cursor` groups of [LilypadDbCache.test.ts](../src/cache/LilypadDbCache.test.ts). The cursor itself is tested against PostgreSQL in [LilypadDbGate.integration.test.ts](../src/dbGate/LilypadDbGate.integration.test.ts) ("should not miss a transaction that commits after a later one", "should not return again the changes committed while a long transaction runs").
 

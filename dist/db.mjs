@@ -535,6 +535,10 @@ function quoteLiteral(value) {
 function triggerFunctionName(changelogTable) {
 	return `${identifierPrefix(changelogTable)}_record`;
 }
+/** The name of the function that deletes the old rows of a changelog table (`prune` option). */
+function pruneFunctionName(changelogTable) {
+	return `${identifierPrefix(changelogTable)}_prune`;
+}
 /**
 * The names of the triggers that record the changes of a table: one statement trigger per event,
 * and the row trigger that versions 3 and earlier installed instead of the first three.
@@ -553,6 +557,37 @@ function changelogTriggerNames(table) {
 function escapeFormat(value) {
 	return value.replace(/%/g, "%%");
 }
+/** The comment of the trigger function that records its prune options (read back by the schema check). */
+const PRUNE_MARKER = "lilypad-prune:";
+function resolvePruneOptions(owner, prune) {
+	if (!prune) return;
+	assertNumberOption(owner, "prune.olderThan", prune.olderThan, "positive");
+	assertNumberOption(owner, "prune.every", prune.every, "positive-integer");
+	assertNumberOption(owner, "prune.batchSize", prune.batchSize, "positive-integer");
+	return {
+		olderThan: prune.olderThan,
+		every: prune.every ?? 20,
+		batchSize: prune.batchSize ?? 1e3
+	};
+}
+/**
+* The `prune` options of an installed trigger function, from its source, or `false` if it does not
+* prune: the SQL that fixes an outdated changelog keeps them.
+*/
+function installedLilypadChangelogPrune(source) {
+	const match = source ? new RegExp(`${PRUNE_MARKER} olderThan=(\\S+) every=(\\d+) batchSize=(\\d+)`).exec(source) : null;
+	if (!match) return false;
+	const prune = {
+		olderThan: Number(match[1]),
+		every: Number(match[2]),
+		batchSize: Number(match[3])
+	};
+	return Number.isFinite(prune.olderThan) && prune.olderThan > 0 && prune.every > 0 && prune.batchSize > 0 ? prune : false;
+}
+/** The SQL condition on `changed_at` of the rows older than `olderThan` milliseconds. */
+function olderThanCondition(olderThan) {
+	return `changed_at < clock_timestamp() - make_interval(secs => ${olderThan / 1e3})`;
+}
 /**
 * The SQL that creates the changelog table and its trigger function. Run it once, in a migration.
 * It is idempotent (`IF NOT EXISTS` / `CREATE OR REPLACE`).
@@ -562,8 +597,14 @@ function escapeFormat(value) {
 function lilypadChangelogSql(options = {}) {
 	const table = options.table ?? "lilypad_cache_changes";
 	const channel = options.notifyChannel ?? "cache_events";
+	const prune = resolvePruneOptions("lilypadChangelogSql", options.prune);
 	const quotedTable = quoteIdentifier(table);
 	const indexPrefix = identifierPrefix(table);
+	const pruneFunction = quoteIdentifier(pruneFunctionName(table));
+	const pruneCall = (indent) => prune ? `
+${indent}IF random() * ${prune.every} < 1 AND current_setting('transaction_isolation') = 'read committed' THEN
+${indent}  PERFORM ${pruneFunction}();
+${indent}END IF;` : "";
 	const notify = (idExpression, opExpression) => channel === false ? "" : `
     PERFORM pg_notify(${quoteLiteral(channel)}, json_build_object(
       'schema', TG_TABLE_SCHEMA, 'table', TG_TABLE_NAME, 'id', ${idExpression}, 'op', ${opExpression},
@@ -598,7 +639,21 @@ CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${indexPrefix}_table_xid_idx`)}
   ON ${quotedTable} (table_name, xid);
 CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${indexPrefix}_changed_at_idx`)}
   ON ${quotedTable} (changed_at);
-
+${prune ? `
+-- Deletes up to ${prune.batchSize} changelog rows older than the retention, for the trigger function.
+-- SECURITY DEFINER, so that the writing roles need no DELETE privilege on the changelog, with the
+-- search_path of this migration, where the changelog table is. SKIP LOCKED: concurrent prunes
+-- delete different rows and never wait for each other.
+CREATE OR REPLACE FUNCTION ${pruneFunction}() RETURNS void AS $$
+  DELETE FROM ${quotedTable} WHERE id IN (
+    SELECT id FROM ${quotedTable}
+    WHERE ${olderThanCondition(prune.olderThan)}
+    ORDER BY changed_at
+    LIMIT ${prune.batchSize}
+    FOR UPDATE SKIP LOCKED
+  );
+$$ LANGUAGE sql SECURITY DEFINER SET search_path FROM CURRENT;
+` : ""}
 -- Records the changes of the rows of a statement, or a TRUNCATE of the table; the trigger argument
 -- is the primary key column.
 CREATE OR REPLACE FUNCTION ${functionName}() RETURNS trigger AS $$
@@ -606,10 +661,11 @@ DECLARE
   new_id text;
   old_id text;
   changed text;
-BEGIN
+BEGIN${prune ? `
+  -- ${PRUNE_MARKER} olderThan=${prune.olderThan} every=${prune.every} batchSize=${prune.batchSize}` : ""}
   IF TG_OP = 'TRUNCATE' THEN
     INSERT INTO ${quotedTable} (table_schema, table_name, row_id, op)
-      VALUES (TG_TABLE_SCHEMA, TG_TABLE_NAME, NULL, 'TRUNCATE');${notify("NULL", `'TRUNCATE'`)}
+      VALUES (TG_TABLE_SCHEMA, TG_TABLE_NAME, NULL, 'TRUNCATE');${notify("NULL", `'TRUNCATE'`)}${pruneCall("    ")}
     RETURN NULL;
   END IF;
 
@@ -632,7 +688,7 @@ BEGIN
     END;
     EXECUTE format($record$
       ${recordChanged}
-    $record$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;
+    $record$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;${pruneCall("    ")}
     RETURN NULL;
   END IF;
 
@@ -651,11 +707,32 @@ BEGIN
   END IF;
 
   INSERT INTO ${quotedTable} (table_schema, table_name, row_id, op)
-    VALUES (TG_TABLE_SCHEMA, TG_TABLE_NAME, COALESCE(new_id, old_id), TG_OP);${notify("COALESCE(new_id, old_id)", "TG_OP")}
+    VALUES (TG_TABLE_SCHEMA, TG_TABLE_NAME, COALESCE(new_id, old_id), TG_OP);${notify("COALESCE(new_id, old_id)", "TG_OP")}${pruneCall("  ")}
   RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 COMMENT ON FUNCTION ${functionName}() IS ${quoteLiteral(`${LILYPAD_CHANGELOG_VERSION_PREFIX}4`)};
+${prune ? "" : `DROP FUNCTION IF EXISTS ${pruneFunction}();\n`}`;
+}
+/**
+* The SQL that schedules a pg_cron job deleting the changelog rows older than `olderThan`: the
+* database then prunes its changelog itself. Run it once, in a migration, with pg_cron installed
+* (`CREATE EXTENSION pg_cron`). Running it again updates the job.
+*/
+function lilypadChangelogPruneScheduleSql(options) {
+	assertNumberOption("lilypadChangelogPruneScheduleSql", "olderThan", options.olderThan, "positive");
+	const table = options.changelogTable ?? "lilypad_cache_changes";
+	const jobName = quoteLiteral(options.jobName ?? pruneFunctionName(table));
+	const schedule = quoteLiteral(options.schedule ?? "0 3 * * *");
+	const condition = olderThanCondition(options.olderThan);
+	if (options.database !== void 0) return `SELECT cron.schedule_in_database(${jobName}, ${schedule}, ${quoteLiteral(`DELETE FROM ${quoteIdentifier(table)} WHERE ${condition}`)}, ${quoteLiteral(options.database)});
+`;
+	return `SELECT cron.schedule(${jobName}, ${schedule}, format(
+  'DELETE FROM %I.%I WHERE ${condition}',
+  n.nspname, c.relname
+))
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.oid = ${quoteLiteral(quoteIdentifier(table))}::regclass;
 `;
 }
 /**
@@ -1313,6 +1390,7 @@ async function checkLilypadSchema(gate, options) {
 function evaluateLilypadSchema(facts, options) {
 	const changelog = changelogTarget(options);
 	const notifyChannel = options.notifyChannel ?? false;
+	const prune = installedLilypadChangelogPrune(facts.changelog.functionSource);
 	const problems = [];
 	if (facts.version < 13e4) problems.push({
 		code: "unsupported-version",
@@ -1321,7 +1399,8 @@ function evaluateLilypadSchema(facts, options) {
 	if (changelog) {
 		const changelogSql = lilypadChangelogSql({
 			table: changelog.custom,
-			notifyChannel: notifyChannel !== false ? notifyChannel : installedNotifyChannel(facts.changelog.functionSource)
+			notifyChannel: notifyChannel !== false ? notifyChannel : installedNotifyChannel(facts.changelog.functionSource),
+			prune
 		});
 		const { hasTable, hasSchemaColumn, hasFunction, functionComment } = facts.changelog;
 		if (!hasTable || !hasFunction) problems.push({
@@ -1391,7 +1470,8 @@ function evaluateLilypadSchema(facts, options) {
 			const notifiedEvents = triggers.filter((trigger) => trigger.enabled && notifies.test(trigger.source)).reduce((events, trigger) => events | ((trigger.type & TRIGGER_TYPE_ROW) !== 0 ? trigger.type & ROW_EVENTS : recordedEvents(trigger)), 0);
 			const fix = lilypadChangelogSql({
 				table: changelog?.custom,
-				notifyChannel
+				notifyChannel,
+				prune
 			}) + lilypadChangelogTriggerSql({
 				table,
 				primaryKey,
@@ -2189,6 +2269,6 @@ var LilypadDbCache = class LilypadDbCache extends LilypadCacheCore {
 	}
 };
 //#endregion
-export { LILYPAD_DEFAULT_CHANGELOG_TABLE, LilypadDbCache, LilypadDbGate, LilypadDbNotFoundError, LilypadSchemaCheckError, checkLilypadSchema, lilypadChangelogSql, lilypadChangelogTriggerSql, lilypadServerlessPool, pruneLilypadChangelog, readLilypadChanges };
+export { LILYPAD_DEFAULT_CHANGELOG_TABLE, LilypadDbCache, LilypadDbGate, LilypadDbNotFoundError, LilypadSchemaCheckError, checkLilypadSchema, lilypadChangelogPruneScheduleSql, lilypadChangelogSql, lilypadChangelogTriggerSql, lilypadServerlessPool, pruneLilypadChangelog, readLilypadChanges };
 
 //# sourceMappingURL=db.mjs.map

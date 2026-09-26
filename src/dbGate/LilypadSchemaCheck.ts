@@ -5,6 +5,7 @@ import {
   LILYPAD_CHANGELOG_VERSION,
   LILYPAD_CHANGELOG_VERSION_PREFIX,
   LILYPAD_DEFAULT_CHANGELOG_TABLE,
+  installedLilypadChangelogPrune,
   lilypadChangelogSql,
   lilypadChangelogTriggerSql,
   quoteIdentifier,
@@ -321,6 +322,8 @@ export function evaluateLilypadSchema(
 ): LilypadSchemaCheckResult {
   const changelog = changelogTarget(options);
   const notifyChannel = options.notifyChannel ?? false;
+  // The SQL that fixes the changelog keeps the pruning of the installed trigger function
+  const prune = installedLilypadChangelogPrune(facts.changelog.functionSource);
   const problems: LilypadSchemaProblem[] = [];
 
   if (facts.version < 130000) {
@@ -340,6 +343,7 @@ export function evaluateLilypadSchema(
         notifyChannel !== false
           ? notifyChannel
           : installedNotifyChannel(facts.changelog.functionSource),
+      prune,
     });
     const { hasTable, hasSchemaColumn, hasFunction, functionComment } = facts.changelog;
     if (!hasTable || !hasFunction) {
@@ -434,7 +438,7 @@ export function evaluateLilypadSchema(
           0
         );
       const fix =
-        lilypadChangelogSql({ table: changelog?.custom, notifyChannel }) +
+        lilypadChangelogSql({ table: changelog?.custom, notifyChannel, prune }) +
         lilypadChangelogTriggerSql({ table, primaryKey, changelogTable: changelog?.custom });
       if (notifiedEvents === 0) {
         problems.push({

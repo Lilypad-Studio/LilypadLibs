@@ -4,6 +4,7 @@ import postgres from 'postgres';
 import { LilypadDbGate, LilypadDbNotFoundError, type LilypadDbSchema } from './LilypadDbGate';
 import { LilypadDbCache } from '@/cache/LilypadDbCache';
 import {
+  lilypadChangelogPruneScheduleSql,
   lilypadChangelogSql,
   lilypadChangelogTriggerSql,
   pruneLilypadChangelog,
@@ -633,6 +634,147 @@ describe('LilypadDbGate (integration)', () => {
 
       expect(await pruneLilypadChangelog(gate, { olderThan: 0 })).toBe(1);
       expect((await readAll()).changes).toEqual([]);
+    });
+
+    describe('pruning', () => {
+      /** Records `count` changes, dated two hours ago. */
+      const recordOldChanges = async (count: number) => {
+        await admin`INSERT INTO users (name) SELECT 'old' FROM generate_series(1, ${count})`;
+        await admin`UPDATE lilypad_cache_changes SET changed_at = now() - interval '2 hours'`;
+      };
+      const countChanges = async () => {
+        const [row] = await admin`
+          SELECT count(*) FILTER (WHERE changed_at < now() - interval '1 hour')::int AS old,
+            count(*) FILTER (WHERE changed_at >= now() - interval '1 hour')::int AS recent
+          FROM lilypad_cache_changes
+        `;
+        return row as { old: number; recent: number };
+      };
+
+      describe('from the trigger', () => {
+        beforeAll(async () => {
+          await admin.unsafe(
+            lilypadChangelogSql({
+              notifyChannel: false,
+              prune: { olderThan: 60 * 60_000, every: 1, batchSize: 2 },
+            })
+          );
+          // A role that can write the cached table and record its changes, but not delete them
+          await admin.unsafe(`
+            CREATE ROLE lilypad_writer;
+            GRANT INSERT, UPDATE ON users TO lilypad_writer;
+            GRANT USAGE ON SEQUENCE users_id_seq TO lilypad_writer;
+            GRANT INSERT ON lilypad_cache_changes TO lilypad_writer;
+            GRANT USAGE ON SEQUENCE lilypad_cache_changes_id_seq TO lilypad_writer;
+          `);
+        });
+
+        afterAll(async () => {
+          await admin.unsafe(`
+            DROP OWNED BY lilypad_writer;
+            DROP ROLE lilypad_writer;
+          `);
+          await admin.unsafe(lilypadChangelogSql({ notifyChannel: false }));
+        });
+
+        it('should delete a batch of old rows with a write, even without the DELETE privilege', async () => {
+          await recordOldChanges(3);
+
+          await admin.begin(async (tx) => {
+            await tx`SET LOCAL ROLE lilypad_writer`;
+            await tx`INSERT INTO users (name) VALUES ('Ada')`;
+          });
+
+          expect(await countChanges()).toEqual({ old: 1, recent: 1 });
+        });
+
+        it('should not prune in a transaction stricter than READ COMMITTED', async () => {
+          await recordOldChanges(3);
+
+          await admin.begin('isolation level repeatable read', async (tx) => {
+            await tx`INSERT INTO users (name) VALUES ('Ada')`;
+          });
+
+          expect(await countChanges()).toEqual({ old: 3, recent: 1 });
+        });
+
+        it('should not prune any more once installed without the option', async () => {
+          await admin.unsafe(lilypadChangelogSql({ notifyChannel: false }));
+          try {
+            await recordOldChanges(3);
+            await admin`INSERT INTO users (name) VALUES ('Ada')`;
+
+            expect(await countChanges()).toEqual({ old: 3, recent: 1 });
+            const [row] = await admin`
+              SELECT to_regprocedure('lilypad_cache_changes_prune()') IS NULL AS dropped
+            `;
+            expect(row!.dropped).toBe(true);
+          } finally {
+            await admin.unsafe(
+              lilypadChangelogSql({
+                notifyChannel: false,
+                prune: { olderThan: 60 * 60_000, every: 1, batchSize: 2 },
+              })
+            );
+          }
+        });
+
+        it('should keep the pruning in the fix of an outdated changelog', async () => {
+          await admin`COMMENT ON FUNCTION lilypad_cache_changes_record() IS 'lilypad-changelog:3'`;
+          try {
+            const result = await checkLilypadSchema(gate, { tables: [] });
+
+            expect(result.problems[0]!.fix).toBe(
+              lilypadChangelogSql({
+                notifyChannel: false,
+                prune: { olderThan: 60 * 60_000, every: 1, batchSize: 2 },
+              })
+            );
+          } finally {
+            await admin`COMMENT ON FUNCTION lilypad_cache_changes_record() IS 'lilypad-changelog:4'`;
+          }
+        });
+      });
+
+      it('should schedule a pg_cron job that deletes the old rows', async () => {
+        // pg_cron is not in the image: a stand-in cron.schedule records the job
+        await admin.unsafe(`
+          CREATE SCHEMA cron;
+          CREATE TABLE cron.job (jobname text PRIMARY KEY, schedule text, command text);
+          CREATE FUNCTION cron.schedule(job_name text, schedule text, command text) RETURNS bigint AS $$
+            INSERT INTO cron.job VALUES (job_name, schedule, command)
+            ON CONFLICT (jobname) DO UPDATE SET schedule = excluded.schedule, command = excluded.command;
+            SELECT 1::bigint;
+          $$ LANGUAGE sql;
+        `);
+        try {
+          await admin.unsafe(lilypadChangelogPruneScheduleSql({ olderThan: 60 * 60_000 }));
+          await admin.unsafe(
+            lilypadChangelogPruneScheduleSql({ olderThan: 60 * 60_000, schedule: '0 * * * *' })
+          );
+          const jobs = await admin`SELECT jobname, schedule, command FROM cron.job`;
+          expect(jobs).toEqual([
+            {
+              jobname: 'lilypad_cache_changes_prune',
+              schedule: '0 * * * *',
+              command:
+                'DELETE FROM public.lilypad_cache_changes WHERE changed_at < clock_timestamp() - make_interval(secs => 3600)',
+            },
+          ]);
+
+          await recordOldChanges(3);
+          await admin`INSERT INTO users (name) VALUES ('Ada')`;
+          // The job runs in its own session, with the search_path of its role
+          await admin.begin(async (tx) => {
+            await tx`SET LOCAL search_path TO pg_catalog`;
+            await tx.unsafe(jobs[0]!.command as string);
+          });
+
+          expect(await countChanges()).toEqual({ old: 0, recent: 1 });
+        } finally {
+          await admin`DROP SCHEMA cron CASCADE`;
+        }
+      });
     });
 
     it('should keep a LilypadDbCache in sync without LISTEN', async () => {

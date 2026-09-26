@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { lilypadChangelogSql } from './LilypadChangelog';
 import {
   evaluateLilypadSchema,
   type LilypadSchemaCheckOptions,
@@ -150,6 +151,27 @@ describe('evaluateLilypadSchema', () => {
 
       expect(codes(result)).toEqual(['outdated-changelog']);
       expect(fix(result)).toContain("pg_notify('app''events'");
+    });
+
+    it('should keep the pruning of an outdated changelog', () => {
+      const prune = { olderThan: 86_400_000, every: 5, batchSize: 200 };
+      const result = evaluateLilypadSchema(
+        outdated(lilypadChangelogSql({ notifyChannel: false, prune })),
+        changelogOptions
+      );
+
+      expect(codes(result)).toEqual(['outdated-changelog']);
+      expect(fix(result)).toBe(lilypadChangelogSql({ notifyChannel: false, prune }));
+    });
+
+    it('should not start pruning an outdated changelog that did not', () => {
+      const result = evaluateLilypadSchema(
+        outdated(notifySource('cache_events')),
+        changelogOptions
+      );
+
+      expect(fix(result)).toContain('DROP FUNCTION IF EXISTS "lilypad_cache_changes_prune"()');
+      expect(fix(result)).not.toContain('PERFORM "lilypad_cache_changes_prune"()');
     });
   });
 
