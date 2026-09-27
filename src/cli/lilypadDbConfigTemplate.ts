@@ -1,0 +1,88 @@
+import { LILYPAD_DEFAULT_DB_CONFIG_NAME } from '@/dbConfig/LilypadDbConfigDefaults';
+
+export type LilypadDbConfigTemplateOptions = {
+  /** The name of the config (`default`: no `name` option in the file). */
+  name: string;
+  /** A TypeScript file (with the row type of the example table), or JavaScript. */
+  typescript: boolean;
+  /** No example table: `tables: {}`, with the example as a comment. */
+  empty: boolean;
+};
+
+const HEADER = `// The database config of @lilypad/libs: the tables the application uses, and what the database
+// must provide for them. The application imports it to create its gates and caches;
+// \`npx lilypad-doctor\` checks the database against it, and prints the SQL that fixes what differs.
+//
+// Node.js loads it without a bundler: import only '@lilypad/libs/schema' and relative files with
+// their extension (e.g. './db/users.ts'), and no path aliases.`;
+
+/** The lines of the example table, from `const example = ...` to its end. */
+function exampleTable(typescript: boolean): string[] {
+  return [
+    ...(typescript
+      ? [
+          '/** A row of the `example` table, as the application reads it. */',
+          'type Example = {',
+          '  id: number;',
+          '  name: string;',
+          '  createdAt: Date;',
+          '};',
+          '',
+          "const example = defineLilypadTable<Example, 'id'>({",
+        ]
+      : ['const example = defineLilypadTable({']),
+    "  tableName: 'example', // or 'schema.example'",
+    "  primaryKey: 'id',",
+    '  generatedPrimaryKey: true, // the database generates the id',
+    '  cols: {',
+    "    id: { type: 'number', pgType: 'int4' },",
+    "    name: { type: 'string', pgType: 'text', nullable: false, unique: true },",
+    "    createdAt: { type: 'date', pgType: 'timestamptz', nullable: false, default: { sql: 'now()' } },",
+    '  },',
+    "  // unique: [{ columns: ['name', 'createdAt'] }],",
+    "  // foreignKeys: [{ columns: ['ownerId'], references: { table: 'owners', onDelete: 'cascade' } }],",
+    "  // indexes: [{ columns: ['createdAt'] }],",
+    `  // checks: [{ name: 'example_name_check', expression: "name <> ''" }],`,
+    '  // How LilypadDbCache follows the changes made elsewhere: listen (long-running servers),',
+    "  // { strategy: 'changelog', pollInterval: 5_000 } (serverless platforms), or { strategy: 'none' }",
+    "  sync: { strategy: 'listen' },",
+    '});',
+  ];
+}
+
+/**
+ * The content of a new config file: an example table (or none), and the options of the config
+ * with their defaults, as comments.
+ */
+export function lilypadDbConfigTemplate({
+  name,
+  typescript,
+  empty,
+}: LilypadDbConfigTemplateOptions): string {
+  const table = exampleTable(typescript);
+  const lines = [
+    HEADER,
+    empty
+      ? "import { defineLilypadDb } from '@lilypad/libs/schema';"
+      : "import { defineLilypadDb, defineLilypadTable } from '@lilypad/libs/schema';",
+    '',
+    ...(empty
+      ? [
+          '// Describe each table with defineLilypadTable (imported from the same module), e.g.:',
+          '//',
+          ...table.map((line) => (line === '' ? '//' : `// ${line}`)),
+        ]
+      : table),
+    '',
+    'export default defineLilypadDb({',
+    ...(name === LILYPAD_DEFAULT_DB_CONFIG_NAME ? [] : [`  name: '${name}',`]),
+    "  // defaultSchema: 'public', // the schema of the tables whose name is not qualified",
+    "  // notifyChannel: 'cache_events', // the channel of the 'listen' tables",
+    "  // changelog: { table: 'lilypad_cache_changes', pruning: 'detect' }, // for the 'changelog' tables",
+    '  // strict: false, // true: lilypad-doctor also reports what the database has and the config lacks',
+    empty ? '  tables: {},' : '  tables: { example },',
+    '});',
+    '',
+  ];
+  return lines.join('\n');
+}

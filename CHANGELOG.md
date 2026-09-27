@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `npx lilypad-doctor init [--config <name|path>] [--empty] [--force]` creates a config file to start from: `lilypad.config.ts` (or `lilypad.<name>.config.ts`, or the path given, in JavaScript for `.mjs`/`.js`), with an example table and the options of the config as comments. It never overwrites an existing config without `--force`, and needs no database.
+
 ## 0.6.0
 
 ### Upgrading

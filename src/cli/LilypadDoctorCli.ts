@@ -1,4 +1,5 @@
 import { parseArgs } from 'node:util';
+import { runLilypadInitCli, type LilypadInitDependencies } from '@/cli/LilypadInitCli';
 import type { LilypadDbConfig } from '@/dbConfig/LilypadDbConfig';
 import { loadLilypadDbConfig } from '@/dbConfig/loadLilypadDbConfig';
 import {
@@ -8,10 +9,14 @@ import {
 } from '@/dbGate/LilypadDoctor';
 
 const USAGE = `Usage: lilypad-doctor [options]
+       lilypad-doctor init [--config <name|path>] [--empty] [--force]
 
-Checks the database against a config (see defineLilypadDb): the tables, their columns, keys,
-foreign keys, indexes and checks, the triggers of the sync strategies, the changelog and how it is
-pruned. It only reads the catalogs, and prints the SQL that fixes what it finds.
+init creates a config file to start from (see lilypad-doctor init --help).
+
+Without a command, it checks the database against a config (see defineLilypadDb): the tables,
+their columns, keys, foreign keys, indexes and checks, the triggers of the sync strategies, the
+changelog and how it is pruned. It only reads the catalogs, and prints the SQL that fixes what it
+finds.
 
 Options:
   --config <name|path>  The config: a name finds lilypad.<name>.config.{ts,mts,mjs,js} in the
@@ -90,6 +95,8 @@ export function parseLilypadDoctorArgs(
 export type LilypadDoctorCliDependencies = {
   run?: (options: LilypadDoctorOptions) => Promise<LilypadDoctorReport>;
   load?: (options: { config?: string }) => Promise<{ path: string; config: LilypadDbConfig }>;
+  /** The file system of `init`. */
+  init?: LilypadInitDependencies;
 };
 
 /** The SQL that fixes the problems, once each, in the order of the problems. */
@@ -100,7 +107,8 @@ function fixSql(report: LilypadDoctorReport): string {
 }
 
 /**
- * Runs `lilypad-doctor` with these arguments.
+ * Runs `lilypad-doctor` with these arguments: `init ...` creates a config file, anything else
+ * checks the database.
  *
  * @returns The exit code: 0 without errors (there may be warnings), 1 with errors, 2 when the
  * check could not run (invalid arguments, config not found, unreachable database).
@@ -109,8 +117,11 @@ export async function runLilypadDoctorCli(
   argv: string[],
   env: Record<string, string | undefined>,
   output: LilypadDoctorOutput,
-  { run = runLilypadDoctor, load = loadLilypadDbConfig }: LilypadDoctorCliDependencies = {}
+  { run = runLilypadDoctor, load = loadLilypadDbConfig, init }: LilypadDoctorCliDependencies = {}
 ): Promise<number> {
+  if (argv[0] === 'init') {
+    return runLilypadInitCli(argv.slice(1), output, init);
+  }
   let parsed: LilypadDoctorArgs;
   try {
     parsed = parseLilypadDoctorArgs(argv, env);

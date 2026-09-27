@@ -36,7 +36,7 @@ Requirements:
 
 ## Quick start
 
-The database modules start from a config file that describes the tables (see [Database config](#database-config)):
+The database modules start from a config file that describes the tables (see [Database config](#database-config)). `npx lilypad-doctor init` creates one to start from, with an example table; edit it into:
 
 ```ts
 // lilypad.config.ts
@@ -522,6 +522,16 @@ Keys are compared by their string form, so `get(1)` and `get('1')` read the same
 
 The database modules work from a **config**: a file that describes the database the application expects. It lists its tables with their columns, keys, foreign keys, indexes and checks, how each table is kept in sync, and the changelog with its pruning. The application imports it to create its gates and caches, where nothing is compared with the database. The [`lilypad-doctor`](#lilypad-doctor-checking-the-database) command loads the same file and checks the database against it.
 
+To start, let the command write the file:
+
+```sh
+npx lilypad-doctor init                       # lilypad.config.ts, with an example table
+npx lilypad-doctor init --config analytics    # lilypad.analytics.config.ts (name: 'analytics')
+npx lilypad-doctor init --config ./db/lilypad.config.mjs --empty  # JavaScript, no example table
+```
+
+It never overwrites a config (a file of the same config with any extension) unless you pass `--force`, and it needs no database. The file it writes lists the options of the config with their defaults, as comments. A complete config looks like this:
+
 ```ts
 // lilypad.config.ts, at the root of the project
 import { defineLilypadDb, defineLilypadTable } from '@lilypad/libs/schema';
@@ -982,6 +992,7 @@ Always call `await accounts.dispose()` when you are done with a cache. It remove
 The library installs nothing in the database at runtime, and checks nothing there either: a missing trigger would leave a `listen` cache silently stale, a missing changelog would fail each of its reads, a missing column would fail the queries. `lilypad-doctor` compares the database with a [config](#database-config), for example in a deployment step, before the application starts. It connects with its own connection and only reads the catalogs:
 
 ```sh
+npx lilypad-doctor init                                     # create lilypad.config.ts (see Database config)
 npx lilypad-doctor --url "$DATABASE_URL"                    # lilypad.config.* in the working directory
 npx lilypad-doctor --url "$DATABASE_URL" --config analytics # lilypad.analytics.config.*
 npx lilypad-doctor --config ./db/lilypad.config.ts          # a file; the URL from DATABASE_URL

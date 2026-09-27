@@ -1,0 +1,206 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { lilypadInitTarget, runLilypadInitCli } from './LilypadInitCli';
+import { runLilypadDoctorCli } from './LilypadDoctorCli';
+import { lilypadDbConfigTemplate } from './lilypadDbConfigTemplate';
+import { isLilypadDbConfig, type LilypadDbConfig } from '@/dbConfig/LilypadDbConfig';
+
+const cwd = resolve('/app');
+
+function output() {
+  return { log: vi.fn(), error: vi.fn() };
+}
+
+/** An in-memory file system, with these files already there. */
+function files(...existing: string[]) {
+  const written = new Map<string, string>(existing.map((file) => [resolve(cwd, file), '']));
+  return {
+    written,
+    deps: {
+      cwd,
+      exists: (path: string) => written.has(path),
+      writeFile: (path: string, content: string) => void written.set(path, content),
+    },
+  };
+}
+
+describe('lilypadInitTarget', () => {
+  const none = () => false;
+
+  it.each<[string | undefined, string, string]>([
+    [undefined, 'lilypad.config.ts', 'default'],
+    ['default', 'lilypad.config.ts', 'default'],
+    ['analytics', 'lilypad.analytics.config.ts', 'analytics'],
+    ['./db/lilypad.analytics.config.mjs', 'db/lilypad.analytics.config.mjs', 'analytics'],
+    ['./db/lilypad.config.js', 'db/lilypad.config.js', 'default'],
+    ['./db/database.mts', 'db/database.mts', 'default'],
+  ])('should create for %s the file %s, of the config %s', (config, file, name) => {
+    expect(lilypadInitTarget(config, cwd, none)).toEqual({
+      path: resolve(cwd, file),
+      name,
+      existing: [],
+    });
+  });
+
+  it('should find the files of the same config with any extension', () => {
+    const exists = (path: string) => path === resolve(cwd, 'lilypad.analytics.config.mjs');
+
+    expect(lilypadInitTarget('analytics', cwd, exists).existing).toEqual([
+      resolve(cwd, 'lilypad.analytics.config.mjs'),
+    ]);
+  });
+
+  it('should reject a path that Node.js cannot load as a module', () => {
+    expect(() => lilypadInitTarget('./db/config.json', cwd, none)).toThrow(
+      'must end with .ts, .mts, .mjs or .js'
+    );
+  });
+});
+
+describe('runLilypadInitCli', () => {
+  it('should create lilypad.config.ts with an example table', () => {
+    const out = output();
+    const fs = files();
+
+    expect(runLilypadInitCli([], out, fs.deps)).toBe(0);
+
+    const content = fs.written.get(resolve(cwd, 'lilypad.config.ts'))!;
+    expect(content).toContain("const example = defineLilypadTable<Example, 'id'>({");
+    expect(content).toContain('tables: { example },');
+    expect(content).not.toMatch(/^ {2}name: '/m); // no name option: the default config
+    expect(out.log).toHaveBeenCalledWith(expect.stringContaining('Created lilypad.config.ts.'));
+    expect(out.log).toHaveBeenCalledWith(
+      expect.stringContaining('npx lilypad-doctor --url "$DATABASE_URL"')
+    );
+  });
+
+  it('should name a config created by name, and tell how to check it', () => {
+    const out = output();
+    const fs = files();
+
+    expect(runLilypadInitCli(['--config', 'analytics', '--empty'], out, fs.deps)).toBe(0);
+
+    const content = fs.written.get(resolve(cwd, 'lilypad.analytics.config.ts'))!;
+    expect(content).toContain("name: 'analytics',");
+    expect(content).toContain('tables: {},');
+    expect(content).toContain("import { defineLilypadDb } from '@lilypad/libs/schema';");
+    expect(out.log).toHaveBeenCalledWith(
+      expect.stringContaining('npx lilypad-doctor --config analytics --url')
+    );
+  });
+
+  it('should write JavaScript for a .mjs or .js path', () => {
+    const out = output();
+    const fs = files();
+
+    expect(runLilypadInitCli(['--config', './lilypad.config.js'], out, fs.deps)).toBe(0);
+
+    const content = fs.written.get(resolve(cwd, 'lilypad.config.js'))!;
+    expect(content).toContain('const example = defineLilypadTable({');
+    expect(content).not.toContain('type Example');
+    expect(out.log).toHaveBeenCalledWith(expect.stringContaining('"type": "module"'));
+  });
+
+  it('should not overwrite an existing config without --force', () => {
+    const out = output();
+    const fs = files('lilypad.config.mjs');
+
+    expect(runLilypadInitCli([], out, fs.deps)).toBe(2);
+    expect(out.error).toHaveBeenCalledWith(
+      'lilypad-doctor init: lilypad.config.mjs already exists: pass --force to overwrite lilypad.config.ts.'
+    );
+    expect(fs.written.has(resolve(cwd, 'lilypad.config.ts'))).toBe(false);
+  });
+
+  it('should overwrite with --force, and warn about another file of the same config', () => {
+    const out = output();
+    const fs = files('lilypad.config.ts', 'lilypad.config.mjs');
+
+    expect(runLilypadInitCli(['--force'], out, fs.deps)).toBe(0);
+
+    expect(fs.written.get(resolve(cwd, 'lilypad.config.ts'))).toContain('defineLilypadDb');
+    expect(out.log).toHaveBeenCalledWith(
+      expect.stringContaining('Warning: lilypad.config.mjs defines the same config: remove it.')
+    );
+  });
+
+  it.each([
+    [['--config', './config.json'], 'must end with'],
+    [['--config', ''], '--config needs'],
+    [['--table', 'users'], "Unknown option '--table'"],
+  ])('should exit with 2 on %o', (argv, message) => {
+    const out = output();
+
+    expect(runLilypadInitCli(argv, out, files().deps)).toBe(2);
+    expect(out.error).toHaveBeenCalledWith(expect.stringContaining(message));
+  });
+
+  it('should exit with 2 when the file cannot be written', () => {
+    const out = output();
+    const deps = {
+      ...files().deps,
+      writeFile: () => {
+        throw new Error('EACCES: permission denied');
+      },
+    };
+
+    expect(runLilypadInitCli([], out, deps)).toBe(2);
+    expect(out.error).toHaveBeenCalledWith(
+      'lilypad-doctor init: could not write lilypad.config.ts: EACCES: permission denied'
+    );
+  });
+
+  it('should be the init command of lilypad-doctor, which needs no database', async () => {
+    const out = output();
+    const fs = files();
+
+    await expect(runLilypadDoctorCli(['init'], {}, out, { init: fs.deps })).resolves.toBe(0);
+    await expect(runLilypadDoctorCli(['init', '--help'], {}, out)).resolves.toBe(0);
+
+    expect(fs.written.has(resolve(cwd, 'lilypad.config.ts'))).toBe(true);
+    expect(out.log).toHaveBeenCalledWith(expect.stringContaining('Usage: lilypad-doctor init'));
+  });
+});
+
+describe('lilypadDbConfigTemplate', () => {
+  let dir: string;
+  // The templates import the package: here, its source
+  const schemaEntry = pathToFileURL(resolve(__dirname, '../entries/schema.ts')).href;
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), 'lilypad-template-'));
+  });
+
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it.each([
+    ['TypeScript', 'ts', true, false],
+    ['TypeScript, empty', 'ts', true, true],
+    ['JavaScript', 'mjs', false, false],
+    ['JavaScript, empty', 'mjs', false, true],
+  ])('should define a valid config (%s)', async (_case, extension, typescript, empty) => {
+    const file = join(dir, `lilypad.template-${extension}-${String(empty)}.config.${extension}`);
+    const content = lilypadDbConfigTemplate({ name: 'template', typescript, empty });
+    writeFileSync(file, content.replaceAll("from '@lilypad/libs/schema'", `from '${schemaEntry}'`));
+
+    const module = (await import(pathToFileURL(file).href)) as { default: LilypadDbConfig };
+
+    expect(isLilypadDbConfig(module.default)).toBe(true);
+    expect(module.default.name).toBe('template');
+    expect(Object.keys(module.default.tables)).toEqual(empty ? [] : ['example']);
+    if (!empty) {
+      expect(module.default.tables.example).toMatchObject({
+        qualifiedName: 'public.example',
+        primaryKey: 'id',
+        generatedPrimaryKey: true,
+        unique: [{ columns: ['name'] }],
+        sync: { strategy: 'listen' },
+      });
+    }
+  });
+});
