@@ -1,6 +1,6 @@
 {
   "name": "@lilypad/libs",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "main": "dist/index.mjs",
   "types": "dist/index.d.mts",
   "exports": {
