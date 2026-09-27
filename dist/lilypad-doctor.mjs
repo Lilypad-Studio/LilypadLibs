@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import "./chunks/LilypadDbSchema-Aqkz2mc3.mjs";
 import { n as runLilypadDoctor, o as lilypadDbConfigFileNames, s as loadLilypadDbConfig } from "./chunks/LilypadDoctor-CnFyP25Z.mjs";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, relative, resolve } from "node:path";
-import { parseArgs } from "node:util";
+import { parseArgs, parseEnv } from "node:util";
 //#region src/cli/lilypadDbConfigTemplate.ts
 /** The comment at the top of the file. */
 function header(typescript) {
@@ -199,6 +199,10 @@ Options:
   --config <name|path>  The config: a name finds lilypad.<name>.config.{ts,mts,mjs,js} in the
                         working directory; without it, lilypad.config.* (the "default" config)
   --url <connection>    The database (default: the DATABASE_URL environment variable)
+  --url-env <name>      The environment variable that holds the database URL, instead of
+                        DATABASE_URL
+  --env-file <path>     Read environment variables from this file (e.g. .env); repeatable, the
+                        later files win, and the variables already set win over every file
   --sql                 Print only the SQL that fixes the problems (for a migration)
   --json                Print the result as JSON
   -h, --help            Print this help
@@ -207,12 +211,13 @@ A TypeScript config needs Node.js 22.18 or later (or NODE_OPTIONS=--experimental
 
 Exit code: 0 when the database matches the config (warnings may be printed), 1 when it does not,
 2 when the check could not run (invalid arguments, config not found, unreachable database).`;
+const readEnvFile = (path) => parseEnv(readFileSync(path, "utf8"));
 /**
 * The options of the command line, or the help.
 *
 * @throws With a message for the user when an argument is not valid.
 */
-function parseLilypadDoctorArgs(argv, env) {
+function parseLilypadDoctorArgs(argv, env, readEnv = readEnvFile) {
 	const { values } = parseArgs({
 		args: argv,
 		strict: true,
@@ -220,6 +225,11 @@ function parseLilypadDoctorArgs(argv, env) {
 		options: {
 			config: { type: "string" },
 			url: { type: "string" },
+			"url-env": { type: "string" },
+			"env-file": {
+				type: "string",
+				multiple: true
+			},
 			sql: { type: "boolean" },
 			json: { type: "boolean" },
 			help: {
@@ -229,8 +239,26 @@ function parseLilypadDoctorArgs(argv, env) {
 		}
 	});
 	if (values.help) return { help: true };
-	const connectionString = values.url ?? env.DATABASE_URL;
-	if (!connectionString) throw new Error("Pass --url, or set DATABASE_URL.");
+	const urlEnv = values["url-env"];
+	if (values.url !== void 0 && urlEnv !== void 0) throw new Error("--url and --url-env cannot be used together.");
+	if (urlEnv !== void 0 && urlEnv.trim() === "") throw new Error("--url-env needs the name of an environment variable.");
+	const envFiles = values["env-file"] ?? [];
+	const fromFiles = {};
+	for (const path of envFiles) {
+		let read;
+		try {
+			read = readEnv(path);
+		} catch (error) {
+			throw new Error(`Cannot read the env file ${path}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+		}
+		Object.assign(fromFiles, read);
+	}
+	const name = urlEnv ?? "DATABASE_URL";
+	const connectionString = values.url ?? env[name] ?? fromFiles[name];
+	if (!connectionString) {
+		const from = envFiles.length > 0 ? ` (neither in the environment nor in ${envFiles.join(", ")})` : "";
+		throw new Error(urlEnv === void 0 ? `Pass --url, or set DATABASE_URL${from}.` : `The environment variable ${urlEnv} is not set${from}.`);
+	}
 	if (values.sql && values.json) throw new Error("--sql and --json cannot be used together.");
 	if (values.config !== void 0 && values.config.trim() === "") throw new Error("--config needs the name or the path of a config.");
 	return {
@@ -252,11 +280,11 @@ function fixSql(report) {
 * @returns The exit code: 0 without errors (there may be warnings), 1 with errors, 2 when the
 * check could not run (invalid arguments, config not found, unreachable database).
 */
-async function runLilypadDoctorCli(argv, env, output, { run = runLilypadDoctor, load = loadLilypadDbConfig, init } = {}) {
+async function runLilypadDoctorCli(argv, env, output, { run = runLilypadDoctor, load = loadLilypadDbConfig, readEnv, init } = {}) {
 	if (argv[0] === "init") return runLilypadInitCli(argv.slice(1), output, init);
 	let parsed;
 	try {
-		parsed = parseLilypadDoctorArgs(argv, env);
+		parsed = parseLilypadDoctorArgs(argv, env, readEnv);
 	} catch (error) {
 		output.error(`${error instanceof Error ? error.message : String(error)}\n\n${USAGE}`);
 		return 2;

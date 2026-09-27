@@ -13,6 +13,7 @@
 - `bindLilypadDbHooks(db, { <table>: { write?, select? } })` (`@lilypad/libs/schema`) binds the functions of the application to the tables of a config, typed with the row type of each table. It returns a copy of the config; a gate created with it applies the hooks to the tables of its config however they are given (by key, or as a definition of the original config).
 - `lilypad-doctor` explains a config that Node.js cannot load: a type imported without `import type`, an import that needs a bundler (path alias, missing extension, JSON without its attribute), and what a config may import.
 - `npx lilypad-doctor init [--config <name|path>] [--empty] [--force]` creates a config file to start from: `lilypad.config.ts` (or `lilypad.<name>.config.ts`, or the path given, in JavaScript for `.mjs`/`.js`), with an example table and the options of the config as comments. It never overwrites an existing config without `--force`, and needs no database.
+- `lilypad-doctor --env-file <path>` reads the connection string from an env file such as `.env` (repeatable; the environment wins over the files), and `--url-env <name>` names the variable that holds it (default `DATABASE_URL`): `lilypad-doctor --env-file .env --url-env POSTGRES_URL` works in a `package.json` script on every OS.
 
 ## 0.6.0
 

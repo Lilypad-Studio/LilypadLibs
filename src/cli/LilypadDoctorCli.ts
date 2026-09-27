@@ -1,4 +1,5 @@
-import { parseArgs } from 'node:util';
+import { readFileSync } from 'node:fs';
+import { parseArgs, parseEnv } from 'node:util';
 import { runLilypadInitCli, type LilypadInitDependencies } from '@/cli/LilypadInitCli';
 import type { LilypadDbConfig } from '@/dbConfig/LilypadDbConfig';
 import { loadLilypadDbConfig } from '@/dbConfig/loadLilypadDbConfig';
@@ -22,6 +23,10 @@ Options:
   --config <name|path>  The config: a name finds lilypad.<name>.config.{ts,mts,mjs,js} in the
                         working directory; without it, lilypad.config.* (the "default" config)
   --url <connection>    The database (default: the DATABASE_URL environment variable)
+  --url-env <name>      The environment variable that holds the database URL, instead of
+                        DATABASE_URL
+  --env-file <path>     Read environment variables from this file (e.g. .env); repeatable, the
+                        later files win, and the variables already set win over every file
   --sql                 Print only the SQL that fixes the problems (for a migration)
   --json                Print the result as JSON
   -h, --help            Print this help
@@ -48,6 +53,11 @@ export type LilypadDoctorArgs =
       config?: string;
     };
 
+/** Reads the variables of an env file (`--env-file`), replaceable in tests. */
+export type LilypadEnvFileReader = (path: string) => Record<string, string | undefined>;
+
+const readEnvFile: LilypadEnvFileReader = (path) => parseEnv(readFileSync(path, 'utf8'));
+
 /**
  * The options of the command line, or the help.
  *
@@ -55,7 +65,8 @@ export type LilypadDoctorArgs =
  */
 export function parseLilypadDoctorArgs(
   argv: string[],
-  env: Record<string, string | undefined>
+  env: Record<string, string | undefined>,
+  readEnv: LilypadEnvFileReader = readEnvFile
 ): LilypadDoctorArgs {
   const { values } = parseArgs({
     args: argv,
@@ -64,6 +75,8 @@ export function parseLilypadDoctorArgs(
     options: {
       config: { type: 'string' },
       url: { type: 'string' },
+      'url-env': { type: 'string' },
+      'env-file': { type: 'string', multiple: true },
       sql: { type: 'boolean' },
       json: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
@@ -72,9 +85,38 @@ export function parseLilypadDoctorArgs(
   if (values.help) {
     return { help: true };
   }
-  const connectionString = values.url ?? env.DATABASE_URL;
+  const urlEnv = values['url-env'];
+  if (values.url !== undefined && urlEnv !== undefined) {
+    throw new Error('--url and --url-env cannot be used together.');
+  }
+  if (urlEnv !== undefined && urlEnv.trim() === '') {
+    throw new Error('--url-env needs the name of an environment variable.');
+  }
+  const envFiles = values['env-file'] ?? [];
+  const fromFiles: Record<string, string | undefined> = {};
+  for (const path of envFiles) {
+    let read: Record<string, string | undefined>;
+    try {
+      read = readEnv(path);
+    } catch (error) {
+      throw new Error(
+        `Cannot read the env file ${path}: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error }
+      );
+    }
+    Object.assign(fromFiles, read);
+  }
+  const name = urlEnv ?? 'DATABASE_URL';
+  // As with node --env-file, a variable already set wins over the files.
+  const connectionString = values.url ?? env[name] ?? fromFiles[name];
   if (!connectionString) {
-    throw new Error('Pass --url, or set DATABASE_URL.');
+    const from =
+      envFiles.length > 0 ? ` (neither in the environment nor in ${envFiles.join(', ')})` : '';
+    throw new Error(
+      urlEnv === undefined
+        ? `Pass --url, or set DATABASE_URL${from}.`
+        : `The environment variable ${urlEnv} is not set${from}.`
+    );
   }
   if (values.sql && values.json) {
     throw new Error('--sql and --json cannot be used together.');
@@ -95,6 +137,8 @@ export function parseLilypadDoctorArgs(
 export type LilypadDoctorCliDependencies = {
   run?: (options: LilypadDoctorOptions) => Promise<LilypadDoctorReport>;
   load?: (options: { config?: string }) => Promise<{ path: string; config: LilypadDbConfig }>;
+  /** Reads the files of `--env-file`. */
+  readEnv?: LilypadEnvFileReader;
   /** The file system of `init`. */
   init?: LilypadInitDependencies;
 };
@@ -117,14 +161,19 @@ export async function runLilypadDoctorCli(
   argv: string[],
   env: Record<string, string | undefined>,
   output: LilypadDoctorOutput,
-  { run = runLilypadDoctor, load = loadLilypadDbConfig, init }: LilypadDoctorCliDependencies = {}
+  {
+    run = runLilypadDoctor,
+    load = loadLilypadDbConfig,
+    readEnv,
+    init,
+  }: LilypadDoctorCliDependencies = {}
 ): Promise<number> {
   if (argv[0] === 'init') {
     return runLilypadInitCli(argv.slice(1), output, init);
   }
   let parsed: LilypadDoctorArgs;
   try {
-    parsed = parseLilypadDoctorArgs(argv, env);
+    parsed = parseLilypadDoctorArgs(argv, env, readEnv);
   } catch (error) {
     output.error(`${error instanceof Error ? error.message : String(error)}\n\n${USAGE}`);
     return 2;

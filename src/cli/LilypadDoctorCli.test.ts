@@ -67,6 +67,54 @@ describe('parseLilypadDoctorArgs', () => {
     });
   });
 
+  const files: Record<string, Record<string, string>> = {
+    '.env': { POSTGRES_URL: url, DATABASE_URL: 'postgres://from/env' },
+    '.env.local': { POSTGRES_URL: 'postgres://from/local' },
+  };
+  const readEnv = (path: string) => {
+    const variables = files[path];
+    if (!variables) {
+      throw new Error(`ENOENT: no such file or directory, open '${path}'`);
+    }
+    return variables;
+  };
+  const connectionOf = (argv: string[], env: Record<string, string | undefined> = {}) => {
+    const parsed = parseLilypadDoctorArgs(argv, env, readEnv);
+    return parsed.help ? undefined : parsed.connectionString;
+  };
+
+  it('should take the connection string from the variable named by --url-env', () => {
+    expect(connectionOf(['--url-env', 'POSTGRES_URL'], { POSTGRES_URL: url })).toBe(url);
+  });
+
+  it('should read the variables of --env-file, the later files winning', () => {
+    expect(connectionOf(['--env-file', '.env'])).toBe('postgres://from/env');
+    expect(connectionOf(['--env-file', '.env', '--url-env', 'POSTGRES_URL'])).toBe(url);
+    expect(
+      connectionOf(['--env-file', '.env', '--env-file', '.env.local', '--url-env', 'POSTGRES_URL'])
+    ).toBe('postgres://from/local');
+  });
+
+  it('should prefer the environment and --url to the env files', () => {
+    expect(connectionOf(['--env-file', '.env'], { DATABASE_URL: url })).toBe(url);
+    expect(connectionOf(['--env-file', '.env', '--url', 'postgres://flag'])).toBe(
+      'postgres://flag'
+    );
+  });
+
+  it.each([
+    [['--env-file', 'missing.env'], 'Cannot read the env file missing.env: ENOENT'],
+    [
+      ['--env-file', '.env.local'],
+      'Pass --url, or set DATABASE_URL (neither in the environment nor in .env.local).',
+    ],
+    [['--url-env', 'OTHER_URL'], 'The environment variable OTHER_URL is not set.'],
+    [['--url', url, '--url-env', 'POSTGRES_URL'], 'cannot be used together'],
+    [['--url-env', ' '], '--url-env needs'],
+  ])('should reject %o', (argv, message) => {
+    expect(() => parseLilypadDoctorArgs(argv, {}, readEnv)).toThrow(message);
+  });
+
   it.each([
     [[], 'Pass --url'],
     [['--url', url, '--sql', '--json'], 'cannot be used together'],
@@ -102,6 +150,22 @@ describe('runLilypadDoctorCli', () => {
       runLilypadDoctorCli(['--url', url, '--config', 'analytics'], {}, out, { run, load })
     ).resolves.toBe(0);
     expect(load).toHaveBeenCalledWith({ config: 'analytics' });
+    expect(run).toHaveBeenCalledWith({ connectionString: url, config });
+  });
+
+  it('should read the connection string from the env file given by --env-file', async () => {
+    const out = output();
+    const run = vi.fn(async () => report(true));
+    const readEnv = vi.fn(() => ({ POSTGRES_URL: url }));
+
+    await expect(
+      runLilypadDoctorCli(['--env-file', '.env', '--url-env', 'POSTGRES_URL'], {}, out, {
+        run,
+        load,
+        readEnv,
+      })
+    ).resolves.toBe(0);
+    expect(readEnv).toHaveBeenCalledWith('.env');
     expect(run).toHaveBeenCalledWith({ connectionString: url, config });
   });
 
