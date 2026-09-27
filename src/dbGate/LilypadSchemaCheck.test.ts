@@ -1041,12 +1041,31 @@ describe('evaluateLilypadSchema with the tables of a config', () => {
         minRetention: 3 * 3_600_000,
         checkPruning: true,
       },
+      changelogTable: 'lilypad_cache_changes',
       notifyChannel: false,
     });
     expect(
       lilypadSchemaCheckOptions(defineLilypadDb({ tables: { orgs: db.tables.orgs as never } }))
         .changelog
     ).toBe(false);
+  });
+
+  it('should install the changelog of the config in the fixes of listen tables alone', () => {
+    const listenOnly = defineLilypadDb({
+      changelog: { table: 'app_changes' },
+      tables: { orgs: db.tables.orgs as never },
+    });
+    const listenOptions = lilypadSchemaCheckOptions(listenOnly);
+    const result = evaluateLilypadSchema(
+      facts({ changelog: noChangelog, tables: [{ schema: 'public', triggers: [] }] }),
+      listenOptions
+    );
+
+    expect(listenOptions.changelog).toBe(false);
+    expect(result.problems.map((problem) => problem.code)).toEqual(['missing-notify-trigger']);
+    expect(result.problems[0]!.fix).toContain('CREATE TABLE IF NOT EXISTS "app_changes"');
+    expect(result.problems[0]!.fix).toContain('app_changes_record');
+    expect(result.problems[0]!.fix).not.toContain('lilypad_cache_changes');
   });
 
   it('should require the changelog trigger or the notifying trigger per table', () => {

@@ -13,6 +13,7 @@ import {
 } from '@/dbGate/LilypadChangelog';
 import {
   changelogTarget,
+  readChangelogTarget,
   readLilypadSchemaFacts,
   type LilypadSchemaFacts,
   type LilypadTriggerInfo,
@@ -89,6 +90,11 @@ export type LilypadSchemaCheckOptions = {
         checkPruning?: boolean;
       }
     | false;
+  /**
+   * With `changelog: false`, the changelog table whose trigger function the SQL that fixes the
+   * notifying triggers installs (it notifies too). Defaults to `lilypad_cache_changes`.
+   */
+  changelogTable?: string;
   /**
    * Checks that the tables have a trigger that sends notifications on this channel (the `listen`
    * strategy), unless a table sets its own `notifyChannel`. The trigger may be the changelog trigger
@@ -337,6 +343,8 @@ export function evaluateLilypadSchema(
   options: LilypadSchemaCheckOptions
 ): LilypadSchemaCheckResult {
   const changelog = changelogTarget(options);
+  // The changelog that the fixes install: the checked one, or else `changelogTable`
+  const fixChangelog = readChangelogTarget(options);
   const notifyChannel = options.notifyChannel ?? false;
   const installedPrune = installedLilypadChangelogPrune(facts.changelog.functionSource);
   const problems: LilypadSchemaProblem[] = [];
@@ -417,8 +425,12 @@ export function evaluateLilypadSchema(
         needsChangelog || tableChannel !== false
           ? (needsChangelog
               ? ''
-              : lilypadChangelogSql({ notifyChannel: tableChannel, prune: installedPrune })) +
-            lilypadChangelogTriggerSql({ table, primaryKey, changelogTable: changelog?.custom })
+              : lilypadChangelogSql({
+                  table: fixChangelog.custom,
+                  notifyChannel: tableChannel,
+                  prune: installedPrune,
+                })) +
+            lilypadChangelogTriggerSql({ table, primaryKey, changelogTable: fixChangelog.custom })
           : '';
       problems.push({
         code: 'missing-table',
@@ -503,10 +515,10 @@ export function evaluateLilypadSchema(
         );
       const fix =
         lilypadChangelogSql({
-          table: changelog?.custom,
+          table: fixChangelog.custom,
           notifyChannel: tableChannel,
           prune: installedPrune,
-        }) + lilypadChangelogTriggerSql({ table, primaryKey, changelogTable: changelog?.custom });
+        }) + lilypadChangelogTriggerSql({ table, primaryKey, changelogTable: fixChangelog.custom });
       if (notifiedEvents === 0) {
         problems.push({
           code: 'missing-notify-trigger',

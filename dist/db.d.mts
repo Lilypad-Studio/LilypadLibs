@@ -954,6 +954,11 @@ type LilypadSchemaCheckOptions = {
     checkPruning?: boolean;
   } | false;
   /**
+   * With `changelog: false`, the changelog table whose trigger function the SQL that fixes the
+   * notifying triggers installs (it notifies too). Defaults to `lilypad_cache_changes`.
+   */
+  changelogTable?: string;
+  /**
    * Checks that the tables have a trigger that sends notifications on this channel (the `listen`
    * strategy), unless a table sets its own `notifyChannel`. The trigger may be the changelog trigger
    * or one of your own: its function must call `pg_notify` with the channel name as a literal.

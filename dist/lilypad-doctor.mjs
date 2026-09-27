@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { n as runLilypadDoctor, s as loadLilypadDbConfig } from "./chunks/LilypadDoctor-C9Dw7FXv.mjs";
+import { n as runLilypadDoctor, s as loadLilypadDbConfig } from "./chunks/LilypadDoctor-Bnq8Cqh4.mjs";
 import { parseArgs } from "node:util";
 //#region src/cli/LilypadDoctorCli.ts
 const USAGE = `Usage: lilypad-doctor [options]

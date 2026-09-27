@@ -1049,9 +1049,15 @@ function changelogTarget(options) {
 		functionSignature: `${quoteIdentifier(triggerFunctionName(table))}()`
 	};
 }
-/** The changelog whose facts are read: without one to check, the default one (its facts are then ignored). */
+/**
+* The changelog whose facts are read, and whose SQL the fixes install: the checked one, or else
+* `changelogTable` (the default table without it), whose facts only tell the fixes what is installed.
+*/
 function readChangelogTarget(options) {
-	return changelogTarget(options) ?? changelogTarget({ tables: [] });
+	return changelogTarget(options) ?? changelogTarget({
+		tables: [],
+		changelog: { table: options.changelogTable }
+	});
 }
 async function readDatabaseFacts(gate, options) {
 	const sql = gate.sql;
@@ -1833,6 +1839,7 @@ async function checkLilypadSchema(gate, options) {
 */
 function evaluateLilypadSchema(facts, options) {
 	const changelog = changelogTarget(options);
+	const fixChangelog = readChangelogTarget(options);
 	const notifyChannel = options.notifyChannel ?? false;
 	const installedPrune = installedLilypadChangelogPrune(facts.changelog.functionSource);
 	const problems = [];
@@ -1888,12 +1895,13 @@ function evaluateLilypadSchema(facts, options) {
 			});
 			const createTable = shape && lilypadCreateTableSql(table, primaryKey, shape);
 			const triggerSql = needsChangelog || tableChannel !== false ? (needsChangelog ? "" : lilypadChangelogSql({
+				table: fixChangelog.custom,
 				notifyChannel: tableChannel,
 				prune: installedPrune
 			})) + lilypadChangelogTriggerSql({
 				table,
 				primaryKey,
-				changelogTable: changelog?.custom
+				changelogTable: fixChangelog.custom
 			}) : "";
 			problems.push({
 				code: "missing-table",
@@ -1951,13 +1959,13 @@ function evaluateLilypadSchema(facts, options) {
 			const notifies = new RegExp(`pg_notify\\s*\\(\\s*'${escapeRegExp(tableChannel.replace(/'/g, "''"))}'`, "i");
 			const notifiedEvents = triggers.filter((trigger) => trigger.enabled && notifies.test(trigger.source)).reduce((events, trigger) => events | ((trigger.type & TRIGGER_TYPE_ROW) !== 0 ? trigger.changelog ? 0 : trigger.type & ROW_EVENTS : recordedEvents(trigger)), 0);
 			const fix = lilypadChangelogSql({
-				table: changelog?.custom,
+				table: fixChangelog.custom,
 				notifyChannel: tableChannel,
 				prune: installedPrune
 			}) + lilypadChangelogTriggerSql({
 				table,
 				primaryKey,
-				changelogTable: changelog?.custom
+				changelogTable: fixChangelog.custom
 			});
 			if (notifiedEvents === 0) problems.push({
 				code: "missing-notify-trigger",
@@ -2016,6 +2024,7 @@ function lilypadSchemaCheckOptions(config) {
 			minRetention,
 			checkPruning: true
 		},
+		changelogTable: config.changelog.table,
 		notifyChannel: false
 	};
 }
@@ -2051,4 +2060,4 @@ async function runLilypadDoctor(options) {
 //#endregion
 export { LilypadDbGate as _, normalizeLilypadPgType as a, LilypadDbTable as b, LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD as c, lilypadChangelogSql as d, lilypadChangelogTriggerSql as f, readLilypadChangesBatch as g, readLilypadChanges as h, checkLilypadSchema as i, LILYPAD_MIN_CHANGELOG_RETENTION as l, pruneLilypadChangelog as m, runLilypadDoctor as n, lilypadDbConfigFileNames as o, lilypadCursorCovers as p, LilypadSchemaCheckError as r, loadLilypadDbConfig as s, lilypadSchemaCheckOptions as t, lilypadChangelogPruneScheduleSql as u, lilypadServerlessPool as v, LilypadBackoff as y };
 
-//# sourceMappingURL=LilypadDoctor-C9Dw7FXv.mjs.map
+//# sourceMappingURL=LilypadDoctor-Bnq8Cqh4.mjs.map

@@ -165,9 +165,15 @@ export function changelogTarget(options: LilypadSchemaCheckOptions) {
 /** The facts that do not depend on the cached tables: the database, the changelog, pg_cron. */
 type LilypadDatabaseFacts = Omit<LilypadSchemaFacts, 'tables'>;
 
-/** The changelog whose facts are read: without one to check, the default one (its facts are then ignored). */
-function readChangelogTarget(options: LilypadSchemaCheckOptions) {
-  return changelogTarget(options) ?? changelogTarget({ tables: [] })!;
+/**
+ * The changelog whose facts are read, and whose SQL the fixes install: the checked one, or else
+ * `changelogTable` (the default table without it), whose facts only tell the fixes what is installed.
+ */
+export function readChangelogTarget(options: LilypadSchemaCheckOptions) {
+  return (
+    changelogTarget(options) ??
+    changelogTarget({ tables: [], changelog: { table: options.changelogTable } })!
+  );
 }
 
 async function readDatabaseFacts(

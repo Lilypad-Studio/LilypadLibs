@@ -60,6 +60,8 @@ export function lilypadSchemaCheckOptions(config: LilypadDbConfig): LilypadSchem
             minRetention,
             checkPruning: true,
           },
+    // When no table reads the changelog, the fixes of the listen tables install the config's
+    changelogTable: config.changelog.table,
     notifyChannel: false,
   };
 }
