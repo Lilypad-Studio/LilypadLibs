@@ -4,6 +4,7 @@ import { runAfterResponse, runInBackground, sharedStoreOperation } from './Lilyp
 describe('runInBackground', () => {
   it('should still run the task when the platform function throws', async () => {
     const onError = vi.fn();
+    const onPlatformError = vi.fn();
     const task = vi.fn(async () => 'done');
 
     runInBackground(
@@ -13,12 +14,36 @@ describe('runInBackground', () => {
         },
       },
       task(),
-      onError
+      onError,
+      onPlatformError
     );
     await Promise.resolve();
 
     expect(task).toHaveBeenCalledOnce();
-    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: 'outside a request' }));
+    // The error of the platform is not an error of the task
+    expect(onError).not.toHaveBeenCalled();
+    expect(onPlatformError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'outside a request' })
+    );
+  });
+
+  it('should ignore the error of the platform function without onPlatformError', async () => {
+    const onError = vi.fn();
+
+    expect(() =>
+      runInBackground(
+        {
+          background: () => {
+            throw new Error('outside a request');
+          },
+        },
+        Promise.resolve(),
+        onError
+      )
+    ).not.toThrow();
+    await Promise.resolve();
+
+    expect(onError).not.toHaveBeenCalled();
   });
 
   it('should pass the errors of the task to onError', async () => {
@@ -44,6 +69,7 @@ describe('runAfterResponse', () => {
 
   it('should start the work at once when afterResponse throws', () => {
     const onError = vi.fn();
+    const onPlatformError = vi.fn();
     const work = vi.fn(async () => {});
 
     runAfterResponse(
@@ -53,11 +79,15 @@ describe('runAfterResponse', () => {
         },
       },
       work,
-      onError
+      onError,
+      onPlatformError
     );
 
     expect(work).toHaveBeenCalledOnce();
-    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: 'outside a request' }));
+    expect(onError).not.toHaveBeenCalled();
+    expect(onPlatformError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'outside a request' })
+    );
   });
 });
 

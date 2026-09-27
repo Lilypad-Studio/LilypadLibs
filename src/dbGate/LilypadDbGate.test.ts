@@ -1,5 +1,6 @@
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { LilypadDbGate, lilypadServerlessPool } from './LilypadDbGate';
+import { LilypadDisposedError } from '@/cache/LilypadCacheTypes';
 
 // Nothing listens on this port: any connection attempt would fail
 const unreachable = 'postgres://user:password@127.0.0.1:1/db';
@@ -120,5 +121,33 @@ describe('LilypadDbGate (without database)', () => {
       expect(gate.isListenHealthy()).toBe(true);
       await gate.close();
     });
+  });
+});
+
+describe('LilypadDbGate close', () => {
+  it('should reject an invalid timeout and stay open', async () => {
+    const gate = await LilypadDbGate.create({ connectionString: unreachable });
+
+    expect(() => gate.close({ timeout: -1 })).toThrow('close timeout must be');
+    expect(gate.closed).toBe(false);
+
+    // It can still be closed properly
+    await gate[Symbol.asyncDispose]();
+    expect(gate.closed).toBe(true);
+  });
+
+  it('should reject the queries of a closed gate with a LilypadDisposedError', async () => {
+    const gate = await LilypadDbGate.create({ connectionString: unreachable });
+    await gate.close();
+
+    await expect(
+      gate.selectFromTableByPrimaryKey({ tableName: 't', primaryKey: 'id', cols: { id: {} } }, 1)
+    ).rejects.toThrow(LilypadDisposedError);
+  });
+
+  it('should reject a listenHeartbeat that a timer cannot hold', async () => {
+    await expect(
+      LilypadDbGate.create({ connectionString: unreachable, listenHeartbeat: 2 ** 31 })
+    ).rejects.toThrow('listenHeartbeat must be');
   });
 });

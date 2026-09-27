@@ -1,5 +1,6 @@
 import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
 import {
+  LILYPAD_CHANGELOG_MIN_COMPATIBLE_VERSION,
   LILYPAD_CHANGELOG_NEW_ROWS,
   LILYPAD_CHANGELOG_OLD_ROWS,
   LILYPAD_CHANGELOG_VERSION,
@@ -12,6 +13,7 @@ import {
   olderThanCondition,
   pruneFunctionName,
   quoteIdentifier,
+  textArrayLiteral,
   triggerFunctionName,
   type LilypadChangelogPruneOptions,
 } from '@/dbGate/LilypadChangelog';
@@ -68,7 +70,10 @@ export type LilypadSchemaProblemCode =
   | 'missing-table'
   /** The changelog table or its trigger function does not exist. */
   | 'missing-changelog'
-  /** The changelog table or its trigger function was installed by an older version of the library. */
+  /**
+   * The changelog table or its trigger function was installed by an older version of the library:
+   * an error if the caches cannot read it correctly, a warning if it only lacks an improvement.
+   */
   | 'outdated-changelog'
   /**
    * The enabled changelog triggers of the table do not record each of INSERT, UPDATE and DELETE:
@@ -628,18 +633,20 @@ function suggestPruning(
   };
 }
 
-/**
- * Reads from the catalogs what {@link evaluateLilypadSchema} needs. It changes nothing.
- *
- * @throws If the catalogs cannot be read (e.g. the database is unreachable).
- */
-export async function readLilypadSchemaFacts(
+/** The facts that do not depend on the cached tables: the database, the changelog, pg_cron. */
+type LilypadDatabaseFacts = Omit<LilypadSchemaFacts, 'tables'>;
+
+/** The changelog whose facts are read: without one to check, the default one (its facts are then ignored). */
+function readChangelogTarget(options: LilypadSchemaCheckOptions) {
+  return changelogTarget(options) ?? changelogTarget({ tables: [] })!;
+}
+
+async function readDatabaseFacts(
   gate: LilypadDbGate,
   options: LilypadSchemaCheckOptions
-): Promise<LilypadSchemaFacts> {
+): Promise<LilypadDatabaseFacts> {
   const sql = gate.sql;
-  // Without a changelog to check, the default one is read anyway: its facts are then ignored
-  const changelog = changelogTarget(options) ?? changelogTarget({ tables: [] })!;
+  const changelog = readChangelogTarget(options);
   const quotedChangelog = quoteIdentifier(changelog.table);
   const pruneSignature = `${quoteIdentifier(pruneFunctionName(changelog.table))}()`;
 
@@ -674,38 +681,6 @@ export async function readLilypadSchemaFacts(
   `;
   if (!database) {
     throw new Error('Reading the database settings returned no row.');
-  }
-
-  const tables: LilypadSchemaFacts['tables'] = [];
-  for (const { table } of options.tables) {
-    const [found] = await sql`
-      SELECT
-        n.nspname AS schema_name,
-        (
-          SELECT coalesce(json_agg(json_build_object(
-            'changelog', tr.tgfoid = to_regprocedure(${changelog.functionSignature}::text)::oid,
-            'args', encode(tr.tgargs, 'escape'),
-            'type', tr.tgtype,
-            -- 'R' (ENABLE REPLICA) triggers fire only with session_replication_role = replica
-            'enabled', tr.tgenabled IN ('O', 'A'),
-            'source', p.prosrc,
-            'oldTable', tr.tgoldtable,
-            'newTable', tr.tgnewtable
-          )), '[]'::json)
-          FROM pg_trigger tr JOIN pg_proc p ON p.oid = tr.tgfoid
-          WHERE tr.tgrelid = t.oid AND NOT tr.tgisinternal
-        ) AS triggers
-      FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace
-      WHERE t.oid = to_regclass(${quoteIdentifier(table)}::text)
-    `;
-    tables.push(
-      found
-        ? {
-            schema: found.schema_name as string,
-            triggers: parseJsonColumn(found.triggers) as LilypadTriggerInfo[],
-          }
-        : { schema: null, triggers: [] }
-    );
   }
 
   // How the changelog is pruned, only when it is checked. These reads are best effort: a role
@@ -747,8 +722,119 @@ export async function readLilypadSchemaFacts(
       database: database.cron_database as string | null,
       jobs,
     },
-    tables,
   };
+}
+
+/** For each table of the options, in order, its schema and its triggers: one query for all. */
+async function readTableFacts(
+  gate: LilypadDbGate,
+  options: LilypadSchemaCheckOptions
+): Promise<LilypadSchemaFacts['tables']> {
+  const sql = gate.sql;
+  const changelog = readChangelogTarget(options);
+  const tableRefs = options.tables.map(({ table }) => quoteIdentifier(table));
+  const found =
+    tableRefs.length === 0
+      ? []
+      : await sql`
+    SELECT
+      requested.position,
+      n.nspname AS schema_name,
+      (
+        SELECT coalesce(json_agg(json_build_object(
+          'changelog', tr.tgfoid = to_regprocedure(${changelog.functionSignature}::text)::oid,
+          'args', encode(tr.tgargs, 'escape'),
+          'type', tr.tgtype,
+          -- 'R' (ENABLE REPLICA) triggers fire only with session_replication_role = replica
+          'enabled', tr.tgenabled IN ('O', 'A'),
+          'source', p.prosrc,
+          'oldTable', tr.tgoldtable,
+          'newTable', tr.tgnewtable
+        )), '[]'::json)
+        FROM pg_trigger tr JOIN pg_proc p ON p.oid = tr.tgfoid
+        WHERE tr.tgrelid = t.oid AND NOT tr.tgisinternal
+      ) AS triggers
+    FROM unnest(${textArrayLiteral(tableRefs)}::text[]) WITH ORDINALITY AS requested(ref, position)
+    JOIN pg_class t ON t.oid = to_regclass(requested.ref)
+    JOIN pg_namespace n ON n.oid = t.relnamespace
+  `;
+  const byPosition = new Map(found.map((row) => [Number(row.position), row]));
+  const tables: LilypadSchemaFacts['tables'] = options.tables.map((_, index) => {
+    const row = byPosition.get(index + 1);
+    return row
+      ? {
+          schema: row.schema_name as string,
+          triggers: parseJsonColumn(row.triggers) as LilypadTriggerInfo[],
+        }
+      : { schema: null, triggers: [] };
+  });
+
+  return tables;
+}
+
+/** How long the caches of a gate share the facts of the database (see `shareDatabaseFacts`). */
+const SHARED_FACTS_LIFETIME = 60_000;
+const sharedFacts = new WeakMap<
+  LilypadDbGate,
+  Map<string, { readAt: number; facts: Promise<LilypadDatabaseFacts> }>
+>();
+
+/**
+ * The facts of the database, shared by the checks of the caches of a gate made within a minute:
+ * N caches read them once. A failed read is not shared.
+ */
+function sharedDatabaseFacts(
+  gate: LilypadDbGate,
+  options: LilypadSchemaCheckOptions
+): Promise<LilypadDatabaseFacts> {
+  let gateFacts = sharedFacts.get(gate);
+  if (!gateFacts) {
+    gateFacts = new Map();
+    sharedFacts.set(gate, gateFacts);
+  }
+  const key = JSON.stringify([readChangelogTarget(options).table, options.changelog !== false]);
+  const now = Date.now();
+  const shared = gateFacts.get(key);
+  if (shared && now - shared.readAt < SHARED_FACTS_LIFETIME) {
+    return shared.facts;
+  }
+  const facts = readDatabaseFacts(gate, options);
+  const entry = { readAt: now, facts };
+  gateFacts.set(key, entry);
+  facts.catch(() => {
+    if (gateFacts.get(key) === entry) {
+      gateFacts.delete(key);
+    }
+  });
+  return facts;
+}
+
+/** How `checkLilypadSchema` is called by the library itself. */
+export type LilypadSchemaCheckContext = {
+  /**
+   * Reuses the facts of the database read by another check of the same gate less than a minute
+   * ago (the caches of a gate check the same changelog).
+   */
+  shareDatabaseFacts?: boolean;
+};
+
+/**
+ * Reads from the catalogs what {@link evaluateLilypadSchema} needs. It changes nothing.
+ *
+ * @throws If the catalogs cannot be read (e.g. the database is unreachable).
+ */
+export async function readLilypadSchemaFacts(
+  gate: LilypadDbGate,
+  options: LilypadSchemaCheckOptions,
+  context: LilypadSchemaCheckContext = {}
+): Promise<LilypadSchemaFacts> {
+  const [database, tables] = await Promise.all([
+    context.shareDatabaseFacts
+      ? sharedDatabaseFacts(gate, options)
+      : readDatabaseFacts(gate, options),
+    readTableFacts(gate, options),
+  ]);
+  return { ...database, tables };
 }
 
 /**
@@ -785,9 +871,10 @@ async function readCronJobs(gate: LilypadDbGate): Promise<LilypadCronJobInfo[] |
  */
 export async function checkLilypadSchema(
   gate: LilypadDbGate,
-  options: LilypadSchemaCheckOptions
+  options: LilypadSchemaCheckOptions,
+  context: LilypadSchemaCheckContext = {}
 ): Promise<LilypadSchemaCheckResult> {
-  return evaluateLilypadSchema(await readLilypadSchemaFacts(gate, options), options);
+  return evaluateLilypadSchema(await readLilypadSchemaFacts(gate, options, context), options);
 }
 
 /**
@@ -843,10 +930,16 @@ export function evaluateLilypadSchema(
       ? Number(comment.slice(LILYPAD_CHANGELOG_VERSION_PREFIX.length))
       : 1;
     if ((hasTable && !hasSchemaColumn) || (hasFunction && version < LILYPAD_CHANGELOG_VERSION)) {
+      const compatible =
+        (!hasTable || hasSchemaColumn) && version >= LILYPAD_CHANGELOG_MIN_COMPATIBLE_VERSION;
       problems.push({
         code: 'outdated-changelog',
-        severity: 'error',
-        message: `The changelog "${changelog.table}" was installed by an older version of the library (version ${version}, expected ${LILYPAD_CHANGELOG_VERSION}).`,
+        severity: compatible ? 'warning' : 'error',
+        message:
+          `The changelog "${changelog.table}" was installed by an older version of the library (version ${version}, expected ${LILYPAD_CHANGELOG_VERSION})` +
+          (compatible
+            ? ': the caches read it, but a statement that changes many rows notifies each of them instead of sending one BULK notification.'
+            : '.'),
         fix: changelogSql,
       });
     }

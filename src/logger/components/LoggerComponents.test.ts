@@ -315,3 +315,17 @@ describe('safeJson', () => {
     expect(parsed.error).toMatchObject({ name: 'Error', message: 'boom' });
   });
 });
+
+describe('LilypadDiscordLogger options', () => {
+  it.each([
+    ['maxQueueSize', { maxQueueSize: Number.NaN }],
+    ['maxQueueSize', { maxQueueSize: 0 }],
+    ['minRequestInterval', { minRequestInterval: -1 }],
+    ['minRequestInterval', { minRequestInterval: 2 ** 31 }],
+    ['rateLimitRetries', { rateLimitRetries: 1.5 }],
+  ])('should reject an invalid %s', (name, options) => {
+    expect(
+      () => new LilypadDiscordLogger('https://discord.test/api/webhooks/1/t', options)
+    ).toThrow(`${name} must be`);
+  });
+});

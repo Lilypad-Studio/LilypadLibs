@@ -15,8 +15,23 @@ export const LILYPAD_DEFAULT_NOTIFY_CHANNEL = 'cache_events';
  * The function carries it in its comment (`lilypad-changelog:<version>`), so that
  * `checkLilypadSchema` can tell an installation made by an older version of the library.
  */
-export const LILYPAD_CHANGELOG_VERSION = 4;
+export const LILYPAD_CHANGELOG_VERSION = 5;
 export const LILYPAD_CHANGELOG_VERSION_PREFIX = 'lilypad-changelog:';
+/**
+ * The oldest version that the caches still read correctly: an older installation is an error of
+ * the schema check, a newer one that is not the current version only a warning (version 4 notifies
+ * every row of a large statement, instead of one `BULK` notification).
+ */
+export const LILYPAD_CHANGELOG_MIN_COMPATIBLE_VERSION = 4;
+
+/** Above this number of rows changed by one statement, the trigger sends one `BULK` notification. */
+export const LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD = 1000;
+
+/**
+ * The shortest retention that {@link pruneLilypadChangelog} accepts without `force`: the default
+ * `maxGap` of the caches. A shorter one deletes rows that the caches may still have to read.
+ */
+export const LILYPAD_MIN_CHANGELOG_RETENTION = 60 * 60 * 1000;
 
 /** The transition tables of the statement triggers (version 4): the rows before and after. */
 export const LILYPAD_CHANGELOG_OLD_ROWS = 'lilypad_old';
@@ -83,6 +98,12 @@ export type LilypadChangelogSqlOptions = {
    * send none. Defaults to `cache_events`.
    */
   notifyChannel?: string | false;
+  /**
+   * With a `notifyChannel`, a statement that changes more rows than this sends one `BULK`
+   * notification instead of one per row: the caches then expire every entry of the table instead
+   * of re-reading each row, and the `NOTIFY` queue is not flooded. Defaults to 1000.
+   */
+  notifyBulkThreshold?: number;
   /**
    * Makes the trigger delete the old changelog rows itself, so that no scheduled job is needed:
    * on about one statement in `every`, it deletes up to `batchSize` rows older than `olderThan`,
@@ -169,6 +190,13 @@ export function lilypadChangelogSql(options: LilypadChangelogSqlOptions = {}): s
   const table = options.table ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
   const channel = options.notifyChannel ?? LILYPAD_DEFAULT_NOTIFY_CHANNEL;
   const prune = resolvePruneOptions('lilypadChangelogSql', options.prune);
+  assertNumberOption(
+    'lilypadChangelogSql',
+    'notifyBulkThreshold',
+    options.notifyBulkThreshold,
+    'positive-integer'
+  );
+  const bulkThreshold = options.notifyBulkThreshold ?? LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD;
   const quotedTable = quoteIdentifier(table);
   const indexPrefix = identifierPrefix(table);
   const pruneFunction = quoteIdentifier(pruneFunctionName(table));
@@ -192,20 +220,27 @@ ${indent}END IF;`
   const functionName = quoteIdentifier(triggerFunctionName(table));
   const oldRows = LILYPAD_CHANGELOG_OLD_ROWS;
   const newRows = LILYPAD_CHANGELOG_NEW_ROWS;
-  // The changes of a statement trigger, recorded (and notified) in one query; $1 and $2 are the
-  // schema and the name of the table, %s the query of the changed rows
-  const recordChanged =
+  // The notifications of a statement trigger: one per row, or one BULK notification above the
+  // threshold (the caches then expire the whole table). $1 and $2 are the schema and the name of
+  // the table, %s the query of the changed rows
+  const notifyChanged =
     channel === false
-      ? `INSERT INTO ${escapeFormat(quotedTable)} (table_schema, table_name, row_id, op)
-      SELECT $1, $2, changed.row_id, changed.op FROM (%s) AS changed`
-      : `WITH recorded AS (
-        INSERT INTO ${escapeFormat(quotedTable)} (table_schema, table_name, row_id, op)
-        SELECT $1, $2, changed.row_id, changed.op FROM (%s) AS changed
-        RETURNING row_id, op
-      )
-      SELECT pg_notify(${escapeFormat(quoteLiteral(channel))}, json_build_object(
-        'schema', $1, 'table', $2, 'id', row_id, 'op', op, 'xid', pg_current_xact_id()::text
-      )::text) FROM recorded`;
+      ? ''
+      : `
+    GET DIAGNOSTICS recorded = ROW_COUNT;
+    IF recorded > ${bulkThreshold} THEN
+      PERFORM pg_notify(${quoteLiteral(channel)}, json_build_object(
+        'schema', TG_TABLE_SCHEMA, 'table', TG_TABLE_NAME, 'op', 'BULK',
+        'xid', pg_current_xact_id()::text
+      )::text);
+    ELSIF recorded > 0 THEN
+      EXECUTE format($notify$
+        SELECT pg_notify(${escapeFormat(quoteLiteral(channel))}, json_build_object(
+          'schema', $1, 'table', $2, 'id', changed.row_id, 'op', changed.op,
+          'xid', pg_current_xact_id()::text
+        )::text) FROM (%s) AS changed
+      $notify$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;
+    END IF;`;
 
   return `CREATE TABLE IF NOT EXISTS ${quotedTable} (
   id           bigserial   PRIMARY KEY,
@@ -250,6 +285,7 @@ DECLARE
   new_id text;
   old_id text;
   changed text;
+  recorded bigint;
 BEGIN${
     prune
       ? `
@@ -280,8 +316,9 @@ BEGIN${
         TG_ARGV[0])
     END;
     EXECUTE format($record$
-      ${recordChanged}
-    $record$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;${pruneCall('    ')}
+      INSERT INTO ${escapeFormat(quotedTable)} (table_schema, table_name, row_id, op)
+      SELECT $1, $2, changed.row_id, changed.op FROM (%s) AS changed
+    $record$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;${notifyChanged}${pruneCall('    ')}
     RETURN NULL;
   END IF;
 
@@ -569,25 +606,49 @@ export async function readLilypadChangesBatch(
  * the first query of that connection before, so an array sent by the first query of a process is
  * serialized as `a,b` (malformed array literal), with or without an explicit type.
  */
-function textArrayLiteral(values: readonly string[]): string {
+export function textArrayLiteral(values: readonly string[]): string {
   return `{${values.map((value) => `"${value.replace(/[\\"]/g, '\\$&')}"`).join(',')}}`;
 }
 
 /**
- * Deletes the changelog rows older than `olderThan` milliseconds. Call it periodically (e.g. from
- * a scheduled job): `olderThan` must be much larger than the `maxGap` and the `lookback` of the
- * caches.
+ * Deletes the changelog rows older than `olderThan` milliseconds, in batches of `batchSize` rows
+ * (one statement each, so that no statement locks or rewrites the whole table). Call it
+ * periodically (e.g. from a scheduled job): `olderThan` must be much larger than the `maxGap` and
+ * the `lookback` of the caches, and than the longest transaction.
  *
+ * @param options.olderThan - The retention, in **milliseconds**. Below one hour it throws, unless
+ * `force` is set: a shorter retention deletes rows that the caches may still have to read, and
+ * they would miss these changes without knowing it.
+ * @param options.batchSize - The most rows one statement deletes. Defaults to 10000.
  * @returns The number of deleted rows.
  */
 export async function pruneLilypadChangelog(
   gate: LilypadDbGate,
-  options: { olderThan: number; changelogTable?: string }
+  options: { olderThan: number; changelogTable?: string; batchSize?: number; force?: boolean }
 ): Promise<number> {
-  const changelogTable = options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
-  const result = await gate.sql`
-    DELETE FROM ${gate.sql(changelogTable)}
-    WHERE changed_at < clock_timestamp() - make_interval(secs => ${options.olderThan / 1000})
-  `;
-  return result.count;
+  const owner = 'pruneLilypadChangelog';
+  assertNumberOption(owner, 'olderThan', options.olderThan, 'non-negative');
+  assertNumberOption(owner, 'batchSize', options.batchSize, 'positive-integer');
+  if (options.olderThan < LILYPAD_MIN_CHANGELOG_RETENTION && !options.force) {
+    throw new Error(
+      `${owner}: olderThan is ${options.olderThan} ms, less than one hour: the caches may still need these rows (it is in milliseconds). Pass force: true to prune them anyway.`
+    );
+  }
+  const changelogTable = gate.sql(options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE);
+  const batchSize = options.batchSize ?? 10_000;
+  let deleted = 0;
+  while (true) {
+    const result = await gate.sql`
+      DELETE FROM ${changelogTable} WHERE id IN (
+        SELECT id FROM ${changelogTable}
+        WHERE changed_at < clock_timestamp() - make_interval(secs => ${options.olderThan / 1000})
+        ORDER BY changed_at
+        LIMIT ${batchSize}
+      )
+    `;
+    deleted += result.count;
+    if (result.count < batchSize) {
+      return deleted;
+    }
+  }
 }

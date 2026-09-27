@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { LilypadLoggerComponent } from './LilypadLoggerComponent';
 import { LilypadLogger } from './LilypadLogger';
+import { LilypadJsonConsoleLogger } from './components/JsonConsoleLogger';
 import {
   getLilypadSingletonInstanceAsync,
   removeLilypadSingletonInstance,
@@ -419,6 +420,29 @@ describe('LilypadLogger', () => {
 
       await expect(logger.info('message')).resolves.toBeUndefined();
       expect(mockComponent.write).toHaveBeenCalledOnce();
+    });
+  });
+});
+
+describe('LilypadLogger redaction of objects with toJSON', () => {
+  it('should redact the keys of what toJSON returns, in the JSON output', async () => {
+    const lines: string[] = [];
+    const log = vi.spyOn(console, 'log').mockImplementation((line: string) => lines.push(line));
+    const logger = LilypadLogger.create<'info'>({
+      components: { info: [new LilypadJsonConsoleLogger()] },
+      context: () => ({
+        request: { toJSON: () => ({ url: '/users', headers: { authorization: 'Bearer secret' } }) },
+        at: new Date(0),
+      }),
+    });
+
+    await logger.info('request');
+    log.mockRestore();
+
+    expect(lines[0]).not.toContain('secret');
+    expect(JSON.parse(lines[0]!)).toMatchObject({
+      request: { url: '/users', headers: { authorization: '[Redacted]' } },
+      at: '1970-01-01T00:00:00.000Z',
     });
   });
 });

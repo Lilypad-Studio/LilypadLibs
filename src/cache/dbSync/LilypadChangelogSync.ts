@@ -5,7 +5,11 @@ import type {
 } from '@/cache/dbSync/LilypadDbSyncTypes';
 import type { LilypadSchemaVerifier } from '@/cache/dbSync/LilypadSchemaVerifier';
 import type { LilypadCacheKey } from '@/cache/LilypadCacheTypes';
-import type { LilypadChangelogCursor, LilypadChangesRequest } from '@/dbGate/LilypadChangelog';
+import type {
+  LilypadChange,
+  LilypadChangelogCursor,
+  LilypadChangesRequest,
+} from '@/dbGate/LilypadChangelog';
 import {
   getLilypadChangelogReader,
   type LilypadChangelogReadResult,
@@ -16,6 +20,36 @@ import { LilypadBackoff } from '@/internal/LilypadBackoff';
 import { runInBackground } from '@/platform/LilypadPlatform';
 
 export const DEFAULT_MAX_GAP = 60 * 60 * 1000; // 1 hour
+
+/**
+ * Above this number of changed keys in one read, the table is expired as a whole instead of key by
+ * key: following each key would remove each one from the shared level, on every instance.
+ */
+export const LILYPAD_BULK_CHANGE_THRESHOLD = 1000;
+
+/**
+ * The changes to apply, in order: whether the table was emptied, and the last change of each row
+ * after the last `TRUNCATE`. The changes of a row are ordered by the lock of the row, so its last
+ * change says what it is now; the changes of a row made before a `TRUNCATE` no longer matter.
+ */
+export function lilypadNetChanges(changes: LilypadChange[]): {
+  truncated: boolean;
+  rows: Map<string, Exclude<LilypadChange, { op: 'TRUNCATE' }>>;
+} {
+  let truncated = false;
+  const rows = new Map<string, Exclude<LilypadChange, { op: 'TRUNCATE' }>>();
+  for (const change of changes) {
+    if (change.op === 'TRUNCATE') {
+      truncated = true;
+      rows.clear();
+    } else {
+      // Deleted first, so that the map keeps the order of the last changes
+      rows.delete(change.rowId);
+      rows.set(change.rowId, change);
+    }
+  }
+  return { truncated, rows };
+}
 
 /**
  * The `changelog` strategy: before a read, at most once per `pollInterval`, the cache reads the
@@ -119,21 +153,29 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
         // Every change committed from now on is returned by the next reads
         this.chainStartedAt = readAt;
       }
-      const changedKeys: K[] = [];
-      let truncated = false;
-      for (const change of changes) {
-        if (change.op === 'TRUNCATE') {
-          changedKeys.push(...host.applyTruncate('lazy'));
-          truncated = true;
-        } else {
-          changedKeys.push(await host.applyChange(change.op, change.rowId, 'lazy', change.xid));
+      const { truncated, rows } = lilypadNetChanges(changes);
+      const changedKeys = new Set<K>();
+      let wholeCache = truncated;
+      if (truncated) {
+        for (const key of host.applyTruncate('lazy')) {
+          changedKeys.add(key);
+        }
+      }
+      if (rows.size > LILYPAD_BULK_CHANGE_THRESHOLD) {
+        // Too many rows to follow one by one: one expiration and one event for the whole table
+        host.applyBulkChange();
+        changedKeys.clear();
+        wholeCache = true;
+      } else {
+        for (const change of rows.values()) {
+          changedKeys.add(await host.applyChange(change.op, change.rowId, 'lazy', change.xid));
         }
       }
       host.forgetOwnWritesCoveredBy(cursor);
       this.cursor = cursor;
       this.lastRead = readAt;
       this.backoff.succeed();
-      host.emitInvalidation('changelog', changedKeys, { wholeCache: truncated });
+      host.emitInvalidation('changelog', [...changedKeys], { wholeCache });
     } catch (error) {
       // The cursor is kept: the next read, after a backoff, returns these changes again
       this.backoff.fail();

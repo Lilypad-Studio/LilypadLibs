@@ -22,9 +22,9 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 	enumerable: true
 }) : target, mod));
 //#endregion
-const require_LilypadCacheCore = require("./chunks/LilypadCacheCore-CMu2ChAi.cjs");
-const require_LilypadPlatform = require("./chunks/LilypadPlatform-jQx1ySi1.cjs");
-const require_LilypadFlowControl = require("./chunks/LilypadFlowControl-C95dEMEn.cjs");
+const require_LilypadCacheCore = require("./chunks/LilypadCacheCore-CRKEPtrF.cjs");
+const require_LilypadValidation = require("./chunks/LilypadValidation-BobS4Y-i.cjs");
+const require_LilypadPlatform = require("./chunks/LilypadPlatform-B4n37kmx.cjs");
 const require_LilypadSingleton = require("./chunks/LilypadSingleton-B2cch1Oh.cjs");
 let node_crypto = require("node:crypto");
 let postgres = require("postgres");
@@ -138,6 +138,23 @@ function toPostgresPoolOptions(pool) {
 		max_lifetime: seconds(pool?.maxLifetime)
 	}).filter(([, value]) => value !== void 0));
 }
+/** Thrown by the writes when the data has no primary key where one is needed. */
+var LilypadDbMissingPrimaryKeyError = class extends Error {
+	constructor(schema, context) {
+		super(`Primary key "${String(schema.primaryKey)}" is missing in the ${context} data for table "${schema.tableName}".`);
+		this.name = "LilypadDbMissingPrimaryKeyError";
+		this.tableName = schema.tableName;
+		this.primaryKey = String(schema.primaryKey);
+	}
+};
+/** Thrown by an insert or an update whose data has no column of the schema to write. */
+var LilypadDbEmptyWriteError = class extends Error {
+	constructor(tableName, operation) {
+		super(`No columns to ${operation} for table "${tableName}".`);
+		this.name = "LilypadDbEmptyWriteError";
+		this.tableName = tableName;
+	}
+};
 /** Thrown by `updateToTable` when no row has the primary key of the data. */
 var LilypadDbNotFoundError = class extends Error {
 	constructor(tableName, primaryKeyValue) {
@@ -158,7 +175,7 @@ const DEFAULT_CLOSE_TIMEOUT = 5e3;
 const XID_COLUMN = "__lilypad_xid";
 const DEFAULT_LISTEN_HEARTBEAT = 15e3;
 function lilypadMissingPrimaryKeyError(schema, context) {
-	return /* @__PURE__ */ new Error(`Primary key "${String(schema.primaryKey)}" is missing in the ${context} data for table "${schema.tableName}".`);
+	return new LilypadDbMissingPrimaryKeyError(schema, context);
 }
 /**
 * A gateway to a PostgreSQL database: typed CRUD helpers over a {@link LilypadDbSchema}, and
@@ -181,8 +198,8 @@ var LilypadDbGate = class LilypadDbGate {
 		this.releaseSingleton = () => {};
 		this.heartbeatChannel = `lilypad_heartbeat_${this.id.slice(-36).replace(/-/g, "")}`;
 		this.heartbeatBackoff = new LilypadBackoff(() => 1e3);
-		if (options.statementTimeout !== false) require_LilypadFlowControl.assertNumberOption("LilypadDbGate", "statementTimeout", options.statementTimeout, "positive");
-		if (options.listenHeartbeat !== false) require_LilypadFlowControl.assertNumberOption("LilypadDbGate", "listenHeartbeat", options.listenHeartbeat, "positive");
+		if (options.statementTimeout !== false) require_LilypadValidation.assertNumberOption("LilypadDbGate", "statementTimeout", options.statementTimeout, "positive");
+		if (options.listenHeartbeat !== false) require_LilypadValidation.assertNumberOption("LilypadDbGate", "listenHeartbeat", options.listenHeartbeat, "positive-delay");
 		this.logger = options.logger;
 		const statementTimeout = resolveStatementTimeout(options);
 		this.sql = (0, postgres.default)(options.connectionString, {
@@ -250,6 +267,7 @@ var LilypadDbGate = class LilypadDbGate {
 	* - validates the primary key, which an update always needs to find the row;
 	* - restricts the written columns to the schema columns, so that extra properties of `data`
 	*   (e.g. coming from a request body) are never written to the table;
+	* - leaves the primary key out of the `SET` of an update: it identifies the row;
 	* - skips `undefined` values, which postgres.js rejects.
 	*/
 	prepareWrite(schema, data, operation) {
@@ -257,8 +275,8 @@ var LilypadDbGate = class LilypadDbGate {
 		const primaryKeyValue = writeData[schema.primaryKey];
 		if ((operation === "update" || !schema.generatedPrimaryKey) && (primaryKeyValue === void 0 || primaryKeyValue === null)) throw lilypadMissingPrimaryKeyError(schema, operation);
 		if (schema.generatedPrimaryKey) delete writeData[schema.primaryKey];
-		const columns = Object.keys(schema.cols).filter((column) => writeData[column] !== void 0);
-		if (columns.length === 0) throw new Error(`No columns to ${operation} for table "${schema.tableName}".`);
+		const columns = Object.keys(schema.cols).filter((column) => writeData[column] !== void 0 && !(operation === "update" && column === schema.primaryKey));
+		if (columns.length === 0) throw new LilypadDbEmptyWriteError(schema.tableName, operation);
 		return {
 			data: writeData,
 			columns,
@@ -505,8 +523,9 @@ var LilypadDbGate = class LilypadDbGate {
 	get closed() {
 		return this.closing !== void 0;
 	}
+	/** @throws {LilypadDisposedError} If the gate is closed. */
 	assertOpen() {
-		if (this.closing) throw new Error(`LilypadDbGate "${this.id}" is closed.`);
+		if (this.closing) throw new require_LilypadCacheCore.LilypadDisposedError(`LilypadDbGate "${this.id}"`, "closed");
 	}
 	/**
 	* Closes the connections, after the queries still running (for at most `timeout` ms; the ones
@@ -514,13 +533,18 @@ var LilypadDbGate = class LilypadDbGate {
 	* returns the same promise.
 	*
 	* @param options.timeout - How long to wait for the running queries, in ms. Defaults to 5 s.
+	* @throws If the timeout is not valid: the gate then stays open.
 	*/
 	close(options = {}) {
+		require_LilypadValidation.assertNumberOption("LilypadDbGate", "close timeout", options.timeout, "non-negative-delay");
 		this.closing ??= this.closeConnections(options.timeout ?? DEFAULT_CLOSE_TIMEOUT);
 		return this.closing;
 	}
+	/** `await using gate = ...` closes the gate at the end of the scope. */
+	[Symbol.asyncDispose]() {
+		return this.close();
+	}
 	async closeConnections(timeout) {
-		require_LilypadFlowControl.assertNumberOption("LilypadDbGate", "close timeout", timeout, "non-negative");
 		this.listeners.clear();
 		this.heartbeat?.stop();
 		this.heartbeatStop = void 0;
@@ -542,6 +566,13 @@ function resolveStatementTimeout(options) {
 const LILYPAD_DEFAULT_CHANGELOG_TABLE = "lilypad_cache_changes";
 const LILYPAD_DEFAULT_NOTIFY_CHANNEL = "cache_events";
 const LILYPAD_CHANGELOG_VERSION_PREFIX = "lilypad-changelog:";
+/** Above this number of rows changed by one statement, the trigger sends one `BULK` notification. */
+const LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD = 1e3;
+/**
+* The shortest retention that {@link pruneLilypadChangelog} accepts without `force`: the default
+* `maxGap` of the caches. A shorter one deletes rows that the caches may still have to read.
+*/
+const LILYPAD_MIN_CHANGELOG_RETENTION = 36e5;
 /** The transition tables of the statement triggers (version 4): the rows before and after. */
 const LILYPAD_CHANGELOG_OLD_ROWS = "lilypad_old";
 const LILYPAD_CHANGELOG_NEW_ROWS = "lilypad_new";
@@ -586,9 +617,9 @@ function escapeFormat(value) {
 const PRUNE_MARKER = "lilypad-prune:";
 function resolvePruneOptions(owner, prune) {
 	if (!prune) return;
-	require_LilypadFlowControl.assertNumberOption(owner, "prune.olderThan", prune.olderThan, "positive");
-	require_LilypadFlowControl.assertNumberOption(owner, "prune.every", prune.every, "positive-integer");
-	require_LilypadFlowControl.assertNumberOption(owner, "prune.batchSize", prune.batchSize, "positive-integer");
+	require_LilypadValidation.assertNumberOption(owner, "prune.olderThan", prune.olderThan, "positive");
+	require_LilypadValidation.assertNumberOption(owner, "prune.every", prune.every, "positive-integer");
+	require_LilypadValidation.assertNumberOption(owner, "prune.batchSize", prune.batchSize, "positive-integer");
 	return {
 		olderThan: prune.olderThan,
 		every: prune.every ?? 20,
@@ -623,6 +654,8 @@ function lilypadChangelogSql(options = {}) {
 	const table = options.table ?? "lilypad_cache_changes";
 	const channel = options.notifyChannel ?? "cache_events";
 	const prune = resolvePruneOptions("lilypadChangelogSql", options.prune);
+	require_LilypadValidation.assertNumberOption("lilypadChangelogSql", "notifyBulkThreshold", options.notifyBulkThreshold, "positive-integer");
+	const bulkThreshold = options.notifyBulkThreshold ?? 1e3;
 	const quotedTable = quoteIdentifier(table);
 	const indexPrefix = identifierPrefix(table);
 	const pruneFunction = quoteIdentifier(pruneFunctionName(table));
@@ -638,15 +671,21 @@ ${indent}END IF;` : "";
 	const functionName = quoteIdentifier(triggerFunctionName(table));
 	const oldRows = LILYPAD_CHANGELOG_OLD_ROWS;
 	const newRows = LILYPAD_CHANGELOG_NEW_ROWS;
-	const recordChanged = channel === false ? `INSERT INTO ${escapeFormat(quotedTable)} (table_schema, table_name, row_id, op)
-      SELECT $1, $2, changed.row_id, changed.op FROM (%s) AS changed` : `WITH recorded AS (
-        INSERT INTO ${escapeFormat(quotedTable)} (table_schema, table_name, row_id, op)
-        SELECT $1, $2, changed.row_id, changed.op FROM (%s) AS changed
-        RETURNING row_id, op
-      )
-      SELECT pg_notify(${escapeFormat(quoteLiteral(channel))}, json_build_object(
-        'schema', $1, 'table', $2, 'id', row_id, 'op', op, 'xid', pg_current_xact_id()::text
-      )::text) FROM recorded`;
+	const notifyChanged = channel === false ? "" : `
+    GET DIAGNOSTICS recorded = ROW_COUNT;
+    IF recorded > ${bulkThreshold} THEN
+      PERFORM pg_notify(${quoteLiteral(channel)}, json_build_object(
+        'schema', TG_TABLE_SCHEMA, 'table', TG_TABLE_NAME, 'op', 'BULK',
+        'xid', pg_current_xact_id()::text
+      )::text);
+    ELSIF recorded > 0 THEN
+      EXECUTE format($notify$
+        SELECT pg_notify(${escapeFormat(quoteLiteral(channel))}, json_build_object(
+          'schema', $1, 'table', $2, 'id', changed.row_id, 'op', changed.op,
+          'xid', pg_current_xact_id()::text
+        )::text) FROM (%s) AS changed
+      $notify$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;
+    END IF;`;
 	return `CREATE TABLE IF NOT EXISTS ${quotedTable} (
   id           bigserial   PRIMARY KEY,
   xid          xid8        NOT NULL DEFAULT pg_current_xact_id(),
@@ -686,6 +725,7 @@ DECLARE
   new_id text;
   old_id text;
   changed text;
+  recorded bigint;
 BEGIN${prune ? `
   -- ${PRUNE_MARKER} olderThan=${prune.olderThan} every=${prune.every} batchSize=${prune.batchSize}` : ""}
   IF TG_OP = 'TRUNCATE' THEN
@@ -712,8 +752,9 @@ BEGIN${prune ? `
         TG_ARGV[0])
     END;
     EXECUTE format($record$
-      ${recordChanged}
-    $record$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;${pruneCall("    ")}
+      INSERT INTO ${escapeFormat(quotedTable)} (table_schema, table_name, row_id, op)
+      SELECT $1, $2, changed.row_id, changed.op FROM (%s) AS changed
+    $record$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;${notifyChanged}${pruneCall("    ")}
     RETURN NULL;
   END IF;
 
@@ -736,7 +777,7 @@ BEGIN${prune ? `
   RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
-COMMENT ON FUNCTION ${functionName}() IS ${quoteLiteral(`${LILYPAD_CHANGELOG_VERSION_PREFIX}4`)};
+COMMENT ON FUNCTION ${functionName}() IS ${quoteLiteral(`${LILYPAD_CHANGELOG_VERSION_PREFIX}5`)};
 ${prune ? "" : `DROP FUNCTION IF EXISTS ${pruneFunction}();\n`}`;
 }
 /**
@@ -745,7 +786,7 @@ ${prune ? "" : `DROP FUNCTION IF EXISTS ${pruneFunction}();\n`}`;
 * (`CREATE EXTENSION pg_cron`). Running it again updates the job.
 */
 function lilypadChangelogPruneScheduleSql(options) {
-	require_LilypadFlowControl.assertNumberOption("lilypadChangelogPruneScheduleSql", "olderThan", options.olderThan, "positive");
+	require_LilypadValidation.assertNumberOption("lilypadChangelogPruneScheduleSql", "olderThan", options.olderThan, "positive");
 	const table = options.changelogTable ?? "lilypad_cache_changes";
 	const jobName = quoteLiteral(options.jobName ?? pruneFunctionName(table));
 	const schedule = quoteLiteral(options.schedule ?? "0 3 * * *");
@@ -917,18 +958,37 @@ function textArrayLiteral(values) {
 	return `{${values.map((value) => `"${value.replace(/[\\"]/g, "\\$&")}"`).join(",")}}`;
 }
 /**
-* Deletes the changelog rows older than `olderThan` milliseconds. Call it periodically (e.g. from
-* a scheduled job): `olderThan` must be much larger than the `maxGap` and the `lookback` of the
-* caches.
+* Deletes the changelog rows older than `olderThan` milliseconds, in batches of `batchSize` rows
+* (one statement each, so that no statement locks or rewrites the whole table). Call it
+* periodically (e.g. from a scheduled job): `olderThan` must be much larger than the `maxGap` and
+* the `lookback` of the caches, and than the longest transaction.
 *
+* @param options.olderThan - The retention, in **milliseconds**. Below one hour it throws, unless
+* `force` is set: a shorter retention deletes rows that the caches may still have to read, and
+* they would miss these changes without knowing it.
+* @param options.batchSize - The most rows one statement deletes. Defaults to 10000.
 * @returns The number of deleted rows.
 */
 async function pruneLilypadChangelog(gate, options) {
-	const changelogTable = options.changelogTable ?? "lilypad_cache_changes";
-	return (await gate.sql`
-    DELETE FROM ${gate.sql(changelogTable)}
-    WHERE changed_at < clock_timestamp() - make_interval(secs => ${options.olderThan / 1e3})
-  `).count;
+	const owner = "pruneLilypadChangelog";
+	require_LilypadValidation.assertNumberOption(owner, "olderThan", options.olderThan, "non-negative");
+	require_LilypadValidation.assertNumberOption(owner, "batchSize", options.batchSize, "positive-integer");
+	if (options.olderThan < 36e5 && !options.force) throw new Error(`${owner}: olderThan is ${options.olderThan} ms, less than one hour: the caches may still need these rows (it is in milliseconds). Pass force: true to prune them anyway.`);
+	const changelogTable = gate.sql(options.changelogTable ?? "lilypad_cache_changes");
+	const batchSize = options.batchSize ?? 1e4;
+	let deleted = 0;
+	while (true) {
+		const result = await gate.sql`
+      DELETE FROM ${changelogTable} WHERE id IN (
+        SELECT id FROM ${changelogTable}
+        WHERE changed_at < clock_timestamp() - make_interval(secs => ${options.olderThan / 1e3})
+        ORDER BY changed_at
+        LIMIT ${batchSize}
+      )
+    `;
+		deleted += result.count;
+		if (result.count < batchSize) return deleted;
+	}
 }
 //#endregion
 //#region src/dbGate/LilypadChangelogReader.ts
@@ -1009,6 +1069,26 @@ function getLilypadChangelogReader(gate, changelogTable = LILYPAD_DEFAULT_CHANGE
 	return reader;
 }
 /**
+* The changes to apply, in order: whether the table was emptied, and the last change of each row
+* after the last `TRUNCATE`. The changes of a row are ordered by the lock of the row, so its last
+* change says what it is now; the changes of a row made before a `TRUNCATE` no longer matter.
+*/
+function lilypadNetChanges(changes) {
+	let truncated = false;
+	const rows = /* @__PURE__ */ new Map();
+	for (const change of changes) if (change.op === "TRUNCATE") {
+		truncated = true;
+		rows.clear();
+	} else {
+		rows.delete(change.rowId);
+		rows.set(change.rowId, change);
+	}
+	return {
+		truncated,
+		rows
+	};
+}
+/**
 * The `changelog` strategy: before a read, at most once per `pollInterval`, the cache reads the
 * changes of its table (with the other caches of the gate, see `LilypadChangelogReader`) and
 * applies them without a query.
@@ -1086,17 +1166,20 @@ var LilypadChangelogSync = class {
 				host.expireEverything();
 				this.chainStartedAt = readAt;
 			}
-			const changedKeys = [];
-			let truncated = false;
-			for (const change of changes) if (change.op === "TRUNCATE") {
-				changedKeys.push(...host.applyTruncate("lazy"));
-				truncated = true;
-			} else changedKeys.push(await host.applyChange(change.op, change.rowId, "lazy", change.xid));
+			const { truncated, rows } = lilypadNetChanges(changes);
+			const changedKeys = /* @__PURE__ */ new Set();
+			let wholeCache = truncated;
+			if (truncated) for (const key of host.applyTruncate("lazy")) changedKeys.add(key);
+			if (rows.size > 1e3) {
+				host.applyBulkChange();
+				changedKeys.clear();
+				wholeCache = true;
+			} else for (const change of rows.values()) changedKeys.add(await host.applyChange(change.op, change.rowId, "lazy", change.xid));
 			host.forgetOwnWritesCoveredBy(cursor);
 			this.cursor = cursor;
 			this.lastRead = readAt;
 			this.backoff.succeed();
-			host.emitInvalidation("changelog", changedKeys, { wholeCache: truncated });
+			host.emitInvalidation("changelog", [...changedKeys], { wholeCache });
 		} catch (error) {
 			this.backoff.fail();
 			host.log("error", "Error applying the changelog:", error);
@@ -1118,13 +1201,16 @@ const lilypadNoSync = {
 	dispose: () => Promise.resolve()
 };
 //#endregion
-//#region src/cache/dbSync/LilypadListenSync.ts
+//#region src/cache/dbSync/LilypadNotificationRouter.ts
 const OPERATIONS = /* @__PURE__ */ new Set([
 	"INSERT",
 	"UPDATE",
 	"DELETE",
-	"TRUNCATE"
+	"TRUNCATE",
+	"BULK"
 ]);
+/** The operations that concern the whole table, not one row: they carry no `id`. */
+const TABLE_OPERATIONS = /* @__PURE__ */ new Set(["TRUNCATE", "BULK"]);
 /**
 * Parses a notification of the `cache_events` channel.
 *
@@ -1141,16 +1227,94 @@ function parseLilypadNotification(payload) {
 	if (typeof parsed !== "object" || parsed === null) return;
 	const { table, op, id, schema, xid } = parsed;
 	if (typeof table !== "string" || table === "" || typeof op !== "string" || !OPERATIONS.has(op)) return;
-	if (op !== "TRUNCATE" && !(typeof id === "string" && id !== "" || typeof id === "number")) return;
+	if (!TABLE_OPERATIONS.has(op) && !(typeof id === "string" && id !== "" || typeof id === "number")) return;
 	if (schema !== void 0 && typeof schema !== "string" || xid !== void 0 && typeof xid !== "string") return;
 	return parsed;
 }
+/**
+* Receives the notifications of a channel for every cache of a gate: one listener on the gate,
+* one `JSON.parse` per notification, and each notification handed to the caches of its table only
+* (instead of every cache parsing and filtering every notification).
+*/
+var LilypadNotificationRouter = class {
+	constructor(gate, channel) {
+		this.gate = gate;
+		this.subscribers = /* @__PURE__ */ new Set();
+		this.listener = {
+			channel,
+			callbackId: "lilypad_notification_router",
+			callback: (payload) => this.dispatch(payload),
+			onReconnect: () => {
+				for (const subscriber of [...this.subscribers]) subscriber.onReconnect();
+			}
+		};
+	}
+	/**
+	* Subscribes a cache, and resolves once the channel is listened to.
+	*
+	* @throws If `LISTEN` fails: the cache is then not subscribed.
+	*/
+	async subscribe(subscriber) {
+		this.subscribers.add(subscriber);
+		try {
+			this.listening ??= this.gate.addListener(this.listener).catch((error) => {
+				this.listening = void 0;
+				throw error;
+			});
+			await this.listening;
+		} catch (error) {
+			this.subscribers.delete(subscriber);
+			throw error;
+		}
+	}
+	/** Unsubscribes a cache; the last one stops listening. It never rejects. */
+	async unsubscribe(subscriber) {
+		if (!this.subscribers.delete(subscriber) || this.subscribers.size > 0) return;
+		const listening = this.listening;
+		this.listening = void 0;
+		await listening?.catch(() => {});
+		if (this.subscribers.size === 0 && !this.listening) await this.gate.removeListener(this.listener.channel, this.listener.callbackId);
+	}
+	async dispatch(raw) {
+		const subscribers = [...this.subscribers];
+		if (subscribers.length === 0) return;
+		const payload = parseLilypadNotification(raw);
+		if (!payload) {
+			subscribers[0].log("warn", "Ignoring a malformed cache_events notification:", raw);
+			return;
+		}
+		await Promise.all(subscribers.filter((subscriber) => subscriber.table === payload.table).map(async (subscriber) => {
+			try {
+				await subscriber.handle(payload);
+			} catch (error) {
+				subscriber.log("error", "Error applying a notification:", error);
+			}
+		}));
+	}
+};
+const routers = /* @__PURE__ */ new WeakMap();
+/** The router shared by the caches of a gate that listen to this channel. */
+function getLilypadNotificationRouter(gate, channel) {
+	let gateRouters = routers.get(gate);
+	if (!gateRouters) {
+		gateRouters = /* @__PURE__ */ new Map();
+		routers.set(gate, gateRouters);
+	}
+	let router = gateRouters.get(channel);
+	if (!router) {
+		router = new LilypadNotificationRouter(gate, channel);
+		gateRouters.set(channel, router);
+	}
+	return router;
+}
+//#endregion
+//#region src/cache/dbSync/LilypadListenSync.ts
 function parseXid(xid) {
 	return xid !== void 0 && /^\d+$/.test(xid) ? BigInt(xid) : void 0;
 }
 /**
-* The `listen` strategy: the cache registers a callback on the `cache_events` channel of the gate,
-* and applies the notifications of its table.
+* The `listen` strategy: the cache subscribes to the `cache_events` channel of the gate (through
+* the router shared by the caches of the gate), and applies the notifications of its table.
 *
 * It trusts that it sees every change while `LISTEN` is active and the gate's heartbeat is recent
 * (`isListenHealthy`): a connection that stopped delivering notifications is not trusted, even
@@ -1164,42 +1328,40 @@ var LilypadListenSync = class {
 		this.seesOwnWrites = true;
 		this.backoff = new LilypadBackoff(() => 1e3);
 		this.applyChanges = options.applyChanges !== false;
-		this.listener = {
-			channel: LILYPAD_DEFAULT_NOTIFY_CHANNEL,
-			callbackId: `lilypad_dbcache_${host.tableName}_${host.id}`,
+		this.router = getLilypadNotificationRouter(host.gate, LILYPAD_DEFAULT_NOTIFY_CHANNEL);
+		this.subscriber = {
+			table: host.tableName.split(".").pop(),
+			handle: (payload) => this.handleNotification(payload),
 			onReconnect: () => {
 				if (host.isDisposed()) return;
 				host.expireEverything();
 				if (this.applyChanges) this.listenTrustedSince = Date.now();
 			},
-			callback: (payload) => this.handleNotification(payload)
+			log: (level, ...message) => host.log(level, ...message)
 		};
 	}
 	start() {
 		return this.options.connect === "lazy" ? Promise.resolve() : this.startListening();
 	}
 	/**
-	* Registers the listener once, after the schema check (which resolves the schema of the table,
-	* to ignore the notifications of other schemas). A failed registration is retried by the next
-	* call, after a backoff for the lazy `LISTEN` of the reads. If the cache was disposed meanwhile,
-	* the listener is removed again.
+	* Subscribes once, after the schema check (which resolves the schema of the table, to ignore the
+	* notifications of other schemas). A failed subscription is retried by the next call, after a
+	* backoff for the lazy `LISTEN` of the reads. If the cache was disposed meanwhile, it
+	* unsubscribes again.
 	*/
 	startListening() {
-		if (!this.listening) {
-			const { gate } = this.host;
-			this.listening = this.verifier.verify().then(() => gate.addListener(this.listener)).then(async () => {
-				if (this.host.isDisposed()) {
-					await gate.removeListener(this.listener.channel, this.listener.callbackId);
-					return;
-				}
-				this.backoff.succeed();
-				if (this.applyChanges) this.listenTrustedSince = Date.now();
-			}).catch((error) => {
-				this.listening = void 0;
-				this.backoff.fail();
-				throw error;
-			});
-		}
+		if (!this.listening) this.listening = this.verifier.verify().then(() => this.router.subscribe(this.subscriber)).then(async () => {
+			if (this.host.isDisposed()) {
+				await this.router.unsubscribe(this.subscriber);
+				return;
+			}
+			this.backoff.succeed();
+			if (this.applyChanges) this.listenTrustedSince = Date.now();
+		}).catch((error) => {
+			this.listening = void 0;
+			this.backoff.fail();
+			throw error;
+		});
 		return this.listening;
 	}
 	beforeRead() {
@@ -1216,19 +1378,16 @@ var LilypadListenSync = class {
 	trustedSince() {
 		return this.host.gate.isListenHealthy() ? this.listenTrustedSince : void 0;
 	}
-	async handleNotification(raw) {
+	async handleNotification(payload) {
 		const { host } = this;
-		if (host.isDisposed()) return;
-		host.log("debug", "Received a notification on the cache_events channel:", raw);
-		const payload = parseLilypadNotification(raw);
-		if (!payload) {
-			host.log("warn", "Ignoring a malformed cache_events notification:", raw);
-			return;
-		}
-		if (!this.isForTable(payload)) return;
+		if (host.isDisposed() || !this.isForSchema(payload)) return;
+		host.log("debug", "Received a notification on the cache_events channel:", payload);
 		if (this.applyChanges) {
 			if (payload.op === "TRUNCATE") host.emitInvalidation("notification", host.applyTruncate("eager"), { wholeCache: true });
-			else {
+			else if (payload.op === "BULK") {
+				host.applyBulkChange();
+				host.emitInvalidation("notification", [], { wholeCache: true });
+			} else {
 				const key = await host.applyChange(payload.op, payload.id, "eager", parseXid(payload.xid));
 				host.emitInvalidation("notification", [key]);
 			}
@@ -1236,18 +1395,17 @@ var LilypadListenSync = class {
 		await this.options.onNotification?.(payload);
 	}
 	/**
-	* Whether a notification is about the table of this cache. `table` is the name without its
-	* schema; `schema`, when the trigger sends it and the schema of the table is known, must match.
+	* Whether a notification of the table (the router matched its name) is about the schema of this
+	* cache: `schema`, when the trigger sends it and the schema of the table is known, must match.
 	*/
-	isForTable(payload) {
-		if (payload.table !== this.host.tableName.split(".").pop()) return false;
+	isForSchema(payload) {
 		const tableSchema = this.host.tableSchema();
 		return payload.schema === void 0 || tableSchema === void 0 || payload.schema === tableSchema;
 	}
-	/** Waits for a `LISTEN` still starting, then removes the listener. It never rejects. */
+	/** Waits for a `LISTEN` still starting, then unsubscribes. It never rejects. */
 	async dispose() {
 		await this.listening?.catch(() => {});
-		await this.host.gate.removeListener(this.listener.channel, this.listener.callbackId);
+		await this.router.unsubscribe(this.subscriber);
 	}
 };
 //#endregion
@@ -1411,7 +1569,7 @@ function lilypadCommandDeletesFrom(command, changelogTable) {
 */
 function evaluatePruning(facts, changelog, options, changelogSql) {
 	const minRetention = options?.minRetention ?? DEFAULT_MIN_RETENTION;
-	require_LilypadFlowControl.assertNumberOption("checkLilypadSchema", "changelog.minRetention", minRetention, "positive");
+	require_LilypadValidation.assertNumberOption("checkLilypadSchema", "changelog.minRetention", minRetention, "positive");
 	const recommended = Math.max(DAY, 4 * minRetention);
 	const installed = installedLilypadChangelogPrune(facts.changelog.functionSource);
 	const problems = [];
@@ -1538,14 +1696,13 @@ function suggestPruning(facts, changelog, olderThan, changelogSql, pruning) {
 		prune
 	};
 }
-/**
-* Reads from the catalogs what {@link evaluateLilypadSchema} needs. It changes nothing.
-*
-* @throws If the catalogs cannot be read (e.g. the database is unreachable).
-*/
-async function readLilypadSchemaFacts(gate, options) {
+/** The changelog whose facts are read: without one to check, the default one (its facts are then ignored). */
+function readChangelogTarget(options) {
+	return changelogTarget(options) ?? changelogTarget({ tables: [] });
+}
+async function readDatabaseFacts(gate, options) {
 	const sql = gate.sql;
-	const changelog = changelogTarget(options) ?? changelogTarget({ tables: [] });
+	const changelog = readChangelogTarget(options);
 	const quotedChangelog = quoteIdentifier(changelog.table);
 	const [database] = await sql`
     SELECT
@@ -1576,36 +1733,6 @@ async function readLilypadSchemaFacts(gate, options) {
       ) AS function_source
   `;
 	if (!database) throw new Error("Reading the database settings returned no row.");
-	const tables = [];
-	for (const { table } of options.tables) {
-		const [found] = await sql`
-      SELECT
-        n.nspname AS schema_name,
-        (
-          SELECT coalesce(json_agg(json_build_object(
-            'changelog', tr.tgfoid = to_regprocedure(${changelog.functionSignature}::text)::oid,
-            'args', encode(tr.tgargs, 'escape'),
-            'type', tr.tgtype,
-            -- 'R' (ENABLE REPLICA) triggers fire only with session_replication_role = replica
-            'enabled', tr.tgenabled IN ('O', 'A'),
-            'source', p.prosrc,
-            'oldTable', tr.tgoldtable,
-            'newTable', tr.tgnewtable
-          )), '[]'::json)
-          FROM pg_trigger tr JOIN pg_proc p ON p.oid = tr.tgfoid
-          WHERE tr.tgrelid = t.oid AND NOT tr.tgisinternal
-        ) AS triggers
-      FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace
-      WHERE t.oid = to_regclass(${quoteIdentifier(table)}::text)
-    `;
-		tables.push(found ? {
-			schema: found.schema_name,
-			triggers: parseJsonColumn(found.triggers)
-		} : {
-			schema: null,
-			triggers: []
-		});
-	}
 	let oldestRowAge = null;
 	let jobs = null;
 	if (options.changelog !== false) {
@@ -1634,7 +1761,85 @@ async function readLilypadSchemaFacts(gate, options) {
 			installed: database.cron_installed,
 			database: database.cron_database,
 			jobs
-		},
+		}
+	};
+}
+/** For each table of the options, in order, its schema and its triggers: one query for all. */
+async function readTableFacts(gate, options) {
+	const sql = gate.sql;
+	const changelog = readChangelogTarget(options);
+	const tableRefs = options.tables.map(({ table }) => quoteIdentifier(table));
+	const found = tableRefs.length === 0 ? [] : await sql`
+    SELECT
+      requested.position,
+      n.nspname AS schema_name,
+      (
+        SELECT coalesce(json_agg(json_build_object(
+          'changelog', tr.tgfoid = to_regprocedure(${changelog.functionSignature}::text)::oid,
+          'args', encode(tr.tgargs, 'escape'),
+          'type', tr.tgtype,
+          -- 'R' (ENABLE REPLICA) triggers fire only with session_replication_role = replica
+          'enabled', tr.tgenabled IN ('O', 'A'),
+          'source', p.prosrc,
+          'oldTable', tr.tgoldtable,
+          'newTable', tr.tgnewtable
+        )), '[]'::json)
+        FROM pg_trigger tr JOIN pg_proc p ON p.oid = tr.tgfoid
+        WHERE tr.tgrelid = t.oid AND NOT tr.tgisinternal
+      ) AS triggers
+    FROM unnest(${textArrayLiteral(tableRefs)}::text[]) WITH ORDINALITY AS requested(ref, position)
+    JOIN pg_class t ON t.oid = to_regclass(requested.ref)
+    JOIN pg_namespace n ON n.oid = t.relnamespace
+  `;
+	const byPosition = new Map(found.map((row) => [Number(row.position), row]));
+	return options.tables.map((_, index) => {
+		const row = byPosition.get(index + 1);
+		return row ? {
+			schema: row.schema_name,
+			triggers: parseJsonColumn(row.triggers)
+		} : {
+			schema: null,
+			triggers: []
+		};
+	});
+}
+/** How long the caches of a gate share the facts of the database (see `shareDatabaseFacts`). */
+const SHARED_FACTS_LIFETIME = 6e4;
+const sharedFacts = /* @__PURE__ */ new WeakMap();
+/**
+* The facts of the database, shared by the checks of the caches of a gate made within a minute:
+* N caches read them once. A failed read is not shared.
+*/
+function sharedDatabaseFacts(gate, options) {
+	let gateFacts = sharedFacts.get(gate);
+	if (!gateFacts) {
+		gateFacts = /* @__PURE__ */ new Map();
+		sharedFacts.set(gate, gateFacts);
+	}
+	const key = JSON.stringify([readChangelogTarget(options).table, options.changelog !== false]);
+	const now = Date.now();
+	const shared = gateFacts.get(key);
+	if (shared && now - shared.readAt < SHARED_FACTS_LIFETIME) return shared.facts;
+	const facts = readDatabaseFacts(gate, options);
+	const entry = {
+		readAt: now,
+		facts
+	};
+	gateFacts.set(key, entry);
+	facts.catch(() => {
+		if (gateFacts.get(key) === entry) gateFacts.delete(key);
+	});
+	return facts;
+}
+/**
+* Reads from the catalogs what {@link evaluateLilypadSchema} needs. It changes nothing.
+*
+* @throws If the catalogs cannot be read (e.g. the database is unreachable).
+*/
+async function readLilypadSchemaFacts(gate, options, context = {}) {
+	const [database, tables] = await Promise.all([context.shareDatabaseFacts ? sharedDatabaseFacts(gate, options) : readDatabaseFacts(gate, options), readTableFacts(gate, options)]);
+	return {
+		...database,
 		tables
 	};
 }
@@ -1668,8 +1873,8 @@ async function readCronJobs(gate) {
 * that fixes it (`ok` is true when there is none).
 * @throws If the catalogs cannot be read (e.g. the database is unreachable).
 */
-async function checkLilypadSchema(gate, options) {
-	return evaluateLilypadSchema(await readLilypadSchemaFacts(gate, options), options);
+async function checkLilypadSchema(gate, options, context = {}) {
+	return evaluateLilypadSchema(await readLilypadSchemaFacts(gate, options, context), options);
 }
 /**
 * The problems of the facts read by {@link readLilypadSchemaFacts}, for these options. It is pure:
@@ -1705,12 +1910,15 @@ function evaluateLilypadSchema(facts, options) {
 		});
 		const comment = functionComment ?? "";
 		const version = comment.startsWith("lilypad-changelog:") ? Number(comment.slice(18)) : 1;
-		if (hasTable && !hasSchemaColumn || hasFunction && version < 4) problems.push({
-			code: "outdated-changelog",
-			severity: "error",
-			message: `The changelog "${changelog.table}" was installed by an older version of the library (version ${version}, expected 4).`,
-			fix: changelogSql
-		});
+		if (hasTable && !hasSchemaColumn || hasFunction && version < 5) {
+			const compatible = (!hasTable || hasSchemaColumn) && version >= 4;
+			problems.push({
+				code: "outdated-changelog",
+				severity: compatible ? "warning" : "error",
+				message: `The changelog "${changelog.table}" was installed by an older version of the library (version ${version}, expected 5)` + (compatible ? ": the caches read it, but a statement that changes many rows notifies each of them instead of sending one BULK notification." : "."),
+				fix: changelogSql
+			});
+		}
 	}
 	const tables = [];
 	options.tables.forEach(({ table, primaryKey }, index) => {
@@ -1810,6 +2018,29 @@ function evaluateLilypadSchema(facts, options) {
 //#endregion
 //#region src/cache/dbSync/LilypadSchemaVerifier.ts
 /**
+* The problems that concern no table (the changelog, its pruning) already reported for each gate:
+* the caches of a gate share the changelog, and each of them would report them again.
+*/
+const reportedProblems = /* @__PURE__ */ new WeakMap();
+/** The problems not reported yet for the gate: the per-table ones, and the others once. */
+function notReportedYet(gate, problems) {
+	let reported = reportedProblems.get(gate);
+	if (!reported) {
+		reported = /* @__PURE__ */ new Set();
+		reportedProblems.set(gate, reported);
+	}
+	const fresh = [];
+	for (const problem of problems) {
+		const key = `${problem.code}
+${problem.message}`;
+		if (problem.table !== void 0 || !reported.has(key)) {
+			fresh.push(problem);
+			if (problem.table === void 0) reported.add(key);
+		}
+	}
+	return fresh;
+}
+/**
 * Checks once that the database has the triggers a sync strategy needs, and resolves the schema of
 * the table. With `warn` it never rejects: problems and failures are logged. With `throw` it rejects
 * if the check found errors; warnings (e.g. a changelog that nothing prunes) are logged. A check that could not
@@ -1860,13 +2091,15 @@ var LilypadSchemaVerifier = class {
 					minRetention
 				} : false,
 				notifyChannel: strategy === "listen" ? LILYPAD_DEFAULT_NOTIFY_CHANNEL : false
-			});
+			}, { shareDatabaseFacts: true });
 			const schema = result.tables[0]?.schema;
 			if (schema) this.options.onSchema(schema);
 			this.backoff.succeed();
 			if (result.problems.length === 0) return true;
 			if (mode === "throw" && !result.ok) throw new LilypadSchemaCheckError(subject, result.problems);
-			const message = formatLilypadSchemaProblems(subject, result.problems);
+			const problems = notReportedYet(gate, result.problems);
+			if (problems.length === 0) return true;
+			const message = formatLilypadSchemaProblems(subject, problems);
 			if (this.options.canWarn()) log("warn", message);
 			else console.warn(message);
 			return true;
@@ -1885,6 +2118,12 @@ const DEFAULT_MAX_AGE = 36e5;
 const FULL_LOAD_RATIO = .25;
 /** How long the writes of this instance are remembered, to recognize their changes. */
 const OWN_WRITE_RETENTION = 6e5;
+/**
+* The most keys that notifications make this instance re-read per second. Anyone can send a
+* notification: beyond this budget, the notified keys are only expired, and read again when the
+* application asks for them, so that a flood of notifications cannot flood the database.
+*/
+const EAGER_REFRESHES_PER_SECOND = 1e3;
 /**
 * A cache of the rows of one table, kept up to date with the changes made elsewhere.
 *
@@ -1949,20 +2188,25 @@ var LilypadDbCache = class LilypadDbCache extends require_LilypadCacheCore.Lilyp
 		this.releaseSingleton = () => {};
 		this.members = /* @__PURE__ */ new Map();
 		this.membersFloor = 0;
-		this.rowFetches = /* @__PURE__ */ new Map();
+		this.rowFetches = new require_LilypadCacheCore.LilypadReadFlights();
 		this.eagerReads = /* @__PURE__ */ new Map();
 		this.refreshes = /* @__PURE__ */ new Map();
 		this.ownWrites = /* @__PURE__ */ new Map();
+		this.eagerWindow = {
+			start: 0,
+			count: 0
+		};
 		const owner = "LilypadDbCache";
-		if (sync.strategy !== "none") require_LilypadFlowControl.assertNumberOption(owner, "sync.maxAge", sync.maxAge, "non-negative");
+		if (sync.strategy !== "none") require_LilypadValidation.assertNumberOption(owner, "sync.maxAge", sync.maxAge, "non-negative");
 		if (sync.strategy === "changelog") {
-			require_LilypadFlowControl.assertNumberOption(owner, "sync.pollInterval", sync.pollInterval, "non-negative");
-			require_LilypadFlowControl.assertNumberOption(owner, "sync.maxGap", sync.maxGap, "positive");
-			require_LilypadFlowControl.assertNumberOption(owner, "sync.lookback", sync.lookback, "non-negative");
+			require_LilypadValidation.assertNumberOption(owner, "sync.pollInterval", sync.pollInterval, "non-negative");
+			require_LilypadValidation.assertNumberOption(owner, "sync.maxGap", sync.maxGap, "positive");
+			require_LilypadValidation.assertNumberOption(owner, "sync.lookback", sync.lookback, "non-negative");
 			if (typeof sync.pollInterval !== "number") throw new Error(`${owner}: sync.pollInterval is required with the changelog strategy.`);
 		}
 		this.gate = gate;
 		this.schema = schema;
+		this.numericPrimaryKey = schema.cols[schema.primaryKey]?.type === "number";
 		this.maxAge = sync.strategy === "none" ? 0 : sync.maxAge ?? DEFAULT_MAX_AGE;
 		const tableNameParts = schema.tableName.split(".");
 		if (tableNameParts.length > 1) this.tableSchema = tableNameParts[tableNameParts.length - 2];
@@ -1998,6 +2242,7 @@ var LilypadDbCache = class LilypadDbCache extends require_LilypadCacheCore.Lilyp
 			isDisposed: () => this.disposed,
 			applyChange: (op, id, mode, xid) => this.applyChange(op, id, mode, xid),
 			applyTruncate: (mode) => this.applyTruncate(mode),
+			applyBulkChange: () => this.applyBulkChange(),
 			expireEverything: () => this.expireEverything(),
 			emitInvalidation: (source, keys, options) => this.emitInvalidation(source, keys, options),
 			forgetOwnWritesCoveredBy: (cursor) => this.forgetOwnWritesCoveredBy(cursor),
@@ -2072,7 +2317,7 @@ var LilypadDbCache = class LilypadDbCache extends require_LilypadCacheCore.Lilyp
 		}
 		if (op !== "DELETE") this.addMember(key);
 		if (!held) this.deleteShared(key);
-		else if (mode === "eager") await this.refreshInBatch(key);
+		else if (mode === "eager" && this.takeEagerRefresh()) await this.refreshInBatch(key);
 		else this.markInvalid(key);
 		return key;
 	}
@@ -2087,12 +2332,40 @@ var LilypadDbCache = class LilypadDbCache extends require_LilypadCacheCore.Lilyp
 	applyTruncate(mode) {
 		const keys = [...this.store.values()].map((entry) => entry.key);
 		for (const key of keys) this.deleteShared(key);
+		this.forgetTable(mode === "lazy");
+		return keys;
+	}
+	/**
+	* Applies a change of too many rows to follow them one by one (a `BULK` notification, or a read
+	* of the changelog with too many keys): the same as an eager `TRUNCATE`, without removing each
+	* key from the shared level (its older copies are ignored instead).
+	*/
+	applyBulkChange() {
+		this.forgetTable(false);
+	}
+	/**
+	* Expires every entry, discards the reads started before, ignores the older copies of the shared
+	* level, and forgets the rows of the table.
+	*
+	* @param empty - The table is known to be empty (a `TRUNCATE` read from the changelog); otherwise
+	* the next `getAll` loads it again.
+	*/
+	forgetTable(empty) {
 		this.expireEverything();
 		this.rejectSharedBefore(Date.now());
 		this.membersFloor = this.nextTicket();
 		this.members.clear();
-		if (mode === "eager") this.membersLoadedAt = void 0;
-		return keys;
+		if (!empty) this.membersLoadedAt = void 0;
+	}
+	/** Takes one key of the eager budget: `false` once the budget of this second is spent. */
+	takeEagerRefresh() {
+		const now = Date.now();
+		if (now - this.eagerWindow.start >= 1e3) this.eagerWindow = {
+			start: now,
+			count: 0
+		};
+		this.eagerWindow.count++;
+		return this.eagerWindow.count <= EAGER_REFRESHES_PER_SECOND;
 	}
 	/**
 	* Whether a change is the one of a write of this instance, and the entry still holds the result
@@ -2130,6 +2403,7 @@ var LilypadDbCache = class LilypadDbCache extends require_LilypadCacheCore.Lilyp
 	}
 	/** Follows the values stored in the cache: a row is a row of the table, `null` is not. */
 	onValueStored(entry) {
+		if (!this.numericPrimaryKey && entry.value !== null && typeof entry.value[this.schema.primaryKey] === "number") this.numericPrimaryKey = true;
 		if (this.membersLoadedAt === void 0 || entry.origin === "fallback") return;
 		const normalizedKey = this.normalizeKey(entry.key);
 		const member = this.members.get(normalizedKey);
@@ -2221,17 +2495,14 @@ var LilypadDbCache = class LilypadDbCache extends require_LilypadCacheCore.Lilyp
 		const toFetch = /* @__PURE__ */ new Map();
 		for (const key of keys) {
 			const normalizedKey = this.normalizeKey(key);
-			const inFlight = this.rowFetches.get(normalizedKey);
-			if (inFlight) pending.add(inFlight);
+			const joined = this.rowFetches.join(normalizedKey, this.currentTicket(normalizedKey));
+			if (joined) pending.add(joined);
 			else toFetch.set(normalizedKey, key);
 		}
 		if (toFetch.size > 0) {
-			const fetching = this.queryRows([...toFetch.values()]);
-			for (const normalizedKey of toFetch.keys()) this.rowFetches.set(normalizedKey, fetching);
-			const cleanup = () => {
-				for (const normalizedKey of toFetch.keys()) if (this.rowFetches.get(normalizedKey) === fetching) this.rowFetches.delete(normalizedKey);
-			};
-			fetching.then(cleanup, cleanup);
+			const read = this.beginRead();
+			const fetching = this.queryRows([...toFetch.values()], read);
+			this.rowFetches.start(toFetch.keys(), read.ticket, fetching);
 			pending.add(fetching);
 		}
 		const values = /* @__PURE__ */ new Map();
@@ -2242,14 +2513,14 @@ var LilypadDbCache = class LilypadDbCache extends require_LilypadCacheCore.Lilyp
 	* Reads rows by primary key, bounded by `bulkSync.timeout`, and caches them (`null` for the keys
 	* without a row).
 	*
+	* @param read - Started before the query: its ticket orders the rows among the writes.
 	* @param shared - Whether the rows also go to the shared level (and end the failure cooldown of
 	* their keys), as a fetch of `getOrFetch` does.
 	*/
-	async queryRows(keys, shared = false) {
+	async queryRows(keys, read, shared = false) {
 		const primaryKey = this.schema.primaryKey;
 		try {
 			return await this.bulkSyncFlowControl.executeWithTimeout(async (signal) => {
-				const read = this.beginRead();
 				const rows = /* @__PURE__ */ new Map();
 				for (const row of await this.gate.selectFromTableByPrimaryKeys(this.schema, keys)) rows.set(this.normalizeKey(row[primaryKey]), row);
 				const values = /* @__PURE__ */ new Map();
@@ -2418,7 +2689,7 @@ var LilypadDbCache = class LilypadDbCache extends require_LilypadCacheCore.Lilyp
 	}
 	async runEagerBatch(keys) {
 		try {
-			if (!this.disposed) await this.queryRows([...keys.values()], true);
+			if (!this.disposed) await this.queryRows([...keys.values()], this.beginRead(), true);
 		} catch {
 			if (!this.disposed) for (const key of keys.values()) this.markInvalid(key);
 		} finally {
@@ -2467,15 +2738,14 @@ var LilypadDbCache = class LilypadDbCache extends require_LilypadCacheCore.Lilyp
 	/**
 	* The key of a notified id: the key of the cached entry or of the known row, so that it keeps
 	* its original type (a notification may carry a numeric key as a string, or the other way
-	* around), or else the id converted to a number when the schema declares the primary key as a
-	* `number` column.
+	* around), or else the id converted to a number when the primary key holds numbers (declared as a
+	* `number` column, or seen in the rows read).
 	*/
 	resolveNotifiedKey(id) {
 		const normalizedKey = String(id);
 		const known = this.store.get(normalizedKey)?.key ?? this.members.get(normalizedKey)?.key;
 		if (known !== void 0) return known;
-		const { cols, primaryKey } = this.schema;
-		if (typeof id === "string" && cols[primaryKey]?.type === "number") {
+		if (typeof id === "string" && this.numericPrimaryKey) {
 			const numeric = Number(id);
 			if (Number.isFinite(numeric) && String(numeric) === id) return numeric;
 		}
@@ -2493,8 +2763,11 @@ var LilypadDbCache = class LilypadDbCache extends require_LilypadCacheCore.Lilyp
 	* the singleton registry (if it was created as a singleton) and clears it. A `LISTEN` still
 	* starting is awaited, so that its listener is removed too.
 	*/
-	async dispose() {
-		if (this.disposed) return;
+	dispose() {
+		this.disposing ??= this.disposeResources();
+		return this.disposing;
+	}
+	async disposeResources() {
 		this.releaseSingleton();
 		await super.dispose();
 		this.members.clear();
@@ -2585,9 +2858,14 @@ var LilypadDbCache = class LilypadDbCache extends require_LilypadCacheCore.Lilyp
 };
 //#endregion
 exports.LILYPAD_DEFAULT_CHANGELOG_TABLE = LILYPAD_DEFAULT_CHANGELOG_TABLE;
+exports.LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD = LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD;
+exports.LILYPAD_MIN_CHANGELOG_RETENTION = LILYPAD_MIN_CHANGELOG_RETENTION;
 exports.LilypadDbCache = LilypadDbCache;
+exports.LilypadDbEmptyWriteError = LilypadDbEmptyWriteError;
 exports.LilypadDbGate = LilypadDbGate;
+exports.LilypadDbMissingPrimaryKeyError = LilypadDbMissingPrimaryKeyError;
 exports.LilypadDbNotFoundError = LilypadDbNotFoundError;
+exports.LilypadDisposedError = require_LilypadCacheCore.LilypadDisposedError;
 exports.LilypadSchemaCheckError = LilypadSchemaCheckError;
 exports.checkLilypadSchema = checkLilypadSchema;
 exports.lilypadChangelogPruneScheduleSql = lilypadChangelogPruneScheduleSql;

@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { lilypadChangelogPruneScheduleSql, lilypadChangelogSql } from './LilypadChangelog';
+import {
+  LILYPAD_CHANGELOG_VERSION,
+  lilypadChangelogPruneScheduleSql,
+  lilypadChangelogSql,
+} from './LilypadChangelog';
 import {
   evaluateLilypadSchema,
   formatLilypadSchemaProblems,
@@ -52,7 +56,7 @@ function facts(overrides: Partial<LilypadSchemaFacts> = {}): LilypadSchemaFacts 
       hasTable: true,
       hasSchemaColumn: true,
       hasFunction: true,
-      functionComment: 'lilypad-changelog:4',
+      functionComment: `lilypad-changelog:${LILYPAD_CHANGELOG_VERSION}`,
       functionSource: null,
       schema: 'public',
       hasPruneFunction: false,
@@ -125,6 +129,20 @@ describe('evaluateLilypadSchema', () => {
     );
 
     expect(codes(result)).toEqual(['outdated-changelog']);
+    expect(result.problems[0]!.severity).toBe('error');
+    expect(result.ok).toBe(false);
+  });
+
+  it('should only warn about a changelog of version 4, which the caches still read', () => {
+    const result = evaluateLilypadSchema(
+      facts({ changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:4' } }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['outdated-changelog']);
+    expect(result.problems[0]!.severity).toBe('warning');
+    expect(result.problems[0]!.message).toContain('BULK');
+    expect(result.ok).toBe(true);
   });
 
   describe('notifications of the changelog fix', () => {

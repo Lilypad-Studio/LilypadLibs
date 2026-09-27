@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { LilypadCache, type LilypadCacheKey } from './LilypadCache';
+import { LilypadCache, LilypadDisposedError, type LilypadCacheKey } from './LilypadCache';
 import { LilypadLoggerType } from '@/logger/LilypadLogger';
 
 describe('LilypadCache', () => {
@@ -321,7 +321,7 @@ describe('LilypadCache', () => {
     it('should throw on invalid autoCleanupInterval', () => {
       expect(
         () => new LilypadCache<string, number>({ ttl: 1000, autoCleanupInterval: -1 })
-      ).toThrow('autoCleanupInterval must be a positive finite number');
+      ).toThrow('autoCleanupInterval must be a positive number of milliseconds');
     });
 
     it('should setup auto cleanup interval', async () => {
@@ -1468,5 +1468,157 @@ describe('LilypadCache', () => {
     it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])('should reject a ttl of %s', (ttl) => {
       expect(() => new LilypadCache<string, number>({ ttl })).toThrow('ttl must be');
     });
+  });
+});
+
+describe('LilypadCache reads after a change', () => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it.each([
+    ['with an expired entry', true],
+    ['without an entry', false],
+  ])('should not join a fetch started before an invalidation, %s', async (_case, withEntry) => {
+    const target = new LilypadCache<string, string>({ ttl: 1000 });
+    if (withEntry) {
+      target.set('k', 'v0', 1);
+      await vi.advanceTimersByTimeAsync(5);
+    }
+    const old = deferred<string>();
+    const first = target.getOrSet('k', () => old.promise);
+
+    target.invalidate('k');
+    const fresh = vi.fn(async () => 'new');
+    const second = target.getOrSet('k', fresh);
+    old.resolve('old');
+
+    await expect(first).resolves.toBe('old');
+    await expect(second).resolves.toBe('new');
+    expect(fresh).toHaveBeenCalledOnce();
+    expect(target.get('k')).toBe('new');
+    await target.dispose();
+  });
+
+  it('should still join a fetch in flight when the key did not change', async () => {
+    const target = new LilypadCache<string, string>({ ttl: 1000 });
+    const read = deferred<string>();
+    const fetch = vi.fn(() => read.promise);
+
+    const pending = [target.getOrSet('k', fetch), target.getOrSet('k', fetch)];
+    read.resolve('v');
+
+    await expect(Promise.all(pending)).resolves.toEqual(['v', 'v']);
+    expect(fetch).toHaveBeenCalledOnce();
+    await target.dispose();
+  });
+
+  it('should keep discarding an older fetch after a second change', async () => {
+    const target = new LilypadCache<string, string>({ ttl: 1000 });
+    const old = deferred<string>();
+    const newer = deferred<string>();
+    const first = target.getOrSet('k', () => old.promise);
+    target.invalidate('k');
+    const second = target.getOrSet('k', () => newer.promise);
+
+    // Invalidated again while both reads are in flight: neither may store its value
+    target.invalidate('k');
+    old.resolve('old');
+    newer.resolve('newer');
+    await Promise.all([first, second]);
+
+    expect(target.peek('k').type).toBe('miss');
+    await target.dispose();
+  });
+
+  it('should return a value written while the fetch was failing, instead of the fallback', async () => {
+    const target = new LilypadCache<string, string>({ ttl: 1000 });
+    const failing = deferred<string>();
+    const pending = target.getOrSetDetailed('k', () => failing.promise, {
+      onError: { fallback: () => 'fallback' },
+    });
+
+    target.set('k', 'written');
+    failing.reject(new Error('source down'));
+
+    await expect(pending).resolves.toEqual({
+      value: 'written',
+      status: 'L1-HIT',
+      refreshFailed: false,
+    });
+    expect(target.get('k')).toBe('written');
+    await target.dispose();
+  });
+
+  it('should reject a per-call timeout that a timer cannot hold, before fetching', async () => {
+    const target = new LilypadCache<string, string>({ ttl: 1000 });
+    const fetch = vi.fn(async () => 'v');
+
+    await expect(target.getOrSet('k', fetch, { timeout: Number.NaN })).rejects.toThrow(
+      'timeout must be'
+    );
+    await expect(target.getOrSet('k', fetch, { timeout: 2 ** 31 })).rejects.toThrow(
+      'timeout must be'
+    );
+    expect(fetch).not.toHaveBeenCalled();
+    await target.dispose();
+  });
+
+  it.each([
+    ['fetchTimeout', { fetchTimeout: 2 ** 31 }],
+    ['autoCleanupInterval', { autoCleanupInterval: 2 ** 31 }],
+    ['bulkSync.timeout', { bulkSync: { timeout: 2 ** 31 } }],
+  ])('should reject a %s beyond 2^31 - 1 ms', (name, options) => {
+    expect(() => new LilypadCache<string, string>({ ttl: 1000, ...options })).toThrow(
+      `${name} must be a positive number of milliseconds, at most 2147483647`
+    );
+  });
+
+  it('should throw a LilypadDisposedError once disposed, also through Symbol.asyncDispose', async () => {
+    const target = new LilypadCache<string, string>({ ttl: 1000 });
+
+    await target[Symbol.asyncDispose]();
+
+    expect(() => target.get('k')).toThrow(LilypadDisposedError);
+    expect(() => target.get('k')).toThrow('LilypadCache');
+  });
+
+  it('should log a failure of platform.background apart from the errors of onInvalidate', async () => {
+    const logger = { error: vi.fn(), warn: vi.fn() };
+    const target = new LilypadCache<string, string>({
+      ttl: 1000,
+      logger,
+      platform: {
+        background: () => {
+          throw new Error('outside a request');
+        },
+        onInvalidate: vi.fn(),
+      },
+    });
+
+    target.invalidate('k');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(
+      target.name,
+      expect.stringContaining('platform could not keep the instance alive'),
+      expect.objectContaining({ message: 'outside a request' })
+    );
+    await target.dispose();
   });
 });

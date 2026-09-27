@@ -145,11 +145,27 @@ describe('LilypadDbCache', () => {
       await expect(createCache()).rejects.toThrow('database unreachable');
     });
 
-    it('should give each cache on the same table its own listener', async () => {
-      await createCache();
-      await createCache();
+    it('should share one listener among the caches of a gate, and parse each notification once', async () => {
+      const first = await createCache();
+      const second = await createCache();
+      const parse = vi.spyOn(JSON, 'parse');
+      await first.getOrFetch('1');
+      await second.getOrFetch('1');
+      fake.rows.set('1', { id: '1', name: 'ONE' });
 
-      expect(fake.listeners.size).toBe(2);
+      await fake.notify({ table: 'items', id: '1', op: 'UPDATE' });
+
+      expect(fake.listeners.size).toBe(1);
+      expect(parse).toHaveBeenCalledOnce();
+      expect(first.get('1')).toEqual({ id: '1', name: 'ONE' });
+      expect(second.get('1')).toEqual({ id: '1', name: 'ONE' });
+      parse.mockRestore();
+
+      // The listener is removed with the last cache only
+      await first.dispose();
+      expect(fake.listeners.size).toBe(1);
+      await second.dispose();
+      expect(fake.listeners.size).toBe(0);
     });
 
     it('should remove its listener when disposed', async () => {
@@ -1142,11 +1158,15 @@ describe('LilypadDbCache', () => {
     it('should check the notification trigger before LISTEN with the listen strategy', async () => {
       await createCache();
 
-      expect(schemaCheck.check).toHaveBeenCalledWith(fake.gate, {
-        tables: [{ table: 'items', primaryKey: 'id' }],
-        changelog: false,
-        notifyChannel: 'cache_events',
-      });
+      expect(schemaCheck.check).toHaveBeenCalledWith(
+        fake.gate,
+        {
+          tables: [{ table: 'items', primaryKey: 'id' }],
+          changelog: false,
+          notifyChannel: 'cache_events',
+        },
+        { shareDatabaseFacts: true }
+      );
       expect(schemaCheck.check.mock.invocationCallOrder[0]!).toBeLessThan(
         fake.mocks.addListener.mock.invocationCallOrder[0]!
       );
@@ -1162,12 +1182,16 @@ describe('LilypadDbCache', () => {
       await cache.getOrFetch('2');
 
       expect(schemaCheck.check).toHaveBeenCalledOnce();
-      expect(schemaCheck.check).toHaveBeenCalledWith(fake.gate, {
-        tables: [{ table: 'items', primaryKey: 'id' }],
-        // The default maxGap (1 hour) is longer than the default lookback (TTL + 1 minute)
-        changelog: { table: 'my_changes', pruning: undefined, minRetention: 3_600_000 },
-        notifyChannel: false,
-      });
+      expect(schemaCheck.check).toHaveBeenCalledWith(
+        fake.gate,
+        {
+          tables: [{ table: 'items', primaryKey: 'id' }],
+          // The default maxGap (1 hour) is longer than the default lookback (TTL + 1 minute)
+          changelog: { table: 'my_changes', pruning: undefined, minRetention: 3_600_000 },
+          notifyChannel: false,
+        },
+        { shareDatabaseFacts: true }
+      );
     });
 
     it.each<[string, { maxGap: number; lookback?: number; staleWhileRevalidate?: number }, number]>(
@@ -1185,11 +1209,15 @@ describe('LilypadDbCache', () => {
         });
         await cache.getOrFetch('1');
 
-        expect(schemaCheck.check).toHaveBeenCalledWith(fake.gate, {
-          tables: [{ table: 'items', primaryKey: 'id' }],
-          changelog: { table: undefined, pruning: 'external', minRetention },
-          notifyChannel: false,
-        });
+        expect(schemaCheck.check).toHaveBeenCalledWith(
+          fake.gate,
+          {
+            tables: [{ table: 'items', primaryKey: 'id' }],
+            changelog: { table: undefined, pruning: 'external', minRetention },
+            notifyChannel: false,
+          },
+          { shareDatabaseFacts: true }
+        );
       }
     );
 
@@ -1596,6 +1624,20 @@ describe('LilypadDbCache', () => {
       expect([...cache['members'].values()].map((member) => member.key)).toContain(42);
       await cache.dispose();
     });
+
+    it('should convert the ids to numbers once it has read numeric keys, without a column type', async () => {
+      const numericFake = createFakeGate([{ id: 7, name: 'seven' } as unknown as Item]);
+      const cache = await LilypadDbCache.create({
+        gate: numericFake.gate,
+        schema: { ...numericSchema, cols: { id: {}, name: {} } },
+      });
+      await cache.getAll();
+
+      await numericFake.notify({ table: 'items', id: '42', op: 'INSERT' });
+
+      expect([...cache['members'].values()].map((member) => member.key)).toContain(42);
+      await cache.dispose();
+    });
   });
 
   describe('disposed cache', () => {
@@ -1788,6 +1830,243 @@ describe('LilypadDbCache', () => {
 
       expect(cache.get('1')).toEqual({ id: '1', name: 'renamed' });
       expect(fake.mocks.selectFromTableByPrimaryKey).toHaveBeenCalledTimes(2); // '1' and '2' only
+    });
+  });
+
+  describe('reads after a change', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      changelog.read.mockReset();
+      changelog.read.mockResolvedValue({ changes: [], cursor: at(100n) });
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('should not return a row read before a change applied from the changelog', async () => {
+      const cache = await createCache({ sync: { strategy: 'changelog', pollInterval: 1000 } });
+      await cache.getOrFetch('2'); // the first read of the changelog
+      // A slow read of '1', which sees the row before the change
+      let release!: () => void;
+      fake.mocks.selectFromTableByPrimaryKey.mockImplementationOnce(async (_schema, key) => {
+        const row = fake.rows.get(String(key)) ?? null;
+        await new Promise<void>((resolve) => (release = resolve));
+        return row;
+      });
+      const slow = cache.getOrFetch('1');
+      fake.rows.set('1', { id: '1', name: 'changed' });
+      changelog.read.mockResolvedValueOnce({
+        changes: [{ id: '5', xid: 2000n, rowId: '1', op: 'UPDATE' }],
+        cursor: at(2001n),
+      });
+      await vi.advanceTimersByTimeAsync(1000);
+
+      // This read applies the change first: it must not join the slow read
+      const after = cache.getOrFetch('1');
+      release();
+
+      await expect(slow).resolves.toEqual({ id: '1', name: 'one' });
+      await expect(after).resolves.toEqual({ id: '1', name: 'changed' });
+      expect(cache.get('1')).toEqual({ id: '1', name: 'changed' });
+    });
+
+    it('should not return the rows of getAll(keys) read before an invalidation', async () => {
+      const cache = await createCache({ sync: { strategy: 'none' } });
+      let release!: () => void;
+      fake.mocks.selectFromTableByPrimaryKeys.mockImplementationOnce(async (_schema, keys) => {
+        const rows = keys.flatMap((key) => fake.rows.get(String(key)) ?? []);
+        await new Promise<void>((resolve) => (release = resolve));
+        return rows;
+      });
+      const slow = cache.getAll(['1']);
+      fake.rows.set('1', { id: '1', name: 'changed' });
+      cache.invalidate('1');
+
+      const after = cache.getAll(['1']);
+      release();
+
+      expect(await after).toEqual([{ id: '1', name: 'changed' }]);
+      // The slow query is not cached: the fresh entry is the row read after the invalidation
+      await slow;
+      expect(cache.get('1')).toEqual({ id: '1', name: 'changed' });
+      expect(fake.mocks.selectFromTableByPrimaryKeys).toHaveBeenCalledTimes(2);
+    });
+
+    it('should still share a query of getAll(keys) when nothing changed', async () => {
+      const cache = await createCache({ sync: { strategy: 'none' } });
+
+      await Promise.all([cache.getAll(['1']), cache.getAll(['1'])]);
+
+      expect(fake.mocks.selectFromTableByPrimaryKeys).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe('large changes', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      changelog.read.mockReset();
+      changelog.read.mockResolvedValue({ changes: [], cursor: at(100n) });
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    /** A shared store that counts its operations. */
+    const countingStore = () => ({
+      get: vi.fn(async () => null),
+      set: vi.fn(async () => {}),
+      delete: vi.fn(async () => {}),
+    });
+
+    it('should expire the whole table on a BULK notification, with one event', async () => {
+      const onInvalidate = vi.fn();
+      const cache = await createCache({ platform: { onInvalidate } });
+      await cache.getAll();
+
+      await fake.notify({ schema: 'public', table: 'items', op: 'BULK', xid: '5000' });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(cache.peek('1').type).toBe('expired');
+      expect(fake.mocks.selectFromTableByPrimaryKeys).not.toHaveBeenCalled();
+      expect(onInvalidate).toHaveBeenCalledOnce();
+      expect(onInvalidate.mock.calls[0]![0]).toMatchObject({ source: 'notification', keys: [] });
+      // The rows of the table are not known any more: the next getAll loads it again
+      await cache.getAll();
+      expect(fake.mocks.selectAllFromTable).toHaveBeenCalledTimes(2);
+    });
+
+    it('should expire the table as a whole when a changelog read changes too many keys', async () => {
+      const onInvalidate = vi.fn();
+      const store = countingStore();
+      const cache = await createCache({
+        name: 'items',
+        shared: { store },
+        platform: { onInvalidate },
+        sync: { strategy: 'changelog', pollInterval: 1000 },
+      });
+      await cache.getOrFetch('1');
+      store.delete.mockClear();
+      changelog.read.mockResolvedValueOnce({
+        changes: Array.from({ length: 1001 }, (_, index) => ({
+          id: String(index),
+          xid: 3000n,
+          rowId: `bulk-${index}`,
+          op: 'UPDATE',
+        })),
+        cursor: at(3001n),
+      });
+
+      await vi.advanceTimersByTimeAsync(1000);
+      await cache.getOrFetch('2');
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(cache.peek('1').type).toBe('expired');
+      // No removal from the shared level per key, and one event for the whole cache
+      expect(store.delete).not.toHaveBeenCalled();
+      const events = onInvalidate.mock.calls.map(([event]) => event as { source: string });
+      expect(events.filter((event) => event.source === 'changelog')).toEqual([
+        expect.objectContaining({ keys: [] }),
+      ]);
+    });
+
+    it('should apply only the last change of each row read from the changelog', async () => {
+      const onInvalidate = vi.fn();
+      const store = countingStore();
+      const cache = await createCache({
+        name: 'items',
+        shared: { store },
+        platform: { onInvalidate },
+        sync: { strategy: 'changelog', pollInterval: 1000 },
+      });
+      await cache.getOrFetch('1');
+      store.delete.mockClear();
+      changelog.read.mockResolvedValueOnce({
+        changes: [
+          { id: '1', xid: 3000n, rowId: '1', op: 'UPDATE' },
+          { id: '2', xid: 3001n, rowId: '9', op: 'UPDATE' },
+          { id: '3', xid: 3002n, rowId: '9', op: 'UPDATE' },
+          { id: '4', xid: 3003n, rowId: '1', op: 'DELETE' },
+        ],
+        cursor: at(3004n),
+      });
+
+      await vi.advanceTimersByTimeAsync(1000);
+      await cache.getOrFetch('2');
+      await vi.advanceTimersByTimeAsync(0);
+
+      // '1' is deleted in the end, and the key not held is removed from the shared level once
+      expect(cache.peek('1')).toMatchObject({ type: 'hit', value: null });
+      expect(store.delete).toHaveBeenCalledTimes(1);
+      const event = onInvalidate.mock.calls
+        .map(([invalidation]) => invalidation as { source: string; keys: string[] })
+        .find((invalidation) => invalidation.source === 'changelog');
+      expect(event?.keys).toEqual(['9', '1']);
+    });
+
+    it('should only expire the notified keys beyond the eager budget', async () => {
+      const ids = Array.from({ length: 1002 }, (_, index) => `n${index}`);
+      for (const id of ids) {
+        fake.rows.set(id, { id, name: id });
+      }
+      const cache = await createCache();
+      await cache.getAll();
+
+      for (const id of ids) {
+        await fake.notify({ table: 'items', id, op: 'UPDATE' });
+      }
+
+      // One query per notification up to the budget of the second, then none
+      expect(fake.mocks.selectFromTableByPrimaryKeys).toHaveBeenCalledTimes(1000);
+      expect(cache.peek('n1001').type).toBe('expired');
+      expect(cache.peek('n0').type).toBe('hit');
+    });
+  });
+
+  describe('disposal and gate sharing', () => {
+    it('should make a second dispose wait until the listener is removed', async () => {
+      const cache = await createCache();
+      let release!: () => void;
+      fake.mocks.removeListener.mockImplementationOnce(async (_channel, callbackId) => {
+        await new Promise<void>((resolve) => (release = resolve));
+        return fake.listeners.delete(callbackId);
+      });
+
+      const first = cache.dispose();
+      const second = cache.dispose();
+      let settled = false;
+      void second.then(() => (settled = true));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(second).toBe(first);
+      expect(settled).toBe(false);
+      release();
+      await second;
+      expect(fake.listeners.size).toBe(0);
+    });
+
+    it('should log the problems of the changelog once for the caches of a gate', async () => {
+      schemaCheck.check.mockResolvedValue({
+        ok: true,
+        problems: [
+          {
+            code: 'no-changelog-pruning',
+            severity: 'warning',
+            message: 'Nothing deletes the old rows of the changelog.',
+          },
+        ],
+        tables: [{ table: 'items', schema: 'public' }],
+      });
+      changelog.read.mockReset();
+      changelog.read.mockResolvedValue({ changes: [], cursor: at(100n) });
+      const logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+      const options = { sync: { strategy: 'changelog', pollInterval: 0, verify: 'throw' }, logger };
+
+      await createCache(options);
+      await createCache({ ...options, name: 'items-2' });
+
+      expect(logger.warn).toHaveBeenCalledOnce();
     });
   });
 });

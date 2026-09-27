@@ -1,3 +1,5 @@
+import { withLilypadTimeout } from '@/internal/LilypadTimeout';
+
 /**
  * Keeps the running instance alive until `task` settles, for work that continues after the
  * response has been sent. On Vercel: `waitUntil` from `@vercel/functions`, or `after` from
@@ -74,29 +76,37 @@ export type LilypadPlatform = {
 /**
  * Runs `task` without awaiting it: its errors go to `onError` (they never become unhandled
  * rejections), and the platform keeps the instance alive until it settles.
+ *
+ * @param onPlatformError - Receives the error of `platform.background` itself (e.g. `after` called
+ * outside a request scope), which is not an error of the task: the task still runs, without the
+ * guarantee. Defaults to ignoring it.
  */
 export function runInBackground(
   platform: LilypadPlatform | undefined,
   task: Promise<unknown>,
-  onError: (error: unknown) => void
+  onError: (error: unknown) => void,
+  onPlatformError: (error: unknown) => void = () => {}
 ): void {
   const handled = task.catch(onError);
   try {
     platform?.background?.(handled);
   } catch (error) {
-    // e.g. `after` called outside a request scope: the task still runs, without the guarantee
-    onError(error);
+    onPlatformError(error);
   }
 }
 
 /**
  * Runs `work` after the response when the platform supports it, otherwise at once as background
  * work. Its errors go to `onError`.
+ *
+ * @param onPlatformError - Receives the error of `platform.afterResponse` or `platform.background`
+ * itself: the work then starts at once. Defaults to ignoring it.
  */
 export function runAfterResponse(
   platform: LilypadPlatform | undefined,
   work: () => Promise<unknown>,
-  onError: (error: unknown) => void
+  onError: (error: unknown) => void,
+  onPlatformError: (error: unknown) => void = () => {}
 ): void {
   if (platform?.afterResponse) {
     try {
@@ -104,10 +114,10 @@ export function runAfterResponse(
       return;
     } catch (error) {
       // e.g. `after` called outside a request scope: fall back to starting the work now
-      onError(error);
+      onPlatformError(error);
     }
   }
-  runInBackground(platform, work(), onError);
+  runInBackground(platform, work(), onError, onPlatformError);
 }
 
 /**
@@ -120,20 +130,15 @@ export async function sharedStoreOperation<T>(
   timeout: number,
   onError: (error: unknown) => void
 ): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`Shared store did not answer within ${timeout}ms`)),
-      timeout
-    );
-  });
   try {
-    return await Promise.race([operation(), timeoutPromise]);
+    return await withLilypadTimeout(
+      () => operation(),
+      timeout,
+      () => new Error(`Shared store did not answer within ${timeout}ms`)
+    );
   } catch (error) {
     onError(error);
     return fallback;
-  } finally {
-    clearTimeout(timer);
   }
 }
 

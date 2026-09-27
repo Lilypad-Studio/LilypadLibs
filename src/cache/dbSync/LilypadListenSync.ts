@@ -4,55 +4,25 @@ import type {
   LilypadDbSyncHost,
   LilypadDbSyncStrategy,
 } from '@/cache/dbSync/LilypadDbSyncTypes';
+import {
+  getLilypadNotificationRouter,
+  type LilypadNotificationRouter,
+  type LilypadNotificationSubscriber,
+} from '@/cache/dbSync/LilypadNotificationRouter';
 import type { LilypadSchemaVerifier } from '@/cache/dbSync/LilypadSchemaVerifier';
 import type { LilypadCacheKey } from '@/cache/LilypadCacheTypes';
 import { LILYPAD_DEFAULT_NOTIFY_CHANNEL } from '@/dbGate/LilypadChangelog';
-import type { LilypadDbListener } from '@/dbGate/LilypadDbGate';
 import { LilypadBackoff } from '@/internal/LilypadBackoff';
 
-const OPERATIONS = new Set(['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']);
-
-/**
- * Parses a notification of the `cache_events` channel.
- *
- * @returns The payload, or `undefined` if it does not have the expected shape.
- */
-export function parseLilypadNotification(payload: unknown): LilypadDbNotification | undefined {
-  if (typeof payload !== 'string') {
-    return undefined;
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(payload);
-  } catch {
-    return undefined;
-  }
-  if (typeof parsed !== 'object' || parsed === null) {
-    return undefined;
-  }
-  const { table, op, id, schema, xid } = parsed as Record<string, unknown>;
-  if (typeof table !== 'string' || table === '' || typeof op !== 'string' || !OPERATIONS.has(op)) {
-    return undefined;
-  }
-  if (op !== 'TRUNCATE' && !((typeof id === 'string' && id !== '') || typeof id === 'number')) {
-    return undefined;
-  }
-  if (
-    (schema !== undefined && typeof schema !== 'string') ||
-    (xid !== undefined && typeof xid !== 'string')
-  ) {
-    return undefined;
-  }
-  return parsed as LilypadDbNotification;
-}
+export { parseLilypadNotification } from '@/cache/dbSync/LilypadNotificationRouter';
 
 function parseXid(xid: string | undefined): bigint | undefined {
   return xid !== undefined && /^\d+$/.test(xid) ? BigInt(xid) : undefined;
 }
 
 /**
- * The `listen` strategy: the cache registers a callback on the `cache_events` channel of the gate,
- * and applies the notifications of its table.
+ * The `listen` strategy: the cache subscribes to the `cache_events` channel of the gate (through
+ * the router shared by the caches of the gate), and applies the notifications of its table.
  *
  * It trusts that it sees every change while `LISTEN` is active and the gate's heartbeat is recent
  * (`isListenHealthy`): a connection that stopped delivering notifications is not trusted, even
@@ -60,7 +30,8 @@ function parseXid(xid: string | undefined): bigint | undefined {
  */
 export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSyncStrategy {
   readonly seesOwnWrites = true;
-  private readonly listener: LilypadDbListener;
+  private readonly router: LilypadNotificationRouter;
+  private readonly subscriber: LilypadNotificationSubscriber;
   private readonly applyChanges: boolean;
   private listening?: Promise<void>;
   private readonly backoff = new LilypadBackoff(() => 1000);
@@ -73,10 +44,10 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
     private readonly verifier: LilypadSchemaVerifier
   ) {
     this.applyChanges = options.applyChanges !== false;
-    this.listener = {
-      channel: LILYPAD_DEFAULT_NOTIFY_CHANNEL,
-      // The instance id keeps the callbacks of different caches on the same table apart
-      callbackId: `lilypad_dbcache_${host.tableName}_${host.id}`,
+    this.router = getLilypadNotificationRouter(host.gate, LILYPAD_DEFAULT_NOTIFY_CHANNEL);
+    this.subscriber = {
+      table: host.tableName.split('.').pop()!,
+      handle: (payload) => this.handleNotification(payload),
       // Notifications sent while the connection was down are lost: every entry may be stale
       onReconnect: () => {
         if (host.isDisposed()) {
@@ -87,7 +58,7 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
           this.listenTrustedSince = Date.now();
         }
       },
-      callback: (payload: unknown) => this.handleNotification(payload),
+      log: (level, ...message) => host.log(level, ...message),
     };
   }
 
@@ -96,21 +67,20 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
   }
 
   /**
-   * Registers the listener once, after the schema check (which resolves the schema of the table,
-   * to ignore the notifications of other schemas). A failed registration is retried by the next
-   * call, after a backoff for the lazy `LISTEN` of the reads. If the cache was disposed meanwhile,
-   * the listener is removed again.
+   * Subscribes once, after the schema check (which resolves the schema of the table, to ignore the
+   * notifications of other schemas). A failed subscription is retried by the next call, after a
+   * backoff for the lazy `LISTEN` of the reads. If the cache was disposed meanwhile, it
+   * unsubscribes again.
    */
   private startListening(): Promise<void> {
     if (!this.listening) {
-      const { gate } = this.host;
       this.listening = this.verifier
         .verify()
-        .then(() => gate.addListener(this.listener))
+        .then(() => this.router.subscribe(this.subscriber))
         .then(async () => {
           if (this.host.isDisposed()) {
-            // dispose() ran while LISTEN was starting: it found no listener to remove
-            await gate.removeListener(this.listener.channel, this.listener.callbackId);
+            // dispose() ran while LISTEN was starting: it found no subscription to remove
+            await this.router.unsubscribe(this.subscriber);
             return;
           }
           this.backoff.succeed();
@@ -146,23 +116,18 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
     return this.host.gate.isListenHealthy() ? this.listenTrustedSince : undefined;
   }
 
-  private async handleNotification(raw: unknown): Promise<void> {
+  private async handleNotification(payload: LilypadDbNotification): Promise<void> {
     const { host } = this;
-    if (host.isDisposed()) {
+    if (host.isDisposed() || !this.isForSchema(payload)) {
       return;
     }
-    host.log('debug', 'Received a notification on the cache_events channel:', raw);
-    const payload = parseLilypadNotification(raw);
-    if (!payload) {
-      host.log('warn', 'Ignoring a malformed cache_events notification:', raw);
-      return;
-    }
-    if (!this.isForTable(payload)) {
-      return;
-    }
+    host.log('debug', 'Received a notification on the cache_events channel:', payload);
     if (this.applyChanges) {
       if (payload.op === 'TRUNCATE') {
         host.emitInvalidation('notification', host.applyTruncate('eager'), { wholeCache: true });
+      } else if (payload.op === 'BULK') {
+        host.applyBulkChange();
+        host.emitInvalidation('notification', [], { wholeCache: true });
       } else {
         const key = await host.applyChange(payload.op, payload.id!, 'eager', parseXid(payload.xid));
         host.emitInvalidation('notification', [key]);
@@ -172,22 +137,19 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
   }
 
   /**
-   * Whether a notification is about the table of this cache. `table` is the name without its
-   * schema; `schema`, when the trigger sends it and the schema of the table is known, must match.
+   * Whether a notification of the table (the router matched its name) is about the schema of this
+   * cache: `schema`, when the trigger sends it and the schema of the table is known, must match.
    */
-  private isForTable(payload: LilypadDbNotification): boolean {
-    if (payload.table !== this.host.tableName.split('.').pop()) {
-      return false;
-    }
+  private isForSchema(payload: LilypadDbNotification): boolean {
     const tableSchema = this.host.tableSchema();
     return (
       payload.schema === undefined || tableSchema === undefined || payload.schema === tableSchema
     );
   }
 
-  /** Waits for a `LISTEN` still starting, then removes the listener. It never rejects. */
+  /** Waits for a `LISTEN` still starting, then unsubscribes. It never rejects. */
   async dispose(): Promise<void> {
     await this.listening?.catch(() => {});
-    await this.host.gate.removeListener(this.listener.channel, this.listener.callbackId);
+    await this.router.unsubscribe(this.subscriber);
   }
 }

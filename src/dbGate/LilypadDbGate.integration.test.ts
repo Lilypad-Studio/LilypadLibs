@@ -1,7 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import postgres from 'postgres';
-import { LilypadDbGate, LilypadDbNotFoundError, type LilypadDbSchema } from './LilypadDbGate';
+import {
+  LilypadDbEmptyWriteError,
+  LilypadDbGate,
+  LilypadDbNotFoundError,
+  type LilypadDbSchema,
+} from './LilypadDbGate';
 import { LilypadDbCache } from '@/cache/LilypadDbCache';
 import {
   lilypadChangelogPruneScheduleSql,
@@ -636,8 +641,19 @@ describe('LilypadDbGate (integration)', () => {
     it('should delete the rows older than the retention', async () => {
       await admin`INSERT INTO users (name) VALUES ('Ada')`;
 
-      expect(await pruneLilypadChangelog(gate, { olderThan: 0 })).toBe(1);
+      expect(await pruneLilypadChangelog(gate, { olderThan: 0, force: true })).toBe(1);
       expect((await readAll()).changes).toEqual([]);
+    });
+
+    it('should delete the old rows in batches, and count them all', async () => {
+      await admin`INSERT INTO users (name) SELECT 'old' FROM generate_series(1, 5)`;
+      await admin`INSERT INTO users (name) VALUES ('recent')`;
+      await admin`
+        UPDATE lilypad_cache_changes SET changed_at = now() - interval '2 hours' WHERE row_id <> '6'
+      `;
+
+      expect(await pruneLilypadChangelog(gate, { olderThan: 60 * 60_000, batchSize: 2 })).toBe(5);
+      expect((await readAll()).changes.map((change) => change.rowId)).toEqual(['6']);
     });
 
     describe('pruning', () => {
@@ -1442,6 +1458,78 @@ describe('LilypadDbGate (integration)', () => {
       await vi.waitFor(async () => expect(await cache.getAll()).toEqual([]));
 
       await cache.dispose();
+    });
+  });
+
+  describe('writes and notifications of large statements', () => {
+    it('should leave the primary key out of the SET of an update', async () => {
+      await admin`INSERT INTO users (name) VALUES ('Ada')`;
+      await admin`CREATE TABLE primary_key_updates (at timestamptz DEFAULT now())`;
+      await admin`
+        CREATE FUNCTION record_primary_key_update() RETURNS trigger AS $$
+        BEGIN INSERT INTO primary_key_updates DEFAULT VALUES; RETURN NULL; END;
+        $$ LANGUAGE plpgsql
+      `;
+      await admin`
+        CREATE TRIGGER users_primary_key_update AFTER UPDATE OF id ON users
+        FOR EACH ROW EXECUTE FUNCTION record_primary_key_update()
+      `;
+      try {
+        const nonGenerated = { ...usersSchema, generatedPrimaryKey: false };
+        await gate.updateToTable(nonGenerated, { id: 1, name: 'Ada', role: 'admin' });
+
+        // UPDATE OF id fires when id is in the SET list, even with the same value
+        expect(await admin`SELECT * FROM primary_key_updates`).toHaveLength(0);
+        await expect(gate.updateToTable(nonGenerated, { id: 1 })).rejects.toThrow(
+          LilypadDbEmptyWriteError
+        );
+      } finally {
+        await admin`DROP TRIGGER users_primary_key_update ON users`;
+        await admin`DROP FUNCTION record_primary_key_update()`;
+        await admin`DROP TABLE primary_key_updates`;
+      }
+    });
+
+    it('should send one BULK notification for a statement above the threshold', async () => {
+      await admin.unsafe(
+        lilypadChangelogSql({
+          table: 'bulk_changes',
+          notifyChannel: 'bulk_events',
+          notifyBulkThreshold: 2,
+        })
+      );
+      await admin`CREATE TABLE bulk_items (id int PRIMARY KEY)`;
+      await admin.unsafe(
+        lilypadChangelogTriggerSql({
+          table: 'bulk_items',
+          primaryKey: 'id',
+          changelogTable: 'bulk_changes',
+        })
+      );
+      const payloads: Record<string, unknown>[] = [];
+      const listener = await admin.listen('bulk_events', (payload) =>
+        payloads.push(JSON.parse(payload) as Record<string, unknown>)
+      );
+      try {
+        await admin`INSERT INTO bulk_items SELECT generate_series(1, 2)`;
+        await admin`INSERT INTO bulk_items SELECT generate_series(3, 5)`;
+
+        await vi.waitFor(() => expect(payloads).toHaveLength(3));
+        expect(payloads.map(({ op, id }) => [op, id])).toEqual([
+          ['INSERT', '1'],
+          ['INSERT', '2'],
+          ['BULK', undefined],
+        ]);
+        expect(payloads[2]).toMatchObject({ schema: 'public', table: 'bulk_items' });
+        // Every row is still recorded in the changelog
+        const [recorded] = await admin`SELECT count(*)::int AS count FROM bulk_changes`;
+        expect(recorded!.count).toBe(5);
+      } finally {
+        await listener.unlisten();
+        await admin`DROP TABLE bulk_items`;
+        await admin`DROP TABLE bulk_changes`;
+        await admin`DROP FUNCTION bulk_changes_record()`;
+      }
     });
   });
 });

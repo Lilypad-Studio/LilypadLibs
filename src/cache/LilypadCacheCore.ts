@@ -1,5 +1,6 @@
 import {
   LilypadCacheCooldownError,
+  LilypadDisposedError,
   type LilypadCachedValueType,
   type LilypadCacheEntry,
   type LilypadCacheEntryOrigin,
@@ -17,6 +18,7 @@ import {
   LilypadSharedLevel,
   type LilypadSharedEntry,
 } from '@/cache/LilypadSharedLevel';
+import { LilypadReadFlights } from '@/cache/LilypadReadFlights';
 import { LilypadFlowControl } from '@/flow/LilypadFlowControl';
 import { assertNumberOption } from '@/internal/LilypadValidation';
 import { libLog, type LilypadLibLogger } from '@/logger/LilypadLibLogger';
@@ -126,6 +128,8 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
   private failures = new Map<string, number>();
   /** Keys whose background refresh is scheduled or running, with the time it was scheduled. */
   private refreshing = new Map<string, number>();
+  /** The fetches of `getOrSet` in flight, which the calls for the same key join. */
+  private fetches = new LilypadReadFlights<LilypadCachedValueType<V>>();
 
   protected constructor(options: LilypadCacheOptions<K, V> = {}) {
     const owner = 'LilypadCache';
@@ -134,12 +138,13 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
     assertNumberOption(owner, 'failureCooldown', options.failureCooldown, 'non-negative');
     assertNumberOption(owner, 'maxEntries', options.maxEntries, 'positive-integer');
     assertNumberOption(owner, 'cleanupOnAccessEvery', options.cleanupOnAccessEvery, 'non-negative');
-    assertNumberOption(owner, 'autoCleanupInterval', options.autoCleanupInterval, 'positive');
+    // The durations given to timers must fit them: beyond 2^31 - 1 ms a timer fires at once
+    assertNumberOption(owner, 'autoCleanupInterval', options.autoCleanupInterval, 'positive-delay');
     assertNumberOption(owner, 'errorTtl', options.errorTtl, 'non-negative');
-    assertNumberOption(owner, 'fetchTimeout', options.fetchTimeout, 'positive');
+    assertNumberOption(owner, 'fetchTimeout', options.fetchTimeout, 'positive-delay');
     assertNumberOption(owner, 'bulkSync.ttl', options.bulkSync?.ttl, 'non-negative');
-    assertNumberOption(owner, 'bulkSync.timeout', options.bulkSync?.timeout, 'positive');
-    assertNumberOption(owner, 'shared.timeout', options.shared?.timeout, 'positive');
+    assertNumberOption(owner, 'bulkSync.timeout', options.bulkSync?.timeout, 'positive-delay');
+    assertNumberOption(owner, 'shared.timeout', options.shared?.timeout, 'positive-delay');
     assertNumberOption(owner, 'shared.refreshLockTtl', options.shared?.refreshLockTtl, 'positive');
 
     const ttl = options.ttl ?? DEFAULT_TTL;
@@ -175,6 +180,7 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
         tagPrefix: this.tagPrefix,
         platform: this.platform,
         warn: (...message) => libLog(this.logger, 'warn', this.name, ...message),
+        onPlatformError: (error) => this.logPlatformError(error),
       });
     }
 
@@ -226,9 +232,10 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
 
   /**
    * The ticket a read must exceed to store a value for the key: the one of its entry, or else the
-   * floor of the missing keys and the fence of the key.
+   * floor of the missing keys and the fence of the key. A read in flight with a lower ticket may
+   * return an outdated value: new callers must not join it.
    */
-  private currentTicket(normalizedKey: string): number {
+  protected currentTicket(normalizedKey: string): number {
     const entry = this.store.get(normalizedKey);
     if (entry) {
       return entry.ticket;
@@ -241,7 +248,7 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
    * their own reads.
    */
   protected hasReadInFlight(normalizedKey: string): boolean {
-    return this.flowControl.isInFlight(this.getOrSetFlightId(normalizedKey));
+    return this.fetches.has(normalizedKey);
   }
 
   /**
@@ -467,19 +474,27 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
   }
 
   /**
-   * The fallback of a failed fetch, chosen for each caller with its own `onError` options, and
-   * cached in this instance only for `onError.ttl` (or the cache's `errorTtl`). The stale value
-   * returned as it is keeps its age: it is not a newer value.
+   * The result of a failed fetch for one caller: the fallback chosen with its own `onError`
+   * options, cached in this instance only for `onError.ttl` (or the cache's `errorTtl`). The stale
+   * value returned as it is keeps its age: it is not a newer value.
    *
+   * A fresh value written while the fetch was failing (e.g. by `set`, or by a write of a subclass)
+   * is newer than anything the fetch could have returned: it is returned and kept as it is.
+   *
+   * @param seen - The entry of the key before the fetch: a different entry was written since.
    * @throws The original error if no fallback value is determined.
    */
-  private errorReturn(
+  private fallbackResult(
     error: unknown,
     options: LilypadCacheGetOptions<K, V>,
-    key: K
-  ): LilypadCachedValueType<V> {
+    key: K,
+    seen: LilypadCacheEntry<K, V> | undefined
+  ): LilypadCacheResult<V> {
     // The current entry, not the one seen before the fetch: it may have been updated meanwhile
     const current = this.store.get(this.normalizeKey(key));
+    if (current && current !== seen && !isStale(current) && current.origin !== 'fallback') {
+      return { value: current.value, status: 'L1-HIT', refreshFailed: false };
+    }
     const stale = current && { value: current.value, fetchedAt: current.fetchedAt };
     const fallback = options.onError?.fallback;
     const value =
@@ -490,23 +505,34 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
     }
     const fetchedAt = stale && value === stale.value ? stale.fetchedAt : Date.now();
     this.writeLocal(key, value, options.onError?.ttl ?? this.errorTtl, 'fallback', fetchedAt);
-    return value;
+    return { value, status: 'MISS', refreshFailed: true };
   }
 
-  private getOrSetFlightId(normalizedKey: string): string {
-    return `LilypadCache-getOrSet-${normalizedKey}`;
-  }
-
-  /** @returns `true` if a `getOrSet` fetch for the key is in flight. */
+  /**
+   * @returns `true` if a `getOrSet` fetch of the key is in flight that a new call would join: one
+   * started after the last change of the key.
+   */
   protected isFetchInFlight(key: K): boolean {
-    return this.flowControl.isInFlight(this.getOrSetFlightId(this.normalizeKey(key)));
+    const normalizedKey = this.normalizeKey(key);
+    return this.fetches.join(normalizedKey, this.currentTicket(normalizedKey)) !== undefined;
   }
 
-  /** Throws if the cache is disposed. */
+  /** @throws {LilypadDisposedError} If the cache is disposed. */
   protected assertNotDisposed() {
     if (this.disposed) {
-      throw new Error(`LilypadCache "${this.name}" is disposed.`);
+      throw new LilypadDisposedError(`LilypadCache "${this.name}"`);
     }
+  }
+
+  /** Logs a failure of the platform function that keeps the instance alive for background work. */
+  protected logPlatformError(error: unknown) {
+    libLog(
+      this.logger,
+      'warn',
+      this.name,
+      'The platform could not keep the instance alive for background work (it still runs):',
+      error
+    );
   }
 
   private inCooldown(normalizedKey: string): boolean {
@@ -559,6 +585,8 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
     options: LilypadCacheGetOptions<K, V> = {}
   ): Promise<LilypadCacheResult<V>> {
     this.assertNotDisposed();
+    // Checked before any fetch: a timer given NaN, or more than 2^31 - 1 ms, fires at once
+    assertNumberOption('LilypadCache', 'timeout', options.timeout, 'positive-delay');
     this.cleanupOnAccess();
     const normalizedKey = this.normalizeKey(key);
 
@@ -600,15 +628,17 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
       }
     }
 
+    // Every write replaces the entry object: another one after the fetch was written meanwhile
+    const seen = this.store.get(normalizedKey);
     if (this.inCooldown(normalizedKey) && !this.isFetchInFlight(key)) {
       const error = new LilypadCacheCooldownError(normalizedKey, this.failureCooldown);
-      return { value: this.errorReturn(error, options, key), status: 'MISS', refreshFailed: true };
+      return this.fallbackResult(error, options, key, seen);
     }
     try {
       const value = await this.fetchAndStore(key, valueFn, options);
       return { value, status: 'MISS', refreshFailed: false };
     } catch (error) {
-      return { value: this.errorReturn(error, options, key), status: 'MISS', refreshFailed: true };
+      return this.fallbackResult(error, options, key, seen);
     }
   }
 
@@ -631,37 +661,46 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
     return { value: entry.value, status, refreshFailed: fallback };
   }
 
-  /** Fetches the value (one fetch per key at a time) and stores it. */
+  /**
+   * Fetches the value and stores it. A fetch of the key in flight is joined, unless it started
+   * before the last change of the key (an invalidation, a removal, a newer write): it may return
+   * the old value, so another fetch starts.
+   */
   private fetchAndStore(
     key: K,
     valueFn: LilypadCacheValueFn<V>,
     options: LilypadCacheGetOptions<K, V>
   ): Promise<LilypadCachedValueType<V>> {
     const normalizedKey = this.normalizeKey(key);
-    return this.flowControl.singleFlight(this.getOrSetFlightId(normalizedKey), () =>
-      this.flowControl
-        .executeWithTimeout(async (signal) => {
-          const read = this.beginRead();
-          const value = await valueFn(signal);
-          // After a timeout the caller already got an error/fallback: a late result is not cached
-          if (!signal.aborted) {
-            read.storeFetched(key, value, options.ttl, options.staleWhileRevalidate);
-          }
-          return value;
-        }, options.timeout)
-        .catch((error: unknown) => {
-          // Once per fetch, while the fallback is chosen per caller in errorReturn
-          libLog(
-            this.logger,
-            'error',
-            this.name,
-            `Error fetching cache key "${normalizedKey}": `,
-            error
-          );
-          this.recordFailure(normalizedKey);
-          throw error;
-        })
-    );
+    const joined = this.fetches.join(normalizedKey, this.currentTicket(normalizedKey));
+    if (joined) {
+      return joined;
+    }
+    const read = this.beginRead();
+    const fetching = this.flowControl
+      .executeWithTimeout(async (signal) => {
+        const value = await valueFn(signal);
+        // After a timeout the caller already got an error/fallback: a late result is not cached
+        if (!signal.aborted) {
+          read.storeFetched(key, value, options.ttl, options.staleWhileRevalidate);
+        }
+        return value;
+      }, options.timeout)
+      .catch((error: unknown) => {
+        // Once per fetch, while the fallback is chosen per caller in fallbackResult
+        libLog(
+          this.logger,
+          'error',
+          this.name,
+          `Error fetching cache key "${normalizedKey}": `,
+          error
+        );
+        this.recordFailure(normalizedKey);
+        throw error;
+      });
+    // Registered before the callers get the promise: it is forgotten before they continue
+    this.fetches.start([normalizedKey], read.ticket, fetching);
+    return fetching;
   }
 
   /**
@@ -702,7 +741,8 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
         }
       },
       // The fetch error has already been logged by fetchAndStore
-      () => {}
+      () => {},
+      (error) => this.logPlatformError(error)
     );
   }
 
@@ -787,7 +827,8 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
     runInBackground(
       this.platform,
       Promise.resolve().then(() => onInvalidate(event)),
-      (error) => libLog(this.logger, 'error', this.name, 'Error in onInvalidate:', error)
+      (error) => libLog(this.logger, 'error', this.name, 'Error in onInvalidate:', error),
+      (error) => this.logPlatformError(error)
     );
   }
 
@@ -1187,6 +1228,11 @@ export abstract class LilypadCacheCore<K extends LilypadCacheKey, V> {
    * It is asynchronous so that subclasses can release their resources (e.g. a database listener):
    * always await it.
    */
+  /** `await using cache = ...` disposes of the cache at the end of the scope. */
+  [Symbol.asyncDispose](): Promise<void> {
+    return this.dispose();
+  }
+
   dispose(): Promise<void> {
     if (this.disposed) {
       return Promise.resolve();

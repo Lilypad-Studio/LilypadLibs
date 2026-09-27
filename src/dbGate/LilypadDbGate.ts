@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { LilypadDisposedError } from '@/cache/LilypadCacheTypes';
 import { LilypadListenHeartbeat } from '@/dbGate/LilypadListenHeartbeat';
 import { LilypadBackoff } from '@/internal/LilypadBackoff';
 import { assertNumberOption } from '@/internal/LilypadValidation';
@@ -159,6 +160,32 @@ export type LilypadDbWriteResult<T> = { row: T | null; xid: bigint };
  */
 export type LilypadDbDeleteResult = { deleted: boolean; xid?: bigint };
 
+/** Thrown by the writes when the data has no primary key where one is needed. */
+export class LilypadDbMissingPrimaryKeyError extends Error {
+  readonly tableName: string;
+  readonly primaryKey: string;
+
+  constructor(schema: { primaryKey: PropertyKey; tableName: string }, context: string) {
+    super(
+      `Primary key "${String(schema.primaryKey)}" is missing in the ${context} data for table "${schema.tableName}".`
+    );
+    this.name = 'LilypadDbMissingPrimaryKeyError';
+    this.tableName = schema.tableName;
+    this.primaryKey = String(schema.primaryKey);
+  }
+}
+
+/** Thrown by an insert or an update whose data has no column of the schema to write. */
+export class LilypadDbEmptyWriteError extends Error {
+  readonly tableName: string;
+
+  constructor(tableName: string, operation: 'insert' | 'update') {
+    super(`No columns to ${operation} for table "${tableName}".`);
+    this.name = 'LilypadDbEmptyWriteError';
+    this.tableName = tableName;
+  }
+}
+
 /** Thrown by `updateToTable` when no row has the primary key of the data. */
 export class LilypadDbNotFoundError extends Error {
   readonly tableName: string;
@@ -186,10 +213,8 @@ const DEFAULT_LISTEN_HEARTBEAT = 15_000;
 export function lilypadMissingPrimaryKeyError(
   schema: { primaryKey: PropertyKey; tableName: string },
   context: string
-): Error {
-  return new Error(
-    `Primary key "${String(schema.primaryKey)}" is missing in the ${context} data for table "${schema.tableName}".`
-  );
+): LilypadDbMissingPrimaryKeyError {
+  return new LilypadDbMissingPrimaryKeyError(schema, context);
 }
 
 type ChannelListener = {
@@ -234,7 +259,12 @@ export class LilypadDbGate {
       assertNumberOption('LilypadDbGate', 'statementTimeout', options.statementTimeout, 'positive');
     }
     if (options.listenHeartbeat !== false) {
-      assertNumberOption('LilypadDbGate', 'listenHeartbeat', options.listenHeartbeat, 'positive');
+      assertNumberOption(
+        'LilypadDbGate',
+        'listenHeartbeat',
+        options.listenHeartbeat,
+        'positive-delay'
+      );
     }
     this.logger = options.logger;
     const statementTimeout = resolveStatementTimeout(options);
@@ -347,6 +377,7 @@ export class LilypadDbGate {
    * - validates the primary key, which an update always needs to find the row;
    * - restricts the written columns to the schema columns, so that extra properties of `data`
    *   (e.g. coming from a request body) are never written to the table;
+   * - leaves the primary key out of the `SET` of an update: it identifies the row;
    * - skips `undefined` values, which postgres.js rejects.
    */
   private prepareWrite<T, PK extends keyof T>(
@@ -368,10 +399,11 @@ export class LilypadDbGate {
     }
 
     const columns = (Object.keys(schema.cols) as (keyof T & string)[]).filter(
-      (column) => writeData[column] !== undefined
+      (column) =>
+        writeData[column] !== undefined && !(operation === 'update' && column === schema.primaryKey)
     );
     if (columns.length === 0) {
-      throw new Error(`No columns to ${operation} for table "${schema.tableName}".`);
+      throw new LilypadDbEmptyWriteError(schema.tableName, operation);
     }
 
     return { data: writeData as postgres.Row, columns, primaryKeyValue };
@@ -749,9 +781,10 @@ export class LilypadDbGate {
     return this.closing !== undefined;
   }
 
+  /** @throws {LilypadDisposedError} If the gate is closed. */
   private assertOpen() {
     if (this.closing) {
-      throw new Error(`LilypadDbGate "${this.id}" is closed.`);
+      throw new LilypadDisposedError(`LilypadDbGate "${this.id}"`, 'closed');
     }
   }
 
@@ -761,14 +794,21 @@ export class LilypadDbGate {
    * returns the same promise.
    *
    * @param options.timeout - How long to wait for the running queries, in ms. Defaults to 5 s.
+   * @throws If the timeout is not valid: the gate then stays open.
    */
   close(options: { timeout?: number } = {}): Promise<void> {
+    // Checked before the gate counts as closed: otherwise it would be closed without ending its pools
+    assertNumberOption('LilypadDbGate', 'close timeout', options.timeout, 'non-negative-delay');
     this.closing ??= this.closeConnections(options.timeout ?? DEFAULT_CLOSE_TIMEOUT);
     return this.closing;
   }
 
+  /** `await using gate = ...` closes the gate at the end of the scope. */
+  [Symbol.asyncDispose](): Promise<void> {
+    return this.close();
+  }
+
   private async closeConnections(timeout: number) {
-    assertNumberOption('LilypadDbGate', 'close timeout', timeout, 'non-negative');
     this.listeners.clear();
     this.heartbeat?.stop();
     this.heartbeatStop = undefined;

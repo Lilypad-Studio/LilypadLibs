@@ -1,9 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import {
   installedLilypadChangelogPrune,
+  LILYPAD_CHANGELOG_VERSION,
   lilypadChangelogPruneScheduleSql,
   lilypadChangelogSql,
+  pruneLilypadChangelog,
 } from './LilypadChangelog';
+import type { LilypadDbGate } from './LilypadDbGate';
 
 // The SQL itself runs against PostgreSQL in LilypadDbGate.integration.test.ts
 describe('lilypadChangelogSql prune option', () => {
@@ -94,5 +97,44 @@ describe('lilypadChangelogPruneScheduleSql', () => {
 
   it('should reject an invalid retention', () => {
     expect(() => lilypadChangelogPruneScheduleSql({ olderThan: -1 })).toThrow('olderThan');
+  });
+});
+
+describe('lilypadChangelogSql notifications', () => {
+  it('should send one BULK notification above the threshold of rows of a statement', () => {
+    const sql = lilypadChangelogSql({ notifyBulkThreshold: 50 });
+
+    expect(sql).toContain('GET DIAGNOSTICS recorded = ROW_COUNT;');
+    expect(sql).toContain('IF recorded > 50 THEN');
+    expect(sql).toContain("'op', 'BULK'");
+    expect(sql).toContain(
+      `COMMENT ON FUNCTION "lilypad_cache_changes_record"() IS 'lilypad-changelog:${LILYPAD_CHANGELOG_VERSION}'`
+    );
+  });
+
+  it('should send no notification at all without a channel', () => {
+    const sql = lilypadChangelogSql({ notifyChannel: false });
+
+    expect(sql).not.toContain('pg_notify');
+    expect(sql).not.toContain('BULK');
+  });
+
+  it('should reject an invalid threshold', () => {
+    expect(() => lilypadChangelogSql({ notifyBulkThreshold: 0 })).toThrow('notifyBulkThreshold');
+  });
+});
+
+describe('pruneLilypadChangelog', () => {
+  // Rejected before any query: the gate is never used
+  const gate = {} as LilypadDbGate;
+
+  it.each([
+    [{ olderThan: Number.NaN }, 'olderThan must be'],
+    [{ olderThan: -1 }, 'olderThan must be'],
+    [{ olderThan: 86_400_000, batchSize: 0 }, 'batchSize must be'],
+    // Seconds instead of milliseconds: 86 seconds
+    [{ olderThan: 86_400 }, 'less than one hour'],
+  ])('should reject %o', async (options, message) => {
+    await expect(pruneLilypadChangelog(gate, options)).rejects.toThrow(message);
   });
 });

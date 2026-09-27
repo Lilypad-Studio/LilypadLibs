@@ -1,3 +1,4 @@
+import { withLilypadTimeout } from '@/internal/LilypadTimeout';
 import { assertNumberOption } from '@/internal/LilypadValidation';
 
 export interface LilypadFlowControlOptions {
@@ -28,6 +29,11 @@ export interface LilypadExecuteFnOptions<T> {
   retries?: number;
   backOffTime?: (attempt: number) => number;
   /**
+   * Whether a failed attempt is retried: return `false` for the errors that another attempt cannot
+   * fix (e.g. a validation error). Defaults to retrying every error.
+   */
+  shouldRetry?: (error: unknown, attempt: number) => boolean;
+  /**
    * Timeout of each attempt of this execution, in milliseconds; overrides the instance's `timeout`.
    * Callers that join an in-flight execution share the timeout of the call that started it.
    */
@@ -54,7 +60,7 @@ export class LilypadRateLimitError extends Error {
 }
 
 /**
- * Above this number of tracked rate limit keys, expired entries are pruned.
+ * Above this number of tracked rate limit keys, expired entries are pruned (at most once per `rate`).
  */
 const RATE_MAP_PRUNE_THRESHOLD = 1000;
 
@@ -94,11 +100,13 @@ export class LilypadFlowControl {
 
   private singleFlightMap: Map<string, Promise<unknown>> = new Map();
   private rateMap: Map<string, number> = new Map();
+  /** When the rate limit entries were last pruned. */
+  private lastRatePrune = 0;
 
   /** @throws If a numeric option is not valid (e.g. `NaN`, or a negative duration). */
   constructor(options?: LilypadFlowControlOptions) {
     assertNumberOption('LilypadFlowControl', 'rate', options?.rate, 'non-negative');
-    assertNumberOption('LilypadFlowControl', 'timeout', options?.timeout, 'positive');
+    assertNumberOption('LilypadFlowControl', 'timeout', options?.timeout, 'positive-delay');
     assertNumberOption('LilypadFlowControl', 'retries', options?.retries, 'non-negative-integer');
     this.rate = options?.rate;
     this.timeout = options?.timeout;
@@ -114,33 +122,22 @@ export class LilypadFlowControl {
    * @returns A promise that resolves with the result of `executionFn` if it completes before the timeout,
    *          or rejects with an error if the timeout is exceeded.
    * @throws {LilypadTimeoutError} If the execution exceeds the timeout.
+   * @throws If the timeout is not a valid delay (e.g. `NaN`, or more than 2^31 - 1 ms).
    *
    * @remarks
-   * This method uses `Promise.race()` to implement the timeout mechanism. The timeout is cleared in the finally block
-   * to ensure no memory leaks occur regardless of whether the operation succeeds or times out.
+   * The timer is always cleared, whether the operation succeeds, fails or times out.
    * JavaScript cannot forcibly stop a running promise: `executionFn` should observe the signal to stop its work.
    */
   async executeWithTimeout<R>(
     executionFn: (signal: AbortSignal) => Promise<R>,
     timeout: number | undefined = this.timeout
   ): Promise<R> {
-    const controller = new AbortController();
+    // Checked here too: a timer given NaN, or more than 2^31 - 1 ms, fires at once
+    assertNumberOption('LilypadFlowControl', 'timeout', timeout, 'positive-delay');
     if (timeout === undefined) {
-      return executionFn(controller.signal);
+      return executionFn(new AbortController().signal);
     }
-    let timeoutId: ReturnType<typeof setTimeout>;
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timeoutId = setTimeout(() => {
-        const error = new LilypadTimeoutError(timeout);
-        controller.abort(error);
-        reject(error);
-      }, timeout);
-    });
-    try {
-      return await Promise.race([executionFn(controller.signal), timeoutPromise]);
-    } finally {
-      clearTimeout(timeoutId!);
-    }
+    return withLilypadTimeout(executionFn, timeout, () => new LilypadTimeoutError(timeout));
   }
 
   /**
@@ -150,6 +147,7 @@ export class LilypadFlowControl {
    * @param options.executionFn - The asynchronous function to execute.
    * @param options.retries - The maximum number of retry attempts. If not provided, the instance's configured retries will be used.
    * @param options.backOffTime - Optional function to calculate the backoff time (in milliseconds) before each retry attempt. Receives the current attempt number as an argument. Defaults to exponential backoff if not provided.
+   * @param options.shouldRetry - Returns `false` for an error that must not be retried: it is thrown at once.
    * @returns A promise that resolves with the result of `executionFn`.
    * @throws The error of the last attempt, once all retries are exhausted.
    */
@@ -157,6 +155,7 @@ export class LilypadFlowControl {
     executionFn: () => Promise<T>;
     retries?: number;
     backOffTime?: (attempt: number) => number;
+    shouldRetry?: (error: unknown, attempt: number) => boolean;
   }): Promise<T> {
     let attempts = 0;
     while (true) {
@@ -164,13 +163,23 @@ export class LilypadFlowControl {
         const result = await options.executionFn();
         return result;
       } catch (error) {
-        if (attempts >= (options.retries ?? this.retries ?? 0)) {
+        if (
+          attempts >= (options.retries ?? this.retries ?? 0) ||
+          options.shouldRetry?.(error, attempts + 1) === false
+        ) {
           throw error;
         }
         attempts++;
         const backoffTimeValue = options.backOffTime
           ? options.backOffTime(attempts)
           : Math.pow(2, attempts) * 100; // Exponential backoff
+        // A delay that a timer cannot hold (NaN, beyond 2^31 - 1 ms) would retry at once
+        assertNumberOption(
+          'LilypadFlowControl',
+          'backOffTime',
+          backoffTimeValue,
+          'non-negative-delay'
+        );
         await new Promise((resolve) => setTimeout(resolve, backoffTimeValue));
       }
     }
@@ -194,7 +203,10 @@ export class LilypadFlowControl {
         throw new LilypadRateLimitError(rateKey);
       }
       this.rateMap.set(rateKey, now);
-      if (this.rateMap.size > RATE_MAP_PRUNE_THRESHOLD) {
+      // At most once per `rate`: when every key is still limited, pruning at each call would scan
+      // the whole map for nothing
+      if (this.rateMap.size > RATE_MAP_PRUNE_THRESHOLD && now - this.lastRatePrune >= this.rate) {
+        this.lastRatePrune = now;
         this.pruneRateMap(now);
       }
     }
@@ -275,6 +287,7 @@ export class LilypadFlowControl {
         executionFn: () => this.executeWithTimeout(options.fn, options.timeout),
         retries: options.retries,
         backOffTime: options.backOffTime,
+        shouldRetry: options.shouldRetry,
       })
     );
   }

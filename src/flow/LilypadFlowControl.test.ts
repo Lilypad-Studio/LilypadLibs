@@ -669,8 +669,9 @@ describe('LilypadFlowControl errors', () => {
   });
 
   it.each([
-    [{ timeout: Number.NaN }, /timeout must be a positive finite number/],
-    [{ timeout: 0 }, /timeout must be a positive finite number/],
+    [{ timeout: Number.NaN }, /timeout must be a positive number of milliseconds/],
+    [{ timeout: 0 }, /timeout must be a positive number of milliseconds/],
+    [{ timeout: 2 ** 31 }, /timeout must be a positive number of milliseconds, at most 2147483647/],
     [{ rate: -1 }, /rate must be a non-negative finite number/],
     [{ retries: 1.5 }, /retries must be a non-negative integer/],
   ])('should reject the invalid options %o', (options, message) => {
@@ -683,5 +684,55 @@ describe('LilypadFlowControl errors', () => {
     const value: number = await flowControl.executeWithTimeout(async () => 42);
 
     expect(value).toBe(42);
+  });
+});
+
+describe('LilypadFlowControl retries and limits', () => {
+  it('should not retry an error that shouldRetry refuses', async () => {
+    const flowControl = new LilypadFlowControl({ retries: 3 });
+    const fn = vi.fn(async () => {
+      throw new Error('invalid input');
+    });
+
+    await expect(
+      flowControl.executeFn({
+        functionIdentifier: 'validate',
+        fn,
+        shouldRetry: (error) => (error as Error).message !== 'invalid input',
+      })
+    ).rejects.toThrow('invalid input');
+    expect(fn).toHaveBeenCalledOnce();
+  });
+
+  it('should reject a backoff time that a timer cannot hold, instead of retrying at once', async () => {
+    const flowControl = new LilypadFlowControl({ retries: 2 });
+    const fn = vi.fn(async () => {
+      throw new Error('down');
+    });
+
+    await expect(
+      flowControl.executeWithRetries({ executionFn: fn, backOffTime: () => Number.NaN })
+    ).rejects.toThrow('backOffTime must be');
+    expect(fn).toHaveBeenCalledOnce();
+  });
+
+  it('should reject a per-call timeout beyond 2^31 - 1 ms', async () => {
+    const flowControl = new LilypadFlowControl();
+
+    await expect(flowControl.executeWithTimeout(async () => 1, 2 ** 31)).rejects.toThrow(
+      'timeout must be'
+    );
+  });
+
+  it('should prune the rate limit entries at most once per rate', () => {
+    const flowControl = new LilypadFlowControl({ rate: 60_000 });
+    const prune = vi.spyOn(flowControl as unknown as { pruneRateMap: () => void }, 'pruneRateMap');
+
+    for (let i = 0; i < 1100; i++) {
+      flowControl.rateLimit(`user${i}#func1`);
+    }
+
+    // Every key is still limited: scanning the map at each call would find nothing to remove
+    expect(prune).toHaveBeenCalledOnce();
   });
 });

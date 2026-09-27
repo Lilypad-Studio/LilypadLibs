@@ -1,3 +1,4 @@
+import { assertNumberOption } from '@/internal/LilypadValidation';
 import { LilypadLoggerComponent, type LilypadLogRecord } from '../LilypadLoggerComponent';
 
 /** Maximum length of the content of a Discord message. */
@@ -79,12 +80,22 @@ export class LilypadDiscordLogger<T extends string> extends LilypadLoggerCompone
   private flushing = false;
   private nextRequestAt = 0;
 
+  /** @throws If a numeric option is not valid (e.g. `NaN`, which would leave the queue unbounded). */
   constructor(webhookUrl: string, options: LilypadDiscordLoggerOptions = {}) {
     super();
+    const owner = 'LilypadDiscordLogger';
+    assertNumberOption(
+      owner,
+      'minRequestInterval',
+      options.minRequestInterval,
+      'non-negative-delay'
+    );
+    assertNumberOption(owner, 'rateLimitRetries', options.rateLimitRetries, 'non-negative-integer');
+    assertNumberOption(owner, 'maxQueueSize', options.maxQueueSize, 'positive-integer');
     this.webhookUrl = webhookUrl;
     this.minRequestInterval = options.minRequestInterval ?? 1000;
     this.rateLimitRetries = options.rateLimitRetries ?? 1;
-    this.maxQueueSize = Math.max(1, options.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE);
+    this.maxQueueSize = options.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE;
   }
 
   write(record: LilypadLogRecord<T>): Promise<void> {

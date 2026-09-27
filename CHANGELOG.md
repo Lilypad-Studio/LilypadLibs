@@ -2,8 +2,33 @@
 
 ## Unreleased
 
+### Upgrading
+
+| Change | What to do |
+| --- | --- |
+| The changelog is at version 5: a statement that changes more rows than `notifyBulkThreshold` (default 1000) sends one `BULK` notification instead of one per row. A function of version 4 is still read correctly: the schema check reports `outdated-changelog` as a warning only. | Run `lilypadChangelogSql()` again (with the same options) when convenient. |
+| `pruneLilypadChangelog` throws for an `olderThan` shorter than one hour, and deletes in batches (`batchSize`, default 10000). | Pass `force: true` for a shorter retention (e.g. in tests). |
+| The durations given to timers (`fetchTimeout`, `bulkSync.timeout`, `shared.timeout`, `autoCleanupInterval`, the `timeout` of `LilypadFlowControl` and of each call, `listenHeartbeat`, the `close` timeout, `minRequestInterval`) must be at most 2^31 - 1 ms, and the `timeout` of a `getOrSet` call is checked too: a timer beyond it, or given `NaN`, fires at once. | Pass shorter durations. |
+| `LilypadDiscordLogger` throws for an invalid `minRequestInterval`, `rateLimitRetries` or `maxQueueSize` (`NaN` left the queue unbounded, `0` meant 1). | Pass valid values. |
+| `runInBackground` and `runAfterResponse` no longer pass the error of `platform.background` / `platform.afterResponse` itself to `onError` (it is not an error of the task), but to a new optional `onPlatformError`. The caches log it as a warning. | Pass `onPlatformError` if you called them directly. |
+| `updateToTable` (and `sqlUpdate`) leaves the primary key out of the `SET` list; data with only the primary key throws `LilypadDbEmptyWriteError`. | None, unless a trigger relied on `UPDATE OF <primary key>`. |
+| The caches of a gate share one listener on `cache_events` (`callbackId: 'lilypad_notification_router'`), instead of one per cache. | None. |
+
+### Fixed
+
+- **A read after an invalidation no longer returns the old value**: `getOrSet`, `getOrFetch` and `getAll(keys)` joined a fetch of the key already in flight even when it had started before an invalidation (or a change applied from the changelog), and returned the value it read before the change. A read now joins only a fetch that started after the last change of the key.
+- A value written while a fetch was failing (by `set`, or a write of `LilypadDbCache`) is returned and kept, instead of being replaced by the `onError` fallback.
+- `LilypadDbGate.close({ timeout })` with an invalid timeout threw after marking the gate as closed, leaving its pools open: it now throws first, and the gate stays open.
+- Concurrent `LilypadDbCache.dispose()` calls return the same promise: the second one no longer resolves before the listener is removed.
+- The ids of notifications and of the changelog are converted to numbers once the cache has read numeric primary keys, even without `cols[primaryKey].type`.
+- The logger redacts the keys of what `toJSON` returns (an object of the context with a `toJSON` method was written to the JSON output unredacted).
+
 ### Added
 
+- `shouldRetry(error, attempt)` in the options of `executeFn` and `executeWithRetries`.
+- Typed errors: `LilypadDisposedError` (a disposed cache, a closed gate), `LilypadDbMissingPrimaryKeyError`, `LilypadDbEmptyWriteError`.
+- `Symbol.asyncDispose` on the caches and the gate: `await using cache = ...`.
+- Performance: a read of the changelog applies only the last change of each row, and beyond 1000 keys expires the table as a whole; notifications re-read at most 1000 keys per second; the caches of a gate share the facts of the database read by their schema checks (for a minute), and log the problems of the changelog once; the schema check reads every table in one query; the rate limit map is pruned at most once per `rate`.
 - `pruning: 'trigger'` and `pruning: 'cron'` (cache `sync` options, or the `changelog` options of `checkLilypadSchema`): the `no-changelog-pruning` warning then always suggests the `prune` option of the trigger, or a pg_cron job, instead of the best one it can tell. With `'cron'`, where the role cannot read `cron.database_name` (e.g. on Neon), it suggests a job in this database, and says that pg_cron must run there.
 
 ### Changed

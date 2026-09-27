@@ -1,5 +1,5 @@
 import { n as LilypadLibLogger } from "./chunks/LilypadLibLogger-DwYjcH1k.mjs";
-import { _ as LilypadCachedValueType, c as LilypadCacheGetOptions, d as LilypadCachePeek, f as LilypadCacheResult, i as LilypadCacheEntry, l as LilypadCacheKey, n as LilypadCacheBulkSyncOptions, t as LilypadCacheCore, u as LilypadCacheOptions } from "./chunks/LilypadCacheCore-CEgPzhea.mjs";
+import { _ as LilypadCachedValueType, c as LilypadCacheGetOptions, d as LilypadCachePeek, f as LilypadCacheResult, i as LilypadCacheEntry, l as LilypadCacheKey, n as LilypadCacheBulkSyncOptions, t as LilypadCacheCore, u as LilypadCacheOptions, v as LilypadDisposedError } from "./chunks/LilypadCacheCore-JGV72iE4.mjs";
 import { t as LilypadSingletonAble } from "./chunks/LilypadSingleton-12K8J38s.mjs";
 import postgres from "postgres";
 //#region src/dbGate/LilypadDbGate.d.ts
@@ -122,6 +122,20 @@ type LilypadDbDeleteResult = {
   deleted: boolean;
   xid?: bigint;
 };
+/** Thrown by the writes when the data has no primary key where one is needed. */
+export declare class LilypadDbMissingPrimaryKeyError extends Error {
+  readonly tableName: string;
+  readonly primaryKey: string;
+  constructor(schema: {
+    primaryKey: PropertyKey;
+    tableName: string;
+  }, context: string);
+}
+/** Thrown by an insert or an update whose data has no column of the schema to write. */
+export declare class LilypadDbEmptyWriteError extends Error {
+  readonly tableName: string;
+  constructor(tableName: string, operation: 'insert' | 'update');
+}
 /** Thrown by `updateToTable` when no row has the primary key of the data. */
 export declare class LilypadDbNotFoundError extends Error {
   readonly tableName: string;
@@ -182,6 +196,7 @@ export declare class LilypadDbGate {
    * - validates the primary key, which an update always needs to find the row;
    * - restricts the written columns to the schema columns, so that extra properties of `data`
    *   (e.g. coming from a request body) are never written to the table;
+   * - leaves the primary key out of the `SET` of an update: it identifies the row;
    * - skips `undefined` values, which postgres.js rejects.
    */
   private prepareWrite;
@@ -272,6 +287,7 @@ export declare class LilypadDbGate {
   isListenHealthy(): boolean;
   /** Whether `close` was called: the gate then rejects every query and listener. */
   get closed(): boolean;
+  /** @throws {LilypadDisposedError} If the gate is closed. */
   private assertOpen;
   /**
    * Closes the connections, after the queries still running (for at most `timeout` ms; the ones
@@ -279,10 +295,13 @@ export declare class LilypadDbGate {
    * returns the same promise.
    *
    * @param options.timeout - How long to wait for the running queries, in ms. Defaults to 5 s.
+   * @throws If the timeout is not valid: the gate then stays open.
    */
   close(options?: {
     timeout?: number;
   }): Promise<void>;
+  /** `await using gate = ...` closes the gate at the end of the scope. */
+  [Symbol.asyncDispose](): Promise<void>;
   private closeConnections;
 }
 //#endregion
@@ -294,6 +313,13 @@ export declare class LilypadDbGate {
  * by other programs. It needs PostgreSQL 13 or later (`xid8`).
  */
 export declare const LILYPAD_DEFAULT_CHANGELOG_TABLE = "lilypad_cache_changes";
+/** Above this number of rows changed by one statement, the trigger sends one `BULK` notification. */
+export declare const LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD = 1000;
+/**
+ * The shortest retention that {@link pruneLilypadChangelog} accepts without `force`: the default
+ * `maxGap` of the caches. A shorter one deletes rows that the caches may still have to read.
+ */
+export declare const LILYPAD_MIN_CHANGELOG_RETENTION: number;
 type LilypadChangelogSqlOptions = {
   /** Name of the changelog table. Defaults to `lilypad_cache_changes`. */
   table?: string;
@@ -302,6 +328,12 @@ type LilypadChangelogSqlOptions = {
    * send none. Defaults to `cache_events`.
    */
   notifyChannel?: string | false;
+  /**
+   * With a `notifyChannel`, a statement that changes more rows than this sends one `BULK`
+   * notification instead of one per row: the caches then expire every entry of the table instead
+   * of re-reading each row, and the `NOTIFY` queue is not flooded. Defaults to 1000.
+   */
+  notifyBulkThreshold?: number;
   /**
    * Makes the trigger delete the old changelog rows itself, so that no scheduled job is needed:
    * on about one statement in `every`, it deletes up to `batchSize` rows older than `olderThan`,
@@ -437,15 +469,22 @@ export declare function readLilypadChanges(gate: LilypadDbGate, options: Lilypad
   cursor: LilypadChangelogCursor;
 }>;
 /**
- * Deletes the changelog rows older than `olderThan` milliseconds. Call it periodically (e.g. from
- * a scheduled job): `olderThan` must be much larger than the `maxGap` and the `lookback` of the
- * caches.
+ * Deletes the changelog rows older than `olderThan` milliseconds, in batches of `batchSize` rows
+ * (one statement each, so that no statement locks or rewrites the whole table). Call it
+ * periodically (e.g. from a scheduled job): `olderThan` must be much larger than the `maxGap` and
+ * the `lookback` of the caches, and than the longest transaction.
  *
+ * @param options.olderThan - The retention, in **milliseconds**. Below one hour it throws, unless
+ * `force` is set: a shorter retention deletes rows that the caches may still have to read, and
+ * they would miss these changes without knowing it.
+ * @param options.batchSize - The most rows one statement deletes. Defaults to 10000.
  * @returns The number of deleted rows.
  */
 export declare function pruneLilypadChangelog(gate: LilypadDbGate, options: {
   olderThan: number;
   changelogTable?: string;
+  batchSize?: number;
+  force?: boolean;
 }): Promise<number>;
 //#endregion
 //#region src/dbGate/LilypadSchemaCheck.d.ts
@@ -499,7 +538,10 @@ type LilypadSchemaProblemCode =
 'missing-table' |
 /** The changelog table or its trigger function does not exist. */
 'missing-changelog' |
-/** The changelog table or its trigger function was installed by an older version of the library. */
+/**
+ * The changelog table or its trigger function was installed by an older version of the library:
+ * an error if the caches cannot read it correctly, a warning if it only lacks an improvement.
+ */
 'outdated-changelog' |
 /**
  * The enabled changelog triggers of the table do not record each of INSERT, UPDATE and DELETE:
@@ -567,6 +609,14 @@ export declare class LilypadSchemaCheckError extends Error {
   readonly problems: LilypadSchemaProblem[];
   constructor(subject: string, problems: LilypadSchemaProblem[]);
 }
+/** How `checkLilypadSchema` is called by the library itself. */
+type LilypadSchemaCheckContext = {
+  /**
+   * Reuses the facts of the database read by another check of the same gate less than a minute
+   * ago (the caches of a gate check the same changelog).
+   */
+  shareDatabaseFacts?: boolean;
+};
 /**
  * Checks that the database has what `LilypadDbCache` needs to learn about changes: the changelog
  * table, its trigger function and a trigger on each cached table, or a trigger that sends
@@ -576,7 +626,7 @@ export declare class LilypadSchemaCheckError extends Error {
  * that fixes it (`ok` is true when there is none).
  * @throws If the catalogs cannot be read (e.g. the database is unreachable).
  */
-export declare function checkLilypadSchema(gate: LilypadDbGate, options: LilypadSchemaCheckOptions): Promise<LilypadSchemaCheckResult>;
+export declare function checkLilypadSchema(gate: LilypadDbGate, options: LilypadSchemaCheckOptions, context?: LilypadSchemaCheckContext): Promise<LilypadSchemaCheckResult>;
 //#endregion
 //#region src/cache/dbSync/LilypadDbSyncTypes.d.ts
 type LilypadDbNotification = {
@@ -588,10 +638,14 @@ type LilypadDbNotification = {
   table: string;
   /**
    * A number when the trigger serializes a numeric primary key as such (e.g. `json_build_object`).
-   * Absent for `TRUNCATE`.
+   * Absent for `TRUNCATE` and `BULK`.
    */
   id?: string | number;
-  op: 'UPDATE' | 'DELETE' | 'INSERT' | 'TRUNCATE';
+  /**
+   * `BULK`: one statement changed more rows than the `notifyBulkThreshold` of the trigger, which
+   * sends this one notification instead of one per row. The cache expires the whole table.
+   */
+  op: 'UPDATE' | 'DELETE' | 'INSERT' | 'TRUNCATE' | 'BULK';
   /**
    * The id of the transaction that made the change (sent by the triggers of version 3). It lets
    * the instance that made the change skip its own writes.
@@ -777,6 +831,14 @@ export declare class LilypadDbCache<V extends object, PK extends keyof V = keyof
    * reflected in it.
    */
   private ownWrites;
+  /** The keys re-read after notifications in the current second, for the eager budget. */
+  private eagerWindow;
+  /**
+   * Whether the primary key holds numbers: declared by `cols[primaryKey].type`, or learned from the
+   * rows read. The ids of notifications and of the changelog are then converted to numbers.
+   */
+  private numericPrimaryKey;
+  private disposing?;
   /**
    * Creates a cache and, with the `listen` strategy (unless `connect: 'lazy'`), registers its
    * database listener. The row type and the primary key are inferred from `schema`.
@@ -830,6 +892,22 @@ export declare class LilypadDbCache<V extends object, PK extends keyof V = keyof
    */
   private applyTruncate;
   /**
+   * Applies a change of too many rows to follow them one by one (a `BULK` notification, or a read
+   * of the changelog with too many keys): the same as an eager `TRUNCATE`, without removing each
+   * key from the shared level (its older copies are ignored instead).
+   */
+  private applyBulkChange;
+  /**
+   * Expires every entry, discards the reads started before, ignores the older copies of the shared
+   * level, and forgets the rows of the table.
+   *
+   * @param empty - The table is known to be empty (a `TRUNCATE` read from the changelog); otherwise
+   * the next `getAll` loads it again.
+   */
+  private forgetTable;
+  /** Takes one key of the eager budget: `false` once the budget of this second is spent. */
+  private takeEagerRefresh;
+  /**
    * Whether a change is the one of a write of this instance, and the entry still holds the result
    * of the last write of this instance (nothing else replaced it since): that result is at least
    * as recent as the change. The write is forgotten either way.
@@ -875,6 +953,7 @@ export declare class LilypadDbCache<V extends object, PK extends keyof V = keyof
    * Reads rows by primary key, bounded by `bulkSync.timeout`, and caches them (`null` for the keys
    * without a row).
    *
+   * @param read - Started before the query: its ticket orders the rows among the writes.
    * @param shared - Whether the rows also go to the shared level (and end the failure cooldown of
    * their keys), as a fetch of `getOrFetch` does.
    */
@@ -956,8 +1035,8 @@ export declare class LilypadDbCache<V extends object, PK extends keyof V = keyof
   /**
    * The key of a notified id: the key of the cached entry or of the known row, so that it keeps
    * its original type (a notification may carry a numeric key as a string, or the other way
-   * around), or else the id converted to a number when the schema declares the primary key as a
-   * `number` column.
+   * around), or else the id converted to a number when the primary key holds numbers (declared as a
+   * `number` column, or seen in the rows read).
    */
   private resolveNotifiedKey;
   /**
@@ -971,6 +1050,7 @@ export declare class LilypadDbCache<V extends object, PK extends keyof V = keyof
    * starting is awaited, so that its listener is removed too.
    */
   dispose(): Promise<void>;
+  private disposeResources;
   private getItemPrimaryKeyValue;
   /**
    * Caches the row returned by a write of this instance, and remembers the write, so that its
@@ -1011,5 +1091,5 @@ export declare class LilypadDbCache<V extends object, PK extends keyof V = keyof
   sqlDelete(key: K): Promise<boolean>;
 }
 //#endregion
-export type { LilypadChange, LilypadChangelogCursor, LilypadChangelogPruneOptions, LilypadChangelogPruneScheduleOptions, LilypadChangelogPruning, LilypadChangelogSqlOptions, LilypadChangesRequest, LilypadDbCacheChangelogSync, LilypadDbCacheListenSync, LilypadDbCacheOptions, LilypadDbCacheSchemaVerification, LilypadDbCacheSync, LilypadDbCacheTrustedSyncOptions, LilypadDbColumn, LilypadDbColumnType, LilypadDbDeleteResult, LilypadDbGateOptions, LilypadDbInsertData, LilypadDbKey, LilypadDbListener, LilypadDbNotification, LilypadDbPoolOptions, LilypadDbSchema, LilypadDbUpdateData, LilypadDbWriteResult, LilypadSchemaCheckOptions, LilypadSchemaCheckResult, LilypadSchemaProblem, LilypadSchemaProblemCode, LilypadSchemaProblemSeverity };
+export { type LilypadChange, type LilypadChangelogCursor, type LilypadChangelogPruneOptions, type LilypadChangelogPruneScheduleOptions, type LilypadChangelogPruning, type LilypadChangelogSqlOptions, type LilypadChangesRequest, type LilypadDbCacheChangelogSync, type LilypadDbCacheListenSync, type LilypadDbCacheOptions, type LilypadDbCacheSchemaVerification, type LilypadDbCacheSync, type LilypadDbCacheTrustedSyncOptions, type LilypadDbColumn, type LilypadDbColumnType, type LilypadDbDeleteResult, type LilypadDbGateOptions, type LilypadDbInsertData, type LilypadDbKey, type LilypadDbListener, type LilypadDbNotification, type LilypadDbPoolOptions, type LilypadDbSchema, type LilypadDbUpdateData, type LilypadDbWriteResult, LilypadDisposedError, type LilypadSchemaCheckOptions, type LilypadSchemaCheckResult, type LilypadSchemaProblem, type LilypadSchemaProblemCode, type LilypadSchemaProblemSeverity };
 //# sourceMappingURL=db.d.mts.map

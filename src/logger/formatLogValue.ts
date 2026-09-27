@@ -43,8 +43,10 @@ function isRedacted(key: unknown, redaction: ReadonlySet<string>): boolean {
 
 /**
  * A copy of `value` whose redacted keys hold `[Redacted]`, for the values serialized as JSON later
- * (the context of a record). Plain objects and arrays are copied; errors and objects with a
- * `toJSON` method are kept as they are. It never throws.
+ * (the context of a record). Plain objects and arrays are copied, and errors are kept as they are
+ * (the JSON of a record holds only their name, message and stack). An object with a `toJSON`
+ * method is replaced with the redacted copy of what `toJSON` returns, which is what the JSON would
+ * hold: otherwise its keys would reach the output unredacted. It never throws.
  */
 export function redactLogValue(
   value: unknown,
@@ -58,8 +60,22 @@ export function redactLogValue(
     return '[Circular]';
   }
   try {
-    if (value instanceof Error || typeof (value as { toJSON?: unknown }).toJSON === 'function') {
+    if (value instanceof Error) {
       return value;
+    }
+    const toJSON = (value as { toJSON?: unknown }).toJSON;
+    if (typeof toJSON === 'function') {
+      const json: unknown = toJSON.call(value);
+      // A primitive (e.g. the string of a Date) holds no key: the value is kept as it is
+      if (typeof json !== 'object' || json === null) {
+        return value;
+      }
+      ancestors.add(value);
+      try {
+        return redactLogValue(json, redaction, ancestors);
+      } finally {
+        ancestors.delete(value);
+      }
     }
     ancestors.add(value);
     try {

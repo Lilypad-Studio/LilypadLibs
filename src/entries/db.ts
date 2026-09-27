@@ -3,10 +3,13 @@
  * TCP connections (postgres.js), which must be installed next to the library.
  */
 export {
+  LilypadDbEmptyWriteError,
   LilypadDbGate,
+  LilypadDbMissingPrimaryKeyError,
   LilypadDbNotFoundError,
   lilypadServerlessPool,
 } from '../dbGate/LilypadDbGate';
+export { LilypadDisposedError } from '../cache/LilypadCacheTypes';
 export type {
   LilypadDbColumn,
   LilypadDbColumnType,
@@ -34,6 +37,8 @@ export type {
 
 export {
   LILYPAD_DEFAULT_CHANGELOG_TABLE,
+  LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD,
+  LILYPAD_MIN_CHANGELOG_RETENTION,
   lilypadChangelogPruneScheduleSql,
   lilypadChangelogSql,
   lilypadChangelogTriggerSql,

@@ -38,6 +38,8 @@ export type LilypadSharedLevelOptions<V> = {
   platform?: LilypadPlatform;
   /** Logs a failed operation (the cache's logger may change, e.g. on dispose). */
   warn: (...message: unknown[]) => void;
+  /** Receives the failure of `platform.background` itself (the operation still runs). */
+  onPlatformError?: (error: unknown) => void;
 };
 
 /**
@@ -108,7 +110,9 @@ export class LilypadSharedLevel<V> {
     runInBackground(
       this.options.platform,
       this.operation(description, operation, undefined),
-      () => {}
+      // The operation reports its own failure, and resolves
+      () => {},
+      this.options.onPlatformError
     );
   }
 

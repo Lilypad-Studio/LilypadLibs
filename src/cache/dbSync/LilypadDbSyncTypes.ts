@@ -14,10 +14,14 @@ export type LilypadDbNotification = {
   table: string;
   /**
    * A number when the trigger serializes a numeric primary key as such (e.g. `json_build_object`).
-   * Absent for `TRUNCATE`.
+   * Absent for `TRUNCATE` and `BULK`.
    */
   id?: string | number;
-  op: 'UPDATE' | 'DELETE' | 'INSERT' | 'TRUNCATE';
+  /**
+   * `BULK`: one statement changed more rows than the `notifyBulkThreshold` of the trigger, which
+   * sends this one notification instead of one per row. The cache expires the whole table.
+   */
+  op: 'UPDATE' | 'DELETE' | 'INSERT' | 'TRUNCATE' | 'BULK';
   /**
    * The id of the transaction that made the change (sent by the triggers of version 3). It lets
    * the instance that made the change skip its own writes.
@@ -156,6 +160,12 @@ export interface LilypadDbSyncHost<K extends LilypadCacheKey> {
   ): Promise<K>;
   /** Applies a `TRUNCATE` of the table. @returns The keys that were cached. */
   applyTruncate(mode: LilypadDbChangeMode): K[];
+  /**
+   * Applies a change of too many rows to follow them one by one: every entry is expired (no query,
+   * no removal from the shared level, whose older copies are ignored), and the next `getAll` loads
+   * the table again.
+   */
+  applyBulkChange(): void;
   /** Expires every entry: the changes made meanwhile may have been missed. */
   expireEverything(): void;
   emitInvalidation(

@@ -6,6 +6,7 @@ import {
   formatLilypadSchemaProblems,
   LilypadSchemaCheckError,
   type LilypadChangelogPruning,
+  type LilypadSchemaProblem,
 } from '@/dbGate/LilypadSchemaCheck';
 import { LilypadBackoff } from '@/internal/LilypadBackoff';
 import type { LilypadLibLogLevel } from '@/logger/LilypadLibLogger';
@@ -30,6 +31,33 @@ export type LilypadSchemaVerifierOptions = {
   /** Receives the schema the table resolves to. */
   onSchema: (schema: string) => void;
 };
+
+/**
+ * The problems that concern no table (the changelog, its pruning) already reported for each gate:
+ * the caches of a gate share the changelog, and each of them would report them again.
+ */
+const reportedProblems = new WeakMap<LilypadDbGate, Set<string>>();
+
+/** The problems not reported yet for the gate: the per-table ones, and the others once. */
+function notReportedYet(gate: LilypadDbGate, problems: LilypadSchemaProblem[]) {
+  let reported = reportedProblems.get(gate);
+  if (!reported) {
+    reported = new Set();
+    reportedProblems.set(gate, reported);
+  }
+  const fresh: LilypadSchemaProblem[] = [];
+  for (const problem of problems) {
+    const key = `${problem.code}
+${problem.message}`;
+    if (problem.table !== undefined || !reported.has(key)) {
+      fresh.push(problem);
+      if (problem.table === undefined) {
+        reported.add(key);
+      }
+    }
+  }
+  return fresh;
+}
 
 /**
  * Checks once that the database has the triggers a sync strategy needs, and resolves the schema of
@@ -84,12 +112,17 @@ export class LilypadSchemaVerifier {
       this.options;
     const subject = `LilypadDbCache "${tableName}" (sync: ${strategy})`;
     try {
-      const result = await checkLilypadSchema(gate, {
-        tables: [{ table: tableName, primaryKey }],
-        changelog:
-          strategy === 'changelog' ? { table: changelogTable, pruning, minRetention } : false,
-        notifyChannel: strategy === 'listen' ? LILYPAD_DEFAULT_NOTIFY_CHANNEL : false,
-      });
+      const result = await checkLilypadSchema(
+        gate,
+        {
+          tables: [{ table: tableName, primaryKey }],
+          changelog:
+            strategy === 'changelog' ? { table: changelogTable, pruning, minRetention } : false,
+          notifyChannel: strategy === 'listen' ? LILYPAD_DEFAULT_NOTIFY_CHANNEL : false,
+        },
+        // The caches of a gate check the same changelog: its facts are read once
+        { shareDatabaseFacts: true }
+      );
       const schema = result.tables[0]?.schema;
       if (schema) {
         this.options.onSchema(schema);
@@ -101,7 +134,12 @@ export class LilypadSchemaVerifier {
       if (mode === 'throw' && !result.ok) {
         throw new LilypadSchemaCheckError(subject, result.problems);
       }
-      const message = formatLilypadSchemaProblems(subject, result.problems);
+      // The problems of the changelog were reported by another cache of the gate
+      const problems = notReportedYet(gate, result.problems);
+      if (problems.length === 0) {
+        return true;
+      }
+      const message = formatLilypadSchemaProblems(subject, problems);
       if (this.options.canWarn()) {
         log('warn', message);
       } else {

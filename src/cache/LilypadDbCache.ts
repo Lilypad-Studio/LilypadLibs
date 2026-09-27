@@ -10,6 +10,7 @@ import {
 import { LilypadListenSync } from '@/cache/dbSync/LilypadListenSync';
 import { LilypadSchemaVerifier } from '@/cache/dbSync/LilypadSchemaVerifier';
 import { LilypadCacheCore } from '@/cache/LilypadCacheCore';
+import { LilypadReadFlights } from '@/cache/LilypadReadFlights';
 import type {
   LilypadCacheBulkSyncOptions,
   LilypadCachedValueType,
@@ -18,6 +19,7 @@ import type {
   LilypadCacheKey,
   LilypadCacheOptions,
   LilypadCachePeek,
+  LilypadCacheRead,
   LilypadCacheResult,
 } from '@/cache/LilypadCacheTypes';
 import { lilypadCursorCovers, type LilypadChangelogCursor } from '@/dbGate/LilypadChangelog';
@@ -69,6 +71,12 @@ const DEFAULT_MAX_AGE = 60 * 60 * 1000; // 1 hour
 const FULL_LOAD_RATIO = 0.25;
 /** How long the writes of this instance are remembered, to recognize their changes. */
 const OWN_WRITE_RETENTION = 10 * 60 * 1000;
+/**
+ * The most keys that notifications make this instance re-read per second. Anyone can send a
+ * notification: beyond this budget, the notified keys are only expired, and read again when the
+ * application asks for them, so that a flood of notifications cannot flood the database.
+ */
+const EAGER_REFRESHES_PER_SECOND = 1000;
 
 /**
  * A cache of the rows of one table, kept up to date with the changes made elsewhere.
@@ -128,7 +136,7 @@ export class LilypadDbCache<
   /** The load of the whole table in flight, shared by concurrent callers. */
   private tableLoad?: Promise<Map<string, V>>;
   /** The queries of `fetchRows` in flight, by normalized key. */
-  private rowFetches = new Map<string, Promise<Map<string, LilypadCachedValueType<V>>>>();
+  private rowFetches = new LilypadReadFlights<Map<string, LilypadCachedValueType<V>>>();
   /** The keys to re-read after a notification, gathered into one query (see `refreshInBatch`). */
   private eagerBatch?: { keys: Map<string, K>; done: Promise<void> };
   /** The keys of the batches of `refreshInBatch` pending or running, with their number. */
@@ -147,6 +155,14 @@ export class LilypadDbCache<
    * reflected in it.
    */
   private ownWrites = new Map<string, { ticket: number; xids: Set<bigint>; at: number }>();
+  /** The keys re-read after notifications in the current second, for the eager budget. */
+  private eagerWindow = { start: 0, count: 0 };
+  /**
+   * Whether the primary key holds numbers: declared by `cols[primaryKey].type`, or learned from the
+   * rows read. The ids of notifications and of the changelog are then converted to numbers.
+   */
+  private numericPrimaryKey: boolean;
+  private disposing?: Promise<void>;
 
   /**
    * Creates a cache and, with the `listen` strategy (unless `connect: 'lazy'`), registers its
@@ -208,6 +224,7 @@ export class LilypadDbCache<
 
     this.gate = gate;
     this.schema = schema;
+    this.numericPrimaryKey = schema.cols[schema.primaryKey]?.type === 'number';
     this.maxAge = sync.strategy === 'none' ? 0 : (sync.maxAge ?? DEFAULT_MAX_AGE);
     const tableNameParts = schema.tableName.split('.');
     if (tableNameParts.length > 1) {
@@ -262,6 +279,7 @@ export class LilypadDbCache<
       isDisposed: () => this.disposed,
       applyChange: (op, id, mode, xid) => this.applyChange(op, id, mode, xid),
       applyTruncate: (mode) => this.applyTruncate(mode),
+      applyBulkChange: () => this.applyBulkChange(),
       expireEverything: () => this.expireEverything(),
       emitInvalidation: (source, keys, options) => this.emitInvalidation(source, keys, options),
       forgetOwnWritesCoveredBy: (cursor) => this.forgetOwnWritesCoveredBy(cursor),
@@ -370,9 +388,10 @@ export class LilypadDbCache<
     if (!held) {
       // Nobody asked for this row here: no query, but other instances may have shared it
       this.deleteShared(key);
-    } else if (mode === 'eager') {
+    } else if (mode === 'eager' && this.takeEagerRefresh()) {
       await this.refreshInBatch(key);
     } else {
+      // A change read from the changelog, or a notification beyond the eager budget
       this.markInvalid(key);
     }
     return key;
@@ -391,14 +410,44 @@ export class LilypadDbCache<
     for (const key of keys) {
       this.deleteShared(key);
     }
+    this.forgetTable(mode === 'lazy');
+    return keys;
+  }
+
+  /**
+   * Applies a change of too many rows to follow them one by one (a `BULK` notification, or a read
+   * of the changelog with too many keys): the same as an eager `TRUNCATE`, without removing each
+   * key from the shared level (its older copies are ignored instead).
+   */
+  private applyBulkChange() {
+    this.forgetTable(false);
+  }
+
+  /**
+   * Expires every entry, discards the reads started before, ignores the older copies of the shared
+   * level, and forgets the rows of the table.
+   *
+   * @param empty - The table is known to be empty (a `TRUNCATE` read from the changelog); otherwise
+   * the next `getAll` loads it again.
+   */
+  private forgetTable(empty: boolean) {
     this.expireEverything();
     this.rejectSharedBefore(Date.now());
     this.membersFloor = this.nextTicket();
     this.members.clear();
-    if (mode === 'eager') {
+    if (!empty) {
       this.membersLoadedAt = undefined;
     }
-    return keys;
+  }
+
+  /** Takes one key of the eager budget: `false` once the budget of this second is spent. */
+  private takeEagerRefresh(): boolean {
+    const now = Date.now();
+    if (now - this.eagerWindow.start >= 1000) {
+      this.eagerWindow = { start: now, count: 0 };
+    }
+    this.eagerWindow.count++;
+    return this.eagerWindow.count <= EAGER_REFRESHES_PER_SECOND;
   }
 
   /**
@@ -451,6 +500,13 @@ export class LilypadDbCache<
 
   /** Follows the values stored in the cache: a row is a row of the table, `null` is not. */
   protected override onValueStored(entry: LilypadCacheEntry<K, V>): void {
+    if (
+      !this.numericPrimaryKey &&
+      entry.value !== null &&
+      typeof entry.value[this.schema.primaryKey] === 'number'
+    ) {
+      this.numericPrimaryKey = true;
+    }
     // A fallback value after an error says nothing about the table
     if (this.membersLoadedAt === undefined || entry.origin === 'fallback') {
       return;
@@ -568,26 +624,18 @@ export class LilypadDbCache<
     const toFetch = new Map<string, K>();
     for (const key of keys) {
       const normalizedKey = this.normalizeKey(key);
-      const inFlight = this.rowFetches.get(normalizedKey);
-      if (inFlight) {
-        pending.add(inFlight);
+      // Not a query started before the last change of the key: it may return the old row
+      const joined = this.rowFetches.join(normalizedKey, this.currentTicket(normalizedKey));
+      if (joined) {
+        pending.add(joined);
       } else {
         toFetch.set(normalizedKey, key);
       }
     }
     if (toFetch.size > 0) {
-      const fetching = this.queryRows([...toFetch.values()]);
-      for (const normalizedKey of toFetch.keys()) {
-        this.rowFetches.set(normalizedKey, fetching);
-      }
-      const cleanup = () => {
-        for (const normalizedKey of toFetch.keys()) {
-          if (this.rowFetches.get(normalizedKey) === fetching) {
-            this.rowFetches.delete(normalizedKey);
-          }
-        }
-      };
-      void fetching.then(cleanup, cleanup);
+      const read = this.beginRead();
+      const fetching = this.queryRows([...toFetch.values()], read);
+      this.rowFetches.start(toFetch.keys(), read.ticket, fetching);
       pending.add(fetching);
     }
     const values = new Map<string, LilypadCachedValueType<V>>();
@@ -603,17 +651,18 @@ export class LilypadDbCache<
    * Reads rows by primary key, bounded by `bulkSync.timeout`, and caches them (`null` for the keys
    * without a row).
    *
+   * @param read - Started before the query: its ticket orders the rows among the writes.
    * @param shared - Whether the rows also go to the shared level (and end the failure cooldown of
    * their keys), as a fetch of `getOrFetch` does.
    */
   private async queryRows(
     keys: K[],
+    read: LilypadCacheRead<K, V>,
     shared: boolean = false
   ): Promise<Map<string, LilypadCachedValueType<V>>> {
     const primaryKey = this.schema.primaryKey;
     try {
       return await this.bulkSyncFlowControl.executeWithTimeout(async (signal) => {
-        const read = this.beginRead();
         const rows = new Map<string, V>();
         for (const row of await this.gate.selectFromTableByPrimaryKeys<V, PK>(this.schema, keys)) {
           rows.set(this.normalizeKey(row[primaryKey] as K), row);
@@ -832,7 +881,7 @@ export class LilypadDbCache<
   private async runEagerBatch(keys: Map<string, K>): Promise<void> {
     try {
       if (!this.disposed) {
-        await this.queryRows([...keys.values()], true);
+        await this.queryRows([...keys.values()], this.beginRead(), true);
       }
     } catch {
       // Logged by queryRows: the next read of these keys fetches them
@@ -903,8 +952,8 @@ export class LilypadDbCache<
   /**
    * The key of a notified id: the key of the cached entry or of the known row, so that it keeps
    * its original type (a notification may carry a numeric key as a string, or the other way
-   * around), or else the id converted to a number when the schema declares the primary key as a
-   * `number` column.
+   * around), or else the id converted to a number when the primary key holds numbers (declared as a
+   * `number` column, or seen in the rows read).
    */
   private resolveNotifiedKey(id: string | number): K {
     const normalizedKey = String(id);
@@ -912,8 +961,7 @@ export class LilypadDbCache<
     if (known !== undefined) {
       return known;
     }
-    const { cols, primaryKey } = this.schema;
-    if (typeof id === 'string' && cols[primaryKey]?.type === 'number') {
+    if (typeof id === 'string' && this.numericPrimaryKey) {
       const numeric = Number(id);
       // Only when the conversion is exact (not e.g. a bigint beyond 2^53)
       if (Number.isFinite(numeric) && String(numeric) === id) {
@@ -936,10 +984,13 @@ export class LilypadDbCache<
    * the singleton registry (if it was created as a singleton) and clears it. A `LISTEN` still
    * starting is awaited, so that its listener is removed too.
    */
-  override async dispose(): Promise<void> {
-    if (this.disposed) {
-      return;
-    }
+  override dispose(): Promise<void> {
+    // The same promise for every call: a second caller also waits until the listener is removed
+    this.disposing ??= this.disposeResources();
+    return this.disposing;
+  }
+
+  private async disposeResources(): Promise<void> {
     this.releaseSingleton();
     await super.dispose();
     this.members.clear();

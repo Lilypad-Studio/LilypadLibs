@@ -3,7 +3,7 @@
  * in edge runtimes. The database-backed cache is in `@lilypad/libs/db`.
  */
 export { LilypadCache } from '../cache/LilypadCache';
-export { LilypadCacheCooldownError } from '../cache/LilypadCacheTypes';
+export { LilypadCacheCooldownError, LilypadDisposedError } from '../cache/LilypadCacheTypes';
 export type {
   LilypadCacheBulkSyncOptions,
   LilypadCacheEntryOrigin,
