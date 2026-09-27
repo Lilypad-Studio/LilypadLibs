@@ -1,8 +1,9 @@
 /**
- * The type of a column. For a primary key it tells `LilypadDbCache` how to read the ids that
- * notifications and the changelog carry as text: `number` converts them to numbers; `string` and
- * `bigint` keep them as strings. Declare `bigint`/`bigserial` columns as `bigint`: postgres.js
- * returns them as strings, so their keys and the row property are strings (type them as such).
+ * The type of a column, as the application sees it. For a primary key it tells `LilypadDbCache` how
+ * to read the ids that notifications and the changelog carry as text: `number` converts them to
+ * numbers; `string` and `bigint` keep them as strings. Declare `bigint`/`bigserial` columns as
+ * `bigint`: postgres.js returns them as strings, so their keys and the row property are strings
+ * (type them as such). `lilypad-doctor` also checks that the database type fits it (see `pgType`).
  */
 export type LilypadDbColumnType =
   | 'string'
@@ -14,12 +15,102 @@ export type LilypadDbColumnType =
   | 'array';
 
 /**
+ * The default of a column: `true` when the database has one (whatever it is), or its SQL
+ * expression (e.g. `{ sql: 'now()' }`), which `lilypad-doctor` uses in the SQL that fixes the table.
+ * The expression is not compared with the installed one.
+ */
+export type LilypadDbColumnDefault = true | { sql: string };
+
+/**
+ * What the database does to the rows that reference a row that is deleted or updated.
+ * Defaults to `no action`.
+ */
+export type LilypadDbReferentialAction =
+  | 'no action'
+  | 'restrict'
+  | 'cascade'
+  | 'set null'
+  | 'set default';
+
+/** The access method of an index. Defaults to `btree`. */
+export type LilypadDbIndexMethod = 'btree' | 'hash' | 'gin' | 'gist' | 'brin' | 'spgist';
+
+/** A column name of the row type. */
+export type LilypadDbColumnName<T> = keyof T & string;
+
+/**
+ * The table a foreign key references: `table` or `schema.table`. An unqualified name is the table
+ * of the config with this `tableName`, or else a table of the `defaultSchema` of the config.
+ */
+export type LilypadDbReference = {
+  table: string;
+  /**
+   * The referenced columns, in the order of the columns of the foreign key. Defaults to the primary
+   * key of the referenced table, when it is a table of the config.
+   */
+  columns?: readonly string[];
+  onDelete?: LilypadDbReferentialAction;
+  onUpdate?: LilypadDbReferentialAction;
+};
+
+/** The foreign key of one column (the `references` of a column). */
+export type LilypadDbColumnReference = Omit<LilypadDbReference, 'columns'> & {
+  /** The referenced column. Defaults to the primary key of the referenced table. */
+  column?: string;
+};
+
+/** A foreign key of the table, on one or several columns. */
+export type LilypadDbForeignKey<T> = {
+  /** The name of the constraint, used by the SQL that creates it. It is not compared. */
+  name?: string;
+  columns: readonly LilypadDbColumnName<T>[];
+  references: LilypadDbReference;
+};
+
+/**
+ * A set of columns whose values are unique together: a unique constraint, a unique index (neither
+ * partial nor on expressions) or the primary key satisfies it.
+ */
+export type LilypadDbUniqueKey<T> = {
+  /** The name of the constraint, used by the SQL that creates it. It is not compared. */
+  name?: string;
+  columns: readonly LilypadDbColumnName<T>[];
+};
+
+/** An index on columns of the table (neither partial nor on expressions). */
+export type LilypadDbIndex<T> = {
+  /** The name of the index, used by the SQL that creates it. It is not compared. */
+  name?: string;
+  /** The columns, in the order of the index. */
+  columns: readonly LilypadDbColumnName<T>[];
+  unique?: boolean;
+  using?: LilypadDbIndexMethod;
+};
+
+/**
+ * A `CHECK` constraint, found by its name (its expression is not compared: PostgreSQL rewrites it).
+ * With an `expression`, the SQL that fixes the table creates it.
+ */
+export type LilypadDbCheck = { name: string; expression?: string };
+
+/**
+ * The description of a table: what the library reads and writes, and what `lilypad-doctor`
+ * expects to find in the database. Define it with `defineLilypadTable`, in a config file (see
+ * `defineLilypadDb`).
+ *
  * @typeParam T - The row type.
- * @typeParam PK - The primary key column. Declare it (e.g. `LilypadDbSchema<User, 'id'>`) to get
+ * @typeParam PK - The primary key column. Declare it (e.g. `defineLilypadTable<User, 'id'>`) to get
  * precise types for inserts and updates; it defaults to any column of `T`.
  */
 export type LilypadDbSchema<T, PK extends keyof T = keyof T> = {
+  /** The table, unqualified (`users`), or qualified (`app.users`) instead of `schemaName`. */
   tableName: string;
+  /** The PostgreSQL schema of the table. Defaults to the `defaultSchema` of the config. */
+  schemaName?: string;
+  /**
+   * The primary key: one column, whose values are the keys of `LilypadDbCache`. `lilypad-doctor`
+   * checks that it is the primary key of the table.
+   */
   primaryKey: PK;
   /**
    * The database generates the primary key (e.g. `serial`, `identity`, a default): inserts leave
@@ -37,17 +128,40 @@ export type LilypadDbSchema<T, PK extends keyof T = keyof T> = {
    * - Without a `selectSanitizationFn`, only these columns are selected.
    * - Only these columns are written by inserts and updates: any other property of the data is ignored.
    *
-   * The metadata is optional. Only the `type` of the primary key is used: with `number`,
-   * `LilypadDbCache` converts to numbers the ids that notifications and the changelog carry as text.
+   * At runtime, only the `type` of the primary key is used: with `number`, `LilypadDbCache` converts
+   * to numbers the ids that notifications and the changelog carry as text. `lilypad-doctor` checks
+   * the rest against the database.
    */
-  cols: { [K in keyof T]: LilypadDbColumn<T[K]> };
+  cols: { [K in keyof T]: LilypadDbColumn };
+  /** The sets of columns that are unique together (see also the `unique` of a column). */
+  unique?: readonly LilypadDbUniqueKey<T>[];
+  /** The foreign keys of the table (see also the `references` of a column). */
+  foreignKeys?: readonly LilypadDbForeignKey<T>[];
+  indexes?: readonly LilypadDbIndex<T>[];
+  checks?: readonly LilypadDbCheck[];
 };
 
-/** The metadata of a column. `nullable` and `default` are descriptive: the library ignores them. */
-export type LilypadDbColumn<V = unknown> = {
+/**
+ * The metadata of a column. The library reads only the `type` of the primary key at runtime;
+ * `lilypad-doctor` compares the rest with the database.
+ */
+export type LilypadDbColumn = {
   type?: LilypadDbColumnType;
+  /**
+   * The exact PostgreSQL type (e.g. `uuid`, `int4`, `varchar(64)`, `timestamptz`, `text[]`),
+   * compared with the installed one; common aliases are accepted (`int4` is `integer`). Without it,
+   * `lilypad-doctor` only checks that the database type fits `type`, and cannot generate the SQL
+   * that creates the column.
+   */
+  pgType?: string;
+  /** Whether the column accepts `NULL`. Checked when set. */
   nullable?: boolean;
-  default?: V | null;
+  /** Whether the column has a default (see {@link LilypadDbColumnDefault}). Checked when set. */
+  default?: LilypadDbColumnDefault;
+  /** The values of the column are unique (a unique key on this column alone). */
+  unique?: boolean;
+  /** The column is a foreign key to this table. */
+  references?: LilypadDbColumnReference;
 };
 
 /** The data of an insert: the primary key can be omitted when the database generates it. */

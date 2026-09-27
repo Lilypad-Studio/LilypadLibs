@@ -3,7 +3,6 @@ import type {
   LilypadDbSyncHost,
   LilypadDbSyncStrategy,
 } from '@/cache/dbSync/LilypadDbSyncTypes';
-import type { LilypadSchemaVerifier } from '@/cache/dbSync/LilypadSchemaVerifier';
 import type { LilypadCacheKey } from '@/cache/LilypadCacheTypes';
 import type {
   LilypadChange,
@@ -16,10 +15,9 @@ import {
   type LilypadChangelogReader,
   type LilypadChangelogSubscriber,
 } from '@/dbGate/LilypadChangelogReader';
+import { LILYPAD_DEFAULT_MAX_GAP } from '@/dbConfig/LilypadDbConfigDefaults';
 import { LilypadBackoff } from '@/internal/LilypadBackoff';
 import { runInBackground } from '@/platform/LilypadPlatform';
-
-export const DEFAULT_MAX_GAP = 60 * 60 * 1000; // 1 hour
 
 /**
  * Above this number of changed keys in one read, the table is expired as a whole instead of key by
@@ -73,8 +71,7 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
 
   constructor(
     private readonly host: LilypadDbSyncHost<K>,
-    private readonly options: LilypadDbCacheChangelogSync,
-    private readonly verifier: LilypadSchemaVerifier
+    private readonly options: LilypadDbCacheChangelogSync
   ) {
     this.backoff = new LilypadBackoff(() => Math.max(options.pollInterval, 1000));
     this.reader = getLilypadChangelogReader(host.gate, options.table);
@@ -86,7 +83,7 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
   }
 
   private get maxGap(): number {
-    return this.options.maxGap ?? DEFAULT_MAX_GAP;
+    return this.options.maxGap ?? LILYPAD_DEFAULT_MAX_GAP;
   }
 
   start(): Promise<void> {
@@ -98,7 +95,6 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
     if (now - this.lastRead < this.options.pollInterval || !this.backoff.ready(now)) {
       return undefined;
     }
-    this.verifier.checkInBackground(now);
     const reading = this.read();
     if (this.options.poll === 'background') {
       runInBackground(this.host.platform, reading, () => {});

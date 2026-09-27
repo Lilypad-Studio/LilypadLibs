@@ -1,31 +1,30 @@
 import { parseArgs } from 'node:util';
+import type { LilypadDbConfig } from '@/dbConfig/LilypadDbConfig';
+import { loadLilypadDbConfig } from '@/dbConfig/loadLilypadDbConfig';
 import {
   runLilypadDoctor,
   type LilypadDoctorOptions,
   type LilypadDoctorReport,
 } from '@/dbGate/LilypadDoctor';
-import type { LilypadChangelogPruning } from '@/dbGate/LilypadSchemaCheck';
 
 const USAGE = `Usage: lilypad-doctor [options]
 
-Checks that the database has what the LilypadDbCache instances need: the changelog, its triggers,
-the notification triggers, and how the changelog is pruned. It only reads the catalogs.
+Checks the database against a config (see defineLilypadDb): the tables, their columns, keys,
+foreign keys, indexes and checks, the triggers of the sync strategies, the changelog and how it is
+pruned. It only reads the catalogs, and prints the SQL that fixes what it finds.
 
 Options:
-  --url <connection string>   The database (default: the DATABASE_URL environment variable)
-  --table <table>[:<key>]     A cached table and its primary key (default key: id); repeatable
-  --changelog-table <name>    The changelog table, if not lilypad_cache_changes
-  --no-changelog              No cache reads a changelog (the listen strategy only)
-  --notify-channel <channel>  Also check the triggers that notify this channel (e.g. cache_events)
-  --pruning <mode>            detect (default), trigger, cron or external
-  --min-retention <ms>        The largest maxGap and lookback of the caches (default: 1 hour)
-  --json                      Print the result as JSON
-  -h, --help                  Print this help
+  --config <name|path>  The config: a name finds lilypad.<name>.config.{ts,mts,mjs,js} in the
+                        working directory; without it, lilypad.config.* (the "default" config)
+  --url <connection>    The database (default: the DATABASE_URL environment variable)
+  --sql                 Print only the SQL that fixes the problems (for a migration)
+  --json                Print the result as JSON
+  -h, --help            Print this help
 
-Exit code: 0 when nothing prevents the caches from working (warnings may be printed), 1 when the
-database is not set up, 2 when the check could not run.`;
+A TypeScript config needs Node.js 22.18 or later (or NODE_OPTIONS=--experimental-strip-types).
 
-const PRUNING_MODES = new Set<string>(['detect', 'trigger', 'cron', 'external']);
+Exit code: 0 when the database matches the config (warnings may be printed), 1 when it does not,
+2 when the check could not run (invalid arguments, config not found, unreachable database).`;
 
 /** Where the command writes. */
 export type LilypadDoctorOutput = {
@@ -33,14 +32,16 @@ export type LilypadDoctorOutput = {
   error(message: string): void;
 };
 
-/** A cached table given as `table` or `table:primaryKey` (the table may be `schema.table`). */
-function parseTable(spec: string): { table: string; primaryKey: string } {
-  const separator = spec.lastIndexOf(':');
-  if (separator <= 0) {
-    return { table: spec, primaryKey: 'id' };
-  }
-  return { table: spec.slice(0, separator), primaryKey: spec.slice(separator + 1) || 'id' };
-}
+export type LilypadDoctorArgs =
+  | { help: true }
+  | {
+      help: false;
+      json: boolean;
+      sql: boolean;
+      connectionString: string;
+      /** The name or path of the config (`undefined`: the default one). */
+      config?: string;
+    };
 
 /**
  * The options of the command line, or the help.
@@ -50,19 +51,15 @@ function parseTable(spec: string): { table: string; primaryKey: string } {
 export function parseLilypadDoctorArgs(
   argv: string[],
   env: Record<string, string | undefined>
-): { help: true } | { help: false; json: boolean; options: LilypadDoctorOptions } {
+): LilypadDoctorArgs {
   const { values } = parseArgs({
     args: argv,
     strict: true,
     allowPositionals: false,
     options: {
+      config: { type: 'string' },
       url: { type: 'string' },
-      table: { type: 'string', multiple: true },
-      'changelog-table': { type: 'string' },
-      'no-changelog': { type: 'boolean' },
-      'notify-channel': { type: 'string' },
-      pruning: { type: 'string' },
-      'min-retention': { type: 'string' },
+      sql: { type: 'boolean' },
       json: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
     },
@@ -74,49 +71,47 @@ export function parseLilypadDoctorArgs(
   if (!connectionString) {
     throw new Error('Pass --url, or set DATABASE_URL.');
   }
-  const pruning = values.pruning;
-  if (pruning !== undefined && !PRUNING_MODES.has(pruning)) {
-    throw new Error(`--pruning must be one of ${[...PRUNING_MODES].join(', ')}.`);
+  if (values.sql && values.json) {
+    throw new Error('--sql and --json cannot be used together.');
   }
-  const minRetention =
-    values['min-retention'] === undefined ? undefined : Number(values['min-retention']);
-  if (minRetention !== undefined && !(Number.isFinite(minRetention) && minRetention > 0)) {
-    throw new Error('--min-retention must be a positive number of milliseconds.');
-  }
-  if (values['no-changelog'] && values['changelog-table'] !== undefined) {
-    throw new Error('--no-changelog and --changelog-table cannot be used together.');
+  if (values.config !== undefined && values.config.trim() === '') {
+    throw new Error('--config needs the name or the path of a config.');
   }
   return {
     help: false,
     json: values.json ?? false,
-    options: {
-      connectionString,
-      tables: (values.table ?? []).map(parseTable),
-      changelog: values['no-changelog']
-        ? false
-        : {
-            table: values['changelog-table'],
-            pruning: pruning as LilypadChangelogPruning | undefined,
-            minRetention,
-          },
-      notifyChannel: values['notify-channel'] ?? false,
-    },
+    sql: values.sql ?? false,
+    connectionString,
+    config: values.config,
   };
+}
+
+/** What the command uses, replaceable in tests. */
+export type LilypadDoctorCliDependencies = {
+  run?: (options: LilypadDoctorOptions) => Promise<LilypadDoctorReport>;
+  load?: (options: { config?: string }) => Promise<{ path: string; config: LilypadDbConfig }>;
+};
+
+/** The SQL that fixes the problems, once each, in the order of the problems. */
+function fixSql(report: LilypadDoctorReport): string {
+  return [
+    ...new Set(report.problems.flatMap((problem) => (problem.fix ? [problem.fix] : []))),
+  ].join('\n');
 }
 
 /**
  * Runs `lilypad-doctor` with these arguments.
  *
  * @returns The exit code: 0 without errors (there may be warnings), 1 with errors, 2 when the
- * check could not run (invalid arguments, unreachable database).
+ * check could not run (invalid arguments, config not found, unreachable database).
  */
 export async function runLilypadDoctorCli(
   argv: string[],
   env: Record<string, string | undefined>,
   output: LilypadDoctorOutput,
-  run: (options: LilypadDoctorOptions) => Promise<LilypadDoctorReport> = runLilypadDoctor
+  { run = runLilypadDoctor, load = loadLilypadDbConfig }: LilypadDoctorCliDependencies = {}
 ): Promise<number> {
-  let parsed: ReturnType<typeof parseLilypadDoctorArgs>;
+  let parsed: LilypadDoctorArgs;
   try {
     parsed = parseLilypadDoctorArgs(argv, env);
   } catch (error) {
@@ -127,11 +122,21 @@ export async function runLilypadDoctorCli(
     output.log(USAGE);
     return 0;
   }
+  let config: LilypadDbConfig;
   try {
-    const report = await run(parsed.options);
+    ({ config } = await load({ config: parsed.config }));
+  } catch (error) {
+    output.error(`lilypad-doctor: ${error instanceof Error ? error.message : String(error)}`);
+    return 2;
+  }
+  try {
+    const report = await run({ connectionString: parsed.connectionString, config });
     if (parsed.json) {
-      const { text: _text, ...result } = report;
+      const { text: _text, assertOk: _assertOk, ...result } = report;
       output.log(JSON.stringify(result, null, 2));
+    } else if (parsed.sql) {
+      const sql = fixSql(report);
+      output.log(sql === '' ? '-- lilypad-doctor: nothing to fix.' : sql);
     } else if (report.ok) {
       output.log(report.text);
     } else {

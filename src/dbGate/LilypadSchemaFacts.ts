@@ -27,6 +27,52 @@ export type LilypadTriggerInfo = {
   newTable?: string | null;
 };
 
+/** A column of a table (`pg_attribute`). */
+export type LilypadColumnInfo = {
+  name: string;
+  /** `format_type(atttypid, atttypmod)`, e.g. `character varying(64)`, `integer[]`. */
+  type: string;
+  /** `pg_type.typcategory`, e.g. `N` (numeric), `S` (string), `A` (array). */
+  category: string;
+  notNull: boolean;
+  /** Whether it has a default expression (`atthasdef`; a generated column has one too). */
+  hasDefault: boolean;
+  /** An identity column (`GENERATED ... AS IDENTITY`). */
+  identity: boolean;
+  /** A generated column (`GENERATED ALWAYS AS (...) STORED`). */
+  generated: boolean;
+};
+
+/** A constraint of a table (`pg_constraint`): primary key, unique, foreign key or check. */
+export type LilypadConstraintInfo = {
+  name: string;
+  /** `p` (primary key), `u` (unique), `f` (foreign key) or `c` (check). */
+  type: 'p' | 'u' | 'f' | 'c';
+  columns: string[];
+  /** The referenced table of a foreign key, as `schema.table` (`null` otherwise). */
+  referencedTable: string | null;
+  /** The referenced columns of a foreign key, in the order of `columns`. */
+  referencedColumns: string[];
+  /** `confdeltype` / `confupdtype` of a foreign key: `a`, `r`, `c`, `n` or `d`. */
+  onDelete: string;
+  onUpdate: string;
+};
+
+/** An index of a table (`pg_index`). */
+export type LilypadIndexInfo = {
+  name: string;
+  unique: boolean;
+  primary: boolean;
+  /** The access method, e.g. `btree`. */
+  method: string;
+  /** Its key columns, in order (`null` for an expression). */
+  columns: (string | null)[];
+  partial: boolean;
+  expressions: boolean;
+  /** Whether it implements a constraint (a primary key, a unique or exclusion constraint). */
+  constraint: boolean;
+};
+
 /** A job of `cron.job` (pg_cron), as far as the role of the check can see it. */
 export type LilypadCronJobInfo = {
   /** `jobid` (`null` if the table has no such column). */
@@ -82,7 +128,19 @@ export type LilypadSchemaFacts = {
     jobs: LilypadCronJobInfo[] | null;
   };
   /** For each table of the options, in order: `schema` is `null` if the table does not exist. */
-  tables: { schema: string | null; triggers: LilypadTriggerInfo[] }[];
+  tables: LilypadTableFacts[];
+};
+
+/**
+ * What the check reads of a table. Its columns, constraints and indexes are read for the tables
+ * whose shape is checked (absent otherwise).
+ */
+export type LilypadTableFacts = {
+  schema: string | null;
+  triggers: LilypadTriggerInfo[];
+  columns?: LilypadColumnInfo[];
+  constraints?: LilypadConstraintInfo[];
+  indexes?: LilypadIndexInfo[];
 };
 
 /** A `json` column: postgres.js parses it, unless the type is not registered yet. */
@@ -196,7 +254,10 @@ async function readDatabaseFacts(
   };
 }
 
-/** For each table of the options, in order, its schema and its triggers: one query for all. */
+/**
+ * For each table of the options, in order, its schema, its triggers, and, when its shape is checked,
+ * its columns, constraints and indexes: one query for all.
+ */
 async function readTableFacts(
   gate: LilypadDbGate,
   options: LilypadSchemaCheckOptions
@@ -204,6 +265,73 @@ async function readTableFacts(
   const sql = gate.sql;
   const changelog = readChangelogTarget(options);
   const tableRefs = options.tables.map(({ table }) => quoteIdentifier(table));
+  const withShape = options.tables.some((table) => table.shape !== undefined);
+  const shapeColumns = withShape
+    ? sql`,
+      (
+        SELECT coalesce(json_agg(json_build_object(
+          'name', a.attname,
+          'type', format_type(a.atttypid, a.atttypmod),
+          'category', ty.typcategory,
+          'notNull', a.attnotnull,
+          'hasDefault', a.atthasdef,
+          'identity', a.attidentity <> '',
+          'generated', a.attgenerated <> ''
+        ) ORDER BY a.attnum), '[]'::json)
+        FROM pg_attribute a JOIN pg_type ty ON ty.oid = a.atttypid
+        WHERE a.attrelid = t.oid AND a.attnum > 0 AND NOT a.attisdropped
+      ) AS columns,
+      (
+        SELECT coalesce(json_agg(json_build_object(
+          'name', con.conname,
+          'type', con.contype,
+          'columns', (
+            SELECT coalesce(json_agg(a.attname ORDER BY k.ord), '[]'::json)
+            FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum
+          ),
+          'referencedTable', (
+            SELECT rn.nspname || '.' || rc.relname
+            FROM pg_class rc JOIN pg_namespace rn ON rn.oid = rc.relnamespace
+            WHERE rc.oid = con.confrelid
+          ),
+          'referencedColumns', (
+            SELECT coalesce(json_agg(a.attname ORDER BY k.ord), '[]'::json)
+            FROM unnest(con.confkey) WITH ORDINALITY AS k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.attnum
+          ),
+          'onDelete', con.confdeltype,
+          'onUpdate', con.confupdtype
+        )), '[]'::json)
+        FROM pg_constraint con
+        WHERE con.conrelid = t.oid AND con.contype IN ('p', 'u', 'f', 'c')
+      ) AS constraints,
+      (
+        SELECT coalesce(json_agg(json_build_object(
+          'name', ic.relname,
+          'unique', ix.indisunique,
+          'primary', ix.indisprimary,
+          'method', am.amname,
+          -- The key columns only (not INCLUDE), NULL for an expression
+          'columns', (
+            SELECT coalesce(json_agg(a.attname ORDER BY k.ord), '[]'::json)
+            FROM unnest(ix.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+            LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.attnum
+            WHERE k.ord <= ix.indnkeyatts
+          ),
+          'partial', ix.indpred IS NOT NULL,
+          'expressions', ix.indexprs IS NOT NULL,
+          'constraint', EXISTS (
+            SELECT 1 FROM pg_constraint ic_con
+            WHERE ic_con.conindid = ix.indexrelid AND ic_con.conrelid = ix.indrelid
+          )
+        )), '[]'::json)
+        FROM pg_index ix
+        JOIN pg_class ic ON ic.oid = ix.indexrelid
+        JOIN pg_am am ON am.oid = ic.relam
+        WHERE ix.indrelid = t.oid
+      ) AS indexes`
+    : sql``;
   const found =
     tableRefs.length === 0
       ? []
@@ -225,73 +353,31 @@ async function readTableFacts(
         FROM pg_trigger tr JOIN pg_proc p ON p.oid = tr.tgfoid
         WHERE tr.tgrelid = t.oid AND NOT tr.tgisinternal
       ) AS triggers
+      ${shapeColumns}
     FROM unnest(${textArrayLiteral(tableRefs)}::text[]) WITH ORDINALITY AS requested(ref, position)
     JOIN pg_class t ON t.oid = to_regclass(requested.ref)
     JOIN pg_namespace n ON n.oid = t.relnamespace
   `;
   const byPosition = new Map(found.map((row) => [Number(row.position), row]));
-  const tables: LilypadSchemaFacts['tables'] = options.tables.map((_, index) => {
+  const tables: LilypadSchemaFacts['tables'] = options.tables.map((table, index) => {
     const row = byPosition.get(index + 1);
-    return row
-      ? {
-          schema: row.schema_name as string,
-          triggers: parseJsonColumn(row.triggers) as LilypadTriggerInfo[],
-        }
-      : { schema: null, triggers: [] };
+    if (!row) {
+      return { schema: null, triggers: [] };
+    }
+    const facts: LilypadTableFacts = {
+      schema: row.schema_name as string,
+      triggers: parseJsonColumn(row.triggers) as LilypadTriggerInfo[],
+    };
+    if (table.shape !== undefined) {
+      facts.columns = parseJsonColumn(row.columns) as LilypadColumnInfo[];
+      facts.constraints = parseJsonColumn(row.constraints) as LilypadConstraintInfo[];
+      facts.indexes = parseJsonColumn(row.indexes) as LilypadIndexInfo[];
+    }
+    return facts;
   });
 
   return tables;
 }
-
-/** How long the caches of a gate share the facts of the database (see `shareDatabaseFacts`). */
-const SHARED_FACTS_LIFETIME = 60_000;
-const sharedFacts = new WeakMap<
-  LilypadDbGate,
-  Map<string, { readAt: number; facts: Promise<LilypadDatabaseFacts> }>
->();
-
-/**
- * The facts of the database, shared by the checks of the caches of a gate made within a minute:
- * N caches read them once. A failed read is not shared.
- */
-function sharedDatabaseFacts(
-  gate: LilypadDbGate,
-  options: LilypadSchemaCheckOptions
-): Promise<LilypadDatabaseFacts> {
-  let gateFacts = sharedFacts.get(gate);
-  if (!gateFacts) {
-    gateFacts = new Map();
-    sharedFacts.set(gate, gateFacts);
-  }
-  // The facts of the pruning are read only when it is checked
-  const key = JSON.stringify([
-    readChangelogTarget(options).table,
-    options.changelog !== false && options.changelog?.checkPruning !== false,
-  ]);
-  const now = Date.now();
-  const shared = gateFacts.get(key);
-  if (shared && now - shared.readAt < SHARED_FACTS_LIFETIME) {
-    return shared.facts;
-  }
-  const facts = readDatabaseFacts(gate, options);
-  const entry = { readAt: now, facts };
-  gateFacts.set(key, entry);
-  facts.catch(() => {
-    if (gateFacts.get(key) === entry) {
-      gateFacts.delete(key);
-    }
-  });
-  return facts;
-}
-
-/** How `checkLilypadSchema` is called by the library itself. */
-export type LilypadSchemaCheckContext = {
-  /**
-   * Reuses the facts of the database read by another check of the same gate less than a minute
-   * ago (the caches of a gate check the same changelog).
-   */
-  shareDatabaseFacts?: boolean;
-};
 
 /**
  * Reads from the catalogs what {@link evaluateLilypadSchema} needs. It changes nothing.
@@ -300,13 +386,10 @@ export type LilypadSchemaCheckContext = {
  */
 export async function readLilypadSchemaFacts(
   gate: LilypadDbGate,
-  options: LilypadSchemaCheckOptions,
-  context: LilypadSchemaCheckContext = {}
+  options: LilypadSchemaCheckOptions
 ): Promise<LilypadSchemaFacts> {
   const [database, tables] = await Promise.all([
-    context.shareDatabaseFacts
-      ? sharedDatabaseFacts(gate, options)
-      : readDatabaseFacts(gate, options),
+    readDatabaseFacts(gate, options),
     readTableFacts(gate, options),
   ]);
   return { ...database, tables };

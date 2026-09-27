@@ -78,14 +78,22 @@ src/
 │   └── dbSync/
 │       ├── LilypadDbSyncTypes.ts   sync options, the strategy and host interfaces
 │       ├── LilypadListenSync.ts    the `listen` strategy
-│       ├── LilypadChangelogSync.ts the `changelog` strategy
-│       └── LilypadSchemaVerifier.ts the once-per-cache schema check
+│       └── LilypadChangelogSync.ts the `changelog` strategy
+├── dbConfig/
+│   ├── LilypadDbConfig.ts          defineLilypadDb / defineLilypadTable: the database configs
+│   ├── LilypadDbConfigValidation.ts the checks of a config (never of the database)
+│   └── loadLilypadDbConfig.ts      finds and imports a config file (Node.js only)
 ├── dbGate/
-│   ├── LilypadDbGate.ts            postgres.js wrapper, CRUD, LISTEN
+│   ├── LilypadDbGate.ts            postgres.js wrapper, table handles, LISTEN
+│   ├── LilypadDbTable.ts           the CRUD helpers of one table
 │   ├── LilypadListenHeartbeat.ts   is the LISTEN connection still delivering?
 │   ├── LilypadChangelog.ts         changelog SQL + the cursor read
 │   ├── LilypadChangelogReader.ts   one batched read for all caches of a gate
-│   └── LilypadSchemaCheck.ts       reads the catalogs, then evaluates them
+│   ├── LilypadSchemaFacts.ts       reads the catalogs
+│   ├── LilypadSchemaShape.ts       compares a table with its description (pure)
+│   ├── LilypadSchemaCheck.ts       evaluates the facts: triggers, changelog, shapes
+│   └── LilypadDoctor.ts            the check of a config (lilypad-doctor)
+├── cli/                            the lilypad-doctor command
 ├── entries/*.ts                    the public subpaths
 └── index.ts                        the root entry (everything but db)
 ```
@@ -101,8 +109,11 @@ LilypadDbCache ─extends──┘                               platform helper
    │             │                   │
    │             │                   └──uses──> LilypadChangelogReader ──> readLilypadChangesBatch
    │             └──uses──> LilypadDbGate (addListener, isListenHealthy)
-   ├──uses──> LilypadSchemaVerifier ──uses──> checkLilypadSchema
+   ├──reads──> a table definition of a config (defineLilypadDb)
    └──uses──> LilypadDbGate ──uses──> postgres.js, node:crypto, LilypadListenHeartbeat
+
+lilypad-doctor ──loads──> a config file ──> runLilypadDoctor ──> checkLilypadSchema
+                                             (facts of the catalogs ──> evaluateLilypadSchema)
 
 every module ──logs through──> libLog(logger, level, source, message, detail?)
 LilypadLogger, LilypadDbGate, LilypadDbCache ──register in──> the singleton registry
@@ -116,13 +127,13 @@ Three observations help when reading the code:
 
 ### 2.2 How the package is cut
 
-The package is published as several **subpath entries**, one per module ([src/entries/](../src/entries/)): `@lilypad/libs/logger`, `/cache`, `/flow`, `/serializer`, `/singleton`, `/platform` and `/db`. Each entry file is only a list of re-exports: a class that is not listed there does not ship. Everything is exported by name (no default exports).
+The package is published as several **subpath entries**, one per module ([src/entries/](../src/entries/)): `@lilypad/libs/logger`, `/cache`, `/flow`, `/serializer`, `/singleton`, `/platform`, `/schema` (the database configs) and `/db`. Each entry file is only a list of re-exports: a class that is not listed there does not ship. Everything is exported by name (no default exports).
 
 The root entry [src/index.ts](../src/index.ts) re-exports every entry **except `db`**. The reason is the edge runtime (Next.js middleware, Vercel Edge Functions): it has no TCP sockets and no `node:*` modules. `db` needs both (postgres.js, and `node:crypto` for hashing connection strings), so it is kept out of the root, and importing `@lilypad/libs` stays edge-safe. `postgres` is an optional **peer** dependency: an application that uses only the edge modules does not install it.
 
 This rule is enforced twice:
 
-- [src/entries/entries.test.ts](../src/entries/entries.test.ts) reads the source of each entry, follows every *value* import (`import type` is skipped, since it disappears at build time) and fails if an edge entry reaches any external module. The `db` entry may reach exactly `postgres` and `node:crypto`.
+- [src/entries/entries.test.ts](../src/entries/entries.test.ts) reads the source of each entry, follows every *value* import (`import type` is skipped, since it disappears at build time) and fails if an edge entry reaches any external module. The `db` entry may reach exactly `postgres`, `node:crypto`, and `node:fs`, `node:path` and `node:url` (the loader of config files). `/schema` is an edge entry: a config file imports only it, so that the application (edge code included) and the command can both load it.
 - The `edge` project of [vitest.config.ts](../vitest.config.ts) runs the tests of the edge modules a second time inside the `edge-runtime` environment, where Node.js globals do not exist. This is why the cache uses `globalThis.crypto.randomUUID()` and never `node:crypto`.
 
 The build ([tsdown.config.ts](../tsdown.config.ts)) bundles each entry as ESM (`.mjs`) with type declarations and source maps; Node.js 22.12+ also loads them with `require()`. Rolldown puts the modules shared by several entries in common chunks (`dist/chunks/`), so that there is **one copy of each class** no matter which subpath imported it (a second format would bring a second copy). Without that, `error instanceof LilypadCacheCooldownError` could fail when the error was thrown by a class from another bundle copy.
@@ -262,7 +273,6 @@ Inside the engine, you will see pairs of methods such as `delete`/`removeEntry` 
 | notifications of a gate | the channel | `LilypadNotificationRouter` (one listener, one `JSON.parse`) |
 | `refresh(key)` | each key | `LilypadDbCache.refreshes` (plus one queued) |
 | changelog reads | the reader | `LilypadChangelogReader.current` (plus one queued) |
-| the schema check | the cache | `LilypadSchemaVerifier.check` |
 
 The recurring trick is to **store the promise itself** in a map, synchronously, before any `await`, and to remove it when it settles, with a guard like `if (map.get(id) === promise) map.delete(id)` so that a newer promise registered meanwhile is not removed by mistake.
 
@@ -270,7 +280,7 @@ Two of them (`refresh` and the changelog reader) add a **queued** second operati
 
 ### 3.8 Retries back off
 
-Three operations of `LilypadDbCache` can fail and must be retried later, but not at every read: starting a lazy `LISTEN`, reading the changelog, and running the schema check. Each keeps a `LilypadBackoff` ([LilypadBackoff.ts](../src/internal/LilypadBackoff.ts)): `fail()` schedules the next attempt `base × 2^(failures-1)` later (up to one minute, unless the base itself is longer), `succeed()` resets it, and `ready(now)` tells whether an attempt may run. A database outage therefore does not add a failing query to every request.
+Two operations of `LilypadDbCache` can fail and must be retried later, but not at every read: starting a lazy `LISTEN`, and reading the changelog. Each keeps a `LilypadBackoff` ([LilypadBackoff.ts](../src/internal/LilypadBackoff.ts)): `fail()` schedules the next attempt `base × 2^(failures-1)` later (up to one minute, unless the base itself is longer), `succeed()` resets it, and `ready(now)` tells whether an attempt may run. A database outage therefore does not add a failing query to every request.
 
 ---
 
@@ -606,10 +616,10 @@ postgres.js connects lazily, on the first query, so creating a gate opens nothin
 
 #### CRUD helpers
 
-All generic over `LilypadDbSchema<T, PK>`: table name, primary key, the `cols` record (one entry per property of `T`), optional sanitization functions. The parameters are named `schema`.
+All generic over a table definition `LilypadDbTableDefinition<T, PK>` of a config ([4.9](#49-the-database-config-and-lilypad-doctor)): table name and schema, primary key, the `cols` record (one entry per property of `T`), optional sanitization functions. Every query names the table as `qualifiedName` (`"public"."users"`: postgres.js quotes each part), so it reads the table the doctor checked, whatever the `search_path`.
 
 - **Reading rows.** `selectedColumns` selects only the schema columns, or `*` if there is a `selectSanitizationFn` (which may read other columns). `mapRow` builds `T` with the sanitization function, or by copying the `cols` keys; a sanitizer can return `null` to drop a row.
-The CRUD helpers live in `LilypadDbTable` ([src/dbGate/LilypadDbTable.ts](../src/dbGate/LilypadDbTable.ts)), created with `gate.table(schema)`: the schema is bound once, and the gate provides the connections and `assertOpen`. The schema types and errors are in [src/dbGate/LilypadDbSchema.ts](../src/dbGate/LilypadDbSchema.ts).
+The CRUD helpers live in `LilypadDbTable` ([src/dbGate/LilypadDbTable.ts](../src/dbGate/LilypadDbTable.ts)), created with `gate.table(definition)` or `gate.table('<key>')` (a table of the config the gate was created with, `resolveLilypadDbTable`): the definition is bound once, and the gate provides the connections and `assertOpen`. The schema types and errors are in [src/dbGate/LilypadDbSchema.ts](../src/dbGate/LilypadDbSchema.ts).
 
 - `selectAll` reads through a **cursor** in batches of 1000 rows, so the raw result of a large table is never in memory at once. It takes an optional `signal`: it checks it before each batch, and throws its reason once aborted. Throwing out of the `for await` loop closes the cursor, so a table load that timed out stops reading instead of streaming the rest of the table for nothing.
 - `selectByPrimaryKeys` uses `IN (...)`, one query per 1000 keys, since Postgres limits the number of parameters per query.
@@ -703,25 +713,34 @@ Each cache **subscribes** with two functions: `request(readAt)` (what to read fo
 
 `readAll` asks each subscriber for its request, runs the batched query, and calls every `apply` with `Promise.allSettled`, so one cache's failure does not affect the others.
 
-### 4.9 The schema check
+### 4.9 The database config and lilypad-doctor
 
-[src/dbGate/LilypadSchemaCheck.ts](../src/dbGate/LilypadSchemaCheck.ts), about 920 lines. Without the triggers, a `listen` cache would silently stay stale, and a `changelog` cache would fail every read. `checkLilypadSchema` is two steps:
+#### The config
 
-1. `readLilypadSchemaFacts` reads only the catalogs. One query: server version, the current database, whether the changelog table exists (`to_regclass`) and in which schema, whether it has the `table_schema` column, whether the trigger function and the prune function exist (`to_regprocedure`), the function's comment (the version) and its source, the rows deleted from the changelog (`n_tup_del`), and what the server says of pg_cron (available, installed here, `cron.database_name` read from `pg_settings`, which leaves out the settings the role may not read, where `current_setting()` would throw). Then, per table: the table's schema, and all its non-internal triggers as JSON: whether it calls the changelog function, its arguments, its `tgtype` bitmask, whether it is enabled, and the **source** of its function. Last, when the changelog is checked: the age of its oldest row (`min(changed_at)`, one step on its index) and the jobs of `cron.job`, read as `row_to_json` so that the columns older versions of pg_cron lack are simply absent. These two are best effort: a role that cannot read them leaves them unknown (`null`) instead of failing the check.
-2. `evaluateLilypadSchema` turns those facts into problems. It is a pure function, so every rule is unit-tested without a database. Checks on `tgtype` (bits `ROW=1, INSERT=4, DELETE=8, UPDATE=16, TRUNCATE=32`): the enabled changelog triggers must together record `INSERT`, `UPDATE` and `DELETE` (`recordedEvents`: a statement trigger records the events whose transition tables it declares as `lilypad_old`/`lilypad_new`; a row trigger of the changelog function, left by version 3, records nothing); their first argument must be the primary key; a statement-level `TRUNCATE` trigger must exist. For `listen`, a regular expression looks for `pg_notify('cache_events'` in the function source, so a hand-written trigger counts too. The event bits of every enabled row trigger that notifies are OR-ed together, and must cover `INSERT`, `UPDATE` and `DELETE`: one trigger per operation is fine, but a trigger on `UPDATE` alone is reported, since the cache would never hear about inserts and deletes.
+A config ([src/dbConfig/LilypadDbConfig.ts](../src/dbConfig/LilypadDbConfig.ts)) is the one description of the database that both sides use: the application imports it to build its gates, table handles and caches, and `lilypad-doctor` imports it to check the database. `defineLilypadTable<T, PK>` only carries the row type (an identity function); `defineLilypadDb` validates the input (`validateLilypadDbConfigInput`: the config itself, never the database) and **resolves** it, once, into frozen definitions:
 
-The pruning of the changelog is evaluated by `evaluatePruning`. It collects the prunings it can prove: the `prune` option (from the `lilypad-prune:` comment) and the active jobs of this database whose command is a `DELETE FROM` the changelog table (`lilypadCommandDeletesFrom`), each with its retention when it can read it (`lilypadPruneCommandRetention`). A retention not longer than `minRetention` is an **error**: [the cursor cannot notice the missing rows](#choosing-the-options). If it proves none, and `pruning` is not `external` and no row was ever deleted (`n_tup_del`, which also catches `pruneLilypadChangelog` run from the application), it **warns**, with the best pruning for the database (`suggestPruning`, [line 555](../src/dbGate/LilypadSchemaCheck.ts)): a pg_cron job when pg_cron is known to run (installed here, or `cron.database_name` names this database or another one, where the job is then scheduled with `schedule_in_database`); otherwise the `prune` option, which works everywhere. `pruning: 'trigger'` or `'cron'` forces one of the two: `'cron'` keeps the other database when `cron.database_name` names one, and otherwise assumes this one (where the role cannot read the setting, as on managed hosts), saying so in the message. When the suggestion is the `prune` option, the fix of a missing or outdated changelog includes it, so the report shows one SQL. The last rule is a safety net that needs no detection: an oldest row older than the retention (24 hours if unknown) plus 7 days means that the pruning does not run, or does not keep up. The 7 days leave a weekly job its week.
+- the name is split into `tableName`, `schemaName` (from `app.users`, `schemaName`, or `defaultSchema`) and `qualifiedName`;
+- the column shorthands (`unique: true`, `references`) join the table-level `unique` and `foreignKeys`; a reference is resolved to a qualified table (a table of the config by `tableName` first, else `defaultSchema`), and its columns default to the primary key of a table of the config;
+- every default is applied (`sync` `listen`, actions `no action`, index method `btree`, `strict` of the config), and each definition carries the settings of its config (`db`: name, channel, changelog table).
 
-Problems have a severity: `error` (the caches can miss changes; `ok` is false and `verify: 'throw'` rejects) or `warning` (only the pruning checks; logged, never thrown), so that a growing changelog, a cost, never stops an application from starting.
+The definitions carry a mark, `Symbol.for('lilypad.dbTable')` (and the config `Symbol.for('lilypad.dbConfig')`): `Symbol.for`, so that a config made by another copy of the library (the command, loading the application's `node_modules`) is recognized. `gate.table()` and `LilypadDbCache.create()` go through `resolveLilypadDbTable`, which takes a marked definition, or a key looked up in the `config` of the call, else in the config of the gate. On the type side, `LilypadDbGate<C>` carries the type of its config, so `gate.table('users')` and `create({ gate, table: 'users' })` infer the row type (`LilypadDbRow<C, N>`) and reject an unknown key.
 
-Every problem comes with the SQL that fixes it, generated by the same functions as the install SQL (except `missing-table` and `unsupported-version`, which the library cannot fix). The fix of a missing or outdated changelog notifies on the channel the check requires (`notifyChannel`), or else on the channel the installed function notifies on, found in its source: a changelog installed with `notifyChannel: false` is not turned into one that notifies, and one shared with `listen` caches does not stop notifying. Besides diagnostics, the check has a second job: it resolves **which schema** the table lives in, which the cache uses to ignore notifications about a same-named table in another schema.
+The runtime never compares the config with the database. What the caches used to learn from a runtime check, they now read from the definition: the schema of the table (to filter notifications of a same-named table elsewhere), the channel, the changelog table.
 
-A cache runs the check through its `LilypadSchemaVerifier` ([LilypadSchemaVerifier.ts](../src/cache/dbSync/LilypadSchemaVerifier.ts)), at most once successfully per instance, with its `pruning` option and a `minRetention` of `max(maxGap, lookback)`. `verify()` caches the check promise, so concurrent callers share it. Two outcomes are distinguished:
+#### The check
 
-- the check **ran** (whether or not it found problems): its promise stays cached and it is never repeated. The problems were already reported, and repeating the warning at every read would flood the logs;
-- the check **could not run** (an error, e.g. the database was unreachable): `run` returns `false`, the cached promise is forgotten, and its backoff starts (1 s, doubling up to 60 s). A later read calls `checkInBackground`, which runs it again once the backoff is over. Reads never wait for it. With `listen`, the first check runs before `LISTEN`; the reads only retry a check that failed.
+The check itself lives in [src/dbGate/](../src/dbGate/). `lilypadSchemaCheckOptions(config)` ([LilypadDoctor.ts](../src/dbGate/LilypadDoctor.ts)) turns a config into the options of `checkLilypadSchema`: one requirement per table (`changelog` for the `changelog` tables, the config's `notifyChannel` for the `listen` ones, and the definition itself as its `shape`), the changelog (only if a table reads it) with a `minRetention` of the largest of `changelog.minRetention` and each table's `maxGap` and `lookback`. `runLilypadDoctor` opens a gate of one connection, runs it and closes it; the command ([src/cli/](../src/cli/)) loads the config file (`loadLilypadDbConfig`: `lilypad.config.*` or `lilypad.<name>.config.*`, imported with `import()`, so a TypeScript file relies on the type stripping of Node.js) and maps the result to its exit code. `checkLilypadSchema` is two steps:
 
-The reset happens in a `.then` on the promise, not inside `run` itself: if the check failed synchronously, a reset inside it would run *before* `verify` stored the promise, and the failed check would stay cached.
+1. `readLilypadSchemaFacts` ([LilypadSchemaFacts.ts](../src/dbGate/LilypadSchemaFacts.ts)) reads only the catalogs. One query: server version, the current database, whether the changelog table exists (`to_regclass`) and in which schema, whether it has the `table_schema` column, whether the trigger function and the prune function exist (`to_regprocedure`), the function's comment (the version) and its source, the rows deleted from the changelog (`n_tup_del`), and what the server says of pg_cron (available, installed here, `cron.database_name` read from `pg_settings`, which leaves out the settings the role may not read, where `current_setting()` would throw). Then one query for every table: the table's schema, and all its non-internal triggers as JSON: whether it calls the changelog function, its arguments, its `tgtype` bitmask, whether it is enabled, and the **source** of its function. For the tables whose shape is checked, the same query also returns their columns (`format_type`, `typcategory`, `attnotnull`, `atthasdef`, identity, generated), their constraints (primary key, unique, foreign keys with the referenced table, columns and actions, checks) and their indexes (key columns in order, `NULL` for an expression, method, unique, partial, and whether a constraint owns it). Last, when the changelog is checked: the age of its oldest row (`min(changed_at)`, one step on its index) and the jobs of `cron.job`, read as `row_to_json` so that the columns older versions of pg_cron lack are simply absent. These two are best effort: a role that cannot read them leaves them unknown (`null`) instead of failing the check.
+2. `evaluateLilypadSchema` turns those facts into problems. It is a pure function, so every rule is unit-tested without a database. Per table: first its shape (`evaluateLilypadTableShape`, [LilypadSchemaShape.ts](../src/dbGate/LilypadSchemaShape.ts)), then the triggers its sync needs. Checks on `tgtype` (bits `ROW=1, INSERT=4, DELETE=8, UPDATE=16, TRUNCATE=32`): the enabled changelog triggers must together record `INSERT`, `UPDATE` and `DELETE` (`recordedEvents`: a statement trigger records the events whose transition tables it declares as `lilypad_old`/`lilypad_new`; a row trigger of the changelog function, left by version 3, records nothing); their first argument must be the primary key; a statement-level `TRUNCATE` trigger must exist. For `listen`, a regular expression looks for `pg_notify('<channel>'` in the function source, so a hand-written trigger counts too. The event bits of every enabled row trigger that notifies are OR-ed together, and must cover `INSERT`, `UPDATE` and `DELETE`: one trigger per operation is fine, but a trigger on `UPDATE` alone is reported, since the cache would never hear about inserts and deletes.
+
+The shape rules compare structure, never names. A declared `pgType` is normalized the way `format_type` writes it (`normalizeLilypadPgType`: aliases such as `int4` or `timestamptz`, the precision of the time types before their zone, array suffixes) and compared exactly; without it, the `type` must be what postgres.js returns for the column's category (a `numeric` or `bigint` column declared `number` is a warning: postgres.js returns strings). A unique key is satisfied by any primary key, unique constraint or unique index (neither partial nor on expressions) on the same set of columns; a foreign key by a constraint with the same referenced table and the same pairs of columns, whose actions are then compared; an index by one with the same columns in order and the same method. `strict` adds warnings for what the database has and the description lacks, skipping the indexes that implement a constraint. The missing foreign keys are reported after every table (`deferred`), so that the fix SQL, printed in the order of the problems, creates the tables before the keys that reference them.
+
+The pruning of the changelog is evaluated by `evaluatePruning`. It collects the prunings it can prove: the `prune` option (from the `lilypad-prune:` comment) and the active jobs of this database whose command is a `DELETE FROM` the changelog table (`lilypadCommandDeletesFrom`), each with its retention when it can read it (`lilypadPruneCommandRetention`). A retention not longer than `minRetention` is an **error**: [the cursor cannot notice the missing rows](#choosing-the-options). If it proves none, and `pruning` is not `external` and no row was ever deleted (`n_tup_del`, which also catches `pruneLilypadChangelog` run from the application), it **warns**, with the best pruning for the database (`suggestPruning`, [LilypadSchemaPruning.ts](../src/dbGate/LilypadSchemaPruning.ts)): a pg_cron job when pg_cron is known to run (installed here, or `cron.database_name` names this database or another one, where the job is then scheduled with `schedule_in_database`); otherwise the `prune` option, which works everywhere. `pruning: 'trigger'` or `'cron'` forces one of the two: `'cron'` keeps the other database when `cron.database_name` names one, and otherwise assumes this one (where the role cannot read the setting, as on managed hosts), saying so in the message. When the suggestion is the `prune` option, the fix of a missing or outdated changelog includes it, so the report shows one SQL. The last rule is a safety net that needs no detection: an oldest row older than the retention (24 hours if unknown) plus 7 days means that the pruning does not run, or does not keep up. The 7 days leave a weekly job its week.
+
+Problems have a severity: `error` (the database is not what the config describes; `ok` is false and the command exits with 1) or `warning` (it works, but something needs attention).
+
+Every problem that the library can fix comes with the SQL that fixes it, generated by the same functions as the install SQL: a missing table is created (`lilypadCreateTableSql`, when every column has a `pgType`) with its keys, checks, indexes and the triggers its sync needs; a missing column added; a foreign key created, or dropped and created again with other actions. The fix of a missing or outdated changelog notifies on the channel the check requires, or else on the channel the installed function notifies on, found in its source: a changelog installed with `notifyChannel: false` is not turned into one that notifies, and one shared with `listen` caches does not stop notifying.
 
 ### 4.10 LilypadDbCache
 
@@ -737,22 +756,22 @@ What it does **not** have is as important: the writes of `LilypadCache` (`set`, 
 
 #### Types and construction
 
-`create()` is generic over the row type `V` and the primary key column `PK`, both **inferred from `schema`**; the key type is `LilypadDbKey<V, PK> = V[PK] & LilypadCacheKey`. It builds the cache, runs the schema check if `verify: 'throw'`, calls the strategy's `start()` (which starts `LISTEN` for `listen`, unless lazy); on any failure, it disposes and rethrows.
+`create()` is generic over the row type `V` and the primary key column `PK`, both **inferred from the table definition** (given as `db.tables.users`, or by key, in `config` or in the config of the gate: three overloads); the key type is `LilypadDbKey<V, PK> = V[PK] & LilypadCacheKey`. It resolves the definition (`resolveLilypadDbTable`), builds the cache, calls the strategy's `start()` (which starts `LISTEN` for `listen`, unless lazy); on any failure, it disposes and rethrows. It never queries the catalogs.
 
 The constructor:
 
-- takes `gate` and `schema` out of the options and calls `super` with the rest, `name` defaulting to the table name;
-- validates the numeric options of `sync`;
+- takes `gate`, `table` and `sync` out of the options and builds the engine with the rest, `name` defaulting to the table name;
+- merges the `sync` of the definition with the overrides of the cache (`maxAge`, `connect`, `applyChanges`, `onNotification`, `pollInterval`, `poll`), whose numbers it validates (those of the definition were validated by `defineLilypadDb`);
 - sets no bulk sync function: the table is loaded by its own `loadTable` (see [getAll](#members-and-getall)), which calls the engine's `replaceEntries`;
-- takes the schema from a qualified `tableName` (`app.accounts` → `app`);
-- creates the `LilypadSchemaVerifier` and the strategy, giving the strategy a **host** object (`syncHost()`, [line 244](../src/cache/LilypadDbCache.ts)): a few closures over the cache's own methods (`applyChange`, `applyTruncate`, `expireEverything`, `emitInvalidation`, ...), so that the strategy can act on the cache without reaching into it.
+- takes the schema of the table from the definition (`schemaName`);
+- creates the strategy (with the channel or the changelog table of the config), giving the strategy a **host** object (`syncHost()`, [line 244](../src/cache/LilypadDbCache.ts)): a few closures over the cache's own methods (`applyChange`, `applyTruncate`, `expireEverything`, `emitInvalidation`, ...), so that the strategy can act on the cache without reaching into it.
 
 #### The strategies
 
 A strategy ([`LilypadDbSyncStrategy`, LilypadDbSyncTypes.ts:165](../src/cache/dbSync/LilypadDbSyncTypes.ts)) answers four questions: what to start in `create()` (`start`), what to do before a read (`beforeRead`), since when it sees every change (`trustedSince`), and whether the writes of this instance come back through it (`seesOwnWrites`). Plus `dispose`.
 
 - **`lilypadNoSync`**: nothing to start, nothing to wait for, never trusted.
-- **`LilypadListenSync`** ([LilypadListenSync.ts](../src/cache/dbSync/LilypadListenSync.ts)): subscribes to the `LilypadNotificationRouter` of its gate ([LilypadNotificationRouter.ts](../src/cache/dbSync/LilypadNotificationRouter.ts)), which registers **one** callback on `cache_events` for every cache of the gate (`callbackId: 'lilypad_notification_router'`), parses each notification once, and hands it to the caches of its table (the last cache to unsubscribe removes the listener). `startListening` runs the schema check, then subscribes; if the cache was disposed while `LISTEN` was starting, it unsubscribes again (otherwise a lazy `LISTEN` started by a read just before `dispose()` would leave a callback registered forever on the gate). `dispose` waits for a `LISTEN` still starting before removing the listener, for the same reason. `trustedSince` is the time `LISTEN` became active (reset by `onReconnect`), but only **while `gate.isListenHealthy()`**: without recent heartbeats, the cache does not trust it.
+- **`LilypadListenSync`** ([LilypadListenSync.ts](../src/cache/dbSync/LilypadListenSync.ts)): subscribes to the `LilypadNotificationRouter` of its gate ([LilypadNotificationRouter.ts](../src/cache/dbSync/LilypadNotificationRouter.ts)), which registers **one** callback on the channel of the config (`cache_events` by default) for every cache of the gate (`callbackId: 'lilypad_notification_router'`), parses each notification once, and hands it to the caches of its table (the last cache to unsubscribe removes the listener). `startListening` subscribes; if the cache was disposed while `LISTEN` was starting, it unsubscribes again (otherwise a lazy `LISTEN` started by a read just before `dispose()` would leave a callback registered forever on the gate). `dispose` waits for a `LISTEN` still starting before removing the listener, for the same reason. `trustedSince` is the time `LISTEN` became active (reset by `onReconnect`), but only **while `gate.isListenHealthy()`**: without recent heartbeats, the cache does not trust it.
 - **`LilypadChangelogSync`** ([LilypadChangelogSync.ts](../src/cache/dbSync/LilypadChangelogSync.ts)): subscribes to the gate's reader, keeps the cursor, and reads the changelog before a read when `pollInterval` has passed. `trustedSince` is the start of the unbroken chain of cursor reads; `undefined` without a cursor or when the last read is older than `maxGap`. The whole strategy is described in [4.11](#411-the-changelog-strategy-end-to-end).
 
 #### Syncing before a read
@@ -769,8 +788,8 @@ return this.getOrSetDetailed(key, valueFn, options);
 `beforeRead` returns `undefined` when there is nothing to wait for, and the caller only awaits a real promise. That detail matters: even `await undefined` yields to the microtask queue. Without it, the read runs synchronously down to the registration of the fetch, exactly as in the engine. So by the time `getOrFetch` returns its promise, the fetch is already registered as in flight, and a change applied immediately afterwards sees it (`hasReadInFlight`) and fences it. (Wrapping these three lines in an `async` helper would silently break this.) When something is due:
 
 - `listen` + `connect: 'lazy'`: start `LISTEN` on the first read (unless it is already started or in backoff);
-- `listen`, once `LISTEN` is started: only retry a schema check that could not run ([4.9](#49-the-schema-check));
-- `changelog`: if `pollInterval` has passed (and no backoff), start the schema check in the background if it has not run yet (diagnostics only, reads do not wait for it), then read the changelog. With `poll: 'background'`, the read is not awaited.
+- `listen`, once `LISTEN` is started: nothing;
+- `changelog`: if `pollInterval` has passed (and no backoff), read the changelog. With `poll: 'background'`, the read is not awaited.
 
 Failures are logged and turned into a backoff ([3.8](#38-retries-back-off)).
 
@@ -944,9 +963,9 @@ Nothing records which changes were already applied: a cursor read returns each c
 
 #### Step 0: installing
 
-One migration runs `lilypadChangelogSql()` ([LilypadChangelog.ts](../src/dbGate/LilypadChangelog.ts)): the changelog table, its two indexes, the trigger function and its version comment. It also runs `lilypadChangelogTriggerSql({ table, primaryKey })` once per cached table: four statement triggers, see [4.8](#the-sql). The library never runs DDL itself. Instead, the cache checks the installation with its `LilypadSchemaVerifier` ([4.9](#49-the-schema-check)). With `verify: 'warn'` (the default), the first poll starts the check in the background. With `'throw'`, `create()` runs it and rejects.
+One migration runs `lilypadChangelogSql()` ([LilypadChangelog.ts](../src/dbGate/LilypadChangelog.ts)): the changelog table, its two indexes, the trigger function and its version comment. It also runs `lilypadChangelogTriggerSql({ table, primaryKey })` once per cached table: four statement triggers, see [4.8](#the-sql). The library never runs DDL itself, and the cache checks nothing: `lilypad-doctor` checks the installation against the config ([4.9](#49-the-database-config-and-lilypad-doctor)), and prints this SQL when it is missing.
 
-The distinction matters because the two ways of being misconfigured fail differently. A missing changelog **table** makes every read fail, which is logged at each attempt. Missing **triggers** fail silently: the reads succeed and return nothing, and the cache trusts a chain that sees no change. Only the schema check catches that second case.
+The distinction matters because the two ways of being misconfigured fail differently. A missing changelog **table** makes every read fail, which is logged at each attempt. Missing **triggers** fail silently: the reads succeed and return nothing, and the cache trusts a chain that sees no change. Only `lilypad-doctor` catches that second case.
 
 #### Step 1: creating the cache
 
@@ -965,7 +984,6 @@ The constructor of `LilypadDbCache` checks the numeric options (`pollInterval` i
 now - lastRead < pollInterval   → undefined: nothing to wait for
 backoff not ready               → undefined
 otherwise:
-  verifier.checkInBackground()  the schema check, if it has not run or could not run; never awaited
   reading = read()              reader.read(this.subscriber); errors → backoff.fail() + log
   poll: 'background'            → runInBackground(reading); return undefined
   poll: 'await' (default)       → return reading: the caller awaits it
@@ -1059,8 +1077,8 @@ t = 3 h     getOrFetch(7): 3 h > maxGap. Untrusted: lookback read, expireEveryth
 | `maxGap` | 1 h | How long the chain is trusted without an applied read | Far below the retention of the changelog (`olderThan`) |
 | `lookback` | TTL + SWR + 1 min | How far back an untrusted read looks | At least the lifetime of an L2 copy (TTL + SWR), and far below the retention |
 | `maxAge` | 1 h | How long a trusted entry can outlive its TTL | Low if the triggers are sometimes bypassed (`0` disables renewal) |
-| `table` | `lilypad_cache_changes` | Which changelog table | The one installed |
-| `verify` | `'warn'` | The schema check | `'warn'` in code that runs during a build |
+
+They are options of the `sync` of the table, in the config; the changelog table is `changelog.table` of the config, shared by its tables. `create` can override `pollInterval`, `poll` and `maxAge` for one cache: not `maxGap` or `lookback`, which set the retention that `lilypad-doctor` checks.
 
 Why the inequalities:
 
@@ -1074,9 +1092,8 @@ Why the inequalities:
 | --- | --- |
 | The changelog cannot be read (database down, table missing, no privilege) | The user's read goes on with the current memory. The error is logged and the backoff starts (from `max(pollInterval, 1 s)`, doubling up to 1 min). `lastRead` does not move, so the chain is still trusted, and entries still renewed, until `maxGap` after the last applied read. A changelog that stays broken therefore delays changes by up to `maxGap`, not `pollInterval` |
 | One cache fails to apply its changes | That cache keeps its cursor and backs off; the others, applied under `allSettled`, are unaffected. The same changes come back at its next read |
-| The triggers are missing (the table exists) | Every read succeeds and returns nothing for that table: the cache trusts a chain that sees no change. Only the schema check reports it: a warning with the SQL that fixes it, or `create` rejecting with `verify: 'throw'` |
+| The triggers are missing (the table exists) | Every read succeeds and returns nothing for that table: the cache trusts a chain that sees no change. Only `lilypad-doctor` reports it, with the SQL that fixes it |
 | The triggers are bypassed (`ALTER TABLE ... DISABLE TRIGGER`, `session_replication_role = replica` as in `pg_restore`) | The change is never recorded. Entries are renewed until `maxAge`, which is the only bound |
-| The schema check cannot run | Forgotten and retried by a later poll after its own backoff ([4.9](#49-the-schema-check)) |
 | The cache is disposed while a read is in flight | `apply` returns at its first line; `dispose` unsubscribes from the reader, which garbage collects with the gate |
 
 #### Caveats
@@ -1108,7 +1125,7 @@ Setup: a `LilypadDbCache` of `users` with `sync: { strategy: 'changelog', pollIn
 
 **A:**
 
-1. `getOrFetch` → `getOrFetchDetailed` ([DbCache 673](../src/cache/LilypadDbCache.ts)): `assertNotDisposed()`, then `this.sync.beforeRead()` (line 680) → `LilypadChangelogSync.beforeRead`. `lastRead` is `0`, so a poll is due (line 64). The schema check has not run, so it starts in the background (`checkInBackground`, line 67). `read()` → `reader.read(subscriber)`: nothing is running, so `start()` includes every subscriber and runs `readAll`.
+1. `getOrFetch` → `getOrFetchDetailed` ([DbCache 673](../src/cache/LilypadDbCache.ts)): `assertNotDisposed()`, then `this.sync.beforeRead()` (line 680) → `LilypadChangelogSync.beforeRead`. `lastRead` is `0`, so a poll is due (line 64). `read()` → `reader.read(subscriber)`: nothing is running, so `start()` includes every subscriber and runs `readAll`.
 2. `readAll` calls `subscriber.request(readAt)` → `request`: no cursor yet, so `{ lookback: ttl + swr + 60 000 }`. Then the batched query runs. A awaits it.
 
 **B and C** arrive while A is awaiting. `lastRead` is still `0` (it is set only after the read is applied), so their `beforeRead` also calls `reader.read(subscriber)`. This time `current` exists and includes the subscriber, so they get **the same promise**. One query for three callers.
@@ -1308,7 +1325,8 @@ For each target, one of the two branches returns rows (the other one's first con
 - [LilypadCache.test.ts](../src/cache/LilypadCache.test.ts): tickets, fences (including "entries removed while a read is in flight"), bulk sync, eviction (everything runs on fake timers, `vi.advanceTimersByTimeAsync`);
 - [LilypadCache.shared.test.ts](../src/cache/LilypadCache.shared.test.ts): L2, its key format, stale-while-revalidate and the cooldown, with an in-memory store that clones values;
 - [LilypadDbCache.test.ts](../src/cache/LilypadDbCache.test.ts): the sync strategies, untrusted notifications, `getAll`, own writes, against an in-memory fake gate and a mocked changelog;
-- [LilypadChangelogReader.test.ts](../src/dbGate/LilypadChangelogReader.test.ts) and [LilypadSchemaCheck.test.ts](../src/dbGate/LilypadSchemaCheck.test.ts): the batching of changelog reads, and every rule of the schema check, without a database;
-- [LilypadDbGate.integration.test.ts](../src/dbGate/LilypadDbGate.integration.test.ts): the real thing against PostgreSQL in Docker, including the out-of-order commit test for the changelog cursor ("should not miss a transaction that commits after a later one"), the long-transaction test, the heartbeat, and a reference `NOTIFY` trigger.
+- [LilypadChangelogReader.test.ts](../src/dbGate/LilypadChangelogReader.test.ts), [LilypadSchemaCheck.test.ts](../src/dbGate/LilypadSchemaCheck.test.ts) and [LilypadSchemaShape.test.ts](../src/dbGate/LilypadSchemaShape.test.ts): the batching of changelog reads, and every rule of the schema check, without a database;
+- [LilypadDbConfig.test.ts](../src/dbConfig/LilypadDbConfig.test.ts) and [loadLilypadDbConfig.test.ts](../src/dbConfig/loadLilypadDbConfig.test.ts): how a config is validated and resolved, and how its file is found;
+- [LilypadDbGate.integration.test.ts](../src/dbGate/LilypadDbGate.integration.test.ts): the real thing against PostgreSQL in Docker, including the out-of-order commit test for the changelog cursor ("should not miss a transaction that commits after a later one"), the long-transaction test, the heartbeat, a reference `NOTIFY` trigger, and the shape check (the fix SQL creates the tables of a config, and the check then finds nothing).
 
 To see a behaviour in action, run a single test by name: `npx vitest run --project unit -t "<part of the test name>"`.

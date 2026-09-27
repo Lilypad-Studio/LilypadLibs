@@ -9,9 +9,7 @@ import {
   type LilypadNotificationRouter,
   type LilypadNotificationSubscriber,
 } from '@/cache/dbSync/LilypadNotificationRouter';
-import type { LilypadSchemaVerifier } from '@/cache/dbSync/LilypadSchemaVerifier';
 import type { LilypadCacheKey } from '@/cache/LilypadCacheTypes';
-import { LILYPAD_DEFAULT_NOTIFY_CHANNEL } from '@/dbGate/LilypadChangelog';
 import { LilypadBackoff } from '@/internal/LilypadBackoff';
 
 export { parseLilypadNotification } from '@/cache/dbSync/LilypadNotificationRouter';
@@ -21,7 +19,7 @@ function parseXid(xid: string | undefined): bigint | undefined {
 }
 
 /**
- * The `listen` strategy: the cache subscribes to the `cache_events` channel of the gate (through
+ * The `listen` strategy: the cache subscribes to the notification channel of its config (through
  * the router shared by the caches of the gate), and applies the notifications of its table.
  *
  * It trusts that it sees every change while `LISTEN` is active and the gate's heartbeat is recent
@@ -40,11 +38,10 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
 
   constructor(
     private readonly host: LilypadDbSyncHost<K>,
-    private readonly options: LilypadDbCacheListenSync,
-    private readonly verifier: LilypadSchemaVerifier
+    private readonly options: LilypadDbCacheListenSync
   ) {
     this.applyChanges = options.applyChanges !== false;
-    this.router = getLilypadNotificationRouter(host.gate, LILYPAD_DEFAULT_NOTIFY_CHANNEL);
+    this.router = getLilypadNotificationRouter(host.gate, options.channel);
     this.subscriber = {
       table: host.tableName.split('.').pop()!,
       handle: (payload) => this.handleNotification(payload),
@@ -67,16 +64,13 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
   }
 
   /**
-   * Subscribes once, after the schema check (which resolves the schema of the table, to ignore the
-   * notifications of other schemas). A failed subscription is retried by the next call, after a
-   * backoff for the lazy `LISTEN` of the reads. If the cache was disposed meanwhile, it
-   * unsubscribes again.
+   * Subscribes once. A failed subscription is retried by the next call, after a backoff for the
+   * lazy `LISTEN` of the reads. If the cache was disposed meanwhile, it unsubscribes again.
    */
   private startListening(): Promise<void> {
     if (!this.listening) {
-      this.listening = this.verifier
-        .verify()
-        .then(() => this.router.subscribe(this.subscriber))
+      this.listening = this.router
+        .subscribe(this.subscriber)
         .then(async () => {
           if (this.host.isDisposed()) {
             // dispose() ran while LISTEN was starting: it found no subscription to remove
@@ -98,13 +92,7 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
   }
 
   beforeRead(): Promise<void> | undefined {
-    const now = Date.now();
-    if (this.listening) {
-      // Starting LISTEN ran the check: this only retries one that could not run
-      this.verifier.checkInBackground(now);
-      return undefined;
-    }
-    if (this.options.connect !== 'lazy' || !this.backoff.ready(now)) {
+    if (this.listening || this.options.connect !== 'lazy' || !this.backoff.ready(Date.now())) {
       return undefined;
     }
     return this.startListening().catch((error: unknown) => {
@@ -121,7 +109,7 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
     if (host.isDisposed() || !this.isForSchema(payload)) {
       return;
     }
-    host.log('debug', 'Received a notification on the cache_events channel:', payload);
+    host.log('debug', `Received a notification on the ${this.options.channel} channel:`, payload);
     if (this.applyChanges) {
       if (payload.op === 'TRUNCATE') {
         host.emitInvalidation('notification', host.applyTruncate('eager'), { wholeCache: true });
@@ -138,13 +126,10 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
 
   /**
    * Whether a notification of the table (the router matched its name) is about the schema of this
-   * cache: `schema`, when the trigger sends it and the schema of the table is known, must match.
+   * cache: `schema`, when the trigger sends it, must match.
    */
   private isForSchema(payload: LilypadDbNotification): boolean {
-    const tableSchema = this.host.tableSchema();
-    return (
-      payload.schema === undefined || tableSchema === undefined || payload.schema === tableSchema
-    );
+    return payload.schema === undefined || payload.schema === this.host.tableSchema;
   }
 
   /** Waits for a `LISTEN` still starting, then unsubscribes. It never rejects. */

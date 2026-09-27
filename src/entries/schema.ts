@@ -1,0 +1,57 @@
+/**
+ * `@lilypad/libs/schema`: the database configs (`defineLilypadDb`, `defineLilypadTable`) and the
+ * description of the tables. Runs in Node.js and in edge runtimes, without postgres.js: a config
+ * file imports only this entry, so that the application and `lilypad-doctor` can both load it.
+ */
+export {
+  defineLilypadDb,
+  defineLilypadTable,
+  isLilypadDbConfig,
+  isLilypadDbTableDefinition,
+} from '../dbConfig/LilypadDbConfig';
+export type {
+  LilypadChangelogPruning,
+  LilypadDbConfig,
+  LilypadDbConfigInput,
+  LilypadDbConfigSettings,
+  LilypadDbPrimaryKey,
+  LilypadDbResolvedForeignKey,
+  LilypadDbResolvedIndex,
+  LilypadDbResolvedUniqueKey,
+  LilypadDbRow,
+  LilypadDbTableChangelogSync,
+  LilypadDbTableDefinition,
+  LilypadDbTableDefinitionBase,
+  LilypadDbTableDraft,
+  LilypadDbTableInput,
+  LilypadDbTableInputBase,
+  LilypadDbTableListenSync,
+  LilypadDbTableName,
+  LilypadDbTableSync,
+  LilypadDbTableTrustedSync,
+} from '../dbConfig/LilypadDbConfig';
+export { LILYPAD_DEFAULT_DB_CONFIG_NAME } from '../dbConfig/LilypadDbConfigDefaults';
+export {
+  LilypadDbEmptyWriteError,
+  LilypadDbMissingPrimaryKeyError,
+  LilypadDbNotFoundError,
+} from '../dbGate/LilypadDbSchema';
+export type {
+  LilypadDbCheck,
+  LilypadDbColumn,
+  LilypadDbColumnDefault,
+  LilypadDbColumnName,
+  LilypadDbColumnReference,
+  LilypadDbColumnType,
+  LilypadDbDeleteResult,
+  LilypadDbForeignKey,
+  LilypadDbIndex,
+  LilypadDbIndexMethod,
+  LilypadDbInsertData,
+  LilypadDbReference,
+  LilypadDbReferentialAction,
+  LilypadDbSchema,
+  LilypadDbUniqueKey,
+  LilypadDbUpdateData,
+  LilypadDbWriteResult,
+} from '../dbGate/LilypadDbSchema';

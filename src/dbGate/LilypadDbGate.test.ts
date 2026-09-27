@@ -1,6 +1,18 @@
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { LilypadDbGate, lilypadServerlessPool } from './LilypadDbGate';
 import { LilypadDisposedError } from '@/cache/LilypadCacheTypes';
+import { defineLilypadDb, defineLilypadTable } from '@/dbConfig/LilypadDbConfig';
+import { LilypadDbTable } from './LilypadDbTable';
+
+const db = defineLilypadDb({
+  tables: {
+    items: defineLilypadTable<{ id: number }, 'id'>({
+      tableName: 'items',
+      primaryKey: 'id',
+      cols: { id: { type: 'number' } },
+    }),
+  },
+});
 
 // Nothing listens on this port: any connection attempt would fail
 const unreachable = 'postgres://user:password@127.0.0.1:1/db';
@@ -48,14 +60,13 @@ describe('LilypadDbGate (without database)', () => {
   describe('close', () => {
     it('should return the same promise when called again, and reject later queries', async () => {
       const gate = await LilypadDbGate.create({ connectionString: unreachable });
-      const schema = { tableName: 'items', primaryKey: 'id' as const, cols: { id: {} } };
 
       const closing = gate.close();
 
       expect(gate.close()).toBe(closing);
       await closing;
       expect(gate.closed).toBe(true);
-      await expect(gate.table(schema).selectByPrimaryKey(1)).rejects.toThrow('is closed');
+      await expect(gate.table(db.tables.items).selectByPrimaryKey(1)).rejects.toThrow('is closed');
       await expect(
         gate.addListener({ channel: 'c', callbackId: 'a', callback: () => {} })
       ).rejects.toThrow('is closed');
@@ -140,9 +151,49 @@ describe('LilypadDbGate close', () => {
     const gate = await LilypadDbGate.create({ connectionString: unreachable });
     await gate.close();
 
-    await expect(
-      gate.table({ tableName: 't', primaryKey: 'id', cols: { id: {} } }).selectByPrimaryKey(1)
-    ).rejects.toThrow(LilypadDisposedError);
+    await expect(gate.table(db.tables.items).selectByPrimaryKey(1)).rejects.toThrow(
+      LilypadDisposedError
+    );
+  });
+
+  describe('tables', () => {
+    it('should find a table of its config by name, and take the table of any config', async () => {
+      const other = defineLilypadDb({
+        name: 'other',
+        tables: { events: { tableName: 'events', primaryKey: 'id', cols: { id: {} } } },
+      });
+      const gate = await LilypadDbGate.create({ connectionString: unreachable, config: db });
+
+      const byName = gate.table('items');
+      const fromOther = gate.table(other.tables.events);
+
+      expect(byName).toBeInstanceOf(LilypadDbTable);
+      expect(byName.definition).toBe(db.tables.items);
+      expect(fromOther.definition).toBe(other.tables.events);
+      await gate.close();
+    });
+
+    it('should reject a table name without a config, or not in the config', async () => {
+      const gate = await LilypadDbGate.create({ connectionString: unreachable, config: db });
+      const bare = await LilypadDbGate.create({ connectionString: unreachable });
+
+      // @ts-expect-error: not a table of the config
+      expect(() => gate.table('missing')).toThrow('the config "default" has no table "missing"');
+      // @ts-expect-error: the gate has no config
+      expect(() => bare.table('items')).toThrow('there is no config to find it in');
+      await Promise.all([gate.close(), bare.close()]);
+    });
+
+    it('should reject a description that is not a table of a config', async () => {
+      const gate = await LilypadDbGate.create({ connectionString: unreachable });
+      const schema = { tableName: 'items', primaryKey: 'id' as const, cols: { id: {} } };
+
+      // @ts-expect-error: a table must come from defineLilypadDb
+      expect(() => gate.table(schema)).toThrow(
+        'must be a table of a config made with defineLilypadDb'
+      );
+      await gate.close();
+    });
   });
 
   it('should reject a listenHeartbeat that a timer cannot hold', async () => {

@@ -28,6 +28,10 @@
       "types": "./dist/platform.d.mts",
       "default": "./dist/platform.mjs"
     },
+    "./schema": {
+      "types": "./dist/schema.d.mts",
+      "default": "./dist/schema.mjs"
+    },
     "./serializer": {
       "types": "./dist/serializer.d.mts",
       "default": "./dist/serializer.mjs"

@@ -1,16 +1,15 @@
 import { LilypadDbMembers } from '@/cache/dbCache/LilypadDbMembers';
 import { LilypadOwnWrites } from '@/cache/dbCache/LilypadOwnWrites';
-import { DEFAULT_MAX_GAP, LilypadChangelogSync } from '@/cache/dbSync/LilypadChangelogSync';
+import { LilypadChangelogSync } from '@/cache/dbSync/LilypadChangelogSync';
 import {
   lilypadNoSync,
-  type LilypadDbCacheSync,
+  type LilypadDbCacheSyncOverrides,
   type LilypadDbChangeMode,
   type LilypadDbRowChange,
   type LilypadDbSyncHost,
   type LilypadDbSyncStrategy,
 } from '@/cache/dbSync/LilypadDbSyncTypes';
 import { LilypadListenSync } from '@/cache/dbSync/LilypadListenSync';
-import { LilypadSchemaVerifier } from '@/cache/dbSync/LilypadSchemaVerifier';
 import { LilypadCacheEngine } from '@/cache/LilypadCacheEngine';
 import { LilypadReadFlights } from '@/cache/LilypadReadFlights';
 import {
@@ -25,17 +24,24 @@ import {
   type LilypadCacheRead,
   type LilypadCacheResult,
 } from '@/cache/LilypadCacheTypes';
+import {
+  resolveLilypadDbTable,
+  type LilypadDbConfig,
+  type LilypadDbPrimaryKey,
+  type LilypadDbRow,
+  type LilypadDbTableDefinition,
+  type LilypadDbTableName,
+} from '@/dbConfig/LilypadDbConfig';
 import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
 import {
   LilypadDbMissingPrimaryKeyError,
   type LilypadDbInsertData,
-  type LilypadDbSchema,
   type LilypadDbUpdateData,
 } from '@/dbGate/LilypadDbSchema';
 import type { LilypadDbTable } from '@/dbGate/LilypadDbTable';
 import { LilypadFlowControl } from '@/flow/LilypadFlowControl';
 import { assertNumberOption } from '@/internal/LilypadValidation';
-import { libLog } from '@/logger/LilypadLibLogger';
+import { libLog, type LilypadLibLogger } from '@/logger/LilypadLibLogger';
 import {
   createLilypadSingletonAbleAsync,
   type LilypadSingletonAble,
@@ -43,31 +49,59 @@ import {
 } from '@/singleton/LilypadSingleton';
 
 export type {
-  LilypadDbCacheChangelogSync,
-  LilypadDbCacheListenSync,
-  LilypadDbCacheSchemaVerification,
-  LilypadDbCacheSync,
-  LilypadDbCacheTrustedSyncOptions,
+  LilypadDbCacheSyncOverrides,
   LilypadDbNotification,
 } from '@/cache/dbSync/LilypadDbSyncTypes';
 
 /** The key type of a table: the type of its primary key column. */
 export type LilypadDbKey<V, PK extends keyof V> = V[PK] & LilypadCacheKey;
 
-export type LilypadDbCacheOptions<V extends object, PK extends keyof V = keyof V> = Omit<
+/** The options of a cache, apart from its table and its gate. */
+export type LilypadDbCacheBaseOptions<V extends object, PK extends keyof V = keyof V> = Omit<
   LilypadCacheOptions<LilypadDbKey<V, PK>, V>,
   'bulkSync'
 > & {
-  gate: LilypadDbGate;
-  schema: LilypadDbSchema<V, PK>;
-  /** Defaults to `{ strategy: 'listen' }`. */
-  sync?: LilypadDbCacheSync;
+  /**
+   * Changes the options of the sync of the table for this cache (e.g. `connect: 'lazy'`, an
+   * `onNotification` callback). The strategy is the one of the table in its config.
+   */
+  sync?: LilypadDbCacheSyncOverrides;
   /**
    * Loading the whole table (`getAll`): `timeout` bounds each load and each query by primary keys
    * (defaults to 30 seconds); with the `none` strategy, a load stays valid for `ttl` (defaults to
    * the TTL).
    */
   bulkSync?: Omit<LilypadCacheBulkSyncOptions<LilypadDbKey<V, PK>, V>, 'fn'>;
+};
+
+/** The options of a cache of a table given as a definition (`db.tables.users`). */
+export type LilypadDbCacheOptions<
+  V extends object,
+  PK extends keyof V = keyof V,
+> = LilypadDbCacheBaseOptions<V, PK> & {
+  gate: LilypadDbGate;
+  /** The table, from a config: `db.tables.users`, whatever the config of the gate. */
+  table: LilypadDbTableDefinition<V, PK>;
+};
+
+/** The options of a cache of a table given by its key in `config`. */
+export type LilypadDbCacheNamedOptions<
+  C extends LilypadDbConfig,
+  N extends LilypadDbTableName<C>,
+> = LilypadDbCacheBaseOptions<LilypadDbRow<C, N>, LilypadDbPrimaryKey<C, N>> & {
+  gate: LilypadDbGate;
+  config: C;
+  table: N;
+};
+
+/** The options of a cache of a table given by its key in the config of the gate. */
+export type LilypadDbCacheGateNamedOptions<
+  C extends LilypadDbConfig,
+  N extends LilypadDbTableName<C>,
+> = LilypadDbCacheBaseOptions<LilypadDbRow<C, N>, LilypadDbPrimaryKey<C, N>> & {
+  gate: LilypadDbGate<C>;
+  config?: undefined;
+  table: N;
 };
 
 const DEFAULT_MAX_AGE = 60 * 60 * 1000; // 1 hour
@@ -96,7 +130,7 @@ const EAGER_REFRESHES_PER_SECOND = 1000;
  *
  * @example
  * ```typescript
- * const users = await LilypadDbCache.create({ ttl: 60_000, gate, schema: usersSchema, logger });
+ * const users = await LilypadDbCache.create({ ttl: 60_000, gate, table: db.tables.users, logger });
  * const user = await users.getOrFetch(42); // User, or null when there is no such row
  * await users.dispose();
  * ```
@@ -113,22 +147,14 @@ const EAGER_REFRESHES_PER_SECOND = 1000;
 export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
   private readonly engine: LilypadCacheEngine<LilypadDbKey<V, PK>, V>;
   private readonly table: LilypadDbTable<V, PK>;
-  private readonly schema: LilypadDbSchema<V, PK>;
+  private readonly definition: LilypadDbTableDefinition<V, PK>;
   private readonly sync: LilypadDbSyncStrategy;
   private readonly maxAge: number;
-  private readonly verifier: LilypadSchemaVerifier;
   /** Bounds the loads of the table and the queries by primary keys (`bulkSync.timeout`). */
   private readonly loadFlowControl: LilypadFlowControl;
   /** With the `none` strategy, how long a load of the table stays valid (`bulkSync.ttl`). */
   private readonly loadTtl: number;
   private releaseSingleton: LilypadSingletonRelease = () => {};
-  /**
-   * The schema of the table: from `tableName` when it is qualified, otherwise as resolved by the
-   * schema check. Notifications from another schema are ignored; while it is unknown, notifications
-   * of the table in any schema are applied.
-   */
-  private tableSchema?: string;
-
   /** The keys of the rows of the table, for `getAll`. */
   private members = new LilypadDbMembers<LilypadDbKey<V, PK>>();
   /** The load of the whole table in flight, shared by concurrent callers. */
@@ -159,26 +185,50 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
   private disposing?: Promise<void>;
 
   /**
-   * Creates a cache and, with the `listen` strategy (unless `connect: 'lazy'`), registers its
-   * database listener. The row type and the primary key are inferred from `schema`.
+   * Creates a cache of a table of a config and, with the `listen` strategy (unless
+   * `connect: 'lazy'`), registers its database listener. The table is a definition
+   * (`db.tables.users`, from any config), or its key (`'users'`) in `config`, or else in the config
+   * of the gate. The row type and the primary key are inferred from it.
    * With `singleton: '<identifier>'`, a later call with the same identifier returns the existing
    * cache and ignores its own options (a warning is logged if the table or the TTL differ).
    *
-   * @throws If the database listener cannot be registered (e.g. the database is unreachable), or,
-   * with `verify: 'throw'`, if the database is not set up.
+   * Nothing is compared with the database: `lilypad-doctor` checks it against the config.
+   *
+   * @throws If the table is not found, or if the database listener cannot be registered (e.g. the
+   * database is unreachable).
    */
   static async create<V extends object, PK extends keyof V = keyof V>(
     options: LilypadDbCacheOptions<V, PK> & LilypadSingletonAble
-  ): Promise<LilypadDbCache<V, PK>> {
+  ): Promise<LilypadDbCache<V, PK>>;
+  static async create<C extends LilypadDbConfig, N extends LilypadDbTableName<C>>(
+    options: LilypadDbCacheNamedOptions<C, N> & LilypadSingletonAble
+  ): Promise<LilypadDbCache<LilypadDbRow<C, N>, LilypadDbPrimaryKey<C, N>>>;
+  static async create<C extends LilypadDbConfig, N extends LilypadDbTableName<C>>(
+    options: LilypadDbCacheGateNamedOptions<C, N> & LilypadSingletonAble
+  ): Promise<LilypadDbCache<LilypadDbRow<C, N>, LilypadDbPrimaryKey<C, N>>>;
+  static async create(
+    options: LilypadSingletonAble & {
+      gate: LilypadDbGate;
+      table: unknown;
+      config?: LilypadDbConfig;
+      ttl?: number;
+      logger?: LilypadLibLogger;
+    }
+  ): Promise<unknown> {
+    const { table, config, ...rest } = options;
+    const definition = resolveLilypadDbTable(
+      'LilypadDbCache',
+      table,
+      config ?? options.gate.config
+    ) as LilypadDbTableDefinition<object, never>;
+    const resolved = { ...rest, table: definition } as LilypadDbCacheOptions<object, never> &
+      LilypadSingletonAble;
     return createLilypadSingletonAbleAsync(
       'LilypadDbCache',
-      options,
+      resolved,
       async (release) => {
-        const cache = new LilypadDbCache<V, PK>(options);
+        const cache = new LilypadDbCache<object, never>(resolved);
         try {
-          if (cache.verifier.mode === 'throw') {
-            await cache.verifier.verify();
-          }
           await cache.sync.start();
         } catch (error) {
           await cache.dispose();
@@ -188,7 +238,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
         return cache;
       },
       {
-        value: JSON.stringify([options.schema.tableName, options.ttl]),
+        value: JSON.stringify([definition.db.name, definition.qualifiedName, options.ttl]),
         onMismatch: () =>
           libLog(
             options.logger,
@@ -203,8 +253,8 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
   private constructor(options: LilypadDbCacheOptions<V, PK> & LilypadSingletonAble) {
     const {
       gate,
-      schema,
-      sync = { strategy: 'listen' },
+      table: definition,
+      sync: overrides = {},
       bulkSync,
       singleton: _singleton,
       ...cacheOptions
@@ -212,20 +262,12 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
     const owner = 'LilypadDbCache';
     assertNumberOption(owner, 'bulkSync.ttl', bulkSync?.ttl, 'non-negative');
     assertNumberOption(owner, 'bulkSync.timeout', bulkSync?.timeout, 'positive-delay');
-    if (sync.strategy !== 'none') {
-      assertNumberOption(owner, 'sync.maxAge', sync.maxAge, 'non-negative');
-    }
-    if (sync.strategy === 'changelog') {
-      assertNumberOption(owner, 'sync.pollInterval', sync.pollInterval, 'non-negative');
-      assertNumberOption(owner, 'sync.maxGap', sync.maxGap, 'positive');
-      assertNumberOption(owner, 'sync.lookback', sync.lookback, 'non-negative');
-      if (typeof sync.pollInterval !== 'number') {
-        throw new Error(`${owner}: sync.pollInterval is required with the changelog strategy.`);
-      }
-    }
+    assertNumberOption(owner, 'sync.maxAge', overrides.maxAge, 'non-negative');
+    assertNumberOption(owner, 'sync.pollInterval', overrides.pollInterval, 'non-negative');
+    const tableSync = definition.sync;
 
     this.engine = new LilypadCacheEngine<LilypadDbKey<V, PK>, V>(
-      { ...cacheOptions, name: options.name ?? schema.tableName },
+      { ...cacheOptions, name: options.name ?? definition.tableName },
       {
         onValueStored: (entry) => this.followValue(entry),
         hasReadInFlight: (normalizedKey) =>
@@ -234,51 +276,39 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
           this.eagerReads.has(normalizedKey),
       }
     );
-    this.table = gate.table(schema);
-    this.schema = schema;
+    this.table = gate.table(definition);
+    this.definition = definition;
     this.loadTtl = bulkSync?.ttl ?? this.engine.defaultTtl;
     this.loadFlowControl = new LilypadFlowControl({
       timeout: bulkSync?.timeout ?? DEFAULT_LOAD_TIMEOUT,
     });
-    this.numericPrimaryKey = schema.cols[schema.primaryKey]?.type === 'number';
-    this.maxAge = sync.strategy === 'none' ? 0 : (sync.maxAge ?? DEFAULT_MAX_AGE);
-    const tableNameParts = schema.tableName.split('.');
-    if (tableNameParts.length > 1) {
-      this.tableSchema = tableNameParts[tableNameParts.length - 2];
-    }
+    this.numericPrimaryKey = definition.cols[definition.primaryKey]?.type === 'number';
+    this.maxAge =
+      tableSync.strategy === 'none' ? 0 : (overrides.maxAge ?? tableSync.maxAge ?? DEFAULT_MAX_AGE);
 
-    this.verifier = new LilypadSchemaVerifier({
-      gate,
-      tableName: schema.tableName,
-      primaryKey: String(schema.primaryKey),
-      strategy: sync.strategy,
-      changelogTable: sync.strategy === 'changelog' ? sync.table : undefined,
-      pruning: sync.strategy === 'changelog' ? sync.pruning : undefined,
-      checkPruning: sync.strategy === 'changelog' && sync.checkPruning === true,
-      // A changelog read needs every row since the last read (maxGap) or of the lookback
-      minRetention:
-        sync.strategy === 'changelog'
-          ? Math.max(sync.maxGap ?? DEFAULT_MAX_GAP, sync.lookback ?? this.defaultLookback())
-          : undefined,
-      mode: sync.strategy === 'none' ? 'off' : (sync.verify ?? 'warn'),
-      platform: this.engine.platform,
-      log: (level, message, detail) => this.engine.log(level, message, detail),
-      canWarn: () => this.engine.logger?.warn !== undefined,
-      onSchema: (resolved) => {
-        this.tableSchema = resolved;
-      },
-    });
     const host = this.syncHost(gate);
-    this.sync =
-      sync.strategy === 'listen'
-        ? new LilypadListenSync(host, sync, this.verifier)
-        : sync.strategy === 'changelog'
-          ? new LilypadChangelogSync(host, sync, this.verifier)
-          : lilypadNoSync;
+    if (tableSync.strategy === 'listen') {
+      this.sync = new LilypadListenSync(host, {
+        ...tableSync,
+        connect: overrides.connect ?? tableSync.connect,
+        applyChanges: overrides.applyChanges ?? tableSync.applyChanges,
+        onNotification: overrides.onNotification,
+        channel: definition.db.notifyChannel,
+      });
+    } else if (tableSync.strategy === 'changelog') {
+      this.sync = new LilypadChangelogSync(host, {
+        ...tableSync,
+        pollInterval: overrides.pollInterval ?? tableSync.pollInterval,
+        poll: overrides.poll ?? tableSync.poll,
+        table: definition.db.changelogTable,
+      });
+    } else {
+      this.sync = lilypadNoSync;
+    }
 
     this.engine.log(
       'debug',
-      `LilypadDbCache initialized for table "${schema.tableName}" (sync: ${sync.strategy})`
+      `LilypadDbCache initialized for table "${definition.qualifiedName}" (sync: ${tableSync.strategy})`
     );
   }
 
@@ -306,7 +336,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
       id: engine.id,
       name: engine.name,
       gate,
-      tableName: this.schema.tableName,
+      tableName: this.definition.qualifiedName,
       platform: engine.platform,
       log: (level, message, detail) => engine.log(level, message, detail),
       isDisposed: () => engine.disposed,
@@ -316,7 +346,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
       expireEverything: () => engine.expireEverything(),
       emitInvalidation: (source, keys, options) => engine.emitInvalidation(source, keys, options),
       forgetOwnWritesCoveredBy: (cursor) => this.ownWrites.forgetCoveredBy(cursor),
-      tableSchema: () => this.tableSchema,
+      tableSchema: this.definition.schemaName,
       defaultLookback: () => this.defaultLookback(),
     };
   }
@@ -331,7 +361,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
     if (
       !this.numericPrimaryKey &&
       entry.value !== null &&
-      typeof entry.value[this.schema.primaryKey] === 'number'
+      typeof entry.value[this.definition.primaryKey] === 'number'
     ) {
       this.numericPrimaryKey = true;
     }
@@ -486,7 +516,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
   private async loadRows(signal: AbortSignal): Promise<Map<string, V>> {
     const { engine } = this;
     const read = engine.beginRead();
-    const primaryKey = this.schema.primaryKey;
+    const primaryKey = this.definition.primaryKey;
     const rows = new Map<string, V>();
     const entries: [LilypadDbKey<V, PK>, V][] = [];
     for (const row of await this.table.selectAll({ signal })) {
@@ -608,7 +638,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
     shared: boolean = false
   ): Promise<Map<string, LilypadCachedValueType<V>>> {
     const { engine } = this;
-    const primaryKey = this.schema.primaryKey;
+    const primaryKey = this.definition.primaryKey;
     try {
       return await this.loadFlowControl.executeWithTimeout(async (signal) => {
         const rows = new Map<string, V>();
@@ -987,9 +1017,9 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
   // WRITES
 
   private getItemPrimaryKeyValue(item: Partial<V>): LilypadDbKey<V, PK> {
-    const keyValue = item[this.schema.primaryKey];
+    const keyValue = item[this.definition.primaryKey];
     if (keyValue === undefined) {
-      throw new LilypadDbMissingPrimaryKeyError(this.schema, 'item');
+      throw new LilypadDbMissingPrimaryKeyError(this.definition, 'item');
     }
     return keyValue as LilypadDbKey<V, PK>;
   }
@@ -1041,12 +1071,12 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
     if (row === null) {
       return row;
     }
-    const key = row[this.schema.primaryKey] as LilypadDbKey<V, PK> | undefined;
+    const key = row[this.definition.primaryKey] as LilypadDbKey<V, PK> | undefined;
     if (key === undefined) {
       // The row is inserted: failing now would make the caller insert it again
       this.engine.log(
         'warn',
-        `The row created in "${this.schema.tableName}" has no primary key "${String(this.schema.primaryKey)}" after selectSanitizationFn: it is not cached.`
+        `The row created in "${this.definition.tableName}" has no primary key "${String(this.definition.primaryKey)}" after selectSanitizationFn: it is not cached.`
       );
       return row;
     }

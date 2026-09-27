@@ -1,43 +1,74 @@
+import type { LilypadDbConfig } from '@/dbConfig/LilypadDbConfig';
+import { LILYPAD_DEFAULT_MAX_GAP } from '@/dbConfig/LilypadDbConfigDefaults';
 import { LilypadDbGate } from '@/dbGate/LilypadDbGate';
 import {
   checkLilypadSchema,
   formatLilypadSchemaProblems,
-  type LilypadChangelogPruning,
+  LilypadSchemaCheckError,
+  type LilypadSchemaCheckOptions,
   type LilypadSchemaCheckResult,
 } from '@/dbGate/LilypadSchemaCheck';
 
 export type LilypadDoctorOptions = {
   /** The connection string of the database to check. */
   connectionString: string;
-  /** The cached tables, as in their `LilypadDbSchema` (`tableName`, `primaryKey`). */
-  tables: { table: string; primaryKey: string }[];
-  /**
-   * The changelog read by the caches (the `changelog` strategy), or `false` if none reads one.
-   * Defaults to `{}`: the default changelog table.
-   */
-  changelog?:
-    | {
-        table?: string;
-        /** How the old rows are deleted (see {@link LilypadChangelogPruning}). */
-        pruning?: LilypadChangelogPruning;
-        /** The largest `maxGap` and `lookback` of the caches, in ms. Defaults to 1 hour. */
-        minRetention?: number;
-      }
-    | false;
-  /** The channel the `listen` caches listen on (`cache_events`), or `false` (default) if none. */
-  notifyChannel?: string | false;
+  /** The config the database must match (see `defineLilypadDb`, `loadLilypadDbConfig`). */
+  config: LilypadDbConfig;
 };
 
 export type LilypadDoctorReport = LilypadSchemaCheckResult & {
+  /** The name of the config checked. */
+  config: string;
   /** The report, readable, with the SQL that fixes the problems. */
   text: string;
+  /** @throws {LilypadSchemaCheckError} If the check found errors. */
+  assertOk: () => void;
 };
 
 /**
- * Checks everything the caches need from the database, including how the changelog is pruned,
- * which the caches check at runtime only with `sync.checkPruning`. It connects with its own gate
- * (one connection), reads the catalogs only, and closes it. `npx lilypad-doctor` runs it from the
- * command line, e.g. in a deployment step.
+ * What the schema check must verify for a config: each table with its shape (columns, keys,
+ * indexes, checks), the changelog triggers of the `changelog` tables, the notifying triggers of the
+ * `listen` tables, and the changelog and its pruning when a table reads it. The retention the
+ * pruning must keep is the largest of `changelog.minRetention` and the `maxGap` and `lookback` of
+ * the `changelog` tables.
+ */
+export function lilypadSchemaCheckOptions(config: LilypadDbConfig): LilypadSchemaCheckOptions {
+  const definitions = Object.values(config.tables);
+  const changelogSyncs = definitions.flatMap((definition) =>
+    definition.sync.strategy === 'changelog' ? [definition.sync] : []
+  );
+  const minRetention = Math.max(
+    config.changelog.minRetention,
+    ...changelogSyncs.map((sync) =>
+      Math.max(sync.maxGap ?? LILYPAD_DEFAULT_MAX_GAP, sync.lookback ?? 0)
+    )
+  );
+  return {
+    tables: definitions.map((definition) => ({
+      table: definition.qualifiedName,
+      primaryKey: String(definition.primaryKey),
+      changelog: definition.sync.strategy === 'changelog',
+      notifyChannel: definition.sync.strategy === 'listen' ? config.notifyChannel : false,
+      shape: definition,
+    })),
+    changelog:
+      changelogSyncs.length === 0
+        ? false
+        : {
+            table: config.changelog.table,
+            pruning: config.changelog.pruning,
+            minRetention,
+            checkPruning: true,
+          },
+    notifyChannel: false,
+  };
+}
+
+/**
+ * Checks the database against a config: every table (its columns, keys, indexes and checks), the
+ * triggers each sync strategy needs, the changelog and how it is pruned. It connects with its own
+ * gate (one connection), reads the catalogs only, and closes it. `npx lilypad-doctor` runs it from
+ * the command line, e.g. in a deployment step.
  *
  * @throws If the database cannot be reached.
  */
@@ -50,19 +81,20 @@ export async function runLilypadDoctor(
     listenHeartbeat: false,
   });
   try {
-    const changelog = options.changelog ?? {};
-    const result = await checkLilypadSchema(gate, {
-      tables: options.tables,
-      changelog: changelog === false ? false : { ...changelog, checkPruning: true },
-      notifyChannel: options.notifyChannel ?? false,
-    });
-    const subject = 'lilypad-doctor';
+    const result = await checkLilypadSchema(gate, lilypadSchemaCheckOptions(options.config));
+    const subject = `lilypad-doctor (config "${options.config.name}")`;
     return {
       ...result,
+      config: options.config.name,
       text:
         result.problems.length === 0
           ? `${subject}: the database is set up.`
           : formatLilypadSchemaProblems(subject, result.problems),
+      assertOk: () => {
+        if (!result.ok) {
+          throw new LilypadSchemaCheckError(subject, result.problems);
+        }
+      },
     };
   } finally {
     await gate.close();

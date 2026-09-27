@@ -50,7 +50,7 @@ function externalImports(entryFile: string): Set<string> {
 }
 
 describe('package entries', () => {
-  it.each(['logger', 'cache', 'flow', 'serializer', 'singleton', 'platform'])(
+  it.each(['logger', 'cache', 'flow', 'serializer', 'singleton', 'platform', 'schema'])(
     'should keep the "%s" entry free of Node.js-only and database imports',
     (entry) => {
       const imports = externalImports(join(srcDir, 'entries', `${entry}.ts`));
@@ -59,9 +59,15 @@ describe('package entries', () => {
     }
   );
 
-  it('should limit the external imports of the "db" entry to postgres and node:crypto', () => {
+  it('should limit the external imports of the "db" entry to postgres and a few Node.js modules', () => {
     const imports = externalImports(join(srcDir, 'entries', 'db.ts'));
 
-    expect([...imports].sort()).toEqual(['node:crypto', 'postgres']);
+    expect([...imports].sort()).toEqual([
+      'node:crypto',
+      'node:fs',
+      'node:path',
+      'node:url',
+      'postgres',
+    ]);
   });
 });

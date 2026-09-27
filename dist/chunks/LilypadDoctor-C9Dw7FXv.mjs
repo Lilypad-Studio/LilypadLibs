@@ -2,36 +2,12 @@ import { n as LilypadDisposedError } from "./LilypadCacheTypes-DuzvYfI8.mjs";
 import { t as assertNumberOption } from "./LilypadValidation-ByfswRPE.mjs";
 import { t as libLog } from "./LilypadLibLogger-D2eacfBb.mjs";
 import { n as createLilypadSingletonAbleAsync } from "./LilypadSingleton-D729uyb5.mjs";
+import { c as resolveLilypadDbTable, n as LilypadDbMissingPrimaryKeyError, o as isLilypadDbConfig, r as LilypadDbNotFoundError, t as LilypadDbEmptyWriteError } from "./LilypadDbSchema-wa5OpLfP.mjs";
 import { createHash } from "node:crypto";
 import postgres from "postgres";
-//#region src/dbGate/LilypadDbSchema.ts
-/** Thrown by the writes when the data has no primary key where one is needed. */
-var LilypadDbMissingPrimaryKeyError = class extends Error {
-	constructor(schema, context) {
-		super(`Primary key "${String(schema.primaryKey)}" is missing in the ${context} data for table "${schema.tableName}".`);
-		this.name = "LilypadDbMissingPrimaryKeyError";
-		this.tableName = schema.tableName;
-		this.primaryKey = String(schema.primaryKey);
-	}
-};
-/** Thrown by an insert or an update whose data has no column of the schema to write. */
-var LilypadDbEmptyWriteError = class extends Error {
-	constructor(tableName, operation) {
-		super(`No columns to ${operation} for table "${tableName}".`);
-		this.name = "LilypadDbEmptyWriteError";
-		this.tableName = tableName;
-	}
-};
-/** Thrown by `updateToTable` when no row has the primary key of the data. */
-var LilypadDbNotFoundError = class extends Error {
-	constructor(tableName, primaryKeyValue) {
-		super(`No row with primary key "${String(primaryKeyValue)}" found in table "${tableName}".`);
-		this.name = "LilypadDbNotFoundError";
-		this.tableName = tableName;
-		this.primaryKeyValue = primaryKeyValue;
-	}
-};
-//#endregion
+import { existsSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 //#region src/dbGate/LilypadDbTable.ts
 /** Rows read at a time by `selectAll`. */
 const SELECT_ALL_BATCH_SIZE = 1e3;
@@ -40,8 +16,10 @@ const PRIMARY_KEYS_BATCH_SIZE = 1e3;
 /** The column that carries the transaction id in the results of writes. */
 const XID_COLUMN = "__lilypad_xid";
 /**
-* The typed CRUD helpers of one table, created with `gate.table(schema)`: every method uses the
-* schema of the handle, and the connections of the gate (it rejects once the gate is closed).
+* The typed CRUD helpers of one table, created with `gate.table(db.tables.users)` (or
+* `gate.table('users')` on a gate created with a config): every method uses the definition of the
+* table, and the connections of the gate (it rejects once the gate is closed). Queries name the
+* table with its schema (`public.users`), whatever the `search_path`.
 *
 * - Only the `cols` keys are selected (unless there is a `selectSanitizationFn`, which gets `*`)
 *   and written: extra properties of the data (e.g. from a request body) are never written.
@@ -50,15 +28,15 @@ const XID_COLUMN = "__lilypad_xid";
 *
 * @example
 * ```typescript
-* const users = gate.table(usersSchema);
+* const users = gate.table(db.tables.users);
 * const { row } = await users.insert({ name: 'Ada' });
 * const user = await users.selectByPrimaryKey(row!.id);
 * ```
 */
 var LilypadDbTable = class {
-	constructor(gate, schema) {
+	constructor(gate, definition) {
 		this.gate = gate;
-		this.schema = schema;
+		this.definition = definition;
 	}
 	get sql() {
 		return this.gate.sql;
@@ -68,7 +46,7 @@ var LilypadDbTable = class {
 	* otherwise by copying the schema columns.
 	*/
 	mapRow(row) {
-		const { schema } = this;
+		const { definition: schema } = this;
 		if (schema.selectSanitizationFn) return schema.selectSanitizationFn(row);
 		const typedRow = {};
 		for (const key in schema.cols) typedRow[key] = row[key];
@@ -85,17 +63,17 @@ var LilypadDbTable = class {
 	* columns that are not in the schema; otherwise only the schema columns are needed.
 	*/
 	selectedColumns() {
-		return this.schema.selectSanitizationFn ? this.sql`*` : this.sql(Object.keys(this.schema.cols));
+		return this.definition.selectSanitizationFn ? this.sql`*` : this.sql(Object.keys(this.definition.cols));
 	}
 	/** The `RETURNING` list of a write: the selected columns and the transaction id. */
 	returning() {
 		return this.sql`${this.selectedColumns()}, pg_current_xact_id()::text AS ${this.sql(XID_COLUMN)}`;
 	}
 	get tableName() {
-		return this.sql(this.schema.tableName);
+		return this.sql(this.definition.qualifiedName);
 	}
 	get primaryKeyColumn() {
-		return this.sql(String(this.schema.primaryKey));
+		return this.sql(String(this.definition.primaryKey));
 	}
 	/**
 	* Prepares the data of an insert/update:
@@ -107,7 +85,7 @@ var LilypadDbTable = class {
 	* - skips `undefined` values, which postgres.js rejects.
 	*/
 	prepareWrite(data, operation) {
-		const { schema } = this;
+		const { definition: schema } = this;
 		const writeData = schema.writeSanitizationFn ? { ...schema.writeSanitizationFn({ ...data }) } : { ...data };
 		const primaryKeyValue = writeData[schema.primaryKey];
 		if ((operation === "update" || !schema.generatedPrimaryKey) && (primaryKeyValue === void 0 || primaryKeyValue === null)) throw new LilypadDbMissingPrimaryKeyError(schema, operation);
@@ -123,7 +101,7 @@ var LilypadDbTable = class {
 	/** Splits a row returned by a write into the row and the id of its transaction. */
 	writeResult(results) {
 		const [returned] = results;
-		if (!returned) throw new Error(`The write to table "${this.schema.tableName}" returned no row.`);
+		if (!returned) throw new Error(`The write to table "${this.definition.tableName}" returned no row.`);
 		const { [XID_COLUMN]: xid, ...row } = returned;
 		return {
 			row: this.mapRow(row),
@@ -213,7 +191,7 @@ var LilypadDbTable = class {
       WHERE ${this.primaryKeyColumn} = ${primaryKeyValue}
       RETURNING ${this.returning()}
     `;
-		if (results.count === 0) throw new LilypadDbNotFoundError(this.schema.tableName, primaryKeyValue);
+		if (results.count === 0) throw new LilypadDbNotFoundError(this.definition.tableName, primaryKeyValue);
 		return this.writeResult(results);
 	}
 	/**
@@ -349,13 +327,16 @@ const DEFAULT_STATEMENT_TIMEOUT = 3e4;
 const DEFAULT_CLOSE_TIMEOUT = 5e3;
 const DEFAULT_LISTEN_HEARTBEAT = 15e3;
 /**
-* A gateway to a PostgreSQL database: typed CRUD helpers over a {@link LilypadDbSchema} (through
+* A gateway to a PostgreSQL database: typed CRUD helpers over the tables of a config (through
 * {@link LilypadDbGate.table}), and channel listeners (`LISTEN/NOTIFY`) with reconnection handling.
+*
+* @typeParam C - The config the gate was created with, whose tables can be named.
 *
 * @example
 * ```typescript
 * const gate = await LilypadDbGate.create({
 *   connectionString: 'postgres://user:pass@host:port/db',
+*   config: db, // the default export of lilypad.config.ts
 *   listen: [
 *     { channel: 'my_channel', callbackId: 'my_callback', callback: (payload) => console.log(payload) }
 *   ]
@@ -372,6 +353,7 @@ var LilypadDbGate = class LilypadDbGate {
 		if (options.statementTimeout !== false) assertNumberOption("LilypadDbGate", "statementTimeout", options.statementTimeout, "positive");
 		if (options.listenHeartbeat !== false) assertNumberOption("LilypadDbGate", "listenHeartbeat", options.listenHeartbeat, "positive-delay");
 		this.logger = options.logger;
+		this.config = options.config;
 		const statementTimeout = resolveStatementTimeout(options);
 		this.sql = postgres(options.connectionString, {
 			prepare: false,
@@ -400,9 +382,10 @@ var LilypadDbGate = class LilypadDbGate {
 				options.listenerConnectionString,
 				resolveStatementTimeout(options),
 				options.pool,
-				options.listenHeartbeat
+				options.listenHeartbeat,
+				options.config?.name
 			])).digest("hex"),
-			onMismatch: () => libLog(options.logger, "warn", "LilypadDbGate", `Singleton "${options.singleton ?? ""}" already exists with different connection options: the new options are ignored.`)
+			onMismatch: () => libLog(options.logger, "warn", "LilypadDbGate", `Singleton "${options.singleton ?? ""}" already exists with different connection options or config: the new options are ignored.`)
 		});
 	}
 	static async initializeNew(options) {
@@ -415,12 +398,8 @@ var LilypadDbGate = class LilypadDbGate {
 		}
 		return instance;
 	}
-	/**
-	* The typed CRUD helpers of a table: reads and writes of the rows described by `schema`. The
-	* handle is cheap: create one per table and keep it, or call `table` again.
-	*/
-	table(schema) {
-		return new LilypadDbTable(this, schema);
+	table(table) {
+		return new LilypadDbTable(this, resolveLilypadDbTable("LilypadDbGate", table, this.config));
 	}
 	/** The client that listens: postgres.js keeps one dedicated connection per client for LISTEN. */
 	listenClient() {
@@ -578,16 +557,6 @@ var LilypadDbGate = class LilypadDbGate {
 function resolveStatementTimeout(options) {
 	return options.statementTimeout === false ? void 0 : options.statementTimeout ?? DEFAULT_STATEMENT_TIMEOUT;
 }
-//#endregion
-//#region src/dbGate/LilypadChangelog.ts
-/**
-* The changelog records every change of the cached tables in a table, so that each instance can
-* read the changes made since its last check with one query. It needs no long-lived connection
-* (unlike `LISTEN/NOTIFY`), so it suits serverless platforms, and it also catches the changes made
-* by other programs. It needs PostgreSQL 13 or later (`xid8`).
-*/
-const LILYPAD_DEFAULT_CHANGELOG_TABLE = "lilypad_cache_changes";
-const LILYPAD_DEFAULT_NOTIFY_CHANNEL = "cache_events";
 const LILYPAD_CHANGELOG_VERSION_PREFIX = "lilypad-changelog:";
 /** Above this number of rows changed by one statement, the trigger sends one `BULK` notification. */
 const LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD = 1e3;
@@ -820,7 +789,7 @@ WHERE c.oid = ${quoteLiteral(quoteIdentifier(table))}::regclass;
 * Transition tables are not supported on the partitions of a partitioned table, nor on tables with
 * inheritance children: attach the triggers to the partitioned table itself.
 *
-* @param options.table - The cached table (as in its `LilypadDbSchema`).
+* @param options.table - The cached table (`table` or `schema.table`).
 * @param options.primaryKey - Its primary key column.
 * @param options.changelogTable - The changelog table, if not the default one.
 */
@@ -999,6 +968,72 @@ async function pruneLilypadChangelog(gate, options) {
 	}
 }
 //#endregion
+//#region src/dbConfig/loadLilypadDbConfig.ts
+/** The extensions of the config files, in the order they are looked for. */
+const EXTENSIONS = [
+	"ts",
+	"mts",
+	"mjs",
+	"js"
+];
+const CONFIG_NAME = /^[A-Za-z0-9_-]+$/;
+/**
+* The file names of a config: `lilypad.config.<ext>` for the default one, `lilypad.<name>.config.<ext>`
+* for the others.
+*/
+function lilypadDbConfigFileNames(name) {
+	const base = name === "default" ? "lilypad.config" : `lilypad.${name}.config`;
+	return EXTENSIONS.map((extension) => `${base}.${extension}`);
+}
+/**
+* The file of a config: `config` is the name of a config (`default` when absent), looked for in
+* `cwd`, or the path of a file.
+*
+* @throws If there is no such file.
+*/
+function findLilypadDbConfig(config, cwd) {
+	const reference = config ?? "default";
+	if (!CONFIG_NAME.test(reference)) {
+		const path = isAbsolute(reference) ? reference : resolve(cwd, reference);
+		if (!existsSync(path)) throw new Error(`The config file ${path} does not exist.`);
+		return path;
+	}
+	const candidates = lilypadDbConfigFileNames(reference);
+	const found = candidates.map((file) => resolve(cwd, file)).find((path) => existsSync(path));
+	if (!found) throw new Error(`No config "${reference}" in ${cwd}: expected one of ${candidates.join(", ")}.`);
+	return found;
+}
+/**
+* Loads a config file: its default export (or its `config` export) must be a config made with
+* `defineLilypadDb`. A config found by name must have that name.
+*
+* A TypeScript config is loaded by Node.js itself (type stripping: Node.js 22.18 or later, or
+* `--experimental-strip-types`): it may use only erasable syntax, and its relative imports need
+* their extension (`./tables/users.ts`). Otherwise, write it as `.mjs`.
+*
+* @param options.config - The name of the config (`default` when absent), or the path of its file.
+* @param options.cwd - Where the config files are looked for. Defaults to the working directory.
+* @throws If the file does not exist, cannot be loaded, or exports no config.
+*/
+async function loadLilypadDbConfig(options = {}) {
+	const path = findLilypadDbConfig(options.config, options.cwd ?? process.cwd());
+	let module;
+	try {
+		module = await import(pathToFileURL(path).href);
+	} catch (error) {
+		if (error.code === "ERR_UNKNOWN_FILE_EXTENSION") throw new Error(`Node.js ${process.version} cannot load the TypeScript config ${path}: use Node.js 22.18 or later, run it with NODE_OPTIONS=--experimental-strip-types, or write the config as .mjs.`, { cause: error });
+		throw new Error(`Could not load the config ${path}: ${String(error)}`, { cause: error });
+	}
+	const config = [module.default, module.config].find(isLilypadDbConfig);
+	if (!config) throw new Error(`The config ${path} must export a config made with defineLilypadDb (export default defineLilypadDb({ ... })).`);
+	const expected = options.config ?? "default";
+	if (CONFIG_NAME.test(expected) && config.name !== expected) throw new Error(`The config ${path} is named "${config.name}", but it was looked for as "${expected}": set name: '${expected}' in defineLilypadDb, or rename the file.`);
+	return {
+		path,
+		config
+	};
+}
+//#endregion
 //#region src/dbGate/LilypadSchemaFacts.ts
 /** A `json` column: postgres.js parses it, unless the type is not registered yet. */
 function parseJsonColumn(value) {
@@ -1082,11 +1117,78 @@ async function readDatabaseFacts(gate, options) {
 		}
 	};
 }
-/** For each table of the options, in order, its schema and its triggers: one query for all. */
+/**
+* For each table of the options, in order, its schema, its triggers, and, when its shape is checked,
+* its columns, constraints and indexes: one query for all.
+*/
 async function readTableFacts(gate, options) {
 	const sql = gate.sql;
 	const changelog = readChangelogTarget(options);
 	const tableRefs = options.tables.map(({ table }) => quoteIdentifier(table));
+	const shapeColumns = options.tables.some((table) => table.shape !== void 0) ? sql`,
+      (
+        SELECT coalesce(json_agg(json_build_object(
+          'name', a.attname,
+          'type', format_type(a.atttypid, a.atttypmod),
+          'category', ty.typcategory,
+          'notNull', a.attnotnull,
+          'hasDefault', a.atthasdef,
+          'identity', a.attidentity <> '',
+          'generated', a.attgenerated <> ''
+        ) ORDER BY a.attnum), '[]'::json)
+        FROM pg_attribute a JOIN pg_type ty ON ty.oid = a.atttypid
+        WHERE a.attrelid = t.oid AND a.attnum > 0 AND NOT a.attisdropped
+      ) AS columns,
+      (
+        SELECT coalesce(json_agg(json_build_object(
+          'name', con.conname,
+          'type', con.contype,
+          'columns', (
+            SELECT coalesce(json_agg(a.attname ORDER BY k.ord), '[]'::json)
+            FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum
+          ),
+          'referencedTable', (
+            SELECT rn.nspname || '.' || rc.relname
+            FROM pg_class rc JOIN pg_namespace rn ON rn.oid = rc.relnamespace
+            WHERE rc.oid = con.confrelid
+          ),
+          'referencedColumns', (
+            SELECT coalesce(json_agg(a.attname ORDER BY k.ord), '[]'::json)
+            FROM unnest(con.confkey) WITH ORDINALITY AS k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.attnum
+          ),
+          'onDelete', con.confdeltype,
+          'onUpdate', con.confupdtype
+        )), '[]'::json)
+        FROM pg_constraint con
+        WHERE con.conrelid = t.oid AND con.contype IN ('p', 'u', 'f', 'c')
+      ) AS constraints,
+      (
+        SELECT coalesce(json_agg(json_build_object(
+          'name', ic.relname,
+          'unique', ix.indisunique,
+          'primary', ix.indisprimary,
+          'method', am.amname,
+          -- The key columns only (not INCLUDE), NULL for an expression
+          'columns', (
+            SELECT coalesce(json_agg(a.attname ORDER BY k.ord), '[]'::json)
+            FROM unnest(ix.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+            LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.attnum
+            WHERE k.ord <= ix.indnkeyatts
+          ),
+          'partial', ix.indpred IS NOT NULL,
+          'expressions', ix.indexprs IS NOT NULL,
+          'constraint', EXISTS (
+            SELECT 1 FROM pg_constraint ic_con
+            WHERE ic_con.conindid = ix.indexrelid AND ic_con.conrelid = ix.indrelid
+          )
+        )), '[]'::json)
+        FROM pg_index ix
+        JOIN pg_class ic ON ic.oid = ix.indexrelid
+        JOIN pg_am am ON am.oid = ic.relam
+        WHERE ix.indrelid = t.oid
+      ) AS indexes` : sql``;
 	const found = tableRefs.length === 0 ? [] : await sql`
     SELECT
       requested.position,
@@ -1105,57 +1207,37 @@ async function readTableFacts(gate, options) {
         FROM pg_trigger tr JOIN pg_proc p ON p.oid = tr.tgfoid
         WHERE tr.tgrelid = t.oid AND NOT tr.tgisinternal
       ) AS triggers
+      ${shapeColumns}
     FROM unnest(${textArrayLiteral(tableRefs)}::text[]) WITH ORDINALITY AS requested(ref, position)
     JOIN pg_class t ON t.oid = to_regclass(requested.ref)
     JOIN pg_namespace n ON n.oid = t.relnamespace
   `;
 	const byPosition = new Map(found.map((row) => [Number(row.position), row]));
-	return options.tables.map((_, index) => {
+	return options.tables.map((table, index) => {
 		const row = byPosition.get(index + 1);
-		return row ? {
-			schema: row.schema_name,
-			triggers: parseJsonColumn(row.triggers)
-		} : {
+		if (!row) return {
 			schema: null,
 			triggers: []
 		};
+		const facts = {
+			schema: row.schema_name,
+			triggers: parseJsonColumn(row.triggers)
+		};
+		if (table.shape !== void 0) {
+			facts.columns = parseJsonColumn(row.columns);
+			facts.constraints = parseJsonColumn(row.constraints);
+			facts.indexes = parseJsonColumn(row.indexes);
+		}
+		return facts;
 	});
-}
-/** How long the caches of a gate share the facts of the database (see `shareDatabaseFacts`). */
-const SHARED_FACTS_LIFETIME = 6e4;
-const sharedFacts = /* @__PURE__ */ new WeakMap();
-/**
-* The facts of the database, shared by the checks of the caches of a gate made within a minute:
-* N caches read them once. A failed read is not shared.
-*/
-function sharedDatabaseFacts(gate, options) {
-	let gateFacts = sharedFacts.get(gate);
-	if (!gateFacts) {
-		gateFacts = /* @__PURE__ */ new Map();
-		sharedFacts.set(gate, gateFacts);
-	}
-	const key = JSON.stringify([readChangelogTarget(options).table, options.changelog !== false && options.changelog?.checkPruning !== false]);
-	const now = Date.now();
-	const shared = gateFacts.get(key);
-	if (shared && now - shared.readAt < SHARED_FACTS_LIFETIME) return shared.facts;
-	const facts = readDatabaseFacts(gate, options);
-	const entry = {
-		readAt: now,
-		facts
-	};
-	gateFacts.set(key, entry);
-	facts.catch(() => {
-		if (gateFacts.get(key) === entry) gateFacts.delete(key);
-	});
-	return facts;
 }
 /**
 * Reads from the catalogs what {@link evaluateLilypadSchema} needs. It changes nothing.
 *
 * @throws If the catalogs cannot be read (e.g. the database is unreachable).
 */
-async function readLilypadSchemaFacts(gate, options, context = {}) {
-	const [database, tables] = await Promise.all([context.shareDatabaseFacts ? sharedDatabaseFacts(gate, options) : readDatabaseFacts(gate, options), readTableFacts(gate, options)]);
+async function readLilypadSchemaFacts(gate, options) {
+	const [database, tables] = await Promise.all([readDatabaseFacts(gate, options), readTableFacts(gate, options)]);
 	return {
 		...database,
 		tables
@@ -1186,8 +1268,8 @@ async function readCronJobs(gate) {
 //#region src/dbGate/LilypadSchemaPruning.ts
 /**
 * How the changelog is pruned: the `prune` option of its trigger and the pg_cron jobs that delete
-* from it, their retention, and the best pruning to suggest when none is found. The caches check
-* it at runtime only with `sync.checkPruning`; `lilypad-doctor` always does.
+* from it, their retention, and the best pruning to suggest when none is found. `lilypad-doctor`
+* checks it whenever a table of the config reads the changelog.
 */
 const MINUTE = 6e4;
 const HOUR = 60 * MINUTE;
@@ -1395,10 +1477,280 @@ function suggestPruning(facts, changelog, olderThan, changelogSql, pruning) {
 	};
 }
 //#endregion
+//#region src/dbGate/LilypadSchemaShape.ts
+const TYPE_ALIASES = {
+	int: "integer",
+	int4: "integer",
+	serial: "integer",
+	serial4: "integer",
+	int2: "smallint",
+	smallserial: "smallint",
+	serial2: "smallint",
+	int8: "bigint",
+	bigserial: "bigint",
+	serial8: "bigint",
+	float4: "real",
+	float8: "double precision",
+	float: "double precision",
+	bool: "boolean",
+	varchar: "character varying",
+	char: "character",
+	bpchar: "character",
+	decimal: "numeric",
+	timestamptz: "timestamp with time zone",
+	timetz: "time with time zone",
+	varbit: "bit varying"
+};
+const SERIAL_TYPES = /* @__PURE__ */ new Set([
+	"serial",
+	"serial4",
+	"smallserial",
+	"serial2",
+	"bigserial",
+	"serial8"
+]);
+/**
+* A PostgreSQL type as `format_type` writes it: lower case, aliases resolved (`int4` is
+* `integer`, `varchar(64)` is `character varying(64)`, `timestamptz(3)` is
+* `timestamp(3) with time zone`), array suffixes kept.
+*/
+function normalizeLilypadPgType(type) {
+	let text = type.trim().toLowerCase().replace(/\s+/g, " ");
+	let arrays = "";
+	while (text.endsWith("[]")) {
+		arrays += "[]";
+		text = text.slice(0, -2).trimEnd();
+	}
+	const open = text.indexOf("(");
+	const close = open < 0 ? -1 : text.indexOf(")", open);
+	const name = (close < 0 ? text : text.slice(0, open)).trim();
+	const args = close < 0 ? "" : text.slice(open, close + 1).replace(/\s+/g, "");
+	const rest = close < 0 ? "" : text.slice(close + 1).trim();
+	if (name === "timestamp" || name === "time") return `${name}${args} ${rest || "without time zone"}${arrays}`;
+	const resolved = TYPE_ALIASES[name] ?? name;
+	if (resolved === "character" && !args) return `character(1)${arrays}`;
+	const zone = /^(timestamp|time) (with|without) time zone$/.exec(resolved);
+	if (zone) return `${zone[1]}${args} ${zone[2]} time zone${arrays}`;
+	return `${resolved}${args}${rest ? ` ${rest}` : ""}${arrays}`;
+}
+/** Whether a declared type names the installed one (`format_type` qualifies the types of schemas off the `search_path`). */
+function sameType(declared, installed) {
+	const expected = normalizeLilypadPgType(declared);
+	const actual = normalizeLilypadPgType(installed);
+	return actual === expected || actual.endsWith(`.${expected}`) || expected.endsWith(`.${actual}`);
+}
+const TIME_TYPES = /^time(\(\d+\))? with(out)? time zone$/;
+/**
+* Whether a column of this type is read by postgres.js as the declared `type`, or `undefined` if it
+* fits; otherwise, why not.
+*/
+function typeMismatch(type, column) {
+	const installed = normalizeLilypadPgType(column.type);
+	const base = installed.replace(/\(.*$/, "");
+	switch (type) {
+		case "string": return [
+			"S",
+			"E",
+			"I",
+			"V",
+			"T"
+		].includes(column.category) || [
+			"uuid",
+			"xml",
+			"numeric",
+			"bigint"
+		].includes(base) || TIME_TYPES.test(installed) ? void 0 : "postgres.js does not return it as a string";
+		case "number":
+			if (base === "bigint" || base === "numeric") return "postgres.js returns it as a string: declare the column as `bigint` or `string`";
+			return column.category === "N" ? void 0 : "it is not a numeric type";
+		case "bigint": return base === "bigint" || base === "numeric" ? void 0 : "it is not a bigint";
+		case "boolean": return column.category === "B" ? void 0 : "it is not a boolean";
+		case "date": return column.category === "D" && !TIME_TYPES.test(installed) ? void 0 : "postgres.js does not return it as a Date";
+		case "json": return base === "json" || base === "jsonb" ? void 0 : "it is not json or jsonb";
+		case "array": return column.category === "A" ? void 0 : "it is not an array";
+	}
+}
+const ACTION_NAMES = Object.fromEntries(Object.entries({
+	"no action": "a",
+	restrict: "r",
+	cascade: "c",
+	"set null": "n",
+	"set default": "d"
+}).map(([name, code]) => [code, name]));
+function columnList(columns) {
+	return columns.map((column) => column === null ? "<expression>" : column).join(", ");
+}
+function quotedColumns(columns) {
+	return columns.map(quoteIdentifier).join(", ");
+}
+function sameSet(a, b) {
+	return a.length === b.length && a.every((value) => b.includes(value));
+}
+function sameList(a, b) {
+	return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+/** Whether a declared column has a generating default: `default`, a serial type, or the generated primary key. */
+function expectsDefault(name, column, shape, primaryKey) {
+	return column.default !== void 0 || column.pgType !== void 0 && SERIAL_TYPES.has(column.pgType.trim().toLowerCase()) || shape.generatedPrimaryKey === true && name === primaryKey;
+}
+/** The SQL of a column, for `CREATE TABLE` and `ADD COLUMN` (its type must be known). */
+function columnSql(name, column, shape, primaryKey) {
+	const parts = [quoteIdentifier(name), column.pgType];
+	const normalized = normalizeLilypadPgType(column.pgType);
+	if (shape.generatedPrimaryKey === true && name === primaryKey && typeof column.default !== "object" && !SERIAL_TYPES.has(column.pgType.trim().toLowerCase()) && [
+		"integer",
+		"smallint",
+		"bigint"
+	].includes(normalized)) parts.push("GENERATED BY DEFAULT AS IDENTITY");
+	if (column.nullable === false || name === primaryKey) parts.push("NOT NULL");
+	if (typeof column.default === "object") parts.push(`DEFAULT ${column.default.sql}`);
+	return parts.join(" ");
+}
+function foreignKeySql(table, foreignKey) {
+	const name = foreignKey.name ? `CONSTRAINT ${quoteIdentifier(foreignKey.name)} ` : "";
+	return `ALTER TABLE ${quoteIdentifier(table)} ADD ${name}FOREIGN KEY (${quotedColumns(foreignKey.columns)}) REFERENCES ${quoteIdentifier(foreignKey.references.table)} (${quotedColumns(foreignKey.references.columns)}) ON DELETE ${foreignKey.onDelete.toUpperCase()} ON UPDATE ${foreignKey.onUpdate.toUpperCase()};`;
+}
+function indexSql(table, index) {
+	const name = index.name ? `${quoteIdentifier(index.name)} ` : "";
+	const using = index.using === "btree" ? "" : ` USING ${index.using}`;
+	return `CREATE ${index.unique ? "UNIQUE " : ""}INDEX ${name}ON ${quoteIdentifier(table)}${using} (${quotedColumns(index.columns)});`;
+}
+function uniqueSql(table, uniqueKey) {
+	const name = uniqueKey.name ? `CONSTRAINT ${quoteIdentifier(uniqueKey.name)} ` : "";
+	return `ALTER TABLE ${quoteIdentifier(table)} ADD ${name}UNIQUE (${quotedColumns(uniqueKey.columns)});`;
+}
+function checkSql(table, check) {
+	return `ALTER TABLE ${quoteIdentifier(table)} ADD CONSTRAINT ${quoteIdentifier(check.name)} CHECK (${check.expression});`;
+}
+function describeForeignKey(foreignKey) {
+	return `(${foreignKey.columns.join(", ")}) → ${foreignKey.references.table} (${foreignKey.references.columns.join(", ")})`;
+}
+/**
+* The SQL that creates a missing table, with its keys, checks and indexes (its foreign keys are
+* separate problems), or `undefined` if the type of a column is unknown.
+*/
+function lilypadCreateTableSql(table, primaryKey, shape) {
+	const columns = Object.entries(shape.cols);
+	if (columns.some(([, column]) => column.pgType === void 0)) return;
+	const lines = columns.map(([name, column]) => columnSql(name, column, shape, primaryKey));
+	lines.push(`PRIMARY KEY (${quoteIdentifier(primaryKey)})`);
+	for (const uniqueKey of shape.unique) {
+		const name = uniqueKey.name ? `CONSTRAINT ${quoteIdentifier(uniqueKey.name)} ` : "";
+		lines.push(`${name}UNIQUE (${quotedColumns(uniqueKey.columns)})`);
+	}
+	for (const check of shape.checks) if (check.expression !== void 0) lines.push(`CONSTRAINT ${quoteIdentifier(check.name)} CHECK (${check.expression})`);
+	return [`CREATE TABLE ${quoteIdentifier(table)} (\n  ${lines.join(",\n  ")}\n);`, ...shape.indexes.map((index) => indexSql(table, index))].join("\n");
+}
+/** The problems of the foreign keys of a table that does not exist yet: each one is missing. */
+function lilypadMissingTableForeignKeys(table, shape) {
+	return shape.foreignKeys.map((foreignKey) => ({
+		code: "missing-foreign-key",
+		severity: "error",
+		table,
+		message: `The foreign key ${describeForeignKey(foreignKey)} of "${table}" does not exist.`,
+		fix: foreignKeySql(table, foreignKey)
+	}));
+}
+/**
+* The differences between the shape of a table and what the database has. It is pure.
+*
+* @param table - The table, as the check names it (`schema.table`).
+*/
+function evaluateLilypadTableShape(table, primaryKey, shape, facts) {
+	const problems = [];
+	const deferred = [];
+	const columns = facts.columns ?? [];
+	const constraints = facts.constraints ?? [];
+	const indexes = facts.indexes ?? [];
+	const byName = new Map(columns.map((column) => [column.name, column]));
+	const quotedTable = quoteIdentifier(table);
+	const push = (code, severity, message, fix) => {
+		problems.push({
+			code,
+			severity,
+			table,
+			message,
+			...fix !== void 0 && { fix }
+		});
+	};
+	for (const [name, column] of Object.entries(shape.cols)) {
+		const installed = byName.get(name);
+		if (!installed) {
+			push("missing-column", "error", `The column "${name}" of "${table}" does not exist.`, column.pgType === void 0 ? void 0 : `ALTER TABLE ${quotedTable} ADD COLUMN ${columnSql(name, column, shape, primaryKey)};`);
+			continue;
+		}
+		if (column.pgType !== void 0) {
+			if (!sameType(column.pgType, installed.type)) push("column-type-mismatch", "error", `The column "${name}" of "${table}" is ${installed.type}, not ${normalizeLilypadPgType(column.pgType)}.`, `ALTER TABLE ${quotedTable} ALTER COLUMN ${quoteIdentifier(name)} TYPE ${column.pgType};`);
+		} else if (column.type !== void 0) {
+			const mismatch = typeMismatch(column.type, installed);
+			if (mismatch) push("column-type-mismatch", "warning", `The column "${name}" of "${table}" is ${installed.type}, declared as ${column.type}: ${mismatch}.`);
+		}
+		if (column.nullable === false && !installed.notNull) push("column-nullability-mismatch", "error", `The column "${name}" of "${table}" accepts NULL, but is declared not nullable.`, `ALTER TABLE ${quotedTable} ALTER COLUMN ${quoteIdentifier(name)} SET NOT NULL;`);
+		else if (column.nullable === true && installed.notNull) push("column-nullability-mismatch", "error", `The column "${name}" of "${table}" is NOT NULL, but is declared nullable.`, name === primaryKey ? void 0 : `ALTER TABLE ${quotedTable} ALTER COLUMN ${quoteIdentifier(name)} DROP NOT NULL;`);
+		if (expectsDefault(name, column, shape, primaryKey) && !installed.hasDefault && !installed.identity && !installed.generated) push("missing-column-default", "error", shape.generatedPrimaryKey === true && name === primaryKey ? `The primary key "${name}" of "${table}" is declared generated (generatedPrimaryKey), but the database does not generate it.` : `The column "${name}" of "${table}" has no default.`, typeof column.default === "object" ? `ALTER TABLE ${quotedTable} ALTER COLUMN ${quoteIdentifier(name)} SET DEFAULT ${column.default.sql};` : void 0);
+	}
+	for (const column of columns) {
+		if (Object.hasOwn(shape.cols, column.name)) continue;
+		if (column.notNull && !column.hasDefault && !column.identity && !column.generated) push("undeclared-required-column", "warning", `The column "${column.name}" of "${table}" is NOT NULL without a default, and is not in \`cols\`: inserts through the library fail.`);
+		else if (shape.strict) push("undeclared-column", "warning", `The column "${column.name}" (${column.type}) of "${table}" is not in \`cols\`.`);
+	}
+	const primary = constraints.find((constraint) => constraint.type === "p");
+	const isUsableUnique = (index) => index.unique && !index.partial && !index.expressions;
+	if (!primary || !sameList(primary.columns, [primaryKey])) {
+		const uniqueOnKey = indexes.some((index) => isUsableUnique(index) && sameList(index.columns, [primaryKey]));
+		const notNull = byName.get(primaryKey)?.notNull ?? false;
+		const found = primary ? `its primary key is (${primary.columns.join(", ")})` : "it has no primary key";
+		if (uniqueOnKey && notNull) push("wrong-primary-key", "warning", `The key "${primaryKey}" of "${table}" is unique and NOT NULL, but ${found}.`);
+		else if (byName.has(primaryKey)) push("wrong-primary-key", "error", `The key "${primaryKey}" of "${table}" is not unique: ${found}.`, primary ? void 0 : `ALTER TABLE ${quotedTable} ADD PRIMARY KEY (${quoteIdentifier(primaryKey)});`);
+	}
+	const uniqueSets = [...constraints.filter((constraint) => constraint.type === "p" || constraint.type === "u").map((constraint) => constraint.columns), ...indexes.filter(isUsableUnique).map((index) => index.columns)];
+	for (const uniqueKey of shape.unique) if (!uniqueSets.some((columns) => sameSet(columns, uniqueKey.columns))) push("missing-unique-key", "error", `The columns (${uniqueKey.columns.join(", ")}) of "${table}" are not unique together: no unique constraint or index covers exactly them.`, uniqueSql(table, uniqueKey));
+	const foreignConstraints = constraints.filter((constraint) => constraint.type === "f");
+	const pairs = (columns, referenced) => columns.map((column, index) => `${column}\u0000${referenced[index] ?? ""}`);
+	const matchesForeignKey = (constraint, foreignKey) => constraint.referencedTable === foreignKey.references.table && sameSet(pairs(constraint.columns, constraint.referencedColumns), pairs(foreignKey.columns, foreignKey.references.columns));
+	const matchedConstraints = /* @__PURE__ */ new Set();
+	for (const foreignKey of shape.foreignKeys) {
+		const installed = foreignConstraints.find((constraint) => matchesForeignKey(constraint, foreignKey));
+		if (!installed) {
+			deferred.push({
+				code: "missing-foreign-key",
+				severity: "error",
+				table,
+				message: `The foreign key ${describeForeignKey(foreignKey)} of "${table}" does not exist.`,
+				fix: foreignKeySql(table, foreignKey)
+			});
+			continue;
+		}
+		matchedConstraints.add(installed);
+		const onDelete = ACTION_NAMES[installed.onDelete] ?? installed.onDelete;
+		const onUpdate = ACTION_NAMES[installed.onUpdate] ?? installed.onUpdate;
+		if (onDelete !== foreignKey.onDelete || onUpdate !== foreignKey.onUpdate) push("foreign-key-mismatch", "error", `The foreign key ${describeForeignKey(foreignKey)} of "${table}" is ON DELETE ${onDelete.toUpperCase()} ON UPDATE ${onUpdate.toUpperCase()}, not ON DELETE ${foreignKey.onDelete.toUpperCase()} ON UPDATE ${foreignKey.onUpdate.toUpperCase()}.`, `ALTER TABLE ${quotedTable} DROP CONSTRAINT ${quoteIdentifier(installed.name)};\n` + foreignKeySql(table, {
+			...foreignKey,
+			name: foreignKey.name ?? installed.name
+		}));
+	}
+	const usableIndexes = indexes.filter((index) => !index.partial && !index.expressions);
+	const matchedIndexes = /* @__PURE__ */ new Set();
+	for (const declared of shape.indexes) {
+		const installed = usableIndexes.find((index) => sameList(index.columns, declared.columns) && index.method === declared.using && (!declared.unique || index.unique));
+		if (installed) matchedIndexes.add(installed);
+		else push("missing-index", declared.unique ? "error" : "warning", `${declared.unique ? "The unique" : "The"} ${declared.using} index on (${declared.columns.join(", ")}) of "${table}" does not exist.`, indexSql(table, declared));
+	}
+	for (const check of shape.checks) if (!constraints.some((constraint) => constraint.type === "c" && constraint.name === check.name)) push("missing-check", "error", `The check "${check.name}" of "${table}" does not exist.`, check.expression === void 0 ? void 0 : checkSql(table, check));
+	if (shape.strict) {
+		for (const constraint of constraints) if (!(constraint.type === "p" || constraint.type === "f" && matchedConstraints.has(constraint) || constraint.type === "u" && (shape.unique.some((key) => sameSet(key.columns, constraint.columns)) || shape.indexes.some((index) => index.unique && sameSet(index.columns, constraint.columns))) || constraint.type === "c" && shape.checks.some((check) => check.name === constraint.name))) push("undeclared-constraint", "warning", `The ${constraint.type === "f" ? `foreign key (${constraint.columns.join(", ")}) → ${constraint.referencedTable ?? "?"} (${constraint.referencedColumns.join(", ")})` : constraint.type === "u" ? `unique key (${constraint.columns.join(", ")})` : `check "${constraint.name}"`} of "${table}" is not in its description.`);
+		for (const index of indexes) if (!(index.constraint || matchedIndexes.has(index) || index.unique && !index.partial && !index.expressions && shape.unique.some((key) => sameSet(key.columns, index.columns)))) push("undeclared-index", "warning", `The index "${index.name}" (${index.method}: ${columnList(index.columns)}) of "${table}" is not in its description.`);
+	}
+	return {
+		problems,
+		deferred
+	};
+}
+//#endregion
 //#region src/dbGate/LilypadSchemaCheck.ts
 /**
-* Thrown by `LilypadDbCache.create` with `verify: 'throw'` when the database is not set up (the
-* check found errors). Its `problems` include the warnings.
+* Thrown by `assertOk()` of a `lilypad-doctor` report when the database is not set up (the check
+* found errors). Its `problems` include the warnings.
 */
 var LilypadSchemaCheckError = class extends Error {
 	constructor(subject, problems) {
@@ -1472,8 +1824,8 @@ function installedNotifyChannel(source) {
 * that fixes it (`ok` is true when there is none).
 * @throws If the catalogs cannot be read (e.g. the database is unreachable).
 */
-async function checkLilypadSchema(gate, options, context = {}) {
-	return evaluateLilypadSchema(await readLilypadSchemaFacts(gate, options, context), options);
+async function checkLilypadSchema(gate, options) {
+	return evaluateLilypadSchema(await readLilypadSchemaFacts(gate, options), options);
 }
 /**
 * The problems of the facts read by {@link readLilypadSchemaFacts}, for these options. It is pure:
@@ -1523,19 +1875,34 @@ function evaluateLilypadSchema(facts, options) {
 		}
 	}
 	const tables = [];
-	options.tables.forEach(({ table, primaryKey }, index) => {
+	const deferred = [];
+	options.tables.forEach((requirement, index) => {
+		const { table, primaryKey, shape } = requirement;
+		const needsChangelog = changelog !== void 0 && requirement.changelog !== false;
+		const tableChannel = requirement.notifyChannel ?? notifyChannel;
 		const found = facts.tables[index];
 		if (!found || found.schema === null) {
 			tables.push({
 				table,
 				schema: null
 			});
+			const createTable = shape && lilypadCreateTableSql(table, primaryKey, shape);
+			const triggerSql = needsChangelog || tableChannel !== false ? (needsChangelog ? "" : lilypadChangelogSql({
+				notifyChannel: tableChannel,
+				prune: installedPrune
+			})) + lilypadChangelogTriggerSql({
+				table,
+				primaryKey,
+				changelogTable: changelog?.custom
+			}) : "";
 			problems.push({
 				code: "missing-table",
 				severity: "error",
 				table,
-				message: `The table "${table}" does not exist.`
+				message: `The table "${table}" does not exist.`,
+				...createTable !== void 0 && { fix: `${createTable}\n${triggerSql}`.trimEnd() }
 			});
+			if (shape) deferred.push(...lilypadMissingTableForeignKeys(table, shape));
 			return;
 		}
 		tables.push({
@@ -1543,7 +1910,12 @@ function evaluateLilypadSchema(facts, options) {
 			schema: found.schema
 		});
 		const triggers = found.triggers;
-		if (changelog) {
+		if (shape && found.columns) {
+			const shapeProblems = evaluateLilypadTableShape(table, primaryKey, shape, found);
+			problems.push(...shapeProblems.problems);
+			deferred.push(...shapeProblems.deferred);
+		}
+		if (needsChangelog) {
 			const fix = lilypadChangelogTriggerSql({
 				table,
 				primaryKey,
@@ -1575,12 +1947,12 @@ function evaluateLilypadSchema(facts, options) {
 				fix
 			});
 		}
-		if (notifyChannel !== false) {
-			const notifies = new RegExp(`pg_notify\\s*\\(\\s*'${escapeRegExp(notifyChannel.replace(/'/g, "''"))}'`, "i");
+		if (tableChannel !== false) {
+			const notifies = new RegExp(`pg_notify\\s*\\(\\s*'${escapeRegExp(tableChannel.replace(/'/g, "''"))}'`, "i");
 			const notifiedEvents = triggers.filter((trigger) => trigger.enabled && notifies.test(trigger.source)).reduce((events, trigger) => events | ((trigger.type & TRIGGER_TYPE_ROW) !== 0 ? trigger.changelog ? 0 : trigger.type & ROW_EVENTS : recordedEvents(trigger)), 0);
 			const fix = lilypadChangelogSql({
 				table: changelog?.custom,
-				notifyChannel,
+				notifyChannel: tableChannel,
 				prune: installedPrune
 			}) + lilypadChangelogTriggerSql({
 				table,
@@ -1591,26 +1963,26 @@ function evaluateLilypadSchema(facts, options) {
 				code: "missing-notify-trigger",
 				severity: "error",
 				table,
-				message: `No trigger of "${table}" sends notifications on the "${notifyChannel}" channel: the cache is not told about changes made elsewhere.`,
+				message: `No trigger of "${table}" sends notifications on the "${tableChannel}" channel: the cache is not told about changes made elsewhere.`,
 				fix
 			});
 			else if (notifiedEvents !== ROW_EVENTS) problems.push({
 				code: "missing-notify-trigger",
 				severity: "error",
 				table,
-				message: `The triggers of "${table}" send notifications on the "${notifyChannel}" channel only on ${eventNames(notifiedEvents)}: the cache is not told about ${eventNames(ROW_EVENTS & ~notifiedEvents)} made elsewhere.`,
+				message: `The triggers of "${table}" send notifications on the "${tableChannel}" channel only on ${eventNames(notifiedEvents)}: the cache is not told about ${eventNames(ROW_EVENTS & ~notifiedEvents)} made elsewhere.`,
 				fix
 			});
 			else if (!triggers.some((trigger) => firesOnTruncate(trigger) && notifies.test(trigger.source))) problems.push({
 				code: "missing-truncate-trigger",
 				severity: "error",
 				table,
-				message: `No trigger of "${table}" sends a notification on the "${notifyChannel}" channel for TRUNCATE: the caches would keep the removed rows.`,
+				message: `No trigger of "${table}" sends a notification on the "${tableChannel}" channel for TRUNCATE: the caches would keep the removed rows.`,
 				fix
 			});
 		}
 	});
-	problems.push(...pruningProblems);
+	problems.push(...deferred, ...pruningProblems);
 	return {
 		ok: !problems.some((problem) => problem.severity === "error"),
 		problems,
@@ -1620,10 +1992,38 @@ function evaluateLilypadSchema(facts, options) {
 //#endregion
 //#region src/dbGate/LilypadDoctor.ts
 /**
-* Checks everything the caches need from the database, including how the changelog is pruned,
-* which the caches check at runtime only with `sync.checkPruning`. It connects with its own gate
-* (one connection), reads the catalogs only, and closes it. `npx lilypad-doctor` runs it from the
-* command line, e.g. in a deployment step.
+* What the schema check must verify for a config: each table with its shape (columns, keys,
+* indexes, checks), the changelog triggers of the `changelog` tables, the notifying triggers of the
+* `listen` tables, and the changelog and its pruning when a table reads it. The retention the
+* pruning must keep is the largest of `changelog.minRetention` and the `maxGap` and `lookback` of
+* the `changelog` tables.
+*/
+function lilypadSchemaCheckOptions(config) {
+	const definitions = Object.values(config.tables);
+	const changelogSyncs = definitions.flatMap((definition) => definition.sync.strategy === "changelog" ? [definition.sync] : []);
+	const minRetention = Math.max(config.changelog.minRetention, ...changelogSyncs.map((sync) => Math.max(sync.maxGap ?? 36e5, sync.lookback ?? 0)));
+	return {
+		tables: definitions.map((definition) => ({
+			table: definition.qualifiedName,
+			primaryKey: String(definition.primaryKey),
+			changelog: definition.sync.strategy === "changelog",
+			notifyChannel: definition.sync.strategy === "listen" ? config.notifyChannel : false,
+			shape: definition
+		})),
+		changelog: changelogSyncs.length === 0 ? false : {
+			table: config.changelog.table,
+			pruning: config.changelog.pruning,
+			minRetention,
+			checkPruning: true
+		},
+		notifyChannel: false
+	};
+}
+/**
+* Checks the database against a config: every table (its columns, keys, indexes and checks), the
+* triggers each sync strategy needs, the changelog and how it is pruned. It connects with its own
+* gate (one connection), reads the catalogs only, and closes it. `npx lilypad-doctor` runs it from
+* the command line, e.g. in a deployment step.
 *
 * @throws If the database cannot be reached.
 */
@@ -1634,25 +2034,21 @@ async function runLilypadDoctor(options) {
 		listenHeartbeat: false
 	});
 	try {
-		const changelog = options.changelog ?? {};
-		const result = await checkLilypadSchema(gate, {
-			tables: options.tables,
-			changelog: changelog === false ? false : {
-				...changelog,
-				checkPruning: true
-			},
-			notifyChannel: options.notifyChannel ?? false
-		});
-		const subject = "lilypad-doctor";
+		const result = await checkLilypadSchema(gate, lilypadSchemaCheckOptions(options.config));
+		const subject = `lilypad-doctor (config "${options.config.name}")`;
 		return {
 			...result,
-			text: result.problems.length === 0 ? `${subject}: the database is set up.` : formatLilypadSchemaProblems(subject, result.problems)
+			config: options.config.name,
+			text: result.problems.length === 0 ? `${subject}: the database is set up.` : formatLilypadSchemaProblems(subject, result.problems),
+			assertOk: () => {
+				if (!result.ok) throw new LilypadSchemaCheckError(subject, result.problems);
+			}
 		};
 	} finally {
 		await gate.close();
 	}
 }
 //#endregion
-export { LilypadDbNotFoundError as S, lilypadServerlessPool as _, LILYPAD_DEFAULT_CHANGELOG_TABLE as a, LilypadDbEmptyWriteError as b, LILYPAD_MIN_CHANGELOG_RETENTION as c, lilypadChangelogTriggerSql as d, lilypadCursorCovers as f, LilypadDbGate as g, readLilypadChangesBatch as h, formatLilypadSchemaProblems as i, lilypadChangelogPruneScheduleSql as l, readLilypadChanges as m, LilypadSchemaCheckError as n, LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD as o, pruneLilypadChangelog as p, checkLilypadSchema as r, LILYPAD_DEFAULT_NOTIFY_CHANNEL as s, runLilypadDoctor as t, lilypadChangelogSql as u, LilypadBackoff as v, LilypadDbMissingPrimaryKeyError as x, LilypadDbTable as y };
+export { LilypadDbGate as _, normalizeLilypadPgType as a, LilypadDbTable as b, LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD as c, lilypadChangelogSql as d, lilypadChangelogTriggerSql as f, readLilypadChangesBatch as g, readLilypadChanges as h, checkLilypadSchema as i, LILYPAD_MIN_CHANGELOG_RETENTION as l, pruneLilypadChangelog as m, runLilypadDoctor as n, lilypadDbConfigFileNames as o, lilypadCursorCovers as p, LilypadSchemaCheckError as r, loadLilypadDbConfig as s, lilypadSchemaCheckOptions as t, lilypadChangelogPruneScheduleSql as u, lilypadServerlessPool as v, LilypadBackoff as y };
 
-//# sourceMappingURL=LilypadDoctor-BYrsADBf.mjs.map
+//# sourceMappingURL=LilypadDoctor-C9Dw7FXv.mjs.map

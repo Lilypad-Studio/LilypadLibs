@@ -9,33 +9,21 @@ export type {
   LilypadDbPoolOptions,
 } from '../dbGate/LilypadDbGate';
 export { LilypadDbTable } from '../dbGate/LilypadDbTable';
-export {
-  LilypadDbEmptyWriteError,
-  LilypadDbMissingPrimaryKeyError,
-  LilypadDbNotFoundError,
-} from '../dbGate/LilypadDbSchema';
-export type {
-  LilypadDbColumn,
-  LilypadDbColumnType,
-  LilypadDbDeleteResult,
-  LilypadDbInsertData,
-  LilypadDbSchema,
-  LilypadDbUpdateData,
-  LilypadDbWriteResult,
-} from '../dbGate/LilypadDbSchema';
 export { LilypadDisposedError } from '../cache/LilypadCacheTypes';
 
 export { LilypadDbCache } from '../cache/LilypadDbCache';
 export type {
-  LilypadDbCacheChangelogSync,
-  LilypadDbCacheListenSync,
+  LilypadDbCacheBaseOptions,
+  LilypadDbCacheGateNamedOptions,
+  LilypadDbCacheNamedOptions,
   LilypadDbCacheOptions,
-  LilypadDbCacheSchemaVerification,
-  LilypadDbCacheSync,
-  LilypadDbCacheTrustedSyncOptions,
+  LilypadDbCacheSyncOverrides,
   LilypadDbKey,
   LilypadDbNotification,
 } from '../cache/LilypadDbCache';
+
+export * from './schema';
+export { loadLilypadDbConfig, lilypadDbConfigFileNames } from '../dbConfig/loadLilypadDbConfig';
 
 export {
   LILYPAD_DEFAULT_CHANGELOG_TABLE,
@@ -56,14 +44,19 @@ export type {
   LilypadChangesRequest,
 } from '../dbGate/LilypadChangelog';
 
-export { checkLilypadSchema, LilypadSchemaCheckError } from '../dbGate/LilypadSchemaCheck';
-export { runLilypadDoctor } from '../dbGate/LilypadDoctor';
+export {
+  checkLilypadSchema,
+  LilypadSchemaCheckError,
+  normalizeLilypadPgType,
+} from '../dbGate/LilypadSchemaCheck';
+export { lilypadSchemaCheckOptions, runLilypadDoctor } from '../dbGate/LilypadDoctor';
 export type { LilypadDoctorOptions, LilypadDoctorReport } from '../dbGate/LilypadDoctor';
 export type {
-  LilypadChangelogPruning,
   LilypadSchemaCheckOptions,
   LilypadSchemaCheckResult,
+  LilypadSchemaCheckTable,
   LilypadSchemaProblem,
   LilypadSchemaProblemCode,
   LilypadSchemaProblemSeverity,
+  LilypadSchemaTableShape,
 } from '../dbGate/LilypadSchemaCheck';

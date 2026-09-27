@@ -29,6 +29,7 @@ export default defineConfig({
           environment: 'edge-runtime',
           include: [
             'src/cache/LilypadCache*.test.ts',
+            'src/dbConfig/LilypadDbConfig*.test.ts',
             'src/flow/**/*.test.ts',
             'src/internal/**/*.test.ts',
             'src/logger/**/*.test.ts',

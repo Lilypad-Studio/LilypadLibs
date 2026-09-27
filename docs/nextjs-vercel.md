@@ -138,42 +138,51 @@ A `LilypadDbCache` must learn about the changes made by other instances and by o
 
 ### Setting up the changelog
 
-Run this once, in a migration (it uses a direct connection, as any migration):
+Give the tables the `changelog` sync in the [config](../README.md#database-config), then let `lilypad-doctor` print the SQL that installs the changelog and its triggers, and run it once, in a migration (with a direct connection, as any migration):
 
 ```ts
-import { lilypadChangelogSql, lilypadChangelogTriggerSql } from '@lilypad/libs/db';
+// lilypad.config.ts
+const users = defineLilypadTable<User, 'id'>({
+  tableName: 'users',
+  primaryKey: 'id',
+  cols: { /* ... */ },
+  sync: { strategy: 'changelog', pollInterval: 5_000 },
+});
 
-await sql.unsafe(lilypadChangelogSql());
-await sql.unsafe(lilypadChangelogTriggerSql({ table: 'users', primaryKey: 'id' }));
-// ...one trigger per cached table
+export default defineLilypadDb({ changelog: { pruning: 'trigger' }, tables: { users } });
 ```
 
-Or print the SQL and paste it into your migration tool: both functions return plain SQL strings. It needs PostgreSQL 13 or later.
+```sh
+npx lilypad-doctor --url "$DATABASE_URL_UNPOOLED" --sql > migrations/0042_lilypad.sql
+```
+
+`lilypadChangelogSql()` and `lilypadChangelogTriggerSql({ table, primaryKey })` return the same SQL, if you prefer to write the migration yourself. It needs PostgreSQL 13 or later.
 
 - The changelog table (`lilypad_cache_changes`) records the table, the primary key and the operation of every change. An update that changes the primary key is recorded as a delete of the old key and an update of the new one. `lilypadChangelogTriggerSql` also adds a trigger for `TRUNCATE`, which the other triggers do not see.
 - The trigger also sends a `NOTIFY` on `cache_events`, so `listen` and `changelog` can coexist (for example a long-running worker next to the Vercel app). Pass `{ notifyChannel: false }` to skip it.
 - If you installed the changelog with an earlier version of the library, run `lilypadChangelogSql()` and `lilypadChangelogTriggerSql()` again, in one transaction: they update the trigger function (version 5) and replace the row trigger of versions 3 and earlier with statement triggers, which record a statement that changes many rows in one query (the function no longer records the changes of a row trigger).
-- The cache checks the setup once, with its first read of the changelog, and logs a warning with the missing SQL (`verify: 'warn'`, the default). With `verify: 'throw'`, `create` rejects instead, but it then queries the database: keep the default for code that runs during `next build`. To check in a deployment step (e.g. the build command of Vercel, before `next build`), run `npx lilypad-doctor --url "$DATABASE_URL" --table users`: it also checks how the changelog is pruned, and fails the deployment when the database is not set up (see the [README](../README.md#checking-the-database-setup)).
+- The caches check nothing in the database, so `next build` never waits for it. Check the database in a deployment step instead (e.g. the build command of Vercel, before `next build`): `npx lilypad-doctor --url "$DATABASE_URL"` compares it with the config (tables, columns, keys, triggers, and how the changelog is pruned), and fails the deployment when it does not match (see the [README](../README.md#lilypad-doctor-checking-the-database)). A TypeScript config needs Node.js 22.18 or later on the build machine (or `NODE_OPTIONS=--experimental-strip-types`).
 
 ### Using it
 
 ```ts
 const users = await LilypadDbCache.create({
   ttl: 60_000,
-  gate: await getGate(),
-  schema: usersSchema,
+  gate: await getGate(), // created with config: db
+  table: 'users', // with sync: { strategy: 'changelog', pollInterval: 5_000 } in the config
   platform,
   shared: { refreshLockTtl: 60_000 },
-  sync: { strategy: 'changelog', pollInterval: 5_000 },
   staleWhileRevalidate: 60_000,
   cleanupOnAccessEvery: 60_000,
 });
 ```
 
+The options of the sync live in the config (`pollInterval`, `poll`, `maxGap`, `lookback`, `maxAge`); `create` can change `pollInterval`, `poll` and `maxAge` for one cache with its `sync` option.
+
 - **`pollInterval`**: the largest delay you accept for changes made elsewhere. Each read of the changelog is one indexed query, shared by every cache of the gate. It happens only when a cache is used, so an idle instance costs nothing. If the read fails, the next attempts back off (from `pollInterval`, up to one minute) instead of adding a failing query to every request.
 - **`poll: 'await'`** (default): a read that falls due waits for the changelog, so it never returns data older than `pollInterval`. With `'background'` the request does not pay for the query, but may see data one interval older.
 - **`maxGap`** (default: 1 hour): an instance that has not read the changelog for this long stops trusting its memory, and expires it.
-- **`lookback`**: on its first read, or after `maxGap`, an instance applies the changes of this period, which also removes older copies from the shared level. The default (TTL + `staleWhileRevalidate` + 1 minute) covers the lifetime of any shared entry.
+- **`lookback`**: on its first read, or after `maxGap`, an instance applies the changes of this period, which also removes older copies from the shared level. The default (TTL + `staleWhileRevalidate` + 1 minute) covers the lifetime of any shared entry. Declare it in the config when it exceeds `maxGap`, so that `lilypad-doctor` checks that the changelog keeps its rows that long.
 - **No change is ever missed** because of the order in which transactions commit, and **none is read twice**. The cursor holds the transactions a read could not see yet (those still running, and those not started), not the last row read. A long-running transaction, such as a migration, does not make each read return again every change made since it started.
 - `get()` is synchronous, so it cannot read the changelog. Use `getOrFetch` or `getAll`.
 
@@ -209,9 +218,9 @@ The changelog keeps one row per change until it is pruned. The database can prun
 
   On about one statement in `every` (default 20), it deletes up to `batchSize` (default 1000) rows older than `olderThan`, in the writing transaction. The table then grows only with writes, and the writes prune it. The cost falls on the writes: an indexed lookup on one statement in 20, and a few milliseconds when it finds a batch. A `SECURITY DEFINER` function deletes the rows, so the roles that write need no `DELETE` privilege on the changelog. It prunes only in `READ COMMITTED` transactions (the default): in a stricter isolation, deleting rows that a concurrent prune deleted would fail the write. `batchSize / every` (50 rows per statement by default) must stay above the number of rows your statements change on average, or the table keeps growing. Running `lilypadChangelogSql()` without `prune` turns it off again.
 
-`lilypad-doctor` (and the schema check of the caches, with `checkPruning: true` in `sync`) looks for these two, reports a retention shorter than their `maxGap` or `lookback` as an error, and warns with the best one for your database if it finds neither, or with the one you choose with `pruning: 'trigger'` or `'cron'` (`--pruning` for the command) (see [Checking the pruning of the changelog](../README.md#checking-the-pruning-of-the-changelog)).
+`lilypad-doctor` looks for these two, reports a retention shorter than the `maxGap` or `lookback` of the tables as an error, and warns with the best one for your database if it finds neither, or with the one you choose with `changelog: { pruning: 'trigger' }` or `'cron'` in the config (see [Checking the pruning of the changelog](../README.md#checking-the-pruning-of-the-changelog)).
 
-Or delete the rows from the application, for example daily with Vercel Cron. The check cannot see such a job until it has deleted rows: pass `--pruning external` to `lilypad-doctor` (or `pruning: 'external'` in `sync`) to tell it.
+Or delete the rows from the application, for example daily with Vercel Cron. The check cannot see such a job until it has deleted rows: set `changelog: { pruning: 'external' }` in the config to tell it.
 
 ```ts
 // app/api/cron/lilypad-changelog/route.ts
@@ -326,10 +335,10 @@ The subpaths also keep the bundles small, since `postgres` is only pulled in by 
 Use the pooled connection string, and `pool: lilypadServerlessPool`. Check that nothing creates a new gate per request: create it once, as a singleton.
 
 **The build fails because it cannot reach the database, or it is slow.**
-Something connects when a module is imported. Create instances in functions (section 3), and use `sync: 'changelog'` or `connect: 'lazy'`.
+Something connects when a module is imported. Create instances in functions (section 3), and use the `changelog` sync or `connect: 'lazy'`.
 
 **A change made outside the app never shows up.**
-Check that the changelog trigger is on the table (`lilypadChangelogTriggerSql`) and that the table name matches `schema.tableName`. Pass a logger: a failing changelog read is logged as `Error reading the changelog`. Changes show up within `pollInterval`, only when the cache is read with an async method.
+Run `npx lilypad-doctor`: it reports a missing changelog trigger, with the SQL that installs it. Pass a logger: a failing changelog read is logged as `Error reading the changelog`. Changes show up within `pollInterval`, only when the cache is read with an async method.
 
 **Logs, or Discord messages, are missing.**
 Pass `platform` to the logger. In scripts, `await logger.flush()` before exiting.

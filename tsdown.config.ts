@@ -8,6 +8,7 @@ export default defineConfig({
     flow: 'src/entries/flow.ts',
     logger: 'src/entries/logger.ts',
     platform: 'src/entries/platform.ts',
+    schema: 'src/entries/schema.ts',
     serializer: 'src/entries/serializer.ts',
     singleton: 'src/entries/singleton.ts',
     // The `lilypad-doctor` command (package.json `bin`)

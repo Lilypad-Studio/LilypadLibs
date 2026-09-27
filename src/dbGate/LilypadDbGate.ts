@@ -1,6 +1,13 @@
 import { createHash } from 'node:crypto';
 import { LilypadDisposedError } from '@/cache/LilypadCacheTypes';
-import type { LilypadDbSchema } from '@/dbGate/LilypadDbSchema';
+import {
+  resolveLilypadDbTable,
+  type LilypadDbConfig,
+  type LilypadDbPrimaryKey,
+  type LilypadDbRow,
+  type LilypadDbTableDefinition,
+  type LilypadDbTableName,
+} from '@/dbConfig/LilypadDbConfig';
 import { LilypadDbTable } from '@/dbGate/LilypadDbTable';
 import { LilypadListenHeartbeat } from '@/dbGate/LilypadListenHeartbeat';
 import { LilypadBackoff } from '@/internal/LilypadBackoff';
@@ -25,9 +32,17 @@ export type LilypadDbListener = {
    */
   onReconnect?: () => void | Promise<void>;
 };
-export type LilypadDbGateOptions = {
+export type LilypadDbGateOptions<
+  C extends LilypadDbConfig | undefined = LilypadDbConfig | undefined,
+> = {
   logger?: LilypadLibLogger;
   connectionString: string;
+  /**
+   * The config of the database (see `defineLilypadDb`): `gate.table('users')` and
+   * `LilypadDbCache.create({ gate, table: 'users' })` then find the table in it. A table of another
+   * config can still be given as a definition (`other.tables.events`), or with its own `config`.
+   */
+  config?: C;
   /** The connection used for `LISTEN`, if not `connectionString` (e.g. a direct, unpooled one). */
   listenerConnectionString?: string;
   listen?: LilypadDbListener[];
@@ -88,7 +103,8 @@ function toPostgresPoolOptions(pool: LilypadDbPoolOptions | undefined) {
   );
 }
 
-type LilypadDbGateOptionsWithSingleton = LilypadDbGateOptions & LilypadSingletonAble;
+type LilypadDbGateOptionsWithSingleton<C extends LilypadDbConfig | undefined> =
+  LilypadDbGateOptions<C> & LilypadSingletonAble;
 
 const DEFAULT_STATEMENT_TIMEOUT = 30_000;
 /** How long `close` waits for the queries still running, in ms, by default. */
@@ -104,22 +120,27 @@ type ChannelListener = {
 };
 
 /**
- * A gateway to a PostgreSQL database: typed CRUD helpers over a {@link LilypadDbSchema} (through
+ * A gateway to a PostgreSQL database: typed CRUD helpers over the tables of a config (through
  * {@link LilypadDbGate.table}), and channel listeners (`LISTEN/NOTIFY`) with reconnection handling.
+ *
+ * @typeParam C - The config the gate was created with, whose tables can be named.
  *
  * @example
  * ```typescript
  * const gate = await LilypadDbGate.create({
  *   connectionString: 'postgres://user:pass@host:port/db',
+ *   config: db, // the default export of lilypad.config.ts
  *   listen: [
  *     { channel: 'my_channel', callbackId: 'my_callback', callback: (payload) => console.log(payload) }
  *   ]
  * });
  * ```
  */
-export class LilypadDbGate {
+export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConfig | undefined> {
   public readonly id = `LilypadDbGate-${globalThis.crypto.randomUUID()}`;
   public readonly sql: postgres.Sql;
+  /** The config given to `create`, if any. */
+  public readonly config: C;
   /** Only when `listenerConnectionString` differs: otherwise `sql` listens. */
   private readonly listenerClient?: postgres.Sql;
   protected logger?: LilypadLibLogger;
@@ -132,7 +153,7 @@ export class LilypadDbGate {
   private readonly heartbeatBackoff = new LilypadBackoff(() => 1000);
   private closing?: Promise<void>;
 
-  private constructor(options: LilypadDbGateOptions) {
+  private constructor(options: LilypadDbGateOptions<C>) {
     if (options.statementTimeout !== false) {
       assertNumberOption('LilypadDbGate', 'statementTimeout', options.statementTimeout, 'positive');
     }
@@ -145,6 +166,7 @@ export class LilypadDbGate {
       );
     }
     this.logger = options.logger;
+    this.config = options.config as C;
     const statementTimeout = resolveStatementTimeout(options);
     this.sql = postgres(options.connectionString, {
       prepare: false,
@@ -174,7 +196,9 @@ export class LilypadDbGate {
    * With `singleton: '<identifier>'`, a later call with the same identifier returns the existing gate and
    * ignores its own options (a warning is logged if they differ).
    */
-  static async create(options: LilypadDbGateOptionsWithSingleton): Promise<LilypadDbGate> {
+  static async create<C extends LilypadDbConfig | undefined = undefined>(
+    options: LilypadDbGateOptionsWithSingleton<C>
+  ): Promise<LilypadDbGate<C>> {
     return createLilypadSingletonAbleAsync(
       'LilypadDbGate',
       options,
@@ -193,6 +217,7 @@ export class LilypadDbGate {
               resolveStatementTimeout(options),
               options.pool,
               options.listenHeartbeat,
+              options.config?.name,
             ])
           )
           .digest('hex'),
@@ -201,14 +226,16 @@ export class LilypadDbGate {
             options.logger,
             'warn',
             'LilypadDbGate',
-            `Singleton "${options.singleton ?? ''}" already exists with different connection options: the new options are ignored.`
+            `Singleton "${options.singleton ?? ''}" already exists with different connection options or config: the new options are ignored.`
           ),
       }
     );
   }
 
-  private static async initializeNew(options: LilypadDbGateOptions): Promise<LilypadDbGate> {
-    const instance = new LilypadDbGate(options);
+  private static async initializeNew<C extends LilypadDbConfig | undefined>(
+    options: LilypadDbGateOptions<C>
+  ): Promise<LilypadDbGate<C>> {
+    const instance = new LilypadDbGate<C>(options);
     try {
       for (const listenOption of options.listen ?? []) {
         await instance.addListener(listenOption);
@@ -222,11 +249,26 @@ export class LilypadDbGate {
   }
 
   /**
-   * The typed CRUD helpers of a table: reads and writes of the rows described by `schema`. The
-   * handle is cheap: create one per table and keep it, or call `table` again.
+   * The typed CRUD helpers of a table: a table of a config (`db.tables.users`), or the key of a
+   * table of the config of the gate (`'users'`). The handle is cheap: create one per table and
+   * keep it, or call `table` again.
+   *
+   * @throws If the table is given by name and the config of the gate has no such table.
    */
-  table<T, PK extends keyof T = keyof T>(schema: LilypadDbSchema<T, PK>): LilypadDbTable<T, PK> {
-    return new LilypadDbTable(this, schema);
+  table<T, PK extends keyof T = keyof T>(
+    definition: LilypadDbTableDefinition<T, PK>
+  ): LilypadDbTable<T, PK>;
+  table<N extends LilypadDbTableName<C>>(
+    name: N
+  ): LilypadDbTable<LilypadDbRow<C, N>, LilypadDbPrimaryKey<C, N>>;
+  table(table: unknown): unknown {
+    return new LilypadDbTable(
+      this,
+      resolveLilypadDbTable('LilypadDbGate', table, this.config) as LilypadDbTableDefinition<
+        unknown,
+        never
+      >
+    );
   }
 
   // LISTENER MANAGEMENT

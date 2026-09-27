@@ -13,5 +13,6 @@ export * from './entries/cache';
 export * from './entries/flow';
 export * from './entries/logger';
 export * from './entries/platform';
+export * from './entries/schema';
 export * from './entries/serializer';
 export * from './entries/singleton';

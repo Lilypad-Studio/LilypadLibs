@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import { defineLilypadDb } from '@/dbConfig/LilypadDbConfig';
+import { lilypadSchemaCheckOptions } from './LilypadDoctor';
 import {
   LILYPAD_CHANGELOG_VERSION,
   lilypadChangelogPruneScheduleSql,
@@ -975,5 +977,148 @@ describe('formatLilypadSchemaProblems', () => {
         warning,
       ])
     ).toMatch(/^Cache: the database is not set up\.\n- No table\.\n- Warning: /);
+  });
+});
+
+describe('evaluateLilypadSchema with the tables of a config', () => {
+  const db = defineLilypadDb({
+    changelog: { pruning: 'external', minRetention: 2 * 3_600_000 },
+    tables: {
+      orgs: {
+        tableName: 'orgs',
+        primaryKey: 'id',
+        cols: { id: { pgType: 'int4' } },
+        sync: { strategy: 'listen' },
+      },
+      users: {
+        tableName: 'users',
+        primaryKey: 'id',
+        cols: {
+          id: { pgType: 'int4' },
+          orgId: { pgType: 'int4', references: { table: 'orgs' } },
+        },
+        sync: { strategy: 'changelog', pollInterval: 1000, maxGap: 3 * 3_600_000 },
+      },
+      logs: {
+        tableName: 'logs',
+        primaryKey: 'id',
+        cols: { id: {} },
+        sync: { strategy: 'none' },
+      },
+    },
+  });
+  const options = lilypadSchemaCheckOptions(db);
+
+  it('should check each table for what its sync needs, with its shape', () => {
+    expect(options).toEqual({
+      tables: [
+        {
+          table: 'public.orgs',
+          primaryKey: 'id',
+          changelog: false,
+          notifyChannel: 'cache_events',
+          shape: db.tables.orgs,
+        },
+        {
+          table: 'public.users',
+          primaryKey: 'id',
+          changelog: true,
+          notifyChannel: false,
+          shape: db.tables.users,
+        },
+        {
+          table: 'public.logs',
+          primaryKey: 'id',
+          changelog: false,
+          notifyChannel: false,
+          shape: db.tables.logs,
+        },
+      ],
+      // The longest of minRetention and the maxGap of the changelog tables
+      changelog: {
+        table: 'lilypad_cache_changes',
+        pruning: 'external',
+        minRetention: 3 * 3_600_000,
+        checkPruning: true,
+      },
+      notifyChannel: false,
+    });
+    expect(
+      lilypadSchemaCheckOptions(defineLilypadDb({ tables: { orgs: db.tables.orgs as never } }))
+        .changelog
+    ).toBe(false);
+  });
+
+  it('should require the changelog trigger or the notifying trigger per table', () => {
+    const shaped = (columns: string[]) => ({
+      columns: columns.map((name) => ({
+        name,
+        type: 'integer',
+        category: 'N',
+        notNull: name === 'id',
+        hasDefault: false,
+        identity: false,
+        generated: false,
+      })),
+      constraints: [
+        {
+          name: 'pkey',
+          type: 'p' as const,
+          columns: ['id'],
+          referencedTable: null,
+          referencedColumns: [],
+          onDelete: ' ',
+          onUpdate: ' ',
+        },
+      ],
+      indexes: [],
+    });
+    const result = evaluateLilypadSchema(
+      facts({
+        tables: [
+          { schema: 'public', triggers: [], ...shaped(['id']) },
+          { schema: 'public', triggers: [], ...shaped(['id', 'orgId']) },
+          { schema: 'public', triggers: [], ...shaped(['id']) },
+        ],
+      }),
+      options
+    );
+
+    expect(result.problems.map((problem) => [problem.table, problem.code])).toEqual([
+      ['public.orgs', 'missing-notify-trigger'],
+      ['public.users', 'missing-changelog-trigger'],
+      ['public.users', 'missing-foreign-key'],
+    ]);
+  });
+
+  it('should create a missing table with its triggers, and its foreign keys after every table', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        tables: [
+          { schema: null, triggers: [] },
+          { schema: null, triggers: [] },
+          { schema: null, triggers: [] },
+        ],
+      }),
+      options
+    );
+
+    expect(result.problems.map((problem) => [problem.table, problem.code])).toEqual([
+      ['public.orgs', 'missing-table'],
+      ['public.users', 'missing-table'],
+      ['public.logs', 'missing-table'],
+      ['public.users', 'missing-foreign-key'],
+    ]);
+    const [orgs, users, logs, foreignKey] = result.problems;
+    expect(orgs!.fix).toMatch(/^CREATE TABLE "public"\."orgs" \(\n {2}"id" int4 NOT NULL,/);
+    // Without the changelog check for a listen table, the changelog (which notifies) comes along
+    expect(orgs!.fix).toContain("pg_notify('cache_events'");
+    expect(users!.fix).toContain('CREATE TABLE "public"."users"');
+    expect(users!.fix).toContain('lilypad_cache_changes_record');
+    // No pgType for its column: the table cannot be generated
+    expect(logs!.fix).toBeUndefined();
+    expect(foreignKey!.fix).toBe(
+      'ALTER TABLE "public"."users" ADD FOREIGN KEY ("orgId") REFERENCES "public"."orgs" ("id") ON DELETE NO ACTION ON UPDATE NO ACTION;'
+    );
   });
 });

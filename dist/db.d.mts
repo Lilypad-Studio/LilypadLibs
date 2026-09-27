@@ -1,96 +1,14 @@
 import { n as LilypadLibLogger } from "./chunks/LilypadLibLogger-D3C4iJKK.mjs";
 import { c as LilypadCacheOptions, g as LilypadDisposedError, h as LilypadCachedValueType, l as LilypadCachePeek, o as LilypadCacheGetOptions, s as LilypadCacheKey, t as LilypadCacheBulkSyncOptions, u as LilypadCacheResult } from "./chunks/LilypadCacheTypes-CLQapyZs.mjs";
+import { A as LilypadDbColumnReference, B as LilypadDbReference, C as defineLilypadTable, D as LilypadDbColumn, E as LilypadDbCheck, F as LilypadDbIndex, G as LilypadDbWriteResult, H as LilypadDbSchema, I as LilypadDbIndexMethod, L as LilypadDbInsertData, M as LilypadDbDeleteResult, N as LilypadDbEmptyWriteError, O as LilypadDbColumnDefault, P as LilypadDbForeignKey, R as LilypadDbMissingPrimaryKeyError, S as defineLilypadDb, T as isLilypadDbTableDefinition, U as LilypadDbUniqueKey, V as LilypadDbReferentialAction, W as LilypadDbUpdateData, _ as LilypadDbTableInputBase, a as LilypadDbConfigInput, b as LilypadDbTableSync, c as LilypadDbResolvedForeignKey, d as LilypadDbRow, f as LilypadDbTableChangelogSync, g as LilypadDbTableInput, h as LilypadDbTableDraft, i as LilypadDbConfig, j as LilypadDbColumnType, k as LilypadDbColumnName, l as LilypadDbResolvedIndex, m as LilypadDbTableDefinitionBase, n as LILYPAD_DEFAULT_DB_CONFIG_NAME, o as LilypadDbConfigSettings, p as LilypadDbTableDefinition, r as LilypadChangelogPruning, s as LilypadDbPrimaryKey, t as LILYPAD_DEFAULT_CHANGELOG_TABLE, u as LilypadDbResolvedUniqueKey, v as LilypadDbTableListenSync, w as isLilypadDbConfig, x as LilypadDbTableTrustedSync, y as LilypadDbTableName, z as LilypadDbNotFoundError } from "./chunks/schema-B8RIzo97.mjs";
 import { t as LilypadSingletonAble } from "./chunks/LilypadSingleton-CmL74XTL.mjs";
 import postgres from "postgres";
-//#region src/dbGate/LilypadDbSchema.d.ts
-/**
- * The type of a column. For a primary key it tells `LilypadDbCache` how to read the ids that
- * notifications and the changelog carry as text: `number` converts them to numbers; `string` and
- * `bigint` keep them as strings. Declare `bigint`/`bigserial` columns as `bigint`: postgres.js
- * returns them as strings, so their keys and the row property are strings (type them as such).
- */
-type LilypadDbColumnType = 'string' | 'number' | 'bigint' | 'boolean' | 'date' | 'json' | 'array';
-/**
- * @typeParam T - The row type.
- * @typeParam PK - The primary key column. Declare it (e.g. `LilypadDbSchema<User, 'id'>`) to get
- * precise types for inserts and updates; it defaults to any column of `T`.
- */
-type LilypadDbSchema<T, PK extends keyof T = keyof T> = {
-  tableName: string;
-  primaryKey: PK;
-  /**
-   * The database generates the primary key (e.g. `serial`, `identity`, a default): inserts leave
-   * it out, even when the data has one, and return the generated one.
-   */
-  generatedPrimaryKey?: boolean;
-  /**
-   * Transforms the data of inserts and updates. Its result replaces the data: omitting a property
-   * removes it from the write.
-   */
-  writeSanitizationFn?: (data: Partial<T>) => Partial<T>;
-  selectSanitizationFn?: (row: unknown) => T | null;
-  /**
-   * The columns of the table, one for each property of `T`.
-   * - Without a `selectSanitizationFn`, only these columns are selected.
-   * - Only these columns are written by inserts and updates: any other property of the data is ignored.
-   *
-   * The metadata is optional. Only the `type` of the primary key is used: with `number`,
-   * `LilypadDbCache` converts to numbers the ids that notifications and the changelog carry as text.
-   */
-  cols: { [K in keyof T]: LilypadDbColumn<T[K]>; };
-};
-/** The metadata of a column. `nullable` and `default` are descriptive: the library ignores them. */
-type LilypadDbColumn<V = unknown> = {
-  type?: LilypadDbColumnType;
-  nullable?: boolean;
-  default?: V | null;
-};
-/** The data of an insert: the primary key can be omitted when the database generates it. */
-type LilypadDbInsertData<T, PK extends keyof T = keyof T> = Omit<T, PK> & Partial<Pick<T, PK>>;
-/** The data of an update: the primary key identifies the row, the other columns are optional. */
-type LilypadDbUpdateData<T, PK extends keyof T = keyof T> = Partial<T> & Pick<T, PK>;
-/**
- * The result of an insert or an update: the row as stored by the database (`null` if the
- * `selectSanitizationFn` discards it), and the id of the transaction that wrote it, as recorded
- * by the changelog (`xid`).
- */
-type LilypadDbWriteResult<T> = {
-  row: T | null;
-  xid: bigint;
-};
-/**
- * The result of a delete: whether a row had this primary key, and the id of the transaction that
- * deleted it.
- */
-type LilypadDbDeleteResult = {
-  deleted: boolean;
-  xid?: bigint;
-};
-/** Thrown by the writes when the data has no primary key where one is needed. */
-export declare class LilypadDbMissingPrimaryKeyError extends Error {
-  readonly tableName: string;
-  readonly primaryKey: string;
-  constructor(schema: {
-    primaryKey: PropertyKey;
-    tableName: string;
-  }, context: string);
-}
-/** Thrown by an insert or an update whose data has no column of the schema to write. */
-export declare class LilypadDbEmptyWriteError extends Error {
-  readonly tableName: string;
-  constructor(tableName: string, operation: 'insert' | 'update');
-}
-/** Thrown by `updateToTable` when no row has the primary key of the data. */
-export declare class LilypadDbNotFoundError extends Error {
-  readonly tableName: string;
-  readonly primaryKeyValue: unknown;
-  constructor(tableName: string, primaryKeyValue: unknown);
-}
-//#endregion
 //#region src/dbGate/LilypadDbTable.d.ts
 /**
- * The typed CRUD helpers of one table, created with `gate.table(schema)`: every method uses the
- * schema of the handle, and the connections of the gate (it rejects once the gate is closed).
+ * The typed CRUD helpers of one table, created with `gate.table(db.tables.users)` (or
+ * `gate.table('users')` on a gate created with a config): every method uses the definition of the
+ * table, and the connections of the gate (it rejects once the gate is closed). Queries name the
+ * table with its schema (`public.users`), whatever the `search_path`.
  *
  * - Only the `cols` keys are selected (unless there is a `selectSanitizationFn`, which gets `*`)
  *   and written: extra properties of the data (e.g. from a request body) are never written.
@@ -99,15 +17,15 @@ export declare class LilypadDbNotFoundError extends Error {
  *
  * @example
  * ```typescript
- * const users = gate.table(usersSchema);
+ * const users = gate.table(db.tables.users);
  * const { row } = await users.insert({ name: 'Ada' });
  * const user = await users.selectByPrimaryKey(row!.id);
  * ```
  */
 export declare class LilypadDbTable<T, PK extends keyof T = keyof T> {
   private readonly gate;
-  readonly schema: LilypadDbSchema<T, PK>;
-  constructor(gate: LilypadDbGate, schema: LilypadDbSchema<T, PK>);
+  readonly definition: LilypadDbTableDefinition<T, PK>;
+  constructor(gate: LilypadDbGate, definition: LilypadDbTableDefinition<T, PK>);
   private get sql();
   /**
    * Maps a database row to `T`, using the schema's `selectSanitizationFn` if provided,
@@ -196,9 +114,15 @@ type LilypadDbListener = {
    */
   onReconnect?: () => void | Promise<void>;
 };
-type LilypadDbGateOptions = {
+type LilypadDbGateOptions<C extends LilypadDbConfig | undefined = LilypadDbConfig | undefined> = {
   logger?: LilypadLibLogger;
   connectionString: string;
+  /**
+   * The config of the database (see `defineLilypadDb`): `gate.table('users')` and
+   * `LilypadDbCache.create({ gate, table: 'users' })` then find the table in it. A table of another
+   * config can still be given as a definition (`other.tables.events`), or with its own `config`.
+   */
+  config?: C;
   /** The connection used for `LISTEN`, if not `connectionString` (e.g. a direct, unpooled one). */
   listenerConnectionString?: string;
   listen?: LilypadDbListener[];
@@ -239,24 +163,29 @@ type LilypadDbPoolOptions = {
  * number of queries a single instance runs in parallel.
  */
 export declare const lilypadServerlessPool: Readonly<LilypadDbPoolOptions>;
-type LilypadDbGateOptionsWithSingleton = LilypadDbGateOptions & LilypadSingletonAble;
+type LilypadDbGateOptionsWithSingleton<C extends LilypadDbConfig | undefined> = LilypadDbGateOptions<C> & LilypadSingletonAble;
 /**
- * A gateway to a PostgreSQL database: typed CRUD helpers over a {@link LilypadDbSchema} (through
+ * A gateway to a PostgreSQL database: typed CRUD helpers over the tables of a config (through
  * {@link LilypadDbGate.table}), and channel listeners (`LISTEN/NOTIFY`) with reconnection handling.
+ *
+ * @typeParam C - The config the gate was created with, whose tables can be named.
  *
  * @example
  * ```typescript
  * const gate = await LilypadDbGate.create({
  *   connectionString: 'postgres://user:pass@host:port/db',
+ *   config: db, // the default export of lilypad.config.ts
  *   listen: [
  *     { channel: 'my_channel', callbackId: 'my_callback', callback: (payload) => console.log(payload) }
  *   ]
  * });
  * ```
  */
-export declare class LilypadDbGate {
+export declare class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConfig | undefined> {
   readonly id: string;
   readonly sql: postgres.Sql;
+  /** The config given to `create`, if any. */
+  readonly config: C;
   /** Only when `listenerConnectionString` differs: otherwise `sql` listens. */
   private readonly listenerClient?;
   protected logger?: LilypadLibLogger;
@@ -276,13 +205,17 @@ export declare class LilypadDbGate {
    * With `singleton: '<identifier>'`, a later call with the same identifier returns the existing gate and
    * ignores its own options (a warning is logged if they differ).
    */
-  static create(options: LilypadDbGateOptionsWithSingleton): Promise<LilypadDbGate>;
+  static create<C extends LilypadDbConfig | undefined = undefined>(options: LilypadDbGateOptionsWithSingleton<C>): Promise<LilypadDbGate<C>>;
   private static initializeNew;
   /**
-   * The typed CRUD helpers of a table: reads and writes of the rows described by `schema`. The
-   * handle is cheap: create one per table and keep it, or call `table` again.
+   * The typed CRUD helpers of a table: a table of a config (`db.tables.users`), or the key of a
+   * table of the config of the gate (`'users'`). The handle is cheap: create one per table and
+   * keep it, or call `table` again.
+   *
+   * @throws If the table is given by name and the config of the gate has no such table.
    */
-  table<T, PK extends keyof T = keyof T>(schema: LilypadDbSchema<T, PK>): LilypadDbTable<T, PK>;
+  table<T, PK extends keyof T = keyof T>(definition: LilypadDbTableDefinition<T, PK>): LilypadDbTable<T, PK>;
+  table<N extends LilypadDbTableName<C>>(name: N): LilypadDbTable<LilypadDbRow<C, N>, LilypadDbPrimaryKey<C, N>>;
   /** The client that listens: postgres.js keeps one dedicated connection per client for LISTEN. */
   private listenClient;
   /**
@@ -347,13 +280,6 @@ export declare class LilypadDbGate {
 }
 //#endregion
 //#region src/dbGate/LilypadChangelog.d.ts
-/**
- * The changelog records every change of the cached tables in a table, so that each instance can
- * read the changes made since its last check with one query. It needs no long-lived connection
- * (unlike `LISTEN/NOTIFY`), so it suits serverless platforms, and it also catches the changes made
- * by other programs. It needs PostgreSQL 13 or later (`xid8`).
- */
-export declare const LILYPAD_DEFAULT_CHANGELOG_TABLE = "lilypad_cache_changes";
 /** Above this number of rows changed by one statement, the trigger sends one `BULK` notification. */
 export declare const LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD = 1000;
 /**
@@ -441,7 +367,7 @@ export declare function lilypadChangelogPruneScheduleSql(options: LilypadChangel
  * Transition tables are not supported on the partitions of a partitioned table, nor on tables with
  * inheritance children: attach the triggers to the partitioned table itself.
  *
- * @param options.table - The cached table (as in its `LilypadDbSchema`).
+ * @param options.table - The cached table (`table` or `schema.table`).
  * @param options.primaryKey - Its primary key column.
  * @param options.changelogTable - The changelog table, if not the default one.
  */
@@ -527,154 +453,6 @@ export declare function pruneLilypadChangelog(gate: LilypadDbGate, options: {
   force?: boolean;
 }): Promise<number>;
 //#endregion
-//#region src/dbGate/LilypadSchemaFacts.d.ts
-/** How `checkLilypadSchema` is called by the library itself. */
-type LilypadSchemaCheckContext = {
-  /**
-   * Reuses the facts of the database read by another check of the same gate less than a minute
-   * ago (the caches of a gate check the same changelog).
-   */
-  shareDatabaseFacts?: boolean;
-};
-//#endregion
-//#region src/dbGate/LilypadSchemaCheck.d.ts
-/**
- * How the old changelog rows are deleted:
- * - `detect`: the check looks for the `prune` option of the trigger and for a pg_cron job that
- *   deletes them, and suggests the best one for the database if it finds neither;
- * - `trigger`: the same, but it always suggests the `prune` option of the trigger;
- * - `cron`: the same, but it always suggests a pg_cron job, even where it cannot tell whether
- *   pg_cron runs in this database (e.g. when the role cannot read `cron.database_name`);
- * - `external`: a job the database cannot show deletes them (e.g. `pruneLilypadChangelog` called
- *   from a scheduled function): nothing is suggested, only the age of the oldest row is checked.
- */
-type LilypadChangelogPruning = 'detect' | 'trigger' | 'cron' | 'external';
-type LilypadSchemaCheckOptions = {
-  /** The cached tables, as in their `LilypadDbSchema` (`tableName`, `primaryKey`). */
-  tables: {
-    table: string;
-    primaryKey: string;
-  }[];
-  /**
-   * Checks the changelog table, its trigger function, that each table has the changelog trigger
-   * (the `changelog` strategy), and how the changelog is pruned. `false` skips these checks.
-   * Defaults to `{}`: the default changelog table.
-   */
-  changelog?: {
-    table?: string;
-    /** How the old rows are deleted (see {@link LilypadChangelogPruning}). Defaults to `detect`. */
-    pruning?: LilypadChangelogPruning;
-    /**
-     * The shortest retention the caches accept, in ms: the largest `maxGap` and `lookback` of
-     * the caches that read this changelog. A pruning found with a retention that is not longer
-     * is an error. Defaults to 1 hour (the default `maxGap`).
-     */
-    minRetention?: number;
-    /**
-     * Whether to check how the changelog is pruned (reads `cron.job` and the age of the oldest
-     * row). Defaults to true; the caches pass false unless `sync.checkPruning` is set.
-     */
-    checkPruning?: boolean;
-  } | false;
-  /**
-   * Checks that each table has a trigger that sends notifications on this channel (the `listen`
-   * strategy). The trigger may be the changelog trigger or one of your own: its function must call
-   * `pg_notify` with the channel name as a literal. Defaults to `false`: not checked.
-   *
-   * The SQL that fixes a missing or outdated changelog notifies on this channel, or, with `false`,
-   * on the channel the installed trigger function notifies on (none if it sends none).
-   */
-  notifyChannel?: string | false;
-};
-type LilypadSchemaProblemCode =
-/** PostgreSQL is older than 13: the changelog needs `xid8`. */
-'unsupported-version' |
-/** The cached table does not exist (as seen with the `search_path` of the gate). */
-'missing-table' |
-/** The changelog table or its trigger function does not exist. */
-'missing-changelog' |
-/**
- * The changelog table or its trigger function was installed by an older version of the library:
- * an error if the caches cannot read it correctly, a warning if it only lacks an improvement.
- */
-'outdated-changelog' |
-/**
- * The enabled changelog triggers of the table do not record each of INSERT, UPDATE and DELETE:
- * row triggers, or statement triggers with their transition tables.
- */
-'missing-changelog-trigger' |
-/** The changelog trigger of the table records another column than the primary key. */
-'wrong-trigger-primary-key' |
-/**
- * `TRUNCATE` of the table is not recorded (or not notified, with `notifyChannel`): it fires no
- * row trigger, so the caches would keep the removed rows.
- */
-'missing-truncate-trigger' |
-/**
- * No enabled trigger of the table sends notifications on the channel, or not for each of INSERT,
- * UPDATE and DELETE.
- */
-'missing-notify-trigger' |
-/**
- * A warning: nothing is known to delete the old changelog rows. Neither the `prune` option of
- * the trigger nor a pg_cron job was found, no row was ever deleted from the changelog, and
- * `pruning` is not `external`. The fix is the best pruning for the database, or the one
- * `pruning` asks for (`trigger` or `cron`).
- */
-'no-changelog-pruning' |
-/**
- * A warning: the oldest changelog row is older than the retention (or 24 hours, if unknown)
- * plus 7 days, so the pruning does not run, or does not keep up.
- */
-'unpruned-changelog' |
-/**
- * The pruning found deletes rows that are not older than `minRetention`: a cache could miss
- * changes without knowing it.
- */
-'short-changelog-retention';
-/**
- * `error`: the caches can serve stale data, and `LilypadDbCache.create` rejects with
- * `verify: 'throw'`. `warning`: they work, but something needs attention; it is only logged.
- */
-type LilypadSchemaProblemSeverity = 'error' | 'warning';
-type LilypadSchemaProblem = {
-  code: LilypadSchemaProblemCode;
-  severity: LilypadSchemaProblemSeverity;
-  /** The cached table concerned, for the per-table problems. */
-  table?: string;
-  message: string;
-  /** SQL that fixes the problem, to run in a migration. */
-  fix?: string;
-};
-type LilypadSchemaCheckResult = {
-  /** Whether there is no error (there may be warnings). */
-  ok: boolean;
-  problems: LilypadSchemaProblem[];
-  /** The schema each table resolves to (`null` if the table does not exist). */
-  tables: {
-    table: string;
-    schema: string | null;
-  }[];
-};
-/**
- * Thrown by `LilypadDbCache.create` with `verify: 'throw'` when the database is not set up (the
- * check found errors). Its `problems` include the warnings.
- */
-export declare class LilypadSchemaCheckError extends Error {
-  readonly problems: LilypadSchemaProblem[];
-  constructor(subject: string, problems: LilypadSchemaProblem[]);
-}
-/**
- * Checks that the database has what `LilypadDbCache` needs to learn about changes: the changelog
- * table, its trigger function and a trigger on each cached table, or a trigger that sends
- * notifications. It only reads the catalogs: it changes nothing.
- *
- * @returns The problems found, each with a message and, when the library can generate it, the SQL
- * that fixes it (`ok` is true when there is none).
- * @throws If the catalogs cannot be read (e.g. the database is unreachable).
- */
-export declare function checkLilypadSchema(gate: LilypadDbGate, options: LilypadSchemaCheckOptions, context?: LilypadSchemaCheckContext): Promise<LilypadSchemaCheckResult>;
-//#endregion
 //#region src/cache/dbSync/LilypadDbSyncTypes.d.ts
 type LilypadDbNotification = {
   /**
@@ -699,126 +477,60 @@ type LilypadDbNotification = {
    */
   xid?: string;
 };
-/** How the cache checks that the database has the triggers it needs (see {@link LilypadDbCacheSync}). */
-type LilypadDbCacheSchemaVerification = 'warn' | 'throw' | 'off';
-/** The options shared by the strategies that see every change of the table. */
-type LilypadDbCacheTrustedSyncOptions = {
-  verify?: LilypadDbCacheSchemaVerification;
-  /**
-   * While the sync is trusted, an entry read from the database (not a copy from the shared
-   * level, nor a fallback after an error) that reaches its TTL with no change of its row is
-   * kept, without a query, until it is this old (ms). It bounds how long a change the triggers
-   * do not see (disabled triggers, `session_replication_role = replica`) goes unnoticed. The TTL
-   * still bounds the shared level. `0` queries the row again at each TTL. Defaults to 1 hour.
-   */
-  maxAge?: number;
-};
-type LilypadDbCacheListenSync = LilypadDbCacheTrustedSyncOptions & {
-  strategy: 'listen';
-  /**
-   * `eager` (default): `create` resolves once `LISTEN` is active, and rejects if it fails.
-   * `lazy`: `LISTEN` starts on the first read, so creating the cache opens no connection.
-   */
-  connect?: 'eager' | 'lazy';
-  /**
-   * If false, the cache does not apply the notifications: keeping it up to date is then up to
-   * `onNotification`, and entries are never kept past their TTL. Defaults to true.
-   */
-  applyChanges?: boolean;
-  /** Called with every notification of the table, after the cache has applied it. */
-  onNotification?: (payload: LilypadDbNotification) => Promise<void> | void;
-};
-type LilypadDbCacheChangelogSync = LilypadDbCacheTrustedSyncOptions & {
-  strategy: 'changelog';
-  /** Minimum time between two reads of the changelog, in ms. Changes are seen within it. */
-  pollInterval: number;
-  /**
-   * `await` (default): a read that is due waits for the changelog, so it never returns data
-   * older than `pollInterval`. `background`: the read does not wait, and may return data one
-   * interval older.
-   */
-  poll?: 'await' | 'background';
-  /**
-   * If the changelog has not been read for this long (ms), the instance no longer trusts it:
-   * every entry is expired instead. It must be much shorter than the retention of the
-   * changelog (see `pruneLilypadChangelog`): the schema check reports a pruning it finds with a
-   * shorter one. Defaults to 1 hour.
-   */
-  maxGap?: number;
-  /**
-   * On the first read, or after `maxGap`, the changes of this many ms are applied, so that
-   * copies in the shared level older than those changes are removed too. It must cover the
-   * lifetime of a shared entry. Defaults to the TTL plus `staleWhileRevalidate`, plus 1 minute.
-   */
-  lookback?: number;
-  /** The changelog table, if not `lilypad_cache_changes`. */
-  table?: string;
-  /**
-   * Also checks at runtime how the changelog is pruned (the `pg_cron` jobs, the `prune` option of
-   * the trigger, the age of the oldest row), with the other checks of `verify`. Defaults to false:
-   * run `npx lilypad-doctor` (or `checkLilypadSchema`) in a deployment step instead, which checks
-   * it without slowing the start of the caches.
-   */
-  checkPruning?: boolean;
-  /**
-   * How the old changelog rows are deleted, for the pruning check (`checkPruning`, or
-   * `lilypad-doctor`). `detect` (default): it looks for
-   * the `prune` option of the trigger and for a pg_cron job, and warns with the best one for the
-   * database if it finds neither. `trigger` / `cron`: the same, but it always suggests the `prune`
-   * option of the trigger / a pg_cron job. `external`: a job it cannot see deletes them (e.g.
-   * `pruneLilypadChangelog` from a scheduled function), so it suggests nothing.
-   */
-  pruning?: LilypadChangelogPruning;
-};
 /**
- * How the cache learns about the changes made by other instances and other programs.
- *
- * - `listen`: `LISTEN/NOTIFY` on a dedicated connection. Near real-time, for long-running servers.
- *   Not suited to serverless platforms: the connection must stay open, it does not work through a
- *   pooler in transaction mode, and notifications sent while an instance is suspended are lost.
- *   Notifications are only hints (any role can send them): the cache reads the rows again, it
- *   never trusts the content of a notification.
- * - `changelog`: each instance reads the changelog table (see `lilypadChangelogSql`) at most once
- *   per `pollInterval`, when the cache is used. The caches of a gate read their tables together,
- *   in one query. No long-lived connection: suited to serverless platforms. Changes are seen
- *   within `pollInterval`.
- * - `none`: only the writes of this instance and the TTL keep the cache up to date.
- *
- * `listen` and `changelog` rely on triggers that the library does not install (see
- * `lilypadChangelogSql`). Their `verify` option checks that they exist (`checkLilypadSchema`):
- * - `warn` (default): once, when the cache first uses the database (`LISTEN`, or the first read
- *   of the changelog), without delaying changelog reads; problems are logged as a warning, with the
- *   SQL that fixes them (on `console.warn` without a logger).
- * - `throw`: in `create`, which rejects with a `LilypadSchemaCheckError`. `create` then queries
- *   the database, whatever the strategy.
- * - `off`: no check. With `listen`, notifications of a table of the same name in another schema
- *   are then told apart only if `tableName` is qualified (`schema.table`).
- *
- * While `listen` or `changelog` is trusted (`LISTEN` active and its heartbeat recent, changelog
- * read within `maxGap`), the cache sees every change of the table, so the TTL no longer needs a
- * query: an entry that reaches its TTL without a change of its row is kept until `maxAge`.
- *
- * When `LISTEN` or a read of the changelog fails, the next attempts back off exponentially (up to
- * one minute), instead of retrying at every read.
+ * The options of the sync of a table that `LilypadDbCache.create` may change for one cache (the
+ * strategy, `maxGap` and `lookback` stay those of the config, which `lilypad-doctor` checks the
+ * database against). Each applies to the strategies that have it, and is ignored by the others.
  */
-type LilypadDbCacheSync = LilypadDbCacheListenSync | LilypadDbCacheChangelogSync | {
-  strategy: 'none';
+type LilypadDbCacheSyncOverrides = {
+  /** See `maxAge` in the sync of the table. */
+  maxAge?: number;
+  /** `listen`: see {@link LilypadDbTableListenSync}. */
+  connect?: 'eager' | 'lazy';
+  /** `listen`: see {@link LilypadDbTableListenSync}. */
+  applyChanges?: boolean;
+  /** `listen`: called with every notification of the table, after the cache has applied it. */
+  onNotification?: (payload: LilypadDbNotification) => Promise<void> | void;
+  /** `changelog`: see {@link LilypadDbTableChangelogSync}. */
+  pollInterval?: number;
+  /** `changelog`: see {@link LilypadDbTableChangelogSync}. */
+  poll?: 'await' | 'background';
 };
 //#endregion
 //#region src/cache/LilypadDbCache.d.ts
 /** The key type of a table: the type of its primary key column. */
 type LilypadDbKey<V, PK extends keyof V> = V[PK] & LilypadCacheKey;
-type LilypadDbCacheOptions<V extends object, PK extends keyof V = keyof V> = Omit<LilypadCacheOptions<LilypadDbKey<V, PK>, V>, 'bulkSync'> & {
-  gate: LilypadDbGate;
-  schema: LilypadDbSchema<V, PK>;
-  /** Defaults to `{ strategy: 'listen' }`. */
-  sync?: LilypadDbCacheSync;
+/** The options of a cache, apart from its table and its gate. */
+type LilypadDbCacheBaseOptions<V extends object, PK extends keyof V = keyof V> = Omit<LilypadCacheOptions<LilypadDbKey<V, PK>, V>, 'bulkSync'> & {
+  /**
+   * Changes the options of the sync of the table for this cache (e.g. `connect: 'lazy'`, an
+   * `onNotification` callback). The strategy is the one of the table in its config.
+   */
+  sync?: LilypadDbCacheSyncOverrides;
   /**
    * Loading the whole table (`getAll`): `timeout` bounds each load and each query by primary keys
    * (defaults to 30 seconds); with the `none` strategy, a load stays valid for `ttl` (defaults to
    * the TTL).
    */
   bulkSync?: Omit<LilypadCacheBulkSyncOptions<LilypadDbKey<V, PK>, V>, 'fn'>;
+};
+/** The options of a cache of a table given as a definition (`db.tables.users`). */
+type LilypadDbCacheOptions<V extends object, PK extends keyof V = keyof V> = LilypadDbCacheBaseOptions<V, PK> & {
+  gate: LilypadDbGate;
+  /** The table, from a config: `db.tables.users`, whatever the config of the gate. */
+  table: LilypadDbTableDefinition<V, PK>;
+};
+/** The options of a cache of a table given by its key in `config`. */
+type LilypadDbCacheNamedOptions<C extends LilypadDbConfig, N extends LilypadDbTableName<C>> = LilypadDbCacheBaseOptions<LilypadDbRow<C, N>, LilypadDbPrimaryKey<C, N>> & {
+  gate: LilypadDbGate;
+  config: C;
+  table: N;
+};
+/** The options of a cache of a table given by its key in the config of the gate. */
+type LilypadDbCacheGateNamedOptions<C extends LilypadDbConfig, N extends LilypadDbTableName<C>> = LilypadDbCacheBaseOptions<LilypadDbRow<C, N>, LilypadDbPrimaryKey<C, N>> & {
+  gate: LilypadDbGate<C>;
+  config?: undefined;
+  table: N;
 };
 /**
  * A cache of the rows of one table, kept up to date with the changes made elsewhere.
@@ -835,7 +547,7 @@ type LilypadDbCacheOptions<V extends object, PK extends keyof V = keyof V> = Omi
  *
  * @example
  * ```typescript
- * const users = await LilypadDbCache.create({ ttl: 60_000, gate, schema: usersSchema, logger });
+ * const users = await LilypadDbCache.create({ ttl: 60_000, gate, table: db.tables.users, logger });
  * const user = await users.getOrFetch(42); // User, or null when there is no such row
  * await users.dispose();
  * ```
@@ -852,21 +564,14 @@ type LilypadDbCacheOptions<V extends object, PK extends keyof V = keyof V> = Omi
 export declare class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
   private readonly engine;
   private readonly table;
-  private readonly schema;
+  private readonly definition;
   private readonly sync;
   private readonly maxAge;
-  private readonly verifier;
   /** Bounds the loads of the table and the queries by primary keys (`bulkSync.timeout`). */
   private readonly loadFlowControl;
   /** With the `none` strategy, how long a load of the table stays valid (`bulkSync.ttl`). */
   private readonly loadTtl;
   private releaseSingleton;
-  /**
-   * The schema of the table: from `tableName` when it is qualified, otherwise as resolved by the
-   * schema check. Notifications from another schema are ignored; while it is unknown, notifications
-   * of the table in any schema are applied.
-   */
-  private tableSchema?;
   /** The keys of the rows of the table, for `getAll`. */
   private members;
   /** The load of the whole table in flight, shared by concurrent callers. */
@@ -890,15 +595,21 @@ export declare class LilypadDbCache<V extends object, PK extends keyof V = keyof
   private numericPrimaryKey;
   private disposing?;
   /**
-   * Creates a cache and, with the `listen` strategy (unless `connect: 'lazy'`), registers its
-   * database listener. The row type and the primary key are inferred from `schema`.
+   * Creates a cache of a table of a config and, with the `listen` strategy (unless
+   * `connect: 'lazy'`), registers its database listener. The table is a definition
+   * (`db.tables.users`, from any config), or its key (`'users'`) in `config`, or else in the config
+   * of the gate. The row type and the primary key are inferred from it.
    * With `singleton: '<identifier>'`, a later call with the same identifier returns the existing
    * cache and ignores its own options (a warning is logged if the table or the TTL differ).
    *
-   * @throws If the database listener cannot be registered (e.g. the database is unreachable), or,
-   * with `verify: 'throw'`, if the database is not set up.
+   * Nothing is compared with the database: `lilypad-doctor` checks it against the config.
+   *
+   * @throws If the table is not found, or if the database listener cannot be registered (e.g. the
+   * database is unreachable).
    */
   static create<V extends object, PK extends keyof V = keyof V>(options: LilypadDbCacheOptions<V, PK> & LilypadSingletonAble): Promise<LilypadDbCache<V, PK>>;
+  static create<C extends LilypadDbConfig, N extends LilypadDbTableName<C>>(options: LilypadDbCacheNamedOptions<C, N> & LilypadSingletonAble): Promise<LilypadDbCache<LilypadDbRow<C, N>, LilypadDbPrimaryKey<C, N>>>;
+  static create<C extends LilypadDbConfig, N extends LilypadDbTableName<C>>(options: LilypadDbCacheGateNamedOptions<C, N> & LilypadSingletonAble): Promise<LilypadDbCache<LilypadDbRow<C, N>, LilypadDbPrimaryKey<C, N>>>;
   private constructor();
   /** A unique id of the instance. */
   get id(): string;
@@ -1149,42 +860,269 @@ export declare class LilypadDbCache<V extends object, PK extends keyof V = keyof
   sqlDelete(key: LilypadDbKey<V, PK>): Promise<boolean>;
 }
 //#endregion
+//#region src/dbConfig/loadLilypadDbConfig.d.ts
+/**
+ * The file names of a config: `lilypad.config.<ext>` for the default one, `lilypad.<name>.config.<ext>`
+ * for the others.
+ */
+export declare function lilypadDbConfigFileNames(name: string): string[];
+/**
+ * Loads a config file: its default export (or its `config` export) must be a config made with
+ * `defineLilypadDb`. A config found by name must have that name.
+ *
+ * A TypeScript config is loaded by Node.js itself (type stripping: Node.js 22.18 or later, or
+ * `--experimental-strip-types`): it may use only erasable syntax, and its relative imports need
+ * their extension (`./tables/users.ts`). Otherwise, write it as `.mjs`.
+ *
+ * @param options.config - The name of the config (`default` when absent), or the path of its file.
+ * @param options.cwd - Where the config files are looked for. Defaults to the working directory.
+ * @throws If the file does not exist, cannot be loaded, or exports no config.
+ */
+export declare function loadLilypadDbConfig(options?: {
+  config?: string;
+  cwd?: string;
+}): Promise<{
+  path: string;
+  config: LilypadDbConfig;
+}>;
+//#endregion
+//#region src/dbGate/LilypadSchemaShape.d.ts
+/**
+ * The shape of a table, compared with the database by the schema check: its columns, keys,
+ * indexes and checks. A table definition of a config (`db.tables.users`) is one.
+ */
+type LilypadSchemaTableShape = {
+  cols: Readonly<Record<string, LilypadDbColumn>>;
+  generatedPrimaryKey?: boolean;
+  unique: readonly LilypadDbResolvedUniqueKey[];
+  foreignKeys: readonly LilypadDbResolvedForeignKey[];
+  indexes: readonly LilypadDbResolvedIndex[];
+  checks: readonly LilypadDbCheck[];
+  /** Also reports what the database has and the shape lacks (as warnings). */
+  strict: boolean;
+};
+/**
+ * A PostgreSQL type as `format_type` writes it: lower case, aliases resolved (`int4` is
+ * `integer`, `varchar(64)` is `character varying(64)`, `timestamptz(3)` is
+ * `timestamp(3) with time zone`), array suffixes kept.
+ */
+export declare function normalizeLilypadPgType(type: string): string;
+//#endregion
+//#region src/dbGate/LilypadSchemaCheck.d.ts
+/** A table to check, and what it needs. */
+type LilypadSchemaCheckTable = {
+  /** `table`, or `schema.table` (as the tables of a config are named). */
+  table: string;
+  primaryKey: string;
+  /**
+   * Whether the table needs the changelog triggers (the `changelog` strategy). Defaults to true
+   * when the options check the changelog.
+   */
+  changelog?: boolean;
+  /**
+   * The channel on which the table needs notifying triggers (the `listen` strategy), or `false`.
+   * Defaults to the `notifyChannel` of the options.
+   */
+  notifyChannel?: string | false;
+  /**
+   * The columns, keys, indexes and checks the table must have (a table definition of a config is
+   * one). Without it, only the table and its triggers are checked.
+   */
+  shape?: LilypadSchemaTableShape;
+};
+type LilypadSchemaCheckOptions = {
+  tables: LilypadSchemaCheckTable[];
+  /**
+   * Checks the changelog table, its trigger function, that the tables that need it have the
+   * changelog trigger (the `changelog` strategy), and how the changelog is pruned. `false` skips
+   * these checks. Defaults to `{}`: the default changelog table.
+   */
+  changelog?: {
+    table?: string;
+    /** How the old rows are deleted (see {@link LilypadChangelogPruning}). Defaults to `detect`. */
+    pruning?: LilypadChangelogPruning;
+    /**
+     * The shortest retention the caches accept, in ms: the largest `maxGap` and `lookback` of
+     * the caches that read this changelog. A pruning found with a retention that is not longer
+     * is an error. Defaults to 1 hour (the default `maxGap`).
+     */
+    minRetention?: number;
+    /**
+     * Whether to check how the changelog is pruned (reads `cron.job` and the age of the oldest
+     * row). Defaults to true.
+     */
+    checkPruning?: boolean;
+  } | false;
+  /**
+   * Checks that the tables have a trigger that sends notifications on this channel (the `listen`
+   * strategy), unless a table sets its own `notifyChannel`. The trigger may be the changelog trigger
+   * or one of your own: its function must call `pg_notify` with the channel name as a literal.
+   * Defaults to `false`: not checked.
+   *
+   * The SQL that fixes a missing or outdated changelog notifies on this channel, or, with `false`,
+   * on the channel the installed trigger function notifies on (none if it sends none).
+   */
+  notifyChannel?: string | false;
+};
+type LilypadSchemaProblemCode =
+/** PostgreSQL is older than 13: the changelog needs `xid8`. */
+'unsupported-version' |
+/** The cached table does not exist (as seen with the `search_path` of the gate). */
+'missing-table' |
+/** The changelog table or its trigger function does not exist. */
+'missing-changelog' |
+/**
+ * The changelog table or its trigger function was installed by an older version of the library:
+ * an error if the caches cannot read it correctly, a warning if it only lacks an improvement.
+ */
+'outdated-changelog' |
+/**
+ * The enabled changelog triggers of the table do not record each of INSERT, UPDATE and DELETE:
+ * row triggers, or statement triggers with their transition tables.
+ */
+'missing-changelog-trigger' |
+/** The changelog trigger of the table records another column than the primary key. */
+'wrong-trigger-primary-key' |
+/**
+ * `TRUNCATE` of the table is not recorded (or not notified, with `notifyChannel`): it fires no
+ * row trigger, so the caches would keep the removed rows.
+ */
+'missing-truncate-trigger' |
+/**
+ * No enabled trigger of the table sends notifications on the channel, or not for each of INSERT,
+ * UPDATE and DELETE.
+ */
+'missing-notify-trigger' |
+/**
+ * A warning: nothing is known to delete the old changelog rows. Neither the `prune` option of
+ * the trigger nor a pg_cron job was found, no row was ever deleted from the changelog, and
+ * `pruning` is not `external`. The fix is the best pruning for the database, or the one
+ * `pruning` asks for (`trigger` or `cron`).
+ */
+'no-changelog-pruning' |
+/**
+ * A warning: the oldest changelog row is older than the retention (or 24 hours, if unknown)
+ * plus 7 days, so the pruning does not run, or does not keep up.
+ */
+'unpruned-changelog' |
+/**
+ * The pruning found deletes rows that are not older than `minRetention`: a cache could miss
+ * changes without knowing it.
+ */
+'short-changelog-retention' |
+/** A column of the description does not exist. */
+'missing-column' |
+/**
+ * The type of a column is not its `pgType` (an error), or does not fit its `type` (a warning:
+ * e.g. a `numeric` column declared as `number`, which postgres.js returns as a string).
+ */
+'column-type-mismatch' |
+/** A column accepts `NULL` although declared not nullable, or the reverse. */
+'column-nullability-mismatch' |
+/** A column declared with a default (or the generated primary key) has none. */
+'missing-column-default' |
+/**
+ * The primary key of the description is not the primary key of the table: an error if it is not
+ * unique, a warning if a unique index and `NOT NULL` make it a key anyway.
+ */
+'wrong-primary-key' |
+/** No unique constraint or index covers exactly the columns of a unique key. */
+'missing-unique-key' |
+/** A foreign key of the description does not exist (same columns, same referenced table). */
+'missing-foreign-key' |
+/** A foreign key exists with other `ON DELETE` / `ON UPDATE` actions. */
+'foreign-key-mismatch' |
+/** An index does not exist: an error for a unique index, a warning otherwise. */
+'missing-index' |
+/** A check of the description does not exist (found by its name). */
+'missing-check' |
+/**
+ * A warning: a `NOT NULL` column without a default is not in the description, so the inserts
+ * of the library fail.
+ */
+'undeclared-required-column' |
+/** A warning of `strict`: a column of the table is not in the description. */
+'undeclared-column' |
+/** A warning of `strict`: a unique key, foreign key or check is not in the description. */
+'undeclared-constraint' |
+/** A warning of `strict`: an index is not in the description. */
+'undeclared-index';
+/**
+ * `error`: the database is not what the config describes (the caches may serve stale data, the
+ * queries may fail), and `lilypad-doctor` exits with 1. `warning`: it works, but something needs
+ * attention.
+ */
+type LilypadSchemaProblemSeverity = 'error' | 'warning';
+type LilypadSchemaProblem = {
+  code: LilypadSchemaProblemCode;
+  severity: LilypadSchemaProblemSeverity;
+  /** The cached table concerned, for the per-table problems. */
+  table?: string;
+  message: string;
+  /** SQL that fixes the problem, to run in a migration. */
+  fix?: string;
+};
+type LilypadSchemaCheckResult = {
+  /** Whether there is no error (there may be warnings). */
+  ok: boolean;
+  problems: LilypadSchemaProblem[];
+  /** The schema each table resolves to (`null` if the table does not exist). */
+  tables: {
+    table: string;
+    schema: string | null;
+  }[];
+};
+/**
+ * Thrown by `assertOk()` of a `lilypad-doctor` report when the database is not set up (the check
+ * found errors). Its `problems` include the warnings.
+ */
+export declare class LilypadSchemaCheckError extends Error {
+  readonly problems: LilypadSchemaProblem[];
+  constructor(subject: string, problems: LilypadSchemaProblem[]);
+}
+/**
+ * Checks that the database has what `LilypadDbCache` needs to learn about changes: the changelog
+ * table, its trigger function and a trigger on each cached table, or a trigger that sends
+ * notifications. It only reads the catalogs: it changes nothing.
+ *
+ * @returns The problems found, each with a message and, when the library can generate it, the SQL
+ * that fixes it (`ok` is true when there is none).
+ * @throws If the catalogs cannot be read (e.g. the database is unreachable).
+ */
+export declare function checkLilypadSchema(gate: LilypadDbGate, options: LilypadSchemaCheckOptions): Promise<LilypadSchemaCheckResult>;
+//#endregion
 //#region src/dbGate/LilypadDoctor.d.ts
 type LilypadDoctorOptions = {
   /** The connection string of the database to check. */
   connectionString: string;
-  /** The cached tables, as in their `LilypadDbSchema` (`tableName`, `primaryKey`). */
-  tables: {
-    table: string;
-    primaryKey: string;
-  }[];
-  /**
-   * The changelog read by the caches (the `changelog` strategy), or `false` if none reads one.
-   * Defaults to `{}`: the default changelog table.
-   */
-  changelog?: {
-    table?: string;
-    /** How the old rows are deleted (see {@link LilypadChangelogPruning}). */
-    pruning?: LilypadChangelogPruning;
-    /** The largest `maxGap` and `lookback` of the caches, in ms. Defaults to 1 hour. */
-    minRetention?: number;
-  } | false;
-  /** The channel the `listen` caches listen on (`cache_events`), or `false` (default) if none. */
-  notifyChannel?: string | false;
+  /** The config the database must match (see `defineLilypadDb`, `loadLilypadDbConfig`). */
+  config: LilypadDbConfig;
 };
 type LilypadDoctorReport = LilypadSchemaCheckResult & {
+  /** The name of the config checked. */
+  config: string;
   /** The report, readable, with the SQL that fixes the problems. */
   text: string;
+  /** @throws {LilypadSchemaCheckError} If the check found errors. */
+  assertOk: () => void;
 };
 /**
- * Checks everything the caches need from the database, including how the changelog is pruned,
- * which the caches check at runtime only with `sync.checkPruning`. It connects with its own gate
- * (one connection), reads the catalogs only, and closes it. `npx lilypad-doctor` runs it from the
- * command line, e.g. in a deployment step.
+ * What the schema check must verify for a config: each table with its shape (columns, keys,
+ * indexes, checks), the changelog triggers of the `changelog` tables, the notifying triggers of the
+ * `listen` tables, and the changelog and its pruning when a table reads it. The retention the
+ * pruning must keep is the largest of `changelog.minRetention` and the `maxGap` and `lookback` of
+ * the `changelog` tables.
+ */
+export declare function lilypadSchemaCheckOptions(config: LilypadDbConfig): LilypadSchemaCheckOptions;
+/**
+ * Checks the database against a config: every table (its columns, keys, indexes and checks), the
+ * triggers each sync strategy needs, the changelog and how it is pruned. It connects with its own
+ * gate (one connection), reads the catalogs only, and closes it. `npx lilypad-doctor` runs it from
+ * the command line, e.g. in a deployment step.
  *
  * @throws If the database cannot be reached.
  */
 export declare function runLilypadDoctor(options: LilypadDoctorOptions): Promise<LilypadDoctorReport>;
 //#endregion
-export { type LilypadChange, type LilypadChangelogCursor, type LilypadChangelogPruneOptions, type LilypadChangelogPruneScheduleOptions, type LilypadChangelogPruning, type LilypadChangelogSqlOptions, type LilypadChangesRequest, type LilypadDbCacheChangelogSync, type LilypadDbCacheListenSync, type LilypadDbCacheOptions, type LilypadDbCacheSchemaVerification, type LilypadDbCacheSync, type LilypadDbCacheTrustedSyncOptions, type LilypadDbColumn, type LilypadDbColumnType, type LilypadDbDeleteResult, type LilypadDbGateOptions, type LilypadDbInsertData, type LilypadDbKey, type LilypadDbListener, type LilypadDbNotification, type LilypadDbPoolOptions, type LilypadDbSchema, type LilypadDbUpdateData, type LilypadDbWriteResult, LilypadDisposedError, type LilypadDoctorOptions, type LilypadDoctorReport, type LilypadSchemaCheckOptions, type LilypadSchemaCheckResult, type LilypadSchemaProblem, type LilypadSchemaProblemCode, type LilypadSchemaProblemSeverity };
+export { LILYPAD_DEFAULT_CHANGELOG_TABLE, LILYPAD_DEFAULT_DB_CONFIG_NAME, type LilypadChange, type LilypadChangelogCursor, type LilypadChangelogPruneOptions, type LilypadChangelogPruneScheduleOptions, type LilypadChangelogPruning, type LilypadChangelogSqlOptions, type LilypadChangesRequest, type LilypadDbCacheBaseOptions, type LilypadDbCacheGateNamedOptions, type LilypadDbCacheNamedOptions, type LilypadDbCacheOptions, type LilypadDbCacheSyncOverrides, type LilypadDbCheck, type LilypadDbColumn, type LilypadDbColumnDefault, type LilypadDbColumnName, type LilypadDbColumnReference, type LilypadDbColumnType, type LilypadDbConfig, type LilypadDbConfigInput, type LilypadDbConfigSettings, type LilypadDbDeleteResult, LilypadDbEmptyWriteError, type LilypadDbForeignKey, type LilypadDbGateOptions, type LilypadDbIndex, type LilypadDbIndexMethod, type LilypadDbInsertData, type LilypadDbKey, type LilypadDbListener, LilypadDbMissingPrimaryKeyError, LilypadDbNotFoundError, type LilypadDbNotification, type LilypadDbPoolOptions, type LilypadDbPrimaryKey, type LilypadDbReference, type LilypadDbReferentialAction, type LilypadDbResolvedForeignKey, type LilypadDbResolvedIndex, type LilypadDbResolvedUniqueKey, type LilypadDbRow, type LilypadDbSchema, type LilypadDbTableChangelogSync, type LilypadDbTableDefinition, type LilypadDbTableDefinitionBase, type LilypadDbTableDraft, type LilypadDbTableInput, type LilypadDbTableInputBase, type LilypadDbTableListenSync, type LilypadDbTableName, type LilypadDbTableSync, type LilypadDbTableTrustedSync, type LilypadDbUniqueKey, type LilypadDbUpdateData, type LilypadDbWriteResult, LilypadDisposedError, type LilypadDoctorOptions, type LilypadDoctorReport, type LilypadSchemaCheckOptions, type LilypadSchemaCheckResult, type LilypadSchemaCheckTable, type LilypadSchemaProblem, type LilypadSchemaProblemCode, type LilypadSchemaProblemSeverity, type LilypadSchemaTableShape, defineLilypadDb, defineLilypadTable, isLilypadDbConfig, isLilypadDbTableDefinition };
 //# sourceMappingURL=db.d.mts.map

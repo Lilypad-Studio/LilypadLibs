@@ -1,3 +1,4 @@
+import type { LilypadDbTableDefinition } from '@/dbConfig/LilypadDbConfig';
 import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
 import {
   LilypadDbEmptyWriteError,
@@ -5,7 +6,6 @@ import {
   LilypadDbNotFoundError,
   type LilypadDbDeleteResult,
   type LilypadDbInsertData,
-  type LilypadDbSchema,
   type LilypadDbUpdateData,
   type LilypadDbWriteResult,
 } from '@/dbGate/LilypadDbSchema';
@@ -19,8 +19,10 @@ const PRIMARY_KEYS_BATCH_SIZE = 1000;
 const XID_COLUMN = '__lilypad_xid';
 
 /**
- * The typed CRUD helpers of one table, created with `gate.table(schema)`: every method uses the
- * schema of the handle, and the connections of the gate (it rejects once the gate is closed).
+ * The typed CRUD helpers of one table, created with `gate.table(db.tables.users)` (or
+ * `gate.table('users')` on a gate created with a config): every method uses the definition of the
+ * table, and the connections of the gate (it rejects once the gate is closed). Queries name the
+ * table with its schema (`public.users`), whatever the `search_path`.
  *
  * - Only the `cols` keys are selected (unless there is a `selectSanitizationFn`, which gets `*`)
  *   and written: extra properties of the data (e.g. from a request body) are never written.
@@ -29,7 +31,7 @@ const XID_COLUMN = '__lilypad_xid';
  *
  * @example
  * ```typescript
- * const users = gate.table(usersSchema);
+ * const users = gate.table(db.tables.users);
  * const { row } = await users.insert({ name: 'Ada' });
  * const user = await users.selectByPrimaryKey(row!.id);
  * ```
@@ -37,7 +39,7 @@ const XID_COLUMN = '__lilypad_xid';
 export class LilypadDbTable<T, PK extends keyof T = keyof T> {
   constructor(
     private readonly gate: LilypadDbGate,
-    readonly schema: LilypadDbSchema<T, PK>
+    readonly definition: LilypadDbTableDefinition<T, PK>
   ) {}
 
   private get sql(): postgres.Sql {
@@ -49,7 +51,7 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
    * otherwise by copying the schema columns.
    */
   private mapRow(row: postgres.Row): T | null {
-    const { schema } = this;
+    const { definition: schema } = this;
     if (schema.selectSanitizationFn) {
       return schema.selectSanitizationFn(row);
     }
@@ -74,7 +76,9 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
    * columns that are not in the schema; otherwise only the schema columns are needed.
    */
   private selectedColumns() {
-    return this.schema.selectSanitizationFn ? this.sql`*` : this.sql(Object.keys(this.schema.cols));
+    return this.definition.selectSanitizationFn
+      ? this.sql`*`
+      : this.sql(Object.keys(this.definition.cols));
   }
 
   /** The `RETURNING` list of a write: the selected columns and the transaction id. */
@@ -84,11 +88,11 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
   }
 
   private get tableName() {
-    return this.sql(this.schema.tableName);
+    return this.sql(this.definition.qualifiedName);
   }
 
   private get primaryKeyColumn() {
-    return this.sql(String(this.schema.primaryKey));
+    return this.sql(String(this.definition.primaryKey));
   }
 
   /**
@@ -101,7 +105,7 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
    * - skips `undefined` values, which postgres.js rejects.
    */
   private prepareWrite(data: Partial<T>, operation: 'insert' | 'update') {
-    const { schema } = this;
+    const { definition: schema } = this;
     const writeData: Partial<T> = schema.writeSanitizationFn
       ? { ...schema.writeSanitizationFn({ ...data }) }
       : { ...data };
@@ -130,7 +134,7 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
   private writeResult(results: postgres.RowList<postgres.Row[]>): LilypadDbWriteResult<T> {
     const [returned] = results;
     if (!returned) {
-      throw new Error(`The write to table "${this.schema.tableName}" returned no row.`);
+      throw new Error(`The write to table "${this.definition.tableName}" returned no row.`);
     }
     const { [XID_COLUMN]: xid, ...row } = returned;
     return { row: this.mapRow(row), xid: BigInt(xid as string) };
@@ -231,7 +235,7 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
       RETURNING ${this.returning()}
     `;
     if (results.count === 0) {
-      throw new LilypadDbNotFoundError(this.schema.tableName, primaryKeyValue);
+      throw new LilypadDbNotFoundError(this.definition.tableName, primaryKeyValue);
     }
     return this.writeResult(results);
   }

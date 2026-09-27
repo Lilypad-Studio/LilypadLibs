@@ -16,8 +16,8 @@ import { assertNumberOption } from '@/internal/LilypadValidation';
 
 /**
  * How the changelog is pruned: the `prune` option of its trigger and the pg_cron jobs that delete
- * from it, their retention, and the best pruning to suggest when none is found. The caches check
- * it at runtime only with `sync.checkPruning`; `lilypad-doctor` always does.
+ * from it, their retention, and the best pruning to suggest when none is found. `lilypad-doctor`
+ * checks it whenever a table of the config reads the changelog.
  */
 
 const MINUTE = 60_000;
