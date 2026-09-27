@@ -9,12 +9,24 @@ export type LilypadDbConfigTemplateOptions = {
   empty: boolean;
 };
 
-const HEADER = `// The database config of @lilypad/libs: the tables the application uses, and what the database
-// must provide for them. The application imports it to create its gates and caches;
-// \`npx lilypad-doctor\` checks the database against it, and prints the SQL that fixes what differs.
-//
-// Node.js loads it without a bundler: import only '@lilypad/libs/schema' and relative files with
-// their extension (e.g. './db/users.ts'), and no path aliases.`;
+/** The comment at the top of the file. */
+function header(typescript: boolean): string {
+  return [
+    '// The database config of @lilypad/libs: the tables the application uses, and what the database',
+    '// must provide for them. The application imports it to create its gates and caches;',
+    '// `npx lilypad-doctor` checks the database against it, and prints the SQL that fixes what differs.',
+    '//',
+    "// Node.js loads it without a bundler: import only '@lilypad/libs/schema' and relative files with",
+    typescript
+      ? "// their extension (e.g. './db/users.ts'). Import the row types with `import type` (erased before"
+      : "// their extension (e.g. './db/users.mjs'), without path aliases.",
+    ...(typescript
+      ? ["// loading, so path aliases work there: import type { User } from '@/types/user')."]
+      : []),
+    '// Keep the application code out of it: bind the functions applied to the rows where the',
+    '// application creates its gate, with bindLilypadDbHooks(db, { example: { write, select } }).',
+  ].join('\n');
+}
 
 /** The lines of the example table, from `const example = ...` to its end. */
 function exampleTable(typescript: boolean): string[] {
@@ -61,7 +73,7 @@ export function lilypadDbConfigTemplate({
 }: LilypadDbConfigTemplateOptions): string {
   const table = exampleTable(typescript);
   const lines = [
-    HEADER,
+    header(typescript),
     empty
       ? "import { defineLilypadDb } from '@lilypad/libs/schema';"
       : "import { defineLilypadDb, defineLilypadTable } from '@lilypad/libs/schema';",

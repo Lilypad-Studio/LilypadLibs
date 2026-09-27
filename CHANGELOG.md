@@ -2,8 +2,16 @@
 
 ## Unreleased
 
+### Upgrading
+
+| Change | What to do |
+| --- | --- |
+| **A config holds no functions.** `writeSanitizationFn` and `selectSanitizationFn` leave the tables of the config (`defineLilypadDb` throws for them, and for `hooks`): the application binds them with `bindLilypadDbHooks`, so that `lilypad-doctor` loads the config without the application code they import. They are now the `write` and `select` hooks, and `select` receives the row as a `Record<string, unknown>`. | Remove them from `defineLilypadTable`, then, where the gate is created: `const appDb = bindLilypadDbHooks(db, { users: { write: sanitizeUser, select: parseUser } })` and `LilypadDbGate.create({ ..., config: appDb })`. The rest of the application can keep using `db`: the gate applies the hooks of its config to its tables. |
+
 ### Added
 
+- `bindLilypadDbHooks(db, { <table>: { write?, select? } })` (`@lilypad/libs/schema`) binds the functions of the application to the tables of a config, typed with the row type of each table. It returns a copy of the config; a gate created with it applies the hooks to the tables of its config however they are given (by key, or as a definition of the original config).
+- `lilypad-doctor` explains a config that Node.js cannot load: a type imported without `import type`, an import that needs a bundler (path alias, missing extension, JSON without its attribute), and what a config may import.
 - `npx lilypad-doctor init [--config <name|path>] [--empty] [--force]` creates a config file to start from: `lilypad.config.ts` (or `lilypad.<name>.config.ts`, or the path given, in JavaScript for `.mjs`/`.js`), with an example table and the options of the config as comments. It never overwrites an existing config without `--force`, and needs no database.
 
 ## 0.6.0

@@ -1,6 +1,6 @@
 import { n as LilypadLibLogger } from "./chunks/LilypadLibLogger-D3C4iJKK.mjs";
 import { c as LilypadCacheOptions, g as LilypadDisposedError, h as LilypadCachedValueType, l as LilypadCachePeek, o as LilypadCacheGetOptions, s as LilypadCacheKey, t as LilypadCacheBulkSyncOptions, u as LilypadCacheResult } from "./chunks/LilypadCacheTypes-CLQapyZs.mjs";
-import { A as LilypadDbColumnReference, B as LilypadDbReference, C as defineLilypadTable, D as LilypadDbColumn, E as LilypadDbCheck, F as LilypadDbIndex, G as LilypadDbWriteResult, H as LilypadDbSchema, I as LilypadDbIndexMethod, L as LilypadDbInsertData, M as LilypadDbDeleteResult, N as LilypadDbEmptyWriteError, O as LilypadDbColumnDefault, P as LilypadDbForeignKey, R as LilypadDbMissingPrimaryKeyError, S as defineLilypadDb, T as isLilypadDbTableDefinition, U as LilypadDbUniqueKey, V as LilypadDbReferentialAction, W as LilypadDbUpdateData, _ as LilypadDbTableInputBase, a as LilypadDbConfigInput, b as LilypadDbTableSync, c as LilypadDbResolvedForeignKey, d as LilypadDbRow, f as LilypadDbTableChangelogSync, g as LilypadDbTableInput, h as LilypadDbTableDraft, i as LilypadDbConfig, j as LilypadDbColumnType, k as LilypadDbColumnName, l as LilypadDbResolvedIndex, m as LilypadDbTableDefinitionBase, n as LILYPAD_DEFAULT_DB_CONFIG_NAME, o as LilypadDbConfigSettings, p as LilypadDbTableDefinition, r as LilypadChangelogPruning, s as LilypadDbPrimaryKey, t as LILYPAD_DEFAULT_CHANGELOG_TABLE, u as LilypadDbResolvedUniqueKey, v as LilypadDbTableListenSync, w as isLilypadDbConfig, x as LilypadDbTableTrustedSync, y as LilypadDbTableName, z as LilypadDbNotFoundError } from "./chunks/schema-B8RIzo97.mjs";
+import { A as LilypadDbCheck, B as LilypadDbIndexMethod, C as defineLilypadTable, D as LilypadDbTableHooks, E as LilypadDbHooks, F as LilypadDbColumnType, G as LilypadDbReferentialAction, H as LilypadDbMissingPrimaryKeyError, I as LilypadDbDeleteResult, J as LilypadDbUpdateData, K as LilypadDbSchema, L as LilypadDbEmptyWriteError, M as LilypadDbColumnDefault, N as LilypadDbColumnName, O as LilypadDbTableHooksBase, P as LilypadDbColumnReference, R as LilypadDbForeignKey, S as defineLilypadDb, T as isLilypadDbTableDefinition, U as LilypadDbNotFoundError, V as LilypadDbInsertData, W as LilypadDbReference, Y as LilypadDbWriteResult, _ as LilypadDbTableInputBase, a as LilypadDbConfigInput, b as LilypadDbTableSync, c as LilypadDbResolvedForeignKey, d as LilypadDbRow, f as LilypadDbTableChangelogSync, g as LilypadDbTableInput, h as LilypadDbTableDraft, i as LilypadDbConfig, j as LilypadDbColumn, k as bindLilypadDbHooks, l as LilypadDbResolvedIndex, m as LilypadDbTableDefinitionBase, n as LILYPAD_DEFAULT_DB_CONFIG_NAME, o as LilypadDbConfigSettings, p as LilypadDbTableDefinition, q as LilypadDbUniqueKey, r as LilypadChangelogPruning, s as LilypadDbPrimaryKey, t as LILYPAD_DEFAULT_CHANGELOG_TABLE, u as LilypadDbResolvedUniqueKey, v as LilypadDbTableListenSync, w as isLilypadDbConfig, x as LilypadDbTableTrustedSync, y as LilypadDbTableName, z as LilypadDbIndex } from "./chunks/schema-BaNQHPRH.mjs";
 import { t as LilypadSingletonAble } from "./chunks/LilypadSingleton-CmL74XTL.mjs";
 import postgres from "postgres";
 //#region src/dbGate/LilypadDbTable.d.ts
@@ -10,9 +10,9 @@ import postgres from "postgres";
  * table, and the connections of the gate (it rejects once the gate is closed). Queries name the
  * table with its schema (`public.users`), whatever the `search_path`.
  *
- * - Only the `cols` keys are selected (unless there is a `selectSanitizationFn`, which gets `*`)
- *   and written: extra properties of the data (e.g. from a request body) are never written.
- * - Rows are mapped with the `selectSanitizationFn`, or by copying the `cols` keys.
+ * - Only the `cols` keys are selected (unless there is a `select` hook, which gets `*`) and
+ *   written: extra properties of the data (e.g. from a request body) are never written.
+ * - Rows are mapped with the `select` hook (see `bindLilypadDbHooks`), or by copying the `cols` keys.
  * - Writes return the id of their transaction (`xid`), as the changelog records it.
  *
  * @example
@@ -28,14 +28,14 @@ export declare class LilypadDbTable<T, PK extends keyof T = keyof T> {
   constructor(gate: LilypadDbGate, definition: LilypadDbTableDefinition<T, PK>);
   private get sql();
   /**
-   * Maps a database row to `T`, using the schema's `selectSanitizationFn` if provided,
-   * otherwise by copying the schema columns.
+   * Maps a database row to `T`, using the `select` hook of the table if it has one, otherwise by
+   * copying the schema columns.
    */
   private mapRow;
   private mapRows;
   /**
-   * The columns to select. The `selectSanitizationFn` receives the whole row, since it may read
-   * columns that are not in the schema; otherwise only the schema columns are needed.
+   * The columns to select. The `select` hook receives the whole row, since it may read columns
+   * that are not in the schema; otherwise only the schema columns are needed.
    */
   private selectedColumns;
   /** The `RETURNING` list of a write: the selected columns and the transaction id. */
@@ -44,7 +44,7 @@ export declare class LilypadDbTable<T, PK extends keyof T = keyof T> {
   private get primaryKeyColumn();
   /**
    * Prepares the data of an insert/update:
-   * - applies the schema's `writeSanitizationFn`, whose result replaces the data;
+   * - applies the `write` hook of the table, whose result replaces the data;
    * - validates the primary key, which an update always needs to find the row;
    * - restricts the written columns to the schema columns, so that extra properties of `data`
    *   (e.g. coming from a request body) are never written to the table;
@@ -67,7 +67,7 @@ export declare class LilypadDbTable<T, PK extends keyof T = keyof T> {
   /**
    * Selects the rows with these primary keys, in one query per batch of 1000 keys (Postgres limits
    * the parameters of a query). Keys without a row are left out of the result, as are the rows the
-   * `selectSanitizationFn` discards.
+   * `select` hook discards.
    */
   selectByPrimaryKeys(primaryKeyValues: T[PK][]): Promise<T[]>;
   /** Selects the row with this primary key, or `null`. */
@@ -76,7 +76,7 @@ export declare class LilypadDbTable<T, PK extends keyof T = keyof T> {
    * Inserts a row.
    *
    * @returns The row as stored by the database, including generated columns such as an
-   * auto-determined primary key (`null` if the `selectSanitizationFn` discards it), and the id of
+   * auto-determined primary key (`null` if the `select` hook discards it), and the id of
    * the transaction that wrote it.
    * @throws {LilypadDbMissingPrimaryKeyError} Without the primary key, unless it is generated.
    * @throws {LilypadDbEmptyWriteError} If the data has no column of the schema.
@@ -86,7 +86,7 @@ export declare class LilypadDbTable<T, PK extends keyof T = keyof T> {
    * Updates the row identified by the primary key contained in `data`. Only the columns present
    * in `data` are written.
    *
-   * @returns The row as stored by the database (`null` if the `selectSanitizationFn` discards it),
+   * @returns The row as stored by the database (`null` if the `select` hook discards it),
    * and the id of the transaction that wrote it.
    * @throws {LilypadDbNotFoundError} If no row with that primary key exists.
    * @throws {LilypadDbMissingPrimaryKeyError} Without the primary key.
@@ -839,15 +839,15 @@ export declare class LilypadDbCache<V extends object, PK extends keyof V = keyof
    * With `generatedPrimaryKey`, the primary key of `item` can be omitted: the cached row
    * holds the one generated by the database.
    *
-   * @returns The created row, or `null` if the schema's `selectSanitizationFn` discards it. A row
-   * that the `selectSanitizationFn` returns without its primary key is returned, but not cached.
+   * @returns The created row, or `null` if the `select` hook of the table discards it. A row
+   * that the `select` hook returns without its primary key is returned, but not cached.
    */
   sqlCreate(item: LilypadDbInsertData<V, PK>): Promise<V | null>;
   /**
    * Updates the item in the database and caches the row returned by the database.
    * Only the columns present in `item` are written.
    *
-   * @returns The updated row, or `null` if the schema's `selectSanitizationFn` discards it.
+   * @returns The updated row, or `null` if the `select` hook of the table discards it.
    * @throws {LilypadDbNotFoundError} If no row with the item's primary key exists.
    */
   sqlUpdate(item: LilypadDbUpdateData<V, PK>): Promise<V | null>;
@@ -871,8 +871,9 @@ export declare function lilypadDbConfigFileNames(name: string): string[];
  * `defineLilypadDb`. A config found by name must have that name.
  *
  * A TypeScript config is loaded by Node.js itself (type stripping: Node.js 22.18 or later, or
- * `--experimental-strip-types`): it may use only erasable syntax, and its relative imports need
- * their extension (`./tables/users.ts`). Otherwise, write it as `.mjs`.
+ * `--experimental-strip-types`): it may use only erasable syntax, its relative imports need
+ * their extension (`./tables/users.ts`), and its types must be imported with `import type`.
+ * Otherwise, write it as `.mjs`.
  *
  * @param options.config - The name of the config (`default` when absent), or the path of its file.
  * @param options.cwd - Where the config files are looked for. Defaults to the working directory.
@@ -1129,5 +1130,5 @@ export declare function lilypadSchemaCheckOptions(config: LilypadDbConfig): Lily
  */
 export declare function runLilypadDoctor(options: LilypadDoctorOptions): Promise<LilypadDoctorReport>;
 //#endregion
-export { LILYPAD_DEFAULT_CHANGELOG_TABLE, LILYPAD_DEFAULT_DB_CONFIG_NAME, type LilypadChange, type LilypadChangelogCursor, type LilypadChangelogPruneOptions, type LilypadChangelogPruneScheduleOptions, type LilypadChangelogPruning, type LilypadChangelogSqlOptions, type LilypadChangesRequest, type LilypadDbCacheBaseOptions, type LilypadDbCacheGateNamedOptions, type LilypadDbCacheNamedOptions, type LilypadDbCacheOptions, type LilypadDbCacheSyncOverrides, type LilypadDbCheck, type LilypadDbColumn, type LilypadDbColumnDefault, type LilypadDbColumnName, type LilypadDbColumnReference, type LilypadDbColumnType, type LilypadDbConfig, type LilypadDbConfigInput, type LilypadDbConfigSettings, type LilypadDbDeleteResult, LilypadDbEmptyWriteError, type LilypadDbForeignKey, type LilypadDbGateOptions, type LilypadDbIndex, type LilypadDbIndexMethod, type LilypadDbInsertData, type LilypadDbKey, type LilypadDbListener, LilypadDbMissingPrimaryKeyError, LilypadDbNotFoundError, type LilypadDbNotification, type LilypadDbPoolOptions, type LilypadDbPrimaryKey, type LilypadDbReference, type LilypadDbReferentialAction, type LilypadDbResolvedForeignKey, type LilypadDbResolvedIndex, type LilypadDbResolvedUniqueKey, type LilypadDbRow, type LilypadDbSchema, type LilypadDbTableChangelogSync, type LilypadDbTableDefinition, type LilypadDbTableDefinitionBase, type LilypadDbTableDraft, type LilypadDbTableInput, type LilypadDbTableInputBase, type LilypadDbTableListenSync, type LilypadDbTableName, type LilypadDbTableSync, type LilypadDbTableTrustedSync, type LilypadDbUniqueKey, type LilypadDbUpdateData, type LilypadDbWriteResult, LilypadDisposedError, type LilypadDoctorOptions, type LilypadDoctorReport, type LilypadSchemaCheckOptions, type LilypadSchemaCheckResult, type LilypadSchemaCheckTable, type LilypadSchemaProblem, type LilypadSchemaProblemCode, type LilypadSchemaProblemSeverity, type LilypadSchemaTableShape, defineLilypadDb, defineLilypadTable, isLilypadDbConfig, isLilypadDbTableDefinition };
+export { LILYPAD_DEFAULT_CHANGELOG_TABLE, LILYPAD_DEFAULT_DB_CONFIG_NAME, type LilypadChange, type LilypadChangelogCursor, type LilypadChangelogPruneOptions, type LilypadChangelogPruneScheduleOptions, type LilypadChangelogPruning, type LilypadChangelogSqlOptions, type LilypadChangesRequest, type LilypadDbCacheBaseOptions, type LilypadDbCacheGateNamedOptions, type LilypadDbCacheNamedOptions, type LilypadDbCacheOptions, type LilypadDbCacheSyncOverrides, type LilypadDbCheck, type LilypadDbColumn, type LilypadDbColumnDefault, type LilypadDbColumnName, type LilypadDbColumnReference, type LilypadDbColumnType, type LilypadDbConfig, type LilypadDbConfigInput, type LilypadDbConfigSettings, type LilypadDbDeleteResult, LilypadDbEmptyWriteError, type LilypadDbForeignKey, type LilypadDbGateOptions, type LilypadDbHooks, type LilypadDbIndex, type LilypadDbIndexMethod, type LilypadDbInsertData, type LilypadDbKey, type LilypadDbListener, LilypadDbMissingPrimaryKeyError, LilypadDbNotFoundError, type LilypadDbNotification, type LilypadDbPoolOptions, type LilypadDbPrimaryKey, type LilypadDbReference, type LilypadDbReferentialAction, type LilypadDbResolvedForeignKey, type LilypadDbResolvedIndex, type LilypadDbResolvedUniqueKey, type LilypadDbRow, type LilypadDbSchema, type LilypadDbTableChangelogSync, type LilypadDbTableDefinition, type LilypadDbTableDefinitionBase, type LilypadDbTableDraft, type LilypadDbTableHooks, type LilypadDbTableHooksBase, type LilypadDbTableInput, type LilypadDbTableInputBase, type LilypadDbTableListenSync, type LilypadDbTableName, type LilypadDbTableSync, type LilypadDbTableTrustedSync, type LilypadDbUniqueKey, type LilypadDbUpdateData, type LilypadDbWriteResult, LilypadDisposedError, type LilypadDoctorOptions, type LilypadDoctorReport, type LilypadSchemaCheckOptions, type LilypadSchemaCheckResult, type LilypadSchemaCheckTable, type LilypadSchemaProblem, type LilypadSchemaProblemCode, type LilypadSchemaProblemSeverity, type LilypadSchemaTableShape, bindLilypadDbHooks, defineLilypadDb, defineLilypadTable, isLilypadDbConfig, isLilypadDbTableDefinition };
 //# sourceMappingURL=db.d.mts.map

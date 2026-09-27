@@ -4,6 +4,7 @@ import postgres from 'postgres';
 import { LilypadDbGate } from './LilypadDbGate';
 import { LilypadDbEmptyWriteError, LilypadDbNotFoundError } from './LilypadDbSchema';
 import { defineLilypadDb, defineLilypadTable } from '@/dbConfig/LilypadDbConfig';
+import { bindLilypadDbHooks, type LilypadDbTableHooks } from '@/dbConfig/LilypadDbHooks';
 import { LilypadDbCache } from '@/cache/LilypadDbCache';
 import { LilypadDbTable } from './LilypadDbTable';
 import {
@@ -39,6 +40,11 @@ const usersTable = (changes: Partial<typeof usersInput> = {}) =>
   }).tables.users;
 
 const usersSchema = usersTable();
+
+/** The `users` table, with these hooks bound to it. */
+const usersWithHooks = (hooks: LilypadDbTableHooks<User>) =>
+  bindLilypadDbHooks(defineLilypadDb({ tables: { users: usersInput } }), { users: hooks }).tables
+    .users;
 
 const createMockLogger = () =>
   ({
@@ -163,15 +169,13 @@ describe('LilypadDbGate (integration)', () => {
       expect(await gate.table(usersSchema).selectByPrimaryKey(2)).toBeNull();
     });
 
-    it('should pass the whole row to the selectSanitizationFn', async () => {
+    it('should pass the whole row to the select hook', async () => {
       await admin`INSERT INTO users (name, role, is_admin) VALUES ('Ada', 'dev', true)`;
-      const selectSanitizationFn = vi.fn((row: unknown) => row as User);
+      const select = vi.fn((row: unknown) => row as User);
 
-      await gate.table(usersTable({ selectSanitizationFn })).selectAll();
+      await gate.table(usersWithHooks({ select })).selectAll();
 
-      expect(selectSanitizationFn).toHaveBeenCalledWith(
-        expect.objectContaining({ is_admin: true })
-      );
+      expect(select).toHaveBeenCalledWith(expect.objectContaining({ is_admin: true }));
     });
 
     it('should select the rows of several primary keys in one query', async () => {
@@ -221,8 +225,8 @@ describe('LilypadDbGate (integration)', () => {
       expect(await gate.table(usersSchema).delete(1)).toEqual({ deleted: false });
     });
 
-    it('should write the result of the writeSanitizationFn, which can remove properties', async () => {
-      const schema = usersTable({ writeSanitizationFn: ({ role: _role, ...rest }) => rest });
+    it('should write the result of the write hook, which can remove properties', async () => {
+      const schema = usersWithHooks({ write: ({ role: _role, ...rest }) => rest });
 
       const { row: created } = await gate.table(schema).insert({ name: 'Mallory', role: 'admin' });
 
@@ -246,10 +250,10 @@ describe('LilypadDbGate (integration)', () => {
       expect(updated).toEqual({ id: 1, name: 'Ada', role: 'admin' });
     });
 
-    it('should return only the schema columns of a written row, unless a selectSanitizationFn reads it', async () => {
+    it('should return only the schema columns of a written row, unless a select hook reads it', async () => {
       const seen: unknown[] = [];
-      const schema = usersTable({
-        selectSanitizationFn: (row) => {
+      const schema = usersWithHooks({
+        select: (row) => {
           seen.push(row);
           return row as User;
         },
@@ -259,7 +263,7 @@ describe('LilypadDbGate (integration)', () => {
       await gate.table(schema).insert({ name: 'Grace', role: 'dev' });
 
       expect(Object.keys(plain!).sort()).toEqual(['id', 'name', 'role']);
-      // The selectSanitizationFn receives the whole row, as when it selects
+      // The select hook receives the whole row, as when it selects
       expect(seen[0]).toMatchObject({ is_admin: false });
     });
 

@@ -14,12 +14,14 @@ import {
   LILYPAD_DEFAULT_NOTIFY_CHANNEL,
 } from '@/dbConfig/LilypadDbConfigDefaults';
 import { validateLilypadDbConfigInput } from '@/dbConfig/LilypadDbConfigValidation';
+import type { LilypadDbTableHooks, LilypadDbTableHooksBase } from '@/dbConfig/LilypadDbHooks';
 
 /**
  * The config of a database: the tables the library reads and writes, how each one is kept in sync,
  * and what the database must provide for it (the changelog, the notification triggers, the
  * pruning). The application imports it at runtime, where nothing is compared with the database;
- * `lilypad-doctor` loads the same file and checks the database against it.
+ * `lilypad-doctor` loads the same file and checks the database against it. It holds no function:
+ * the application binds the functions applied to the rows with `bindLilypadDbHooks`.
  */
 
 /** Marks the objects made by `defineLilypadDb` (shared by every copy of the library). */
@@ -173,8 +175,8 @@ export type LilypadDbTableDefinitionBase = {
   readonly qualifiedName: string;
   readonly primaryKey: PropertyKey;
   readonly generatedPrimaryKey?: boolean;
-  readonly writeSanitizationFn?: (data: never) => unknown;
-  readonly selectSanitizationFn?: (row: unknown) => unknown;
+  /** The functions bound to the table by `bindLilypadDbHooks`, if any. */
+  readonly hooks?: LilypadDbTableHooksBase;
   readonly cols: Readonly<Record<string, LilypadDbColumn>>;
   readonly sync: LilypadDbTableSync;
   readonly strict: boolean;
@@ -195,30 +197,21 @@ export type LilypadDbTableDefinitionBase = {
  */
 export type LilypadDbTableDefinition<T, PK extends keyof T = keyof T> = Omit<
   LilypadDbTableDefinitionBase,
-  typeof lilypadRowType | 'primaryKey' | 'writeSanitizationFn' | 'selectSanitizationFn' | 'cols'
+  typeof lilypadRowType | 'primaryKey' | 'hooks' | 'cols'
 > & {
   readonly [lilypadRowType]?: T;
   readonly primaryKey: PK;
-  readonly writeSanitizationFn?: (data: Partial<T>) => Partial<T>;
-  readonly selectSanitizationFn?: (row: unknown) => T | null;
+  readonly hooks?: LilypadDbTableHooks<T>;
   readonly cols: { readonly [K in keyof T]: LilypadDbColumn };
 };
 
 /** The input of a table, whatever its row type. */
 export type LilypadDbTableInputBase = Omit<
   LilypadDbTableInput<Record<string, unknown>, string>,
-  | 'writeSanitizationFn'
-  | 'selectSanitizationFn'
-  | 'cols'
-  | 'primaryKey'
-  | 'unique'
-  | 'foreignKeys'
-  | 'indexes'
+  'cols' | 'primaryKey' | 'unique' | 'foreignKeys' | 'indexes'
 > & {
   readonly [lilypadRowType]?: unknown;
   primaryKey: PropertyKey;
-  writeSanitizationFn?: (data: never) => unknown;
-  selectSanitizationFn?: (row: unknown) => unknown;
   cols: Readonly<Record<string, LilypadDbColumn>>;
   unique?: readonly { name?: string; columns: readonly string[] }[];
   foreignKeys?: readonly {
@@ -375,7 +368,8 @@ export function isLilypadDbTableDefinition(value: unknown): value is LilypadDbTa
 
 /**
  * The table definition passed to `gate.table()` or `LilypadDbCache.create()`: a definition, or
- * the key of a table in `config`.
+ * the key of a table in `config`. A definition without hooks of a table of `config` takes the
+ * hooks bound to it there (see {@link withConfigHooks}).
  *
  * @throws If it is neither.
  */
@@ -401,7 +395,31 @@ export function resolveLilypadDbTable(
       `${owner}: the table must be a table of a config made with defineLilypadDb (e.g. db.tables.users), or its name.`
     );
   }
-  return table;
+  return withConfigHooks(table, config);
+}
+
+/**
+ * A definition given without hooks (e.g. `db.tables.users`, imported from the config file) of a
+ * table to which `config` binds hooks (the config of `bindLilypadDbHooks`, given to the gate)
+ * takes those hooks: importing the original config instead of the bound one cannot skip them.
+ * It must be the same table of a config of the same name.
+ */
+function withConfigHooks(
+  definition: LilypadDbTableDefinitionBase,
+  config: LilypadDbConfig | undefined
+): LilypadDbTableDefinitionBase {
+  if (definition.hooks || !config || !Object.hasOwn(config.tables, definition.key)) {
+    return definition;
+  }
+  const bound = config.tables[definition.key];
+  if (
+    !bound?.hooks ||
+    bound.db.name !== definition.db.name ||
+    bound.qualifiedName !== definition.qualifiedName
+  ) {
+    return definition;
+  }
+  return Object.freeze({ ...definition, hooks: bound.hooks });
 }
 
 /** Splits `schema.table`, or applies the default schema. */

@@ -79,7 +79,8 @@ type LilypadDbCheck = {
 /**
  * The description of a table: what the library reads and writes, and what `lilypad-doctor`
  * expects to find in the database. Define it with `defineLilypadTable`, in a config file (see
- * `defineLilypadDb`).
+ * `defineLilypadDb`). It holds no function: the functions applied to the rows are bound to the
+ * config by the application (see `bindLilypadDbHooks`).
  *
  * @typeParam T - The row type.
  * @typeParam PK - The primary key column. Declare it (e.g. `defineLilypadTable<User, 'id'>`) to get
@@ -101,14 +102,8 @@ type LilypadDbSchema<T, PK extends keyof T = keyof T> = {
    */
   generatedPrimaryKey?: boolean;
   /**
-   * Transforms the data of inserts and updates. Its result replaces the data: omitting a property
-   * removes it from the write.
-   */
-  writeSanitizationFn?: (data: Partial<T>) => Partial<T>;
-  selectSanitizationFn?: (row: unknown) => T | null;
-  /**
    * The columns of the table, one for each property of `T`.
-   * - Without a `selectSanitizationFn`, only these columns are selected.
+   * - Without a `select` hook (see `bindLilypadDbHooks`), only these columns are selected.
    * - Only these columns are written by inserts and updates: any other property of the data is ignored.
    *
    * At runtime, only the `type` of the primary key is used: with `number`, `LilypadDbCache` converts
@@ -151,7 +146,7 @@ type LilypadDbInsertData<T, PK extends keyof T = keyof T> = Omit<T, PK> & Partia
 type LilypadDbUpdateData<T, PK extends keyof T = keyof T> = Partial<T> & Pick<T, PK>;
 /**
  * The result of an insert or an update: the row as stored by the database (`null` if the
- * `selectSanitizationFn` discards it), and the id of the transaction that wrote it, as recorded
+ * `select` hook discards it), and the id of the transaction that wrote it, as recorded
  * by the changelog (`xid`).
  */
 type LilypadDbWriteResult<T> = {
@@ -187,12 +182,71 @@ declare class LilypadDbNotFoundError extends Error {
   constructor(tableName: string, primaryKeyValue: unknown);
 }
 //#endregion
+//#region src/dbConfig/LilypadDbHooks.d.ts
+/**
+ * The functions applied to the rows of a table. They are not part of the config file, which
+ * describes the database only: the application binds them to the config with
+ * {@link bindLilypadDbHooks}, so that `lilypad-doctor` loads the config without the application
+ * code they import.
+ *
+ * @typeParam T - The row type.
+ */
+type LilypadDbTableHooks<T> = {
+  /**
+   * Transforms the data of inserts and updates, before the columns of `cols` are picked from it.
+   * Its result replaces the data: omitting a property removes it from the write.
+   */
+  readonly write?: (data: Partial<T>) => Partial<T>;
+  /**
+   * Builds a row from what the database returned. It receives the whole row (`SELECT *`, and
+   * `RETURNING *` for the writes), since it may read columns that are not in `cols`, and can
+   * return `null` to leave the row out of the results.
+   */
+  readonly select?: (row: Record<string, unknown>) => T | null;
+};
+/** The hooks of a table, whatever its row type. */
+type LilypadDbTableHooksBase = {
+  readonly write?: (data: never) => unknown;
+  readonly select?: (row: Record<string, unknown>) => unknown;
+};
+/** The hooks of some tables of a config, by key, typed with the rows of each table. */
+type LilypadDbHooks<C extends LilypadDbConfig> = { readonly [N in LilypadDbTableName<C>]?: LilypadDbTableHooks<LilypadDbRow<C, N>>; };
+/**
+ * Binds functions to the tables of a config (see {@link LilypadDbTableHooks}). It returns a copy
+ * of the config (same name, same settings, same tables) whose tables carry them: create the gate
+ * with it, and use it as you would use the config.
+ *
+ * The config file stays free of application code, so `lilypad-doctor` can load it with Node.js
+ * alone. The functions are bound once, in the module that creates the gate, and follow the table
+ * everywhere: a gate created with the bound config also applies them to the definitions of the
+ * original one (`db.tables.users`).
+ *
+ * Binding a config that already has hooks replaces the hooks given, and keeps the others.
+ *
+ * @example
+ * ```typescript
+ * // src/db.ts
+ * import db from '../lilypad.config';
+ * import { rowToEvent, sanitizeEvent } from './events';
+ *
+ * export const appDb = bindLilypadDbHooks(db, {
+ *   events: { write: sanitizeEvent, select: rowToEvent },
+ * });
+ * export const gate = await LilypadDbGate.create({ connectionString, config: appDb });
+ * ```
+ *
+ * @throws If `config` is not a config made with `defineLilypadDb`, names no such table, or if a
+ * hook is not a function.
+ */
+declare function bindLilypadDbHooks<C extends LilypadDbConfig>(config: C, hooks: LilypadDbHooks<C>): C;
+//#endregion
 //#region src/dbConfig/LilypadDbConfig.d.ts
 /**
  * The config of a database: the tables the library reads and writes, how each one is kept in sync,
  * and what the database must provide for it (the changelog, the notification triggers, the
  * pruning). The application imports it at runtime, where nothing is compared with the database;
- * `lilypad-doctor` loads the same file and checks the database against it.
+ * `lilypad-doctor` loads the same file and checks the database against it. It holds no function:
+ * the application binds the functions applied to the rows with `bindLilypadDbHooks`.
  */
 /** Marks the objects made by `defineLilypadDb` (shared by every copy of the library). */
 declare const LILYPAD_DB_CONFIG: unique symbol;
@@ -339,8 +393,8 @@ type LilypadDbTableDefinitionBase = {
   readonly qualifiedName: string;
   readonly primaryKey: PropertyKey;
   readonly generatedPrimaryKey?: boolean;
-  readonly writeSanitizationFn?: (data: never) => unknown;
-  readonly selectSanitizationFn?: (row: unknown) => unknown;
+  /** The functions bound to the table by `bindLilypadDbHooks`, if any. */
+  readonly hooks?: LilypadDbTableHooksBase;
   readonly cols: Readonly<Record<string, LilypadDbColumn>>;
   readonly sync: LilypadDbTableSync;
   readonly strict: boolean;
@@ -358,19 +412,16 @@ type LilypadDbTableDefinitionBase = {
  * @typeParam T - The row type.
  * @typeParam PK - The primary key column.
  */
-type LilypadDbTableDefinition<T, PK extends keyof T = keyof T> = Omit<LilypadDbTableDefinitionBase, typeof lilypadRowType | 'primaryKey' | 'writeSanitizationFn' | 'selectSanitizationFn' | 'cols'> & {
+type LilypadDbTableDefinition<T, PK extends keyof T = keyof T> = Omit<LilypadDbTableDefinitionBase, typeof lilypadRowType | 'primaryKey' | 'hooks' | 'cols'> & {
   readonly [lilypadRowType]?: T;
   readonly primaryKey: PK;
-  readonly writeSanitizationFn?: (data: Partial<T>) => Partial<T>;
-  readonly selectSanitizationFn?: (row: unknown) => T | null;
+  readonly hooks?: LilypadDbTableHooks<T>;
   readonly cols: { readonly [K in keyof T]: LilypadDbColumn; };
 };
 /** The input of a table, whatever its row type. */
-type LilypadDbTableInputBase = Omit<LilypadDbTableInput<Record<string, unknown>, string>, 'writeSanitizationFn' | 'selectSanitizationFn' | 'cols' | 'primaryKey' | 'unique' | 'foreignKeys' | 'indexes'> & {
+type LilypadDbTableInputBase = Omit<LilypadDbTableInput<Record<string, unknown>, string>, 'cols' | 'primaryKey' | 'unique' | 'foreignKeys' | 'indexes'> & {
   readonly [lilypadRowType]?: unknown;
   primaryKey: PropertyKey;
-  writeSanitizationFn?: (data: never) => unknown;
-  selectSanitizationFn?: (row: unknown) => unknown;
   cols: Readonly<Record<string, LilypadDbColumn>>;
   unique?: readonly {
     name?: string;
@@ -506,5 +557,5 @@ declare const LILYPAD_DEFAULT_CHANGELOG_TABLE = "lilypad_cache_changes";
 /** The name of the config of `lilypad.config.*`: the others are `lilypad.<name>.config.*`. */
 declare const LILYPAD_DEFAULT_DB_CONFIG_NAME = "default";
 //#endregion
-export { LilypadDbColumnReference as A, LilypadDbReference as B, defineLilypadTable as C, LilypadDbColumn as D, LilypadDbCheck as E, LilypadDbIndex as F, LilypadDbWriteResult as G, LilypadDbSchema as H, LilypadDbIndexMethod as I, LilypadDbInsertData as L, LilypadDbDeleteResult as M, LilypadDbEmptyWriteError as N, LilypadDbColumnDefault as O, LilypadDbForeignKey as P, LilypadDbMissingPrimaryKeyError as R, defineLilypadDb as S, isLilypadDbTableDefinition as T, LilypadDbUniqueKey as U, LilypadDbReferentialAction as V, LilypadDbUpdateData as W, LilypadDbTableInputBase as _, LilypadDbConfigInput as a, LilypadDbTableSync as b, LilypadDbResolvedForeignKey as c, LilypadDbRow as d, LilypadDbTableChangelogSync as f, LilypadDbTableInput as g, LilypadDbTableDraft as h, LilypadDbConfig as i, LilypadDbColumnType as j, LilypadDbColumnName as k, LilypadDbResolvedIndex as l, LilypadDbTableDefinitionBase as m, LILYPAD_DEFAULT_DB_CONFIG_NAME as n, LilypadDbConfigSettings as o, LilypadDbTableDefinition as p, LilypadChangelogPruning as r, LilypadDbPrimaryKey as s, LILYPAD_DEFAULT_CHANGELOG_TABLE as t, LilypadDbResolvedUniqueKey as u, LilypadDbTableListenSync as v, isLilypadDbConfig as w, LilypadDbTableTrustedSync as x, LilypadDbTableName as y, LilypadDbNotFoundError as z };
-//# sourceMappingURL=schema-B8RIzo97.d.mts.map
+export { LilypadDbCheck as A, LilypadDbIndexMethod as B, defineLilypadTable as C, LilypadDbTableHooks as D, LilypadDbHooks as E, LilypadDbColumnType as F, LilypadDbReferentialAction as G, LilypadDbMissingPrimaryKeyError as H, LilypadDbDeleteResult as I, LilypadDbUpdateData as J, LilypadDbSchema as K, LilypadDbEmptyWriteError as L, LilypadDbColumnDefault as M, LilypadDbColumnName as N, LilypadDbTableHooksBase as O, LilypadDbColumnReference as P, LilypadDbForeignKey as R, defineLilypadDb as S, isLilypadDbTableDefinition as T, LilypadDbNotFoundError as U, LilypadDbInsertData as V, LilypadDbReference as W, LilypadDbWriteResult as Y, LilypadDbTableInputBase as _, LilypadDbConfigInput as a, LilypadDbTableSync as b, LilypadDbResolvedForeignKey as c, LilypadDbRow as d, LilypadDbTableChangelogSync as f, LilypadDbTableInput as g, LilypadDbTableDraft as h, LilypadDbConfig as i, LilypadDbColumn as j, bindLilypadDbHooks as k, LilypadDbResolvedIndex as l, LilypadDbTableDefinitionBase as m, LILYPAD_DEFAULT_DB_CONFIG_NAME as n, LilypadDbConfigSettings as o, LilypadDbTableDefinition as p, LilypadDbUniqueKey as q, LilypadChangelogPruning as r, LilypadDbPrimaryKey as s, LILYPAD_DEFAULT_CHANGELOG_TABLE as t, LilypadDbResolvedUniqueKey as u, LilypadDbTableListenSync as v, isLilypadDbConfig as w, LilypadDbTableTrustedSync as x, LilypadDbTableName as y, LilypadDbIndex as z };
+//# sourceMappingURL=schema-BaNQHPRH.d.mts.map

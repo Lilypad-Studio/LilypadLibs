@@ -96,7 +96,8 @@ export type LilypadDbCheck = { name: string; expression?: string };
 /**
  * The description of a table: what the library reads and writes, and what `lilypad-doctor`
  * expects to find in the database. Define it with `defineLilypadTable`, in a config file (see
- * `defineLilypadDb`).
+ * `defineLilypadDb`). It holds no function: the functions applied to the rows are bound to the
+ * config by the application (see `bindLilypadDbHooks`).
  *
  * @typeParam T - The row type.
  * @typeParam PK - The primary key column. Declare it (e.g. `defineLilypadTable<User, 'id'>`) to get
@@ -118,14 +119,8 @@ export type LilypadDbSchema<T, PK extends keyof T = keyof T> = {
    */
   generatedPrimaryKey?: boolean;
   /**
-   * Transforms the data of inserts and updates. Its result replaces the data: omitting a property
-   * removes it from the write.
-   */
-  writeSanitizationFn?: (data: Partial<T>) => Partial<T>;
-  selectSanitizationFn?: (row: unknown) => T | null;
-  /**
    * The columns of the table, one for each property of `T`.
-   * - Without a `selectSanitizationFn`, only these columns are selected.
+   * - Without a `select` hook (see `bindLilypadDbHooks`), only these columns are selected.
    * - Only these columns are written by inserts and updates: any other property of the data is ignored.
    *
    * At runtime, only the `type` of the primary key is used: with `number`, `LilypadDbCache` converts
@@ -173,7 +168,7 @@ export type LilypadDbUpdateData<T, PK extends keyof T = keyof T> = Partial<T> & 
 
 /**
  * The result of an insert or an update: the row as stored by the database (`null` if the
- * `selectSanitizationFn` discards it), and the id of the transaction that wrote it, as recorded
+ * `select` hook discards it), and the id of the transaction that wrote it, as recorded
  * by the changelog (`xid`).
  */
 export type LilypadDbWriteResult<T> = { row: T | null; xid: bigint };

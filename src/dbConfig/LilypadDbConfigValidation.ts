@@ -117,6 +117,27 @@ function assertSync(sync: LilypadDbTableSync | undefined, what: string): void {
   assertOneOf(sync.poll, new Set(['await', 'background']), `${what}.poll`);
 }
 
+/** The functions a table description may no longer hold, and the hook that replaces each. */
+const HOOK_FIELDS: Record<string, string> = {
+  writeSanitizationFn: 'write',
+  selectSanitizationFn: 'select',
+  hooks: 'write, select',
+};
+
+/**
+ * A config holds no function, so that `lilypad-doctor` loads it without the application code:
+ * they are bound by the application (a config in JavaScript is not type-checked).
+ */
+function assertNoHooks(key: string, table: Record<string, unknown>): void {
+  for (const [field, hook] of Object.entries(HOOK_FIELDS)) {
+    if (table[field] !== undefined) {
+      fail(
+        `tables.${key}.${field}: a config holds no functions, so that lilypad-doctor loads it without the application code. Bind them where the application creates its gate: bindLilypadDbHooks(db, { ${key}: { ${hook} } }).`
+      );
+    }
+  }
+}
+
 function assertTable(key: string, table: LilypadDbTableInputBase, defaultSchema: string): string {
   const what = `tables.${key}`;
   if (typeof table !== 'object' || table === null) {
@@ -173,6 +194,7 @@ function assertTable(key: string, table: LilypadDbTableInputBase, defaultSchema:
     }
   });
   assertSync(table.sync, `${what}.sync`);
+  assertNoHooks(key, table as Record<string, unknown>);
   return qualified ? table.tableName : `${table.schemaName ?? defaultSchema}.${table.tableName}`;
 }
 

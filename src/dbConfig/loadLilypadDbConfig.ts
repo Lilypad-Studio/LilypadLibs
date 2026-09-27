@@ -43,13 +43,34 @@ export function findLilypadDbConfig(config: string | undefined, cwd: string): st
   return found;
 }
 
+/** The errors of a module that Node.js cannot resolve without a bundler. */
+const RESOLUTION_ERRORS = new Set([
+  'ERR_MODULE_NOT_FOUND',
+  'ERR_UNSUPPORTED_DIR_IMPORT',
+  'ERR_IMPORT_ATTRIBUTE_MISSING',
+  'ERR_IMPORT_ASSERTION_TYPE_MISSING',
+]);
+
+/** What to change in a config that Node.js could not load, from its error. */
+export function lilypadConfigLoadHint(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  const message = error instanceof Error ? error.message : '';
+  const cause = /does not provide an export named/.test(message)
+    ? 'A type is imported without `import type`: the type stripping of Node.js keeps the import, which then fails (`verbatimModuleSyntax` in tsconfig.json reports them). '
+    : typeof code === 'string' && RESOLUTION_ERRORS.has(code)
+      ? "Node.js loads the config without a bundler: path aliases, relative imports without their extension, and JSON imports without `with { type: 'json' }` do not resolve. "
+      : '';
+  return `${cause}A config should import only '@lilypad/libs/schema', its own files, and types (\`import type\`, erased before loading): bind the functions of the application to it with bindLilypadDbHooks where the application creates its gate.`;
+}
+
 /**
  * Loads a config file: its default export (or its `config` export) must be a config made with
  * `defineLilypadDb`. A config found by name must have that name.
  *
  * A TypeScript config is loaded by Node.js itself (type stripping: Node.js 22.18 or later, or
- * `--experimental-strip-types`): it may use only erasable syntax, and its relative imports need
- * their extension (`./tables/users.ts`). Otherwise, write it as `.mjs`.
+ * `--experimental-strip-types`): it may use only erasable syntax, its relative imports need
+ * their extension (`./tables/users.ts`), and its types must be imported with `import type`.
+ * Otherwise, write it as `.mjs`.
  *
  * @param options.config - The name of the config (`default` when absent), or the path of its file.
  * @param options.cwd - Where the config files are looked for. Defaults to the working directory.
@@ -69,7 +90,13 @@ export async function loadLilypadDbConfig(
         { cause: error }
       );
     }
-    throw new Error(`Could not load the config ${path}: ${String(error)}`, { cause: error });
+    throw new Error(
+      `Could not load the config ${path}: ${String(error)}
+${lilypadConfigLoadHint(error)}`,
+      {
+        cause: error,
+      }
+    );
   }
   const config = [module.default, module.config].find(isLilypadDbConfig);
   if (!config) {

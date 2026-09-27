@@ -1,16 +1,24 @@
 #!/usr/bin/env node
-import "./chunks/LilypadDbSchema-wa5OpLfP.mjs";
-import { n as runLilypadDoctor, o as lilypadDbConfigFileNames, s as loadLilypadDbConfig } from "./chunks/LilypadDoctor-Bnq8Cqh4.mjs";
+import "./chunks/LilypadDbSchema-Aqkz2mc3.mjs";
+import { n as runLilypadDoctor, o as lilypadDbConfigFileNames, s as loadLilypadDbConfig } from "./chunks/LilypadDoctor-CnFyP25Z.mjs";
 import { existsSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
 //#region src/cli/lilypadDbConfigTemplate.ts
-const HEADER = `// The database config of @lilypad/libs: the tables the application uses, and what the database
-// must provide for them. The application imports it to create its gates and caches;
-// \`npx lilypad-doctor\` checks the database against it, and prints the SQL that fixes what differs.
-//
-// Node.js loads it without a bundler: import only '@lilypad/libs/schema' and relative files with
-// their extension (e.g. './db/users.ts'), and no path aliases.`;
+/** The comment at the top of the file. */
+function header(typescript) {
+	return [
+		"// The database config of @lilypad/libs: the tables the application uses, and what the database",
+		"// must provide for them. The application imports it to create its gates and caches;",
+		"// `npx lilypad-doctor` checks the database against it, and prints the SQL that fixes what differs.",
+		"//",
+		"// Node.js loads it without a bundler: import only '@lilypad/libs/schema' and relative files with",
+		typescript ? "// their extension (e.g. './db/users.ts'). Import the row types with `import type` (erased before" : "// their extension (e.g. './db/users.mjs'), without path aliases.",
+		...typescript ? ["// loading, so path aliases work there: import type { User } from '@/types/user')."] : [],
+		"// Keep the application code out of it: bind the functions applied to the rows where the",
+		"// application creates its gate, with bindLilypadDbHooks(db, { example: { write, select } })."
+	].join("\n");
+}
 /** The lines of the example table, from `const example = ...` to its end. */
 function exampleTable(typescript) {
 	return [
@@ -49,7 +57,7 @@ function exampleTable(typescript) {
 function lilypadDbConfigTemplate({ name, typescript, empty }) {
 	const table = exampleTable(typescript);
 	return [
-		HEADER,
+		header(typescript),
 		empty ? "import { defineLilypadDb } from '@lilypad/libs/schema';" : "import { defineLilypadDb, defineLilypadTable } from '@lilypad/libs/schema';",
 		"",
 		...empty ? [

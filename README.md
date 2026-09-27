@@ -596,7 +596,7 @@ const members = await LilypadDbCache.create({ ttl: 60_000, gate, table: 'members
 const teams = gate.table(db.tables.teams); // the CRUD helpers; gate.table('teams') works too
 ```
 
-`defineLilypadDb` checks the config itself, and throws on the first mistake: a primary key that is not a column, a foreign key whose columns do not match the referenced ones, two keys for the same table, a `changelog` sync without `pollInterval`, and so on. It never queries the database. Its result is frozen, and its `tables` are the definitions that `gate.table()` and `LilypadDbCache.create()` take: they reject a description that does not come from `defineLilypadDb`.
+`defineLilypadDb` checks the config itself, and throws on the first mistake: a primary key that is not a column, a foreign key whose columns do not match the referenced ones, two keys for the same table, a `changelog` sync without `pollInterval`, a function in a table, and so on. It never queries the database. Its result is frozen, and its `tables` are the definitions that `gate.table()` and `LilypadDbCache.create()` take: they reject a description that does not come from `defineLilypadDb`.
 
 | Option | Default | What it does |
 | --- | --- | --- |
@@ -626,8 +626,8 @@ const teams = gate.table(db.tables.teams); // the CRUD helpers; gate.table('team
 | `checks` | none | `[{ name, expression? }]`: found by name; with an `expression`, the fix creates it |
 | `sync` | `{ strategy: 'listen' }` | How `LilypadDbCache` keeps the table up to date (see [Keeping the cache in sync with the database](#keeping-the-cache-in-sync-with-the-database)) |
 | `strict` | `strict` of the config | See the config options |
-| `writeSanitizationFn` | none | Applied to the data before every insert and update. Its result replaces the data, so a property it leaves out is not written |
-| `selectSanitizationFn` | none | Builds `T` from a database row (see below) |
+
+A table holds no function: the functions that transform its rows are bound by the application (see [Functions applied to the rows](#functions-applied-to-the-rows-bindlilypaddbhooks)).
 
 The columns of `cols`:
 
@@ -644,16 +644,45 @@ The columns of `cols`:
 - The library does not validate or convert values at runtime: postgres.js converts them. Declare `bigint`/`bigserial` keys as `'bigint'`, and type them as `string` in `T`: postgres.js returns them as strings, so their keys stay strings.
 - A foreign key references `table`, a table of the config with this `tableName`, or else a table of `defaultSchema` (or `'schema.table'`). The referenced columns default to the primary key of a table of the config; give them for another table. The actions (`'no action'`, the default, `'restrict'`, `'cascade'`, `'set null'`, `'set default'`) are checked.
 - The unique keys, foreign keys and indexes are found by their columns, not by their `name`, which only names what the fix creates. A unique key is satisfied by the primary key, a unique constraint or a unique index (neither partial nor on expressions) on the same columns; an index by one with the same columns in the same order, and the same method.
-- `LilypadDbCache.sqlCreate` returns, without caching it, a created row that the `selectSanitizationFn` returns without its primary key (with a warning): the row is inserted, and failing would make the caller insert it again.
-- `selectSanitizationFn(row)` receives the whole row (`SELECT *`), and it can return `null` to leave the row out of the results:
 
-  ```ts
-  selectSanitizationFn: (row) => {
-    const r = row as Record<string, unknown>;
-    if (typeof r.name !== 'string') return null; // skip malformed rows
-    return { id: Number(r.id), slug: String(r.slug), name: r.name };
-  },
-  ```
+### Functions applied to the rows (`bindLilypadDbHooks`)
+
+The config describes the database only, so that `lilypad-doctor` can load it with Node.js alone. The functions that transform the rows usually import application code (validation, parsing, `server-only` modules, path aliases, JSON): the application binds them to the config, in the module that creates its gate.
+
+```ts
+// src/db.ts
+import { bindLilypadDbHooks } from '@lilypad/libs/schema';
+import { LilypadDbGate } from '@lilypad/libs/db';
+import db from '../lilypad.config';
+import { parseMember, sanitizeMember } from '@/members/rows';
+
+export const appDb = bindLilypadDbHooks(db, {
+  members: { write: sanitizeMember, select: parseMember },
+});
+
+export const gate = await LilypadDbGate.create({
+  connectionString: process.env.DATABASE_URL!,
+  config: appDb,
+});
+```
+
+| Hook | What it does |
+| --- | --- |
+| `write(data)` | Applied to the data before every insert and update. Its result replaces the data, so a property it leaves out is not written. Only the `cols` columns of the result are written |
+| `select(row)` | Builds `T` from a database row. It receives the whole row (`SELECT *`, and `RETURNING *` for the writes), and can return `null` to leave the row out of the results |
+
+- The hooks are typed with the row type of each table: `write: (data: Partial<Member>) => Partial<Member>`, `select: (row: Record<string, unknown>) => Member | null`. A key that is not a table of the config is a type error, and `bindLilypadDbHooks` throws for it.
+- `bindLilypadDbHooks` returns a copy of the config (same name, settings and tables) and leaves `db` untouched. There is still one description of each table, in the config file; the copy only adds the functions.
+- A gate created with the bound config applies the hooks to its tables however they are given: `gate.table('members')`, `LilypadDbCache.create({ gate, table: 'members' })`, and also `db.tables.members`, the definition of the original config. The rest of the application can keep importing `lilypad.config`. A gate without a config applies only the hooks of the definitions it is given: pass it `appDb.tables.members`.
+- Binding a bound config again replaces the hooks given, and keeps the others.
+- `LilypadDbCache.sqlCreate` returns, without caching it, a created row that `select` returns without its primary key (with a warning): the row is inserted, and failing would make the caller insert it again.
+
+```ts
+select: (row) => {
+  if (typeof row.name !== 'string') return null; // skip malformed rows
+  return { id: Number(row.id), slug: String(row.slug), name: row.name };
+},
+```
 
 ### Several configs
 
@@ -676,11 +705,12 @@ const sessions = await LilypadDbCache.create({ ttl, gate, table: analytics.table
 
 `lilypad-doctor` imports the config with Node.js, outside the application (no bundler, no path aliases), so:
 
-- import only `@lilypad/libs/schema` (it runs in edge runtimes too, and does not load postgres.js) and your types (`import type`); keep application code out of the config;
+- import only `@lilypad/libs/schema` (it runs in edge runtimes too, and does not load postgres.js), the files of the config, and your types with `import type`. Type imports are erased before loading, so they may use path aliases and name application modules: `import type { Member } from '@/members/types'`. A type imported without `type` is kept by the type stripping of Node.js, and fails (`does not provide an export named`): `verbatimModuleSyntax` in `tsconfig.json` reports them;
+- keep application code out of the config: its functions are bound by the application (see [Functions applied to the rows](#functions-applied-to-the-rows-bindlilypaddbhooks)), and `defineLilypadDb` rejects a table with a function;
 - a TypeScript config is loaded by the type stripping of Node.js: Node.js 22.18 or later, or `NODE_OPTIONS=--experimental-strip-types` from 22.12 to 22.17. It may use only erasable syntax (no `enum`, no `namespace`, no parameter properties), and its relative imports need their extension (`import { teams } from './db/teams.ts'`, with `allowImportingTsExtensions` in `tsconfig.json`). Or write it as `.mjs`;
 - the file name decides the config it is (`lilypad.config.ts`, `.mts`, `.mjs` or `.js`; `lilypad.<name>.config.*`), and a config found by name must have that `name`.
 
-`loadLilypadDbConfig({ config, cwd })` (from `@lilypad/libs/db`) loads a config file from code, as the command does.
+When the config does not load, the error says why when it can tell (a type imported as a value, an import Node.js cannot resolve) and what a config may import. `loadLilypadDbConfig({ config, cwd })` (from `@lilypad/libs/db`) loads a config file from code, as the command does.
 
 ## LilypadDbGate
 
@@ -747,9 +777,9 @@ const { row: updated } = await posts.update({ id: 1, title: 'Updated' });
 const { deleted } = await posts.delete(1); // false if the row did not exist
 ```
 
-- `insert` and `update` resolve to `{ row, xid }`: the row as stored by the database, including generated columns (`null` if `selectSanitizationFn` rejects it), and the id of the transaction that made the write, the one the changelog records. `LilypadDbCache` uses it to recognize its own writes. `delete` resolves to `{ deleted, xid }` (`xid` only if a row was deleted).
+- `insert` and `update` resolve to `{ row, xid }`: the row as stored by the database, including generated columns (`null` if the `select` hook rejects it), and the id of the transaction that made the write, the one the changelog records. `LilypadDbCache` uses it to recognize its own writes. `delete` resolves to `{ deleted, xid }` (`xid` only if a row was deleted).
 - The queries name the table with its schema (`"public"."posts"`), so they read the table that `lilypad-doctor` checked, whatever the `search_path`.
-- The writes return only the `cols` columns (`RETURNING` lists them), or the whole row when the table has a `selectSanitizationFn`.
+- The writes return only the `cols` columns (`RETURNING` lists them), or the whole row when the table has a `select` hook.
 - `update` throws a `LilypadDbNotFoundError` (with `tableName` and `primaryKeyValue`) when no row has the primary key.
 - `selectAll({ signal })` stops reading, and closes its cursor, once the signal is aborted; it then rejects with the reason of the signal.
 - `selectByPrimaryKeys` leaves out the keys without a row. It sends one query per 1 000 keys, since Postgres limits the parameters of a query.
@@ -871,7 +901,7 @@ await accounts.sqlUpdate({ id: created!.id, plan: 'pro' }); // LilypadDbNotFound
 await accounts.sqlDelete(created!.id); // true if a row was deleted; the key is then cached as null, even if protected
 ```
 
-`sqlCreate` and `sqlUpdate` return `null` if the table's `selectSanitizationFn` rejects the returned row. Each write sends a `write` event to `platform.onInvalidate`.
+`sqlCreate` and `sqlUpdate` return `null` if the `select` hook of the table rejects the returned row. Each write sends a `write` event to `platform.onInvalidate`.
 
 To reload a key from the database:
 
@@ -1214,7 +1244,7 @@ Open database connections keep Node.js running. Call `await dispose()` on every 
 The other modules log only through the logger you pass them, on the levels `error`, `warn`, `info` and `debug`. Check that you passed `logger` and that it has those methods (with a `LilypadLogger`, that those channels have components).
 
 **`lilypad-doctor` cannot load `lilypad.config.ts`.**
-Node.js loads it without a bundler: use Node.js 22.18 or later (or `NODE_OPTIONS=--experimental-strip-types`), import only `@lilypad/libs/schema` and relative files with their extension, and no path aliases. See [Writing the config file](#writing-the-config-file).
+Node.js loads it without a bundler: use Node.js 22.18 or later (or `NODE_OPTIONS=--experimental-strip-types`), import only `@lilypad/libs/schema`, relative files with their extension, and types with `import type` (a type imported without `type` fails with `does not provide an export named`). Functions that need application code do not belong in the config: bind them with [`bindLilypadDbHooks`](#functions-applied-to-the-rows-bindlilypaddbhooks). See [Writing the config file](#writing-the-config-file).
 
 **`the table must be a table of a config made with defineLilypadDb`.**
 `gate.table()` and `LilypadDbCache.create()` take a table of a config (`db.tables.users`), or its key: pass the result of `defineLilypadDb`, not the object given to `defineLilypadTable`.

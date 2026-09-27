@@ -2,7 +2,7 @@ import { n as LilypadDisposedError } from "./LilypadCacheTypes-DuzvYfI8.mjs";
 import { t as assertNumberOption } from "./LilypadValidation-ByfswRPE.mjs";
 import { t as libLog } from "./LilypadLibLogger-D2eacfBb.mjs";
 import { n as createLilypadSingletonAbleAsync } from "./LilypadSingleton-D729uyb5.mjs";
-import { c as resolveLilypadDbTable, n as LilypadDbMissingPrimaryKeyError, o as isLilypadDbConfig, r as LilypadDbNotFoundError, t as LilypadDbEmptyWriteError } from "./LilypadDbSchema-wa5OpLfP.mjs";
+import { c as resolveLilypadDbTable, n as LilypadDbMissingPrimaryKeyError, o as isLilypadDbConfig, r as LilypadDbNotFoundError, t as LilypadDbEmptyWriteError } from "./LilypadDbSchema-Aqkz2mc3.mjs";
 import { createHash } from "node:crypto";
 import postgres from "postgres";
 import { existsSync } from "node:fs";
@@ -21,9 +21,9 @@ const XID_COLUMN = "__lilypad_xid";
 * table, and the connections of the gate (it rejects once the gate is closed). Queries name the
 * table with its schema (`public.users`), whatever the `search_path`.
 *
-* - Only the `cols` keys are selected (unless there is a `selectSanitizationFn`, which gets `*`)
-*   and written: extra properties of the data (e.g. from a request body) are never written.
-* - Rows are mapped with the `selectSanitizationFn`, or by copying the `cols` keys.
+* - Only the `cols` keys are selected (unless there is a `select` hook, which gets `*`) and
+*   written: extra properties of the data (e.g. from a request body) are never written.
+* - Rows are mapped with the `select` hook (see `bindLilypadDbHooks`), or by copying the `cols` keys.
 * - Writes return the id of their transaction (`xid`), as the changelog records it.
 *
 * @example
@@ -42,12 +42,13 @@ var LilypadDbTable = class {
 		return this.gate.sql;
 	}
 	/**
-	* Maps a database row to `T`, using the schema's `selectSanitizationFn` if provided,
-	* otherwise by copying the schema columns.
+	* Maps a database row to `T`, using the `select` hook of the table if it has one, otherwise by
+	* copying the schema columns.
 	*/
 	mapRow(row) {
 		const { definition: schema } = this;
-		if (schema.selectSanitizationFn) return schema.selectSanitizationFn(row);
+		const select = schema.hooks?.select;
+		if (select) return select(row);
 		const typedRow = {};
 		for (const key in schema.cols) typedRow[key] = row[key];
 		return typedRow;
@@ -59,11 +60,11 @@ var LilypadDbTable = class {
 		}
 	}
 	/**
-	* The columns to select. The `selectSanitizationFn` receives the whole row, since it may read
-	* columns that are not in the schema; otherwise only the schema columns are needed.
+	* The columns to select. The `select` hook receives the whole row, since it may read columns
+	* that are not in the schema; otherwise only the schema columns are needed.
 	*/
 	selectedColumns() {
-		return this.definition.selectSanitizationFn ? this.sql`*` : this.sql(Object.keys(this.definition.cols));
+		return this.definition.hooks?.select ? this.sql`*` : this.sql(Object.keys(this.definition.cols));
 	}
 	/** The `RETURNING` list of a write: the selected columns and the transaction id. */
 	returning() {
@@ -77,7 +78,7 @@ var LilypadDbTable = class {
 	}
 	/**
 	* Prepares the data of an insert/update:
-	* - applies the schema's `writeSanitizationFn`, whose result replaces the data;
+	* - applies the `write` hook of the table, whose result replaces the data;
 	* - validates the primary key, which an update always needs to find the row;
 	* - restricts the written columns to the schema columns, so that extra properties of `data`
 	*   (e.g. coming from a request body) are never written to the table;
@@ -86,7 +87,8 @@ var LilypadDbTable = class {
 	*/
 	prepareWrite(data, operation) {
 		const { definition: schema } = this;
-		const writeData = schema.writeSanitizationFn ? { ...schema.writeSanitizationFn({ ...data }) } : { ...data };
+		const write = schema.hooks?.write;
+		const writeData = write ? { ...write({ ...data }) } : { ...data };
 		const primaryKeyValue = writeData[schema.primaryKey];
 		if ((operation === "update" || !schema.generatedPrimaryKey) && (primaryKeyValue === void 0 || primaryKeyValue === null)) throw new LilypadDbMissingPrimaryKeyError(schema, operation);
 		if (schema.generatedPrimaryKey) delete writeData[schema.primaryKey];
@@ -132,7 +134,7 @@ var LilypadDbTable = class {
 	/**
 	* Selects the rows with these primary keys, in one query per batch of 1000 keys (Postgres limits
 	* the parameters of a query). Keys without a row are left out of the result, as are the rows the
-	* `selectSanitizationFn` discards.
+	* `select` hook discards.
 	*/
 	async selectByPrimaryKeys(primaryKeyValues) {
 		this.gate.assertOpen();
@@ -159,7 +161,7 @@ var LilypadDbTable = class {
 	* Inserts a row.
 	*
 	* @returns The row as stored by the database, including generated columns such as an
-	* auto-determined primary key (`null` if the `selectSanitizationFn` discards it), and the id of
+	* auto-determined primary key (`null` if the `select` hook discards it), and the id of
 	* the transaction that wrote it.
 	* @throws {LilypadDbMissingPrimaryKeyError} Without the primary key, unless it is generated.
 	* @throws {LilypadDbEmptyWriteError} If the data has no column of the schema.
@@ -176,7 +178,7 @@ var LilypadDbTable = class {
 	* Updates the row identified by the primary key contained in `data`. Only the columns present
 	* in `data` are written.
 	*
-	* @returns The row as stored by the database (`null` if the `selectSanitizationFn` discards it),
+	* @returns The row as stored by the database (`null` if the `select` hook discards it),
 	* and the id of the transaction that wrote it.
 	* @throws {LilypadDbNotFoundError} If no row with that primary key exists.
 	* @throws {LilypadDbMissingPrimaryKeyError} Without the primary key.
@@ -1003,13 +1005,27 @@ function findLilypadDbConfig(config, cwd) {
 	if (!found) throw new Error(`No config "${reference}" in ${cwd}: expected one of ${candidates.join(", ")}.`);
 	return found;
 }
+/** The errors of a module that Node.js cannot resolve without a bundler. */
+const RESOLUTION_ERRORS = /* @__PURE__ */ new Set([
+	"ERR_MODULE_NOT_FOUND",
+	"ERR_UNSUPPORTED_DIR_IMPORT",
+	"ERR_IMPORT_ATTRIBUTE_MISSING",
+	"ERR_IMPORT_ASSERTION_TYPE_MISSING"
+]);
+/** What to change in a config that Node.js could not load, from its error. */
+function lilypadConfigLoadHint(error) {
+	const code = error?.code;
+	const message = error instanceof Error ? error.message : "";
+	return `${/does not provide an export named/.test(message) ? "A type is imported without `import type`: the type stripping of Node.js keeps the import, which then fails (`verbatimModuleSyntax` in tsconfig.json reports them). " : typeof code === "string" && RESOLUTION_ERRORS.has(code) ? "Node.js loads the config without a bundler: path aliases, relative imports without their extension, and JSON imports without `with { type: 'json' }` do not resolve. " : ""}A config should import only '@lilypad/libs/schema', its own files, and types (\`import type\`, erased before loading): bind the functions of the application to it with bindLilypadDbHooks where the application creates its gate.`;
+}
 /**
 * Loads a config file: its default export (or its `config` export) must be a config made with
 * `defineLilypadDb`. A config found by name must have that name.
 *
 * A TypeScript config is loaded by Node.js itself (type stripping: Node.js 22.18 or later, or
-* `--experimental-strip-types`): it may use only erasable syntax, and its relative imports need
-* their extension (`./tables/users.ts`). Otherwise, write it as `.mjs`.
+* `--experimental-strip-types`): it may use only erasable syntax, its relative imports need
+* their extension (`./tables/users.ts`), and its types must be imported with `import type`.
+* Otherwise, write it as `.mjs`.
 *
 * @param options.config - The name of the config (`default` when absent), or the path of its file.
 * @param options.cwd - Where the config files are looked for. Defaults to the working directory.
@@ -1022,7 +1038,8 @@ async function loadLilypadDbConfig(options = {}) {
 		module = await import(pathToFileURL(path).href);
 	} catch (error) {
 		if (error.code === "ERR_UNKNOWN_FILE_EXTENSION") throw new Error(`Node.js ${process.version} cannot load the TypeScript config ${path}: use Node.js 22.18 or later, run it with NODE_OPTIONS=--experimental-strip-types, or write the config as .mjs.`, { cause: error });
-		throw new Error(`Could not load the config ${path}: ${String(error)}`, { cause: error });
+		throw new Error(`Could not load the config ${path}: ${String(error)}
+${lilypadConfigLoadHint(error)}`, { cause: error });
 	}
 	const config = [module.default, module.config].find(isLilypadDbConfig);
 	if (!config) throw new Error(`The config ${path} must export a config made with defineLilypadDb (export default defineLilypadDb({ ... })).`);
@@ -2060,4 +2077,4 @@ async function runLilypadDoctor(options) {
 //#endregion
 export { LilypadDbGate as _, normalizeLilypadPgType as a, LilypadDbTable as b, LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD as c, lilypadChangelogSql as d, lilypadChangelogTriggerSql as f, readLilypadChangesBatch as g, readLilypadChanges as h, checkLilypadSchema as i, LILYPAD_MIN_CHANGELOG_RETENTION as l, pruneLilypadChangelog as m, runLilypadDoctor as n, lilypadDbConfigFileNames as o, lilypadCursorCovers as p, LilypadSchemaCheckError as r, loadLilypadDbConfig as s, lilypadSchemaCheckOptions as t, lilypadChangelogPruneScheduleSql as u, lilypadServerlessPool as v, LilypadBackoff as y };
 
-//# sourceMappingURL=LilypadDoctor-Bnq8Cqh4.mjs.map
+//# sourceMappingURL=LilypadDoctor-CnFyP25Z.mjs.map

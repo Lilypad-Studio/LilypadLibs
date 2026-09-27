@@ -53,11 +53,20 @@ Pass `platform` to every module you create (see below).
 
 ```ts
 // lib/db.ts
+import 'server-only';
 import { LilypadDbGate, lilypadServerlessPool } from '@lilypad/libs/db';
+import { bindLilypadDbHooks } from '@lilypad/libs/schema';
+import db from '../lilypad.config';
+import { parseUser, sanitizeUser } from '@/lib/users'; // application code: aliases, server-only...
+
+// The functions applied to the rows are bound here, not in the config: lilypad-doctor loads the
+// config with Node.js alone
+export const appDb = bindLilypadDbHooks(db, { users: { write: sanitizeUser, select: parseUser } });
 
 export const getGate = () =>
   LilypadDbGate.create({
     singleton: 'main',
+    config: appDb, // its tables by key, with their hooks
     connectionString: process.env.DATABASE_URL!, // the POOLED connection string
     pool: lilypadServerlessPool, // { max: 3, idleTimeout: 5 s, connectTimeout: 10 s }
     statementTimeout: 10_000, // Postgres cancels queries longer than 10 s
@@ -67,6 +76,7 @@ export const getGate = () =>
 - **Use the pooled connection string** (with Neon, the host that contains `-pooler`). Every instance opens its own pool, and a pooler lets many of them share few database connections. The gate already disables prepared statements (`prepare: false`), which transaction-mode poolers require.
 - **`lilypadServerlessPool`** keeps few connections per instance (`max: 3`) and closes them after 5 idle seconds, so a suspended instance does not hold connections. Raise `max` if a single request runs many queries in parallel.
 - **`statementTimeout`** (default: 30 s) makes Postgres stop queries that take too long, so that slow queries whose callers already gave up do not hold the few connections of the pool. Keep it below the `maxDuration` of your functions.
+- **`config: appDb`**: the gate finds the tables by key (`table: 'users'`) and applies the hooks to them, even to a definition taken from the original config (`db.tables.users`). The config file itself imports only `@lilypad/libs/schema` and types (`import type`): see [Functions applied to the rows](../README.md#functions-applied-to-the-rows-bindlilypaddbhooks).
 - `listenerConnectionString` (a direct, non-pooled connection) is only needed by the `listen` strategy, which is not recommended on Vercel (see section 5).
 
 ## 3. Creating instances without connecting at build time
@@ -168,7 +178,7 @@ npx lilypad-doctor --url "$DATABASE_URL_UNPOOLED" --sql > migrations/0042_lilypa
 ```ts
 const users = await LilypadDbCache.create({
   ttl: 60_000,
-  gate: await getGate(), // created with config: db
+  gate: await getGate(), // created with config: appDb
   table: 'users', // with sync: { strategy: 'changelog', pollInterval: 5_000 } in the config
   platform,
   shared: { refreshLockTtl: 60_000 },
@@ -336,6 +346,9 @@ Use the pooled connection string, and `pool: lilypadServerlessPool`. Check that 
 
 **The build fails because it cannot reach the database, or it is slow.**
 Something connects when a module is imported. Create instances in functions (section 3), and use the `changelog` sync or `connect: 'lazy'`.
+
+**`lilypad-doctor` cannot load the config (`server-only`, `Cannot find package '@/...'`, `does not provide an export named`).**
+The config imports application code, directly or through a file it imports. Import the row types with `import type`, and bind the functions that need the application with `bindLilypadDbHooks` in `lib/db.ts` (section 2).
 
 **A change made outside the app never shows up.**
 Run `npx lilypad-doctor`: it reports a missing changelog trigger, with the SQL that installs it. Pass a logger: a failing changelog read is logged as `Error reading the changelog`. Changes show up within `pollInterval`, only when the cache is read with an async method.

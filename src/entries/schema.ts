@@ -1,7 +1,8 @@
 /**
- * `@lilypad/libs/schema`: the database configs (`defineLilypadDb`, `defineLilypadTable`) and the
- * description of the tables. Runs in Node.js and in edge runtimes, without postgres.js: a config
- * file imports only this entry, so that the application and `lilypad-doctor` can both load it.
+ * `@lilypad/libs/schema`: the database configs (`defineLilypadDb`, `defineLilypadTable`), the
+ * description of the tables, and `bindLilypadDbHooks`, with which the application binds its
+ * functions to a config. Runs in Node.js and in edge runtimes, without postgres.js: a config file
+ * imports only this entry, so that the application and `lilypad-doctor` can both load it.
  */
 export {
   defineLilypadDb,
@@ -30,6 +31,12 @@ export type {
   LilypadDbTableSync,
   LilypadDbTableTrustedSync,
 } from '../dbConfig/LilypadDbConfig';
+export { bindLilypadDbHooks } from '../dbConfig/LilypadDbHooks';
+export type {
+  LilypadDbHooks,
+  LilypadDbTableHooks,
+  LilypadDbTableHooksBase,
+} from '../dbConfig/LilypadDbHooks';
 export { LILYPAD_DEFAULT_DB_CONFIG_NAME } from '../dbConfig/LilypadDbConfigDefaults';
 export {
   LilypadDbEmptyWriteError,

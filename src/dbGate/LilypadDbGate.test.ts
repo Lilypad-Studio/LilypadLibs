@@ -2,6 +2,7 @@ import { afterEach, describe, it, expect, vi } from 'vitest';
 import { LilypadDbGate, lilypadServerlessPool } from './LilypadDbGate';
 import { LilypadDisposedError } from '@/cache/LilypadCacheTypes';
 import { defineLilypadDb, defineLilypadTable } from '@/dbConfig/LilypadDbConfig';
+import { bindLilypadDbHooks } from '@/dbConfig/LilypadDbHooks';
 import { LilypadDbTable } from './LilypadDbTable';
 
 const db = defineLilypadDb({
@@ -171,6 +172,20 @@ describe('LilypadDbGate close', () => {
       expect(byName.definition).toBe(db.tables.items);
       expect(fromOther.definition).toBe(other.tables.events);
       await gate.close();
+    });
+
+    it('should apply the hooks of its config to the definitions of the original config', async () => {
+      const select = (row: Record<string, unknown>) => ({ id: Number(row.id) });
+      const appDb = bindLilypadDbHooks(db, { items: { select } });
+      const gate = await LilypadDbGate.create({ connectionString: unreachable, config: appDb });
+      const bare = await LilypadDbGate.create({ connectionString: unreachable, config: db });
+
+      expect(gate.table('items').definition.hooks?.select).toBe(select);
+      expect(gate.table(db.tables.items).definition.hooks?.select).toBe(select);
+      expect(gate.table(db.tables.items).definition.qualifiedName).toBe('public.items');
+      expect(bare.table(appDb.tables.items).definition).toBe(appDb.tables.items);
+      expect(bare.table(db.tables.items).definition.hooks).toBeUndefined();
+      await Promise.all([gate.close(), bare.close()]);
     });
 
     it('should reject a table name without a config, or not in the config', async () => {

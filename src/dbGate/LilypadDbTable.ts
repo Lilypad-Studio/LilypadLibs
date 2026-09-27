@@ -24,9 +24,9 @@ const XID_COLUMN = '__lilypad_xid';
  * table, and the connections of the gate (it rejects once the gate is closed). Queries name the
  * table with its schema (`public.users`), whatever the `search_path`.
  *
- * - Only the `cols` keys are selected (unless there is a `selectSanitizationFn`, which gets `*`)
- *   and written: extra properties of the data (e.g. from a request body) are never written.
- * - Rows are mapped with the `selectSanitizationFn`, or by copying the `cols` keys.
+ * - Only the `cols` keys are selected (unless there is a `select` hook, which gets `*`) and
+ *   written: extra properties of the data (e.g. from a request body) are never written.
+ * - Rows are mapped with the `select` hook (see `bindLilypadDbHooks`), or by copying the `cols` keys.
  * - Writes return the id of their transaction (`xid`), as the changelog records it.
  *
  * @example
@@ -47,13 +47,14 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
   }
 
   /**
-   * Maps a database row to `T`, using the schema's `selectSanitizationFn` if provided,
-   * otherwise by copying the schema columns.
+   * Maps a database row to `T`, using the `select` hook of the table if it has one, otherwise by
+   * copying the schema columns.
    */
   private mapRow(row: postgres.Row): T | null {
     const { definition: schema } = this;
-    if (schema.selectSanitizationFn) {
-      return schema.selectSanitizationFn(row);
+    const select = schema.hooks?.select;
+    if (select) {
+      return select(row);
     }
     const typedRow: Partial<T> = {};
     for (const key in schema.cols) {
@@ -72,11 +73,11 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
   }
 
   /**
-   * The columns to select. The `selectSanitizationFn` receives the whole row, since it may read
-   * columns that are not in the schema; otherwise only the schema columns are needed.
+   * The columns to select. The `select` hook receives the whole row, since it may read columns
+   * that are not in the schema; otherwise only the schema columns are needed.
    */
   private selectedColumns() {
-    return this.definition.selectSanitizationFn
+    return this.definition.hooks?.select
       ? this.sql`*`
       : this.sql(Object.keys(this.definition.cols));
   }
@@ -97,7 +98,7 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
 
   /**
    * Prepares the data of an insert/update:
-   * - applies the schema's `writeSanitizationFn`, whose result replaces the data;
+   * - applies the `write` hook of the table, whose result replaces the data;
    * - validates the primary key, which an update always needs to find the row;
    * - restricts the written columns to the schema columns, so that extra properties of `data`
    *   (e.g. coming from a request body) are never written to the table;
@@ -106,9 +107,8 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
    */
   private prepareWrite(data: Partial<T>, operation: 'insert' | 'update') {
     const { definition: schema } = this;
-    const writeData: Partial<T> = schema.writeSanitizationFn
-      ? { ...schema.writeSanitizationFn({ ...data }) }
-      : { ...data };
+    const write = schema.hooks?.write;
+    const writeData: Partial<T> = write ? { ...write({ ...data }) } : { ...data };
 
     const primaryKeyValue = writeData[schema.primaryKey];
     const primaryKeyRequired = operation === 'update' || !schema.generatedPrimaryKey;
@@ -167,7 +167,7 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
   /**
    * Selects the rows with these primary keys, in one query per batch of 1000 keys (Postgres limits
    * the parameters of a query). Keys without a row are left out of the result, as are the rows the
-   * `selectSanitizationFn` discards.
+   * `select` hook discards.
    */
   async selectByPrimaryKeys(primaryKeyValues: T[PK][]): Promise<T[]> {
     this.gate.assertOpen();
@@ -199,7 +199,7 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
    * Inserts a row.
    *
    * @returns The row as stored by the database, including generated columns such as an
-   * auto-determined primary key (`null` if the `selectSanitizationFn` discards it), and the id of
+   * auto-determined primary key (`null` if the `select` hook discards it), and the id of
    * the transaction that wrote it.
    * @throws {LilypadDbMissingPrimaryKeyError} Without the primary key, unless it is generated.
    * @throws {LilypadDbEmptyWriteError} If the data has no column of the schema.
@@ -219,7 +219,7 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
    * Updates the row identified by the primary key contained in `data`. Only the columns present
    * in `data` are written.
    *
-   * @returns The row as stored by the database (`null` if the `selectSanitizationFn` discards it),
+   * @returns The row as stored by the database (`null` if the `select` hook discards it),
    * and the id of the transaction that wrote it.
    * @throws {LilypadDbNotFoundError} If no row with that primary key exists.
    * @throws {LilypadDbMissingPrimaryKeyError} Without the primary key.

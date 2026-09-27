@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   findLilypadDbConfig,
+  lilypadConfigLoadHint,
   lilypadDbConfigFileNames,
   loadLilypadDbConfig,
 } from './loadLilypadDbConfig';
@@ -24,6 +25,7 @@ describe('loadLilypadDbConfig', () => {
     writeFileSync(join(dir, 'custom.mjs'), configModule('custom'));
     writeFileSync(join(dir, 'not-a-config.mjs'), 'export default { name: "plain" };\n');
     writeFileSync(join(dir, 'broken.mjs'), 'export default (;\n');
+    writeFileSync(join(dir, 'app-code.mjs'), "throw new Error('server-only');\n");
     // Written as ESM: `.js` files are loaded as modules by the "type" of this package.json
     writeFileSync(join(dir, 'package.json'), '{ "type": "module" }\n');
   });
@@ -78,6 +80,42 @@ describe('loadLilypadDbConfig', () => {
     ['a module that does not load', { config: './broken.mjs' }, 'Could not load the config'],
   ])('should reject %s', async (_case, options, message) => {
     await expect(loadLilypadDbConfig({ ...options, cwd: dir })).rejects.toThrow(message);
+  });
+
+  it('should explain what a config may import when it does not load', async () => {
+    const loading = loadLilypadDbConfig({ config: './app-code.mjs', cwd: dir });
+
+    await expect(loading).rejects.toThrow('Could not load the config');
+    await expect(loading).rejects.toThrow('server-only');
+    await expect(loading).rejects.toThrow('bind the functions of the application to it');
+  });
+
+  // Vitest resolves the imports more leniently than Node.js: the errors are built as Node.js throws them
+  it.each([
+    [
+      'a type imported as a value',
+      new SyntaxError(
+        "The requested module './types.ts' does not provide an export named 'Permission'"
+      ),
+      'A type is imported without `import type`',
+    ],
+    [
+      'an import without its extension',
+      Object.assign(new Error("Cannot find module './types'"), { code: 'ERR_MODULE_NOT_FOUND' }),
+      'Node.js loads the config without a bundler',
+    ],
+    [
+      'a JSON import without its attribute',
+      Object.assign(new TypeError('needs an import attribute of "type: json"'), {
+        code: 'ERR_IMPORT_ATTRIBUTE_MISSING',
+      }),
+      'Node.js loads the config without a bundler',
+    ],
+  ])('should explain how to fix %s', (_case, error, cause) => {
+    const hint = lilypadConfigLoadHint(error);
+
+    expect(hint.startsWith(cause)).toBe(true);
+    expect(hint).toContain('bindLilypadDbHooks');
   });
 
   it('should find a config file by name in order of extension', () => {

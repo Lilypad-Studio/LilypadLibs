@@ -99,6 +99,19 @@ function assertSync(sync, what) {
 	assertNumberOption(OWNER, `${what}.lookback`, sync.lookback, "non-negative");
 	assertOneOf(sync.poll, /* @__PURE__ */ new Set(["await", "background"]), `${what}.poll`);
 }
+/** The functions a table description may no longer hold, and the hook that replaces each. */
+const HOOK_FIELDS = {
+	writeSanitizationFn: "write",
+	selectSanitizationFn: "select",
+	hooks: "write, select"
+};
+/**
+* A config holds no function, so that `lilypad-doctor` loads it without the application code:
+* they are bound by the application (a config in JavaScript is not type-checked).
+*/
+function assertNoHooks(key, table) {
+	for (const [field, hook] of Object.entries(HOOK_FIELDS)) if (table[field] !== void 0) fail(`tables.${key}.${field}: a config holds no functions, so that lilypad-doctor loads it without the application code. Bind them where the application creates its gate: bindLilypadDbHooks(db, { ${key}: { ${hook} } }).`);
+}
 function assertTable(key, table, defaultSchema) {
 	const what = `tables.${key}`;
 	if (typeof table !== "object" || table === null) fail(`${what} must be a table (see defineLilypadTable).`);
@@ -135,6 +148,7 @@ function assertTable(key, table, defaultSchema) {
 		if (check.expression !== void 0) assertName(check.expression, `${what}.checks[${index}].expression`);
 	});
 	assertSync(table.sync, `${what}.sync`);
+	assertNoHooks(key, table);
 	return qualified ? table.tableName : `${table.schemaName ?? defaultSchema}.${table.tableName}`;
 }
 /**
@@ -169,7 +183,8 @@ function validateLilypadDbConfigInput(input) {
 * The config of a database: the tables the library reads and writes, how each one is kept in sync,
 * and what the database must provide for it (the changelog, the notification triggers, the
 * pruning). The application imports it at runtime, where nothing is compared with the database;
-* `lilypad-doctor` loads the same file and checks the database against it.
+* `lilypad-doctor` loads the same file and checks the database against it. It holds no function:
+* the application binds the functions applied to the rows with `bindLilypadDbHooks`.
 */
 /** Marks the objects made by `defineLilypadDb` (shared by every copy of the library). */
 const LILYPAD_DB_CONFIG = Symbol.for("lilypad.dbConfig");
@@ -208,7 +223,8 @@ function isLilypadDbTableDefinition(value) {
 }
 /**
 * The table definition passed to `gate.table()` or `LilypadDbCache.create()`: a definition, or
-* the key of a table in `config`.
+* the key of a table in `config`. A definition without hooks of a table of `config` takes the
+* hooks bound to it there (see {@link withConfigHooks}).
 *
 * @throws If it is neither.
 */
@@ -220,7 +236,22 @@ function resolveLilypadDbTable(owner, table, config) {
 		return definition;
 	}
 	if (!isLilypadDbTableDefinition(table)) throw new Error(`${owner}: the table must be a table of a config made with defineLilypadDb (e.g. db.tables.users), or its name.`);
-	return table;
+	return withConfigHooks(table, config);
+}
+/**
+* A definition given without hooks (e.g. `db.tables.users`, imported from the config file) of a
+* table to which `config` binds hooks (the config of `bindLilypadDbHooks`, given to the gate)
+* takes those hooks: importing the original config instead of the bound one cannot skip them.
+* It must be the same table of a config of the same name.
+*/
+function withConfigHooks(definition, config) {
+	if (definition.hooks || !config || !Object.hasOwn(config.tables, definition.key)) return definition;
+	const bound = config.tables[definition.key];
+	if (!bound?.hooks || bound.db.name !== definition.db.name || bound.qualifiedName !== definition.qualifiedName) return definition;
+	return Object.freeze({
+		...definition,
+		hooks: bound.hooks
+	});
 }
 /** Splits `schema.table`, or applies the default schema. */
 function qualify(name, defaultSchema) {
@@ -376,4 +407,4 @@ var LilypadDbNotFoundError = class extends Error {
 //#endregion
 export { defineLilypadTable as a, resolveLilypadDbTable as c, LILYPAD_DEFAULT_MAX_GAP as d, LILYPAD_DEFAULT_NOTIFY_CHANNEL as f, defineLilypadDb as i, LILYPAD_DEFAULT_CHANGELOG_TABLE as l, LilypadDbMissingPrimaryKeyError as n, isLilypadDbConfig as o, LilypadDbNotFoundError as r, isLilypadDbTableDefinition as s, LilypadDbEmptyWriteError as t, LILYPAD_DEFAULT_DB_CONFIG_NAME as u };
 
-//# sourceMappingURL=LilypadDbSchema-wa5OpLfP.mjs.map
+//# sourceMappingURL=LilypadDbSchema-Aqkz2mc3.mjs.map

@@ -82,6 +82,7 @@ src/
 ├── dbConfig/
 │   ├── LilypadDbConfig.ts          defineLilypadDb / defineLilypadTable: the database configs
 │   ├── LilypadDbConfigValidation.ts the checks of a config (never of the database)
+│   ├── LilypadDbHooks.ts           bindLilypadDbHooks: the functions the application binds to a config
 │   └── loadLilypadDbConfig.ts      finds and imports a config file (Node.js only)
 ├── dbGate/
 │   ├── LilypadDbGate.ts            postgres.js wrapper, table handles, LISTEN
@@ -616,15 +617,15 @@ postgres.js connects lazily, on the first query, so creating a gate opens nothin
 
 #### CRUD helpers
 
-All generic over a table definition `LilypadDbTableDefinition<T, PK>` of a config ([4.9](#49-the-database-config-and-lilypad-doctor)): table name and schema, primary key, the `cols` record (one entry per property of `T`), optional sanitization functions. Every query names the table as `qualifiedName` (`"public"."users"`: postgres.js quotes each part), so it reads the table the doctor checked, whatever the `search_path`.
+All generic over a table definition `LilypadDbTableDefinition<T, PK>` of a config ([4.9](#49-the-database-config-and-lilypad-doctor)): table name and schema, primary key, the `cols` record (one entry per property of `T`), and the optional `hooks` the application bound to it (`write`, `select`: see [4.9](#the-hooks-of-the-application)). Every query names the table as `qualifiedName` (`"public"."users"`: postgres.js quotes each part), so it reads the table the doctor checked, whatever the `search_path`.
 
-- **Reading rows.** `selectedColumns` selects only the schema columns, or `*` if there is a `selectSanitizationFn` (which may read other columns). `mapRow` builds `T` with the sanitization function, or by copying the `cols` keys; a sanitizer can return `null` to drop a row.
+- **Reading rows.** `selectedColumns` selects only the schema columns, or `*` if there is a `select` hook (which may read other columns). `mapRow` builds `T` with the hook, or by copying the `cols` keys; the hook can return `null` to drop a row.
 The CRUD helpers live in `LilypadDbTable` ([src/dbGate/LilypadDbTable.ts](../src/dbGate/LilypadDbTable.ts)), created with `gate.table(definition)` or `gate.table('<key>')` (a table of the config the gate was created with, `resolveLilypadDbTable`): the definition is bound once, and the gate provides the connections and `assertOpen`. The schema types and errors are in [src/dbGate/LilypadDbSchema.ts](../src/dbGate/LilypadDbSchema.ts).
 
 - `selectAll` reads through a **cursor** in batches of 1000 rows, so the raw result of a large table is never in memory at once. It takes an optional `signal`: it checks it before each batch, and throws its reason once aborted. Throwing out of the `for await` loop closes the cursor, so a table load that timed out stops reading instead of streaming the rest of the table for nothing.
 - `selectByPrimaryKeys` uses `IN (...)`, one query per 1000 keys, since Postgres limits the number of parameters per query.
-- **Writing rows.** `prepareWrite` is the security-relevant function: it applies `writeSanitizationFn` (whose result *replaces* the data), checks the primary key, removes it when the database generates it, and keeps **only the columns declared in `cols`** that are not `undefined`. An application can pass a request body directly; an extra `is_admin: true` is simply never written (no mass assignment).
-- **Write results.** `insert`, `update` and `delete` return the transaction id with the result. Their `RETURNING` lists the selected columns (not `*`, unless there is a `selectSanitizationFn`) plus `pg_current_xact_id()::text AS __lilypad_xid`; `writeResult` strips that column before mapping the row and returns `{ row, xid }`. `pg_current_xact_id()` is the function the changelog trigger uses as the default of its `xid` column, so the ids match; it is how `LilypadDbCache` recognises its own writes when they come back ([4.10](#own-writes)). A delete returns `{ deleted, xid }`. An update of a missing row throws `LilypadDbNotFoundError`, which carries `tableName` and `primaryKeyValue`.
+- **Writing rows.** `prepareWrite` is the security-relevant function: it applies the `write` hook (whose result *replaces* the data), checks the primary key, removes it when the database generates it, and keeps **only the columns declared in `cols`** that are not `undefined`. An application can pass a request body directly; an extra `is_admin: true` is simply never written (no mass assignment).
+- **Write results.** `insert`, `update` and `delete` return the transaction id with the result. Their `RETURNING` lists the selected columns (not `*`, unless there is a `select` hook) plus `pg_current_xact_id()::text AS __lilypad_xid`; `writeResult` strips that column before mapping the row and returns `{ row, xid }`. `pg_current_xact_id()` is the function the changelog trigger uses as the default of its `xid` column, so the ids match; it is how `LilypadDbCache` recognises its own writes when they come back ([4.10](#own-writes)). A delete returns `{ deleted, xid }`. An update of a missing row throws `LilypadDbNotFoundError`, which carries `tableName` and `primaryKeyValue`.
 
 #### LISTEN management
 
@@ -726,6 +727,14 @@ A config ([src/dbConfig/LilypadDbConfig.ts](../src/dbConfig/LilypadDbConfig.ts))
 The definitions carry a mark, `Symbol.for('lilypad.dbTable')` (and the config `Symbol.for('lilypad.dbConfig')`): `Symbol.for`, so that a config made by another copy of the library (the command, loading the application's `node_modules`) is recognized. `gate.table()` and `LilypadDbCache.create()` go through `resolveLilypadDbTable`, which takes a marked definition, or a key looked up in the `config` of the call, else in the config of the gate. On the type side, `LilypadDbGate<C>` carries the type of its config, so `gate.table('users')` and `create({ gate, table: 'users' })` infer the row type (`LilypadDbRow<C, N>`) and reject an unknown key.
 
 The runtime never compares the config with the database. What the caches used to learn from a runtime check, they now read from the definition: the schema of the table (to filter notifications of a same-named table elsewhere), the channel, the changelog table.
+
+#### The hooks of the application
+
+The config holds no function. `lilypad-doctor` loads it with a plain `import()`, so everything it imports, even indirectly, must load in Node.js as it is: functions that transform rows usually import application code (path aliases, `server-only`, JSON, modules with side effects), which would make the config unloadable, or run that code at every check. So `defineLilypadDb` rejects `writeSanitizationFn`, `selectSanitizationFn` and `hooks` in a table (a JavaScript config is not type-checked, and silently dropping a write function would drop what it removes), and the application binds them with `bindLilypadDbHooks(db, { users: { write, select } })` ([LilypadDbHooks.ts](../src/dbConfig/LilypadDbHooks.ts)).
+
+`bindLilypadDbHooks` returns a frozen copy of the config: the same settings and the same definitions, except that those it names are copied with a frozen `hooks` object (merged over the hooks already bound, so binding again replaces only what it names). The spread keeps the `Symbol.for` marks, so the copy is a config and its tables are definitions. The types of the hooks come from the row type of each table (`LilypadDbHooks<C>`, with `LilypadDbRow<C, N>`).
+
+Two definitions of the same table now exist: `db.tables.users` and `appDb.tables.users`. Using the first one where the second was meant would skip the hooks, silently. `resolveLilypadDbTable` closes that gap: a definition without hooks whose key names a table with hooks in the config it resolves against (the gate's), with the same config name and the same `qualifiedName`, is returned with those hooks (`withConfigHooks`). Every table handle goes through `gate.table()`, including the one of `LilypadDbCache`, so a gate created with `appDb` applies the hooks whichever copy the application passes. It is not an identity check, on purpose: a singleton gate outlives the module reloads of a development server, which create new config objects.
 
 #### The check
 
@@ -1215,7 +1224,7 @@ The change reached the instance within `pollInterval`, with one changelog query 
 Same instance. The application calls `accounts.sqlUpdate({ id: 7, plan: 'team' })`.
 
 1. `sqlUpdate`: not disposed; `key = 7`; `startTicket = nextTicket()` = 60.
-2. `table.update` → `prepareWrite`: sanitization; primary key present; with `generatedPrimaryKey` the `id` is removed from the data (it only identifies the row); `columns = ['plan']` (only the declared columns that are not `undefined`).
+2. `table.update` → `prepareWrite`: the `write` hook, if any; primary key present; with `generatedPrimaryKey` the `id` is removed from the data (it only identifies the row); `columns = ['plan']` (only the declared columns that are not `undefined`).
 3. SQL: `UPDATE "accounts" SET "plan" = $1 WHERE "id" = $2 RETURNING "id", "email", "plan", pg_current_xact_id()::text AS "__lilypad_xid"`. `writeResult` strips `__lilypad_xid` and returns `{ row, xid: 9200n }`.
 4. `storeWritten(7, row, 60, 9200n)`: the entry's ticket (say 58) is not greater than 60, so nothing interfered. `engine.set(7, row)` → ticket 61, and the row is written to L2. `ownWrites.record('7', 9200n, 61)`.
 5. `emitInvalidation('write', [7])`: `platform.onInvalidate` can call `revalidateTag('lilypad:accounts:7')`.
