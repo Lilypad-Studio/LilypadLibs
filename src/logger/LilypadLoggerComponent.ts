@@ -1,3 +1,4 @@
+import { safeJson } from '@/logger/formatLogValue';
 /**
  * A log message, as received by the components.
  */
@@ -13,7 +14,10 @@ export type LilypadLogRecord<T extends string = string> = {
   parts: unknown[];
   timestamp: Date;
   loggerName?: string;
-  /** The result of the logger's `context` option when the message was logged, redacted. */
+  /**
+   * The result of the logger's `context` option when the message was logged: its JSON-safe copy,
+   * redacted (see `toLogJson`).
+   */
   context?: Record<string, unknown>;
 };
 
@@ -75,46 +79,5 @@ export function writeToConsole(message: string, type: string): void {
   }
 }
 
-/**
- * `JSON.stringify` that never throws (circular references, BigInts). Only a reference to one of
- * its own ancestors prints as `[Circular]`: an object referenced twice side by side is printed twice.
- */
-export function safeJson(value: unknown): string {
-  try {
-    return JSON.stringify(toJsonSafe(value, new Set()));
-  } catch {
-    return '"[Unserializable]"';
-  }
-}
-
-function toJsonSafe(value: unknown, ancestors: Set<object>): unknown {
-  if (typeof value === 'bigint') {
-    return `${value}n`;
-  }
-  if (typeof value !== 'object' || value === null) {
-    return value;
-  }
-  if (ancestors.has(value)) {
-    return '[Circular]';
-  }
-  if (value instanceof Error) {
-    return { name: value.name, message: value.message, stack: value.stack };
-  }
-  const json = (value as { toJSON?: unknown }).toJSON;
-  if (typeof json === 'function') {
-    return toJsonSafe((json as () => unknown).call(value), ancestors);
-  }
-  ancestors.add(value);
-  try {
-    if (Array.isArray(value)) {
-      return value.map((item) => toJsonSafe(item, ancestors));
-    }
-    const result: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value)) {
-      result[key] = toJsonSafe(item, ancestors);
-    }
-    return result;
-  } finally {
-    ancestors.delete(value);
-  }
-}
+/** `JSON.stringify` that never throws (circular references, BigInts): see `toLogJson`. */
+export { safeJson } from '@/logger/formatLogValue';

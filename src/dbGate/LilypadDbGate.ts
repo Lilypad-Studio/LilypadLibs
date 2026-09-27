@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 import { LilypadDisposedError } from '@/cache/LilypadCacheTypes';
+import type { LilypadDbSchema } from '@/dbGate/LilypadDbSchema';
+import { LilypadDbTable } from '@/dbGate/LilypadDbTable';
 import { LilypadListenHeartbeat } from '@/dbGate/LilypadListenHeartbeat';
 import { LilypadBackoff } from '@/internal/LilypadBackoff';
 import { assertNumberOption } from '@/internal/LilypadValidation';
@@ -88,134 +90,10 @@ function toPostgresPoolOptions(pool: LilypadDbPoolOptions | undefined) {
 
 type LilypadDbGateOptionsWithSingleton = LilypadDbGateOptions & LilypadSingletonAble;
 
-/**
- * The type of a column. For a primary key it tells `LilypadDbCache` how to read the ids that
- * notifications and the changelog carry as text: `number` converts them to numbers; `string` and
- * `bigint` keep them as strings. Declare `bigint`/`bigserial` columns as `bigint`: postgres.js
- * returns them as strings, so their keys and the row property are strings (type them as such).
- */
-export type LilypadDbColumnType =
-  | 'string'
-  | 'number'
-  | 'bigint'
-  | 'boolean'
-  | 'date'
-  | 'json'
-  | 'array';
-
-/**
- * @typeParam T - The row type.
- * @typeParam PK - The primary key column. Declare it (e.g. `LilypadDbSchema<User, 'id'>`) to get
- * precise types for inserts and updates; it defaults to any column of `T`.
- */
-export type LilypadDbSchema<T, PK extends keyof T = keyof T> = {
-  tableName: string;
-  primaryKey: PK;
-  /**
-   * The database generates the primary key (e.g. `serial`, `identity`, a default): inserts leave
-   * it out, even when the data has one, and return the generated one.
-   */
-  generatedPrimaryKey?: boolean;
-  /**
-   * Transforms the data of inserts and updates. Its result replaces the data: omitting a property
-   * removes it from the write.
-   */
-  writeSanitizationFn?: (data: Partial<T>) => Partial<T>;
-  selectSanitizationFn?: (row: unknown) => T | null;
-  /**
-   * The columns of the table, one for each property of `T`.
-   * - Without a `selectSanitizationFn`, only these columns are selected.
-   * - Only these columns are written by inserts and updates: any other property of the data is ignored.
-   *
-   * The metadata is optional. Only the `type` of the primary key is used: with `number`,
-   * `LilypadDbCache` converts to numbers the ids that notifications and the changelog carry as text.
-   */
-  cols: { [K in keyof T]: LilypadDbColumn<T[K]> };
-};
-
-/** The metadata of a column. `nullable` and `default` are descriptive: the library ignores them. */
-export type LilypadDbColumn<V = unknown> = {
-  type?: LilypadDbColumnType;
-  nullable?: boolean;
-  default?: V | null;
-};
-
-/** The data of an insert: the primary key can be omitted when the database generates it. */
-export type LilypadDbInsertData<T, PK extends keyof T = keyof T> = Omit<T, PK> &
-  Partial<Pick<T, PK>>;
-
-/** The data of an update: the primary key identifies the row, the other columns are optional. */
-export type LilypadDbUpdateData<T, PK extends keyof T = keyof T> = Partial<T> & Pick<T, PK>;
-
-/**
- * The result of an insert or an update: the row as stored by the database (`null` if the
- * `selectSanitizationFn` discards it), and the id of the transaction that wrote it, as recorded
- * by the changelog (`xid`).
- */
-export type LilypadDbWriteResult<T> = { row: T | null; xid: bigint };
-
-/**
- * The result of a delete: whether a row had this primary key, and the id of the transaction that
- * deleted it.
- */
-export type LilypadDbDeleteResult = { deleted: boolean; xid?: bigint };
-
-/** Thrown by the writes when the data has no primary key where one is needed. */
-export class LilypadDbMissingPrimaryKeyError extends Error {
-  readonly tableName: string;
-  readonly primaryKey: string;
-
-  constructor(schema: { primaryKey: PropertyKey; tableName: string }, context: string) {
-    super(
-      `Primary key "${String(schema.primaryKey)}" is missing in the ${context} data for table "${schema.tableName}".`
-    );
-    this.name = 'LilypadDbMissingPrimaryKeyError';
-    this.tableName = schema.tableName;
-    this.primaryKey = String(schema.primaryKey);
-  }
-}
-
-/** Thrown by an insert or an update whose data has no column of the schema to write. */
-export class LilypadDbEmptyWriteError extends Error {
-  readonly tableName: string;
-
-  constructor(tableName: string, operation: 'insert' | 'update') {
-    super(`No columns to ${operation} for table "${tableName}".`);
-    this.name = 'LilypadDbEmptyWriteError';
-    this.tableName = tableName;
-  }
-}
-
-/** Thrown by `updateToTable` when no row has the primary key of the data. */
-export class LilypadDbNotFoundError extends Error {
-  readonly tableName: string;
-  readonly primaryKeyValue: unknown;
-
-  constructor(tableName: string, primaryKeyValue: unknown) {
-    super(`No row with primary key "${String(primaryKeyValue)}" found in table "${tableName}".`);
-    this.name = 'LilypadDbNotFoundError';
-    this.tableName = tableName;
-    this.primaryKeyValue = primaryKeyValue;
-  }
-}
-
-/** Rows read at a time by `selectAllFromTable`. */
-const SELECT_ALL_BATCH_SIZE = 1000;
-/** Primary keys per query of `selectFromTableByPrimaryKeys`. */
-const PRIMARY_KEYS_BATCH_SIZE = 1000;
 const DEFAULT_STATEMENT_TIMEOUT = 30_000;
 /** How long `close` waits for the queries still running, in ms, by default. */
 const DEFAULT_CLOSE_TIMEOUT = 5_000;
-/** The column that carries the transaction id in the results of writes. */
-const XID_COLUMN = '__lilypad_xid';
 const DEFAULT_LISTEN_HEARTBEAT = 15_000;
-
-export function lilypadMissingPrimaryKeyError(
-  schema: { primaryKey: PropertyKey; tableName: string },
-  context: string
-): LilypadDbMissingPrimaryKeyError {
-  return new LilypadDbMissingPrimaryKeyError(schema, context);
-}
 
 type ChannelListener = {
   callbacks: Map<string, LilypadDbListener>;
@@ -226,8 +104,8 @@ type ChannelListener = {
 };
 
 /**
- * A gateway to a PostgreSQL database: typed CRUD helpers over a {@link LilypadDbSchema}, and
- * channel listeners (`LISTEN/NOTIFY`) with reconnection handling.
+ * A gateway to a PostgreSQL database: typed CRUD helpers over a {@link LilypadDbSchema} (through
+ * {@link LilypadDbGate.table}), and channel listeners (`LISTEN/NOTIFY`) with reconnection handling.
  *
  * @example
  * ```typescript
@@ -293,7 +171,7 @@ export class LilypadDbGate {
    * Creates a gate and registers the listeners of `options.listen`.
    * Without listeners it opens no connection: the pool connects on the first query, so creating a
    * gate at module level does not reach the database (e.g. during a build).
-   * With `singleton: true`, a later call with the same identifier returns the existing gate and
+   * With `singleton: '<identifier>'`, a later call with the same identifier returns the existing gate and
    * ignores its own options (a warning is logged if they differ).
    */
   static async create(options: LilypadDbGateOptionsWithSingleton): Promise<LilypadDbGate> {
@@ -323,7 +201,7 @@ export class LilypadDbGate {
             options.logger,
             'warn',
             'LilypadDbGate',
-            `Singleton "${options.singleton ? options.singletonIdentifier : ''}" already exists with different connection options: the new options are ignored.`
+            `Singleton "${options.singleton ?? ''}" already exists with different connection options: the new options are ignored.`
           ),
       }
     );
@@ -343,229 +221,12 @@ export class LilypadDbGate {
     return instance;
   }
 
-  // CRUD OPERATIONS
-
   /**
-   * Maps a database row to `T`, using the schema's `selectSanitizationFn` if provided,
-   * otherwise by copying the schema columns.
+   * The typed CRUD helpers of a table: reads and writes of the rows described by `schema`. The
+   * handle is cheap: create one per table and keep it, or call `table` again.
    */
-  private mapRow<T, PK extends keyof T>(
-    schema: LilypadDbSchema<T, PK>,
-    row: postgres.Row
-  ): T | null {
-    if (schema.selectSanitizationFn) {
-      return schema.selectSanitizationFn(row);
-    }
-    const typedRow: Partial<T> = {};
-    for (const key in schema.cols) {
-      typedRow[key] = row[key] as T[typeof key];
-    }
-    return typedRow as T;
-  }
-
-  /**
-   * The columns to select. The `selectSanitizationFn` receives the whole row, since it may read
-   * columns that are not in the schema; otherwise only the schema columns are needed.
-   */
-  private selectedColumns<T, PK extends keyof T>(schema: LilypadDbSchema<T, PK>) {
-    return schema.selectSanitizationFn ? this.sql`*` : this.sql(Object.keys(schema.cols));
-  }
-
-  /**
-   * Prepares the data of an insert/update:
-   * - applies the schema's `writeSanitizationFn`, whose result replaces the data;
-   * - validates the primary key, which an update always needs to find the row;
-   * - restricts the written columns to the schema columns, so that extra properties of `data`
-   *   (e.g. coming from a request body) are never written to the table;
-   * - leaves the primary key out of the `SET` of an update: it identifies the row;
-   * - skips `undefined` values, which postgres.js rejects.
-   */
-  private prepareWrite<T, PK extends keyof T>(
-    schema: LilypadDbSchema<T, PK>,
-    data: Partial<T>,
-    operation: 'insert' | 'update'
-  ) {
-    const writeData: Partial<T> = schema.writeSanitizationFn
-      ? { ...schema.writeSanitizationFn({ ...data }) }
-      : { ...data };
-
-    const primaryKeyValue = writeData[schema.primaryKey];
-    const primaryKeyRequired = operation === 'update' || !schema.generatedPrimaryKey;
-    if (primaryKeyRequired && (primaryKeyValue === undefined || primaryKeyValue === null)) {
-      throw lilypadMissingPrimaryKeyError(schema, operation);
-    }
-    if (schema.generatedPrimaryKey) {
-      delete writeData[schema.primaryKey];
-    }
-
-    const columns = (Object.keys(schema.cols) as (keyof T & string)[]).filter(
-      (column) =>
-        writeData[column] !== undefined && !(operation === 'update' && column === schema.primaryKey)
-    );
-    if (columns.length === 0) {
-      throw new LilypadDbEmptyWriteError(schema.tableName, operation);
-    }
-
-    return { data: writeData as postgres.Row, columns, primaryKeyValue };
-  }
-
-  /**
-   * Selects every row of the table. Rows are read in batches through a cursor, so the raw result
-   * of the whole table is never held in memory at once.
-   *
-   * @param options.signal - Stops reading (and closes the cursor) once aborted: the promise then
-   * rejects with the reason of the signal.
-   */
-  async selectAllFromTable<T, PK extends keyof T = keyof T>(
-    schema: LilypadDbSchema<T, PK>,
-    options: { signal?: AbortSignal } = {}
-  ): Promise<T[]> {
-    this.assertOpen();
-    const { signal } = options;
-    signal?.throwIfAborted();
-    const typedResults: T[] = [];
-    const cursor = this.sql`
-      SELECT ${this.selectedColumns(schema)} FROM ${this.sql(schema.tableName)}
-    `.cursor(SELECT_ALL_BATCH_SIZE);
-
-    for await (const rows of cursor) {
-      // Leaving the loop closes the cursor
-      signal?.throwIfAborted();
-      for (const row of rows) {
-        const typedRow = this.mapRow(schema, row);
-        if (typedRow !== null) {
-          typedResults.push(typedRow);
-        }
-      }
-    }
-    return typedResults;
-  }
-
-  /**
-   * Selects the rows with these primary keys, in one query per batch of 1000 keys (Postgres limits
-   * the parameters of a query). Keys without a row are left out of the result, as are the rows the
-   * `selectSanitizationFn` discards.
-   */
-  async selectFromTableByPrimaryKeys<T, PK extends keyof T = keyof T>(
-    schema: LilypadDbSchema<T, PK>,
-    primaryKeyValues: T[PK][]
-  ): Promise<T[]> {
-    this.assertOpen();
-    const typedRows: T[] = [];
-    for (let start = 0; start < primaryKeyValues.length; start += PRIMARY_KEYS_BATCH_SIZE) {
-      const batch = primaryKeyValues.slice(start, start + PRIMARY_KEYS_BATCH_SIZE);
-      const results = await this.sql`
-        SELECT ${this.selectedColumns(schema)} FROM ${this.sql(schema.tableName)}
-        WHERE ${this.sql(String(schema.primaryKey))} IN ${this.sql(batch as string[])}
-      `;
-      for (const row of results) {
-        const typedRow = this.mapRow(schema, row);
-        if (typedRow !== null) {
-          typedRows.push(typedRow);
-        }
-      }
-    }
-    return typedRows;
-  }
-
-  async selectFromTableByPrimaryKey<T, PK extends keyof T = keyof T>(
-    schema: LilypadDbSchema<T, PK>,
-    primaryKeyValue: T[PK]
-  ): Promise<T | null> {
-    this.assertOpen();
-    const results = await this.sql`
-      SELECT ${this.selectedColumns(schema)} FROM ${this.sql(schema.tableName)}
-      WHERE ${this.sql(String(schema.primaryKey))} = ${primaryKeyValue as string}
-    `;
-
-    const [row] = results;
-    return row ? this.mapRow(schema, row) : null;
-  }
-
-  /**
-   * Inserts a row.
-   *
-   * @returns The row as stored by the database, including generated columns such as an
-   * auto-determined primary key (`null` if the `selectSanitizationFn` discards it), and the id of
-   * the transaction that wrote it.
-   */
-  async insertToTable<T, PK extends keyof T = keyof T>(
-    schema: LilypadDbSchema<T, PK>,
-    data: LilypadDbInsertData<T, PK>
-  ): Promise<LilypadDbWriteResult<T>> {
-    this.assertOpen();
-    const { data: insertData, columns } = this.prepareWrite(schema, data as Partial<T>, 'insert');
-
-    const results = await this.sql`
-      INSERT INTO ${this.sql(schema.tableName)} ${this.sql(insertData, columns)}
-      RETURNING ${this.selectedColumns(schema)}, pg_current_xact_id()::text AS ${this.sql(XID_COLUMN)}
-    `;
-    return this.writeResult(schema, results);
-  }
-
-  /** Splits a row returned by a write into the row and the id of its transaction. */
-  private writeResult<T, PK extends keyof T>(
-    schema: LilypadDbSchema<T, PK>,
-    results: postgres.RowList<postgres.Row[]>
-  ): LilypadDbWriteResult<T> {
-    const [returned] = results;
-    if (!returned) {
-      throw new Error(`The write to table "${schema.tableName}" returned no row.`);
-    }
-    const { [XID_COLUMN]: xid, ...row } = returned;
-    return { row: this.mapRow(schema, row), xid: BigInt(xid as string) };
-  }
-
-  /**
-   * Updates the row identified by the primary key contained in `data`. Only the columns present
-   * in `data` are written.
-   *
-   * @returns The row as stored by the database (`null` if the `selectSanitizationFn` discards it),
-   * and the id of the transaction that wrote it.
-   * @throws {LilypadDbNotFoundError} If no row with that primary key exists.
-   */
-  async updateToTable<T, PK extends keyof T = keyof T>(
-    schema: LilypadDbSchema<T, PK>,
-    data: LilypadDbUpdateData<T, PK>
-  ): Promise<LilypadDbWriteResult<T>> {
-    this.assertOpen();
-    const {
-      data: updateData,
-      columns,
-      primaryKeyValue,
-    } = this.prepareWrite(schema, data, 'update');
-
-    const results = await this.sql`
-      UPDATE ${this.sql(schema.tableName)}
-      SET ${this.sql(updateData, columns)}
-      WHERE ${this.sql(String(schema.primaryKey))} = ${primaryKeyValue as string}
-      RETURNING ${this.selectedColumns(schema)}, pg_current_xact_id()::text AS ${this.sql(XID_COLUMN)}
-    `;
-    if (results.count === 0) {
-      throw new LilypadDbNotFoundError(schema.tableName, primaryKeyValue);
-    }
-    return this.writeResult(schema, results);
-  }
-
-  /**
-   * Deletes the row with this primary key.
-   *
-   * @returns Whether a row had this primary key, and the id of the transaction that deleted it.
-   */
-  async deleteFromTable<T, PK extends keyof T = keyof T>(
-    schema: LilypadDbSchema<T, PK>,
-    primaryKeyValue: T[PK]
-  ): Promise<LilypadDbDeleteResult> {
-    this.assertOpen();
-    const results = await this.sql`
-      DELETE FROM ${this.sql(schema.tableName)}
-      WHERE ${this.sql(String(schema.primaryKey))} = ${primaryKeyValue as string}
-      RETURNING pg_current_xact_id()::text AS ${this.sql(XID_COLUMN)}
-    `;
-    const [deleted] = results;
-    return deleted
-      ? { deleted: true, xid: BigInt(deleted[XID_COLUMN] as string) }
-      : { deleted: false };
+  table<T, PK extends keyof T = keyof T>(schema: LilypadDbSchema<T, PK>): LilypadDbTable<T, PK> {
+    return new LilypadDbTable(this, schema);
   }
 
   // LISTENER MANAGEMENT
@@ -782,7 +443,7 @@ export class LilypadDbGate {
   }
 
   /** @throws {LilypadDisposedError} If the gate is closed. */
-  private assertOpen() {
+  assertOpen() {
     if (this.closing) {
       throw new LilypadDisposedError(`LilypadDbGate "${this.id}"`, 'closed');
     }

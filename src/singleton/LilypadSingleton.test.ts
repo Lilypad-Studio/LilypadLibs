@@ -68,7 +68,7 @@ describe('LilypadSingleton', () => {
   });
 
   it('should keep singletons of different namespaces apart', async () => {
-    const options = { singleton: true as const, singletonIdentifier: uniqueId() };
+    const options = { singleton: uniqueId() };
 
     const a = await createLilypadSingletonAbleAsync('A', options, async () => ({ kind: 'a' }));
     const b = await createLilypadSingletonAbleAsync('B', options, async () => ({ kind: 'b' }));
@@ -78,7 +78,7 @@ describe('LilypadSingleton', () => {
   });
 
   it('should give the factory a release function that removes the singleton once', async () => {
-    const options = { singleton: true as const, singletonIdentifier: uniqueId() };
+    const options = { singleton: uniqueId() };
     let release!: () => void;
     const first = await createLilypadSingletonAbleAsync('A', options, async (r) => {
       release = r;
@@ -96,13 +96,13 @@ describe('LilypadSingleton', () => {
   });
 
   it('should not remove, on release, an instance registered after a manual removal', async () => {
-    const options = { singleton: true as const, singletonIdentifier: uniqueId() };
+    const options = { singleton: uniqueId() };
     let releaseFirst!: () => void;
     await createLilypadSingletonAbleAsync('A', options, async (release) => {
       releaseFirst = release;
       return { value: 1 };
     });
-    removeLilypadSingletonInstance(`A:${options.singletonIdentifier}`);
+    removeLilypadSingletonInstance(`A:${options.singleton}`);
     const second = await createLilypadSingletonAbleAsync('A', options, async () => ({ value: 2 }));
 
     // The first instance is disposed only now: its release must leave the second one registered
@@ -114,13 +114,13 @@ describe('LilypadSingleton', () => {
   });
 
   it('should release a synchronous singleton only while it is the registered one', () => {
-    const options = { singleton: true as const, singletonIdentifier: uniqueId() };
+    const options = { singleton: uniqueId() };
     let releaseFirst!: () => void;
     const first = createLilypadSingletonAble('S', options, (release) => {
       releaseFirst = release;
       return { value: 1 };
     });
-    removeLilypadSingletonInstance(`S:${options.singletonIdentifier}`);
+    removeLilypadSingletonInstance(`S:${options.singleton}`);
     const second = createLilypadSingletonAble('S', options, () => ({ value: 2 }));
 
     releaseFirst();
@@ -142,7 +142,7 @@ describe('LilypadSingleton', () => {
   });
 
   it('should create synchronous singletons with the same namespacing', () => {
-    const options = { singleton: true as const, singletonIdentifier: uniqueId() };
+    const options = { singleton: uniqueId() };
     let release!: () => void;
     const first = createLilypadSingletonAble('A', options, (r) => {
       release = r;

@@ -7,7 +7,7 @@ import {
   formatLogValue,
   LILYPAD_DEFAULT_REDACTED_KEYS,
   lilypadRedaction,
-  redactLogValue,
+  toLogJson,
 } from '@/logger/formatLogValue';
 import { runInBackground, type LilypadPlatform } from '@/platform/LilypadPlatform';
 import type { LilypadLibLogLevel } from '@/logger/LilypadLibLogger';
@@ -45,8 +45,11 @@ export type LilypadLoggerConstructorOptions<T extends string> = {
   redact?: readonly string[] | false;
 } & LilypadSingletonAble;
 
-// Define a utility type to map channel keys to method signatures
-type ChannelMethodFunction = (...message: unknown[]) => Promise<void>;
+/**
+ * A channel method: it logs without being awaited (it never throws, and component errors go to
+ * `errorLogging`). Await `logger.flush()` to wait until the messages are sent.
+ */
+type ChannelMethodFunction = (...message: unknown[]) => void;
 type ChannelMethods<T extends string> = {
   [K in T]: ChannelMethodFunction;
 };
@@ -69,6 +72,7 @@ type ChannelMethods<T extends string> = {
  * logger.info('Information message');
  * logger.error('Error message');
  * logger.warn('Warning message');
+ * await logger.flush(); // e.g. before the process exits
  * ```
  *
  * @remarks
@@ -94,8 +98,7 @@ export class LilypadLogger<T extends string> {
    * @template T - The log level type, defaults to the levels the other Lilypad modules log on
    * ('error' | 'warn' | 'info' | 'debug'), so that the logger can be passed to them
    * @param options - Configuration options for the logger
-   * @param options.singleton - Whether to use a singleton instance
-   * @param options.singletonIdentifier - Unique identifier for the singleton instance
+   * @param options.singleton - The identifier of the singleton instance, if one is wanted
    * @returns A LilypadLogger instance typed according to the generic parameter T
    *
    * @example
@@ -107,8 +110,7 @@ export class LilypadLogger<T extends string> {
    * @example
    * // Create or retrieve a singleton logger (later calls ignore their options)
    * const singletonLogger = LilypadLogger.create<'info' | 'error'>({
-   *   singleton: true,
-   *   singletonIdentifier: 'app-logger',
+   *   singleton: 'app-logger',
    *   components: { info: [new LilypadConsoleLogger()], error: [new LilypadConsoleLogger()] },
    * });
    */
@@ -124,7 +126,7 @@ export class LilypadLogger<T extends string> {
         value: JSON.stringify([options.name, Object.keys(options.components).sort()]),
         onMismatch: () =>
           console.warn(
-            `LilypadLogger singleton "${options.singleton ? options.singletonIdentifier : ''}" already exists with different options: the new options are ignored.`
+            `LilypadLogger singleton "${options.singleton ?? ''}" already exists with different options: the new options are ignored.`
           ),
       }
     );
@@ -168,7 +170,7 @@ export class LilypadLogger<T extends string> {
             parts: message,
             timestamp: new Date(),
             loggerName: this.name,
-            context: redactLogValue(context, redaction) as Record<string, unknown> | undefined,
+            context: toLogJson(context, redaction) as Record<string, unknown> | undefined,
           };
           // allSettled: a failing component must neither stop nor hide the errors of the others
           const results = await Promise.allSettled(
@@ -185,14 +187,13 @@ export class LilypadLogger<T extends string> {
         }
       };
 
-      const logFn = (...message: unknown[]): Promise<void> => {
+      const logFn = (...message: unknown[]): void => {
         // The context is read synchronously, while the caller's async context is still active
         const task = send(message, readContext(options.context));
         this._pending.add(task);
         void task.finally(() => this._pending.delete(task));
         // `task` never rejects: the error handler is only required by runInBackground
         runInBackground(options.platform, task, () => {});
-        return task;
       };
 
       // Assign the function directly to the class instance (this)

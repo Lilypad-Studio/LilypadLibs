@@ -51,7 +51,7 @@ export type LilypadNotificationSubscriber = {
   handle(payload: LilypadDbNotification): Promise<void> | void;
   /** `LISTEN` is active again after its connection was lost: notifications may have been lost. */
   onReconnect(): void;
-  log(level: LilypadLibLogLevel, ...message: unknown[]): void;
+  log(level: LilypadLibLogLevel, message: string, detail?: unknown): void;
 };
 
 /**

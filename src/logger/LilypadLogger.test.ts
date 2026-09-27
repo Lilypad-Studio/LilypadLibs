@@ -38,7 +38,9 @@ describe('LilypadLogger', () => {
       },
     });
 
-    await logger.info('test message');
+    logger.info('test message');
+
+    await logger.flush();
 
     expect(mockComponent.write).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'info', message: 'test message' })
@@ -54,7 +56,8 @@ describe('LilypadLogger', () => {
     });
 
     const obj = { key: 'value' };
-    await logger.info(obj);
+    logger.info(obj);
+    await logger.flush();
 
     expect(mockComponent.write).toHaveBeenCalledWith(
       expect.objectContaining({ message: "{ key: 'value' }" })
@@ -66,7 +69,9 @@ describe('LilypadLogger', () => {
       components: { info: [], error: [mockComponent] },
     });
 
-    await logger.error('Failure:', new Error('boom'));
+    logger.error('Failure:', new Error('boom'));
+
+    await logger.flush();
 
     const message = vi.mocked(mockComponent.write).mock.calls[0]![0].message;
     expect(message).toContain('Failure: Error: boom');
@@ -80,7 +85,9 @@ describe('LilypadLogger', () => {
     const circular: Record<string, unknown> = { name: 'circular' };
     circular.self = circular;
 
-    await expect(logger.info(circular, 10n)).resolves.toBeUndefined();
+    expect(logger.info(circular, 10n)).toBeUndefined();
+
+    await logger.flush();
 
     const message = vi.mocked(mockComponent.write).mock.calls[0]![0].message;
     expect(message).toContain('[Circular]');
@@ -112,7 +119,9 @@ describe('LilypadLogger', () => {
       },
     });
 
-    await logger.info('test');
+    logger.info('test');
+
+    await logger.flush();
 
     expect(mockComponent.write).toHaveBeenCalled();
     expect(mockComponent2.write).toHaveBeenCalled();
@@ -132,7 +141,9 @@ describe('LilypadLogger', () => {
       errorLogging,
     });
 
-    await logger.info('test');
+    logger.info('test');
+
+    await logger.flush();
 
     expect(errorLogging).toHaveBeenCalledWith(expect.any(Error));
   });
@@ -150,7 +161,9 @@ describe('LilypadLogger', () => {
       },
     });
 
-    await logger.info('test');
+    logger.info('test');
+
+    await logger.flush();
 
     expect(consoleSpy).toHaveBeenCalled();
     consoleSpy.mockRestore();
@@ -168,7 +181,9 @@ describe('LilypadLogger', () => {
       info: [mockComponent2],
     });
 
-    await logger.info('test');
+    logger.info('test');
+
+    await logger.flush();
 
     expect(mockComponent.write).toHaveBeenCalled();
     expect(mockComponent2.write).toHaveBeenCalled();
@@ -222,8 +237,11 @@ describe('LilypadLogger', () => {
       },
     });
 
-    await logger.info('first message');
-    await logger.info('second message');
+    logger.info('first message');
+
+    await logger.flush();
+    logger.info('second message');
+    await logger.flush();
 
     expect(mockComponent.write).toHaveBeenCalledTimes(2);
   });
@@ -236,7 +254,9 @@ describe('LilypadLogger', () => {
       },
     });
 
-    await logger.info('test message'); // Should not throw
+    logger.info('test message'); // Should not throw
+
+    await logger.flush();
     expect(true).toBe(true); // Just to ensure the test passes
   });
 
@@ -252,7 +272,9 @@ describe('LilypadLogger', () => {
       },
     });
 
-    await expect(logger.info('test')).resolves.toBeUndefined();
+    expect(logger.info('test')).toBeUndefined();
+
+    await logger.flush();
 
     expect(consoleSpy).toHaveBeenCalledWith(expect.any(String), expect.any(Error));
     expect(consoleSpy).toHaveBeenCalledTimes(2); // the errorLogging failure and the original error
@@ -272,7 +294,9 @@ describe('LilypadLogger', () => {
       errorLogging,
     });
 
-    await logger.info('test');
+    logger.info('test');
+
+    await logger.flush();
 
     expect(errorLogging).toHaveBeenCalledTimes(2);
     expect(errorLogging).toHaveBeenCalledWith(expect.objectContaining({ message: 'first' }));
@@ -282,8 +306,7 @@ describe('LilypadLogger', () => {
   it('should keep singletons apart from other classes using the same identifier', async () => {
     const identifier = 'LilypadLogger.test-namespace';
     const logger = LilypadLogger.create<mockType>({
-      singleton: true,
-      singletonIdentifier: identifier,
+      singleton: identifier,
       components: { info: [], error: [] },
     });
     const other = await getLilypadSingletonInstanceAsync(identifier, async () => ({ other: true }));
@@ -291,8 +314,7 @@ describe('LilypadLogger', () => {
     expect(other).toEqual({ other: true });
     expect(
       LilypadLogger.create<mockType>({
-        singleton: true,
-        singletonIdentifier: identifier,
+        singleton: identifier,
         components: { info: [], error: [] },
       })
     ).toBe(logger);
@@ -309,7 +331,7 @@ describe('LilypadLogger', () => {
         platform: { background },
       });
 
-      const logged = logger.info('after the response');
+      logger.info('after the response');
 
       expect(background).toHaveBeenCalledOnce();
       const task = background.mock.calls[0]![0] as Promise<unknown>;
@@ -318,7 +340,7 @@ describe('LilypadLogger', () => {
       await Promise.resolve();
       expect(settled).toBe(false);
       resolveOutput();
-      await logged;
+      await logger.flush();
       await task;
       expect(settled).toBe(true);
     });
@@ -333,7 +355,9 @@ describe('LilypadLogger', () => {
         },
       });
 
-      await expect(logger.info('message')).resolves.toBeUndefined();
+      expect(logger.info('message')).toBeUndefined();
+
+      await logger.flush();
       expect(mockComponent.write).toHaveBeenCalledOnce();
     });
 
@@ -362,9 +386,9 @@ describe('LilypadLogger', () => {
         context: () => ({ requestId }),
       });
 
-      const logged = logger.info('message');
+      logger.info('message');
       requestId = 'req-2';
-      await logged;
+      await logger.flush();
 
       expect(mockComponent.write).toHaveBeenCalledWith(
         expect.objectContaining({ message: 'message', context: { requestId: 'req-1' } })
@@ -380,7 +404,9 @@ describe('LilypadLogger', () => {
         config: { headers: { Authorization: 'Bearer secret', Accept: 'json' } },
       });
 
-      await logger.info('Failed:', error, { apiKey: 'k', tokenCount: 3 });
+      logger.info('Failed:', error, { apiKey: 'k', tokenCount: 3 });
+
+      await logger.flush();
 
       const record = vi.mocked(mockComponent.write).mock.calls[0]![0];
       expect(record.message).toContain("Authorization: [Redacted], Accept: 'json'");
@@ -401,8 +427,11 @@ describe('LilypadLogger', () => {
         redact: false,
       });
 
-      await custom.info({ ssn: '123', password: 'p' });
-      await none.info({ password: 'p' });
+      custom.info({ ssn: '123', password: 'p' });
+
+      await custom.flush();
+      none.info({ password: 'p' });
+      await none.flush();
 
       expect(vi.mocked(mockComponent.write).mock.calls[0]![0].message).toBe(
         "{ ssn: [Redacted], password: 'p' }"
@@ -418,7 +447,9 @@ describe('LilypadLogger', () => {
         },
       });
 
-      await expect(logger.info('message')).resolves.toBeUndefined();
+      expect(logger.info('message')).toBeUndefined();
+
+      await logger.flush();
       expect(mockComponent.write).toHaveBeenCalledOnce();
     });
   });
@@ -436,7 +467,9 @@ describe('LilypadLogger redaction of objects with toJSON', () => {
       }),
     });
 
-    await logger.info('request');
+    logger.info('request');
+
+    await logger.flush();
     log.mockRestore();
 
     expect(lines[0]).not.toContain('secret');

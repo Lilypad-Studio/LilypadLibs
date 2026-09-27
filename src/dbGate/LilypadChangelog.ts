@@ -66,7 +66,8 @@ export function pruneFunctionName(changelogTable: string): string {
 
 /**
  * The names of the triggers that record the changes of a table: one statement trigger per event,
- * and the row trigger that versions 3 and earlier installed instead of the first three.
+ * and the row trigger that versions 3 and earlier installed instead of the first three (which
+ * `lilypadChangelogTriggerSql` drops).
  */
 export function changelogTriggerNames(table: string): {
   insert: string;
@@ -227,20 +228,20 @@ ${indent}END IF;`
     channel === false
       ? ''
       : `
-    GET DIAGNOSTICS recorded = ROW_COUNT;
-    IF recorded > ${bulkThreshold} THEN
-      PERFORM pg_notify(${quoteLiteral(channel)}, json_build_object(
-        'schema', TG_TABLE_SCHEMA, 'table', TG_TABLE_NAME, 'op', 'BULK',
+  GET DIAGNOSTICS recorded = ROW_COUNT;
+  IF recorded > ${bulkThreshold} THEN
+    PERFORM pg_notify(${quoteLiteral(channel)}, json_build_object(
+      'schema', TG_TABLE_SCHEMA, 'table', TG_TABLE_NAME, 'op', 'BULK',
+      'xid', pg_current_xact_id()::text
+    )::text);
+  ELSIF recorded > 0 THEN
+    EXECUTE format($notify$
+      SELECT pg_notify(${escapeFormat(quoteLiteral(channel))}, json_build_object(
+        'schema', $1, 'table', $2, 'id', changed.row_id, 'op', changed.op,
         'xid', pg_current_xact_id()::text
-      )::text);
-    ELSIF recorded > 0 THEN
-      EXECUTE format($notify$
-        SELECT pg_notify(${escapeFormat(quoteLiteral(channel))}, json_build_object(
-          'schema', $1, 'table', $2, 'id', changed.row_id, 'op', changed.op,
-          'xid', pg_current_xact_id()::text
-        )::text) FROM (%s) AS changed
-      $notify$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;
-    END IF;`;
+      )::text) FROM (%s) AS changed
+    $notify$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;
+  END IF;`;
 
   return `CREATE TABLE IF NOT EXISTS ${quotedTable} (
   id           bigserial   PRIMARY KEY,
@@ -282,8 +283,6 @@ $$ LANGUAGE sql SECURITY DEFINER SET search_path FROM CURRENT;
 -- is the primary key column.
 CREATE OR REPLACE FUNCTION ${functionName}() RETURNS trigger AS $$
 DECLARE
-  new_id text;
-  old_id text;
   changed text;
   recorded bigint;
 BEGIN${
@@ -298,46 +297,33 @@ BEGIN${
     RETURN NULL;
   END IF;
 
-  IF TG_LEVEL = 'STATEMENT' THEN
-    -- Statement triggers (version 4): every row of the statement in one query, from the transition
-    -- tables. Only the primary key column is read, instead of converting whole rows to JSON.
-    changed := CASE TG_OP
-      WHEN 'INSERT' THEN format(
-        'SELECT to_jsonb(n.%1$I) #>> ''{}'' AS row_id, ''INSERT'' AS op FROM ${newRows} n',
-        TG_ARGV[0])
-      WHEN 'DELETE' THEN format(
-        'SELECT to_jsonb(o.%1$I) #>> ''{}'' AS row_id, ''DELETE'' AS op FROM ${oldRows} o',
-        TG_ARGV[0])
-      -- An update that changes primary keys also deletes the old keys that no row has any more
-      ELSE format(
-        'SELECT to_jsonb(o.%1$I) #>> ''{}'' AS row_id, ''DELETE'' AS op FROM ${oldRows} o '
-        || 'WHERE NOT EXISTS (SELECT 1 FROM ${newRows} n WHERE n.%1$I = o.%1$I) '
-        || 'UNION ALL SELECT to_jsonb(n.%1$I) #>> ''{}'', ''UPDATE'' FROM ${newRows} n',
-        TG_ARGV[0])
-    END;
-    EXECUTE format($record$
-      INSERT INTO ${escapeFormat(quotedTable)} (table_schema, table_name, row_id, op)
-      SELECT $1, $2, changed.row_id, changed.op FROM (%s) AS changed
-    $record$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;${notifyChanged}${pruneCall('    ')}
+  IF TG_LEVEL = 'ROW' THEN
+    -- A row trigger of version 3 or earlier: its changes can no longer be recorded. The write
+    -- goes on (a failing write would be worse), and the schema check reports the trigger
+    RAISE WARNING 'lilypad: the row trigger % on %.% is outdated, run lilypadChangelogTriggerSql', TG_NAME, TG_TABLE_SCHEMA, TG_TABLE_NAME;
     RETURN NULL;
   END IF;
 
-  -- Row triggers, installed by version 3 and earlier: one change at a time
-  IF TG_OP <> 'DELETE' THEN
-    new_id := to_jsonb(NEW) ->> TG_ARGV[0];
-  END IF;
-  IF TG_OP <> 'INSERT' THEN
-    old_id := to_jsonb(OLD) ->> TG_ARGV[0];
-  END IF;
-
-  -- An update that changes the primary key also deletes the old key
-  IF TG_OP = 'UPDATE' AND old_id IS DISTINCT FROM new_id THEN
-    INSERT INTO ${quotedTable} (table_schema, table_name, row_id, op)
-      VALUES (TG_TABLE_SCHEMA, TG_TABLE_NAME, old_id, 'DELETE');${notify('old_id', `'DELETE'`)}
-  END IF;
-
-  INSERT INTO ${quotedTable} (table_schema, table_name, row_id, op)
-    VALUES (TG_TABLE_SCHEMA, TG_TABLE_NAME, COALESCE(new_id, old_id), TG_OP);${notify('COALESCE(new_id, old_id)', 'TG_OP')}${pruneCall('  ')}
+  -- Every row of the statement in one query, from the transition tables. Only the primary key
+  -- column is read, instead of converting whole rows to JSON.
+  changed := CASE TG_OP
+    WHEN 'INSERT' THEN format(
+      'SELECT to_jsonb(n.%1$I) #>> ''{}'' AS row_id, ''INSERT'' AS op FROM ${newRows} n',
+      TG_ARGV[0])
+    WHEN 'DELETE' THEN format(
+      'SELECT to_jsonb(o.%1$I) #>> ''{}'' AS row_id, ''DELETE'' AS op FROM ${oldRows} o',
+      TG_ARGV[0])
+    -- An update that changes primary keys also deletes the old keys that no row has any more
+    ELSE format(
+      'SELECT to_jsonb(o.%1$I) #>> ''{}'' AS row_id, ''DELETE'' AS op FROM ${oldRows} o '
+      || 'WHERE NOT EXISTS (SELECT 1 FROM ${newRows} n WHERE n.%1$I = o.%1$I) '
+      || 'UNION ALL SELECT to_jsonb(n.%1$I) #>> ''{}'', ''UPDATE'' FROM ${newRows} n',
+      TG_ARGV[0])
+  END;
+  EXECUTE format($record$
+    INSERT INTO ${escapeFormat(quotedTable)} (table_schema, table_name, row_id, op)
+    SELECT $1, $2, changed.row_id, changed.op FROM (%s) AS changed
+  $record$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;${notifyChanged}${pruneCall('  ')}
   RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
@@ -402,8 +388,8 @@ WHERE c.oid = ${quoteLiteral(quoteIdentifier(table))}::regclass;
 /**
  * The SQL that attaches the changelog triggers to a cached table: one statement trigger for each of
  * INSERT, UPDATE and DELETE, which records all the rows of a statement in one query (through its
- * transition tables), and one for `TRUNCATE`. It replaces the row trigger of the versions 3 and
- * earlier. Run it once per table, in a migration (in one transaction, so that no write goes
+ * transition tables), and one for `TRUNCATE`. It drops the row trigger of the versions 3 and
+ * earlier, which the trigger function no longer serves. Run it once per table, in a migration (in one transaction, so that no write goes
  * unrecorded), after {@link lilypadChangelogSql}.
  *
  * Transition tables are not supported on the partitions of a partitioned table, nor on tables with
@@ -495,8 +481,7 @@ export function lilypadCursorCovers(cursor: LilypadChangelogCursor, xid: bigint)
  * changes recorded in the last `lookback` milliseconds instead.
  *
  * `tableName` is resolved as the gate's queries resolve it (with the `search_path` when it is not
- * qualified), so a table of the same name in another schema is not mixed up with it. Rows recorded
- * by a version 1 trigger, which had no schema, match any schema.
+ * qualified), so a table of the same name in another schema is not mixed up with it.
  */
 export async function readLilypadChanges(
   gate: LilypadDbGate,
@@ -563,13 +548,13 @@ export async function readLilypadChangesBatch(
       SELECT c.id, c.xid, c.row_id, c.op FROM ${changelogTable} c
       WHERE targets.since_xmax IS NOT NULL
         AND c.table_name = targets.rel_name
-        AND (c.table_schema = targets.schema_name OR c.table_schema IS NULL)
+        AND c.table_schema = targets.schema_name
         AND (c.xid >= targets.since_xmax OR c.xid = ANY(targets.since_xip))
       UNION ALL
       SELECT c.id, c.xid, c.row_id, c.op FROM ${changelogTable} c
       WHERE targets.since_xmax IS NULL
         AND c.table_name = targets.rel_name
-        AND (c.table_schema = targets.schema_name OR c.table_schema IS NULL)
+        AND c.table_schema = targets.schema_name
         AND c.changed_at >= clock_timestamp() - make_interval(secs => targets.lookback_secs)
     ) c ON true
     ORDER BY c.id
@@ -577,8 +562,7 @@ export async function readLilypadChangesBatch(
 
   const changes: LilypadChange[][] = options.requests.map(() => []);
   for (const row of rows) {
-    // A row change without a row id cannot be applied (e.g. recorded by a version 3 function
-    // called by a statement trigger)
+    // A row change without a row id cannot be applied
     if (row.id !== null && (row.row_id !== null || row.op === 'TRUNCATE')) {
       changes[row.request as number]?.push({
         id: row.id as string,

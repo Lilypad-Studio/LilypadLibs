@@ -55,7 +55,7 @@ describe('LilypadDbGate (without database)', () => {
       expect(gate.close()).toBe(closing);
       await closing;
       expect(gate.closed).toBe(true);
-      await expect(gate.selectFromTableByPrimaryKey(schema, 1)).rejects.toThrow('is closed');
+      await expect(gate.table(schema).selectByPrimaryKey(1)).rejects.toThrow('is closed');
       await expect(
         gate.addListener({ channel: 'c', callbackId: 'a', callback: () => {} })
       ).rejects.toThrow('is closed');
@@ -141,7 +141,7 @@ describe('LilypadDbGate close', () => {
     await gate.close();
 
     await expect(
-      gate.selectFromTableByPrimaryKey({ tableName: 't', primaryKey: 'id', cols: { id: {} } }, 1)
+      gate.table({ tableName: 't', primaryKey: 'id', cols: { id: {} } }).selectByPrimaryKey(1)
     ).rejects.toThrow(LilypadDisposedError);
   });
 

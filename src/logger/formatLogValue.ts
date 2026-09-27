@@ -1,5 +1,7 @@
-/** Nesting levels printed before objects are abbreviated as `[Object]` / `[Array]`. */
-const MAX_DEPTH = 4;
+/** Nesting levels printed in the text form before objects are abbreviated as `[Object]` / `[Array]`. */
+const MAX_TEXT_DEPTH = 4;
+/** Nesting levels kept in the JSON form: beyond, a value is abbreviated too (pathological depth). */
+const MAX_JSON_DEPTH = 64;
 
 /**
  * The keys whose values the logger replaces with `[Redacted]` by default, wherever they appear in
@@ -24,77 +26,272 @@ export const LILYPAD_DEFAULT_REDACTED_KEYS: readonly string[] = Object.freeze([
   'private_key',
 ]);
 
-const REDACTED = '[Redacted]';
-
 function normalizeRedactedKey(key: string): string {
   return key.toLowerCase().replace(/[-_]/g, '');
 }
 
-/** The keys to redact, in the form that `formatLogValue` and `redactLogValue` compare. */
+/** The keys to redact, in the form that the functions of this module compare. */
 export function lilypadRedaction(keys: readonly string[]): ReadonlySet<string> {
   return new Set(keys.map(normalizeRedactedKey));
 }
 
 const DEFAULT_REDACTION = lilypadRedaction(LILYPAD_DEFAULT_REDACTED_KEYS);
+const NO_REDACTION: ReadonlySet<string> = new Set();
 
 function isRedacted(key: unknown, redaction: ReadonlySet<string>): boolean {
   return typeof key === 'string' && redaction.size > 0 && redaction.has(normalizeRedactedKey(key));
 }
 
 /**
- * A copy of `value` whose redacted keys hold `[Redacted]`, for the values serialized as JSON later
- * (the context of a record). Plain objects and arrays are copied, and errors are kept as they are
- * (the JSON of a record holds only their name, message and stack). An object with a `toJSON`
- * method is replaced with the redacted copy of what `toJSON` returns, which is what the JSON would
- * hold: otherwise its keys would reach the output unredacted. It never throws.
+ * A logged value, normalized once by {@link walk}: the text form and the JSON form are rendered
+ * from it, so that both handle cycles, redaction, errors and throwing getters the same way.
  */
-export function redactLogValue(
-  value: unknown,
-  redaction: ReadonlySet<string> = DEFAULT_REDACTION,
-  ancestors: Set<object> = new Set()
-): unknown {
-  if (redaction.size === 0 || typeof value !== 'object' || value === null) {
-    return value;
+type LogNode =
+  | { kind: 'string'; value: string }
+  | { kind: 'scalar'; value: number | boolean | null | undefined }
+  /** Printed as it is, and a string in JSON: a BigInt, a symbol, a function, a `RegExp`. */
+  | { kind: 'text'; text: string }
+  /** `[Circular]`, `[Redacted]`, `[Getter threw]`, `[Object]`...: never quoted. */
+  | { kind: 'marker'; text: string }
+  | { kind: 'date'; iso: string | null }
+  | { kind: 'array'; items: LogNode[] }
+  | { kind: 'map'; entries: [LogNode, LogNode][] }
+  | { kind: 'set'; items: LogNode[] }
+  | { kind: 'object'; properties: [string, LogNode][] }
+  | {
+      kind: 'error';
+      name: string;
+      message: string;
+      stack: string | undefined;
+      /** Its own properties; `undefined` beyond the depth of the text form. */
+      properties: [string, LogNode][] | undefined;
+      cause: LogNode | undefined;
+    };
+
+const marker = (text: string): LogNode => ({ kind: 'marker', text });
+const REDACTED = marker('[Redacted]');
+
+type WalkState = {
+  /** The ancestors of the value being walked: only a reference to one of them is circular. */
+  seen: Set<object>;
+  redaction: ReadonlySet<string>;
+  /** The JSON form follows `toJSON`, as `JSON.stringify` would; the text form prints the object. */
+  json: boolean;
+  maxDepth: number;
+};
+
+/** Properties of errors printed by the stack, or separately. */
+const ERROR_OWN_KEYS = new Set(['name', 'stack', 'message', 'cause']);
+
+function walk(value: unknown, depth: number, state: WalkState): LogNode {
+  switch (typeof value) {
+    case 'string':
+      return { kind: 'string', value };
+    case 'bigint':
+      return { kind: 'text', text: `${value}n` };
+    case 'symbol':
+      return { kind: 'text', text: value.toString() };
+    case 'function':
+      return { kind: 'text', text: `[Function: ${value.name || '(anonymous)'}]` };
+    case 'object':
+      break;
+    default:
+      return { kind: 'scalar', value: value as number | boolean | undefined };
   }
-  if (ancestors.has(value)) {
-    return '[Circular]';
+  if (value === null) {
+    return { kind: 'scalar', value: null };
   }
-  try {
-    if (value instanceof Error) {
-      return value;
-    }
+  const { seen } = state;
+  if (seen.has(value)) {
+    return marker('[Circular]');
+  }
+  if (value instanceof Error) {
+    return walkError(value, depth, state);
+  }
+  if (value instanceof Date) {
+    return { kind: 'date', iso: Number.isNaN(value.getTime()) ? null : value.toISOString() };
+  }
+  if (value instanceof RegExp) {
+    return { kind: 'text', text: value.toString() };
+  }
+  if (state.json) {
     const toJSON = (value as { toJSON?: unknown }).toJSON;
     if (typeof toJSON === 'function') {
-      const json: unknown = toJSON.call(value);
-      // A primitive (e.g. the string of a Date) holds no key: the value is kept as it is
-      if (typeof json !== 'object' || json === null) {
-        return value;
-      }
-      ancestors.add(value);
+      // What JSON.stringify would write, redacted like the rest
+      seen.add(value);
       try {
-        return redactLogValue(json, redaction, ancestors);
+        return walk(toJSON.call(value), depth, state);
       } finally {
-        ancestors.delete(value);
+        seen.delete(value);
       }
     }
-    ancestors.add(value);
+  }
+  if (depth >= state.maxDepth) {
+    return marker(
+      Array.isArray(value)
+        ? '[Array]'
+        : value instanceof Map
+          ? '[Map]'
+          : value instanceof Set
+            ? '[Set]'
+            : '[Object]'
+    );
+  }
+
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return { kind: 'array', items: value.map((item) => walk(item, depth + 1, state)) };
+    }
+    if (value instanceof Map) {
+      return {
+        kind: 'map',
+        entries: [...value].map(([key, item]) => [
+          walk(key, depth + 1, state),
+          isRedacted(key, state.redaction) ? REDACTED : walk(item, depth + 1, state),
+        ]),
+      };
+    }
+    if (value instanceof Set) {
+      return { kind: 'set', items: [...value].map((item) => walk(item, depth + 1, state)) };
+    }
+    return { kind: 'object', properties: walkProperties(value, depth, state) };
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function walkError(error: Error, depth: number, state: WalkState): LogNode {
+  state.seen.add(error);
+  try {
+    return {
+      kind: 'error',
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+      properties:
+        depth < state.maxDepth ? walkProperties(error, depth, state, ERROR_OWN_KEYS) : undefined,
+      cause: error.cause !== undefined ? walk(error.cause, depth + 1, state) : undefined,
+    };
+  } finally {
+    state.seen.delete(error);
+  }
+}
+
+/** The own enumerable properties of an object. A getter that throws does not stop the others. */
+function walkProperties(
+  value: object,
+  depth: number,
+  state: WalkState,
+  excluded?: Set<string>
+): [string, LogNode][] {
+  const properties: [string, LogNode][] = [];
+  for (const key of Object.keys(value)) {
+    if (excluded?.has(key)) {
+      continue;
+    }
+    if (isRedacted(key, state.redaction)) {
+      properties.push([key, REDACTED]);
+      continue;
+    }
+    let item: unknown;
     try {
-      if (Array.isArray(value)) {
-        return value.map((item) => redactLogValue(item, redaction, ancestors));
-      }
-      const copy: Record<string, unknown> = {};
-      for (const [key, item] of Object.entries(value)) {
-        copy[key] = isRedacted(key, redaction)
-          ? REDACTED
-          : redactLogValue(item, redaction, ancestors);
-      }
-      return copy;
-    } finally {
-      ancestors.delete(value);
+      item = (value as Record<string, unknown>)[key];
+    } catch {
+      properties.push([key, marker('[Getter threw]')]);
+      continue;
     }
-  } catch {
-    // e.g. a getter or a Proxy trap that throws
-    return '[Unformattable value]';
+    properties.push([key, walk(item, depth + 1, state)]);
+  }
+  return properties;
+}
+
+function renderText(node: LogNode, depth: number): string {
+  switch (node.kind) {
+    case 'string':
+      return depth === 0 ? node.value : `'${node.value.replace(/'/g, "\\'")}'`;
+    case 'scalar':
+      return String(node.value);
+    case 'text':
+    case 'marker':
+      return node.text;
+    case 'date':
+      return node.iso ?? 'Invalid Date';
+    case 'array': {
+      const items = node.items.map((item) => renderText(item, depth + 1));
+      return items.length === 0 ? '[]' : `[ ${items.join(', ')} ]`;
+    }
+    case 'map': {
+      const items = node.entries.map(
+        ([key, item]) => `${renderText(key, depth + 1)} => ${renderText(item, depth + 1)}`
+      );
+      return `Map(${items.length}) {${items.length ? ` ${items.join(', ')} ` : ''}}`;
+    }
+    case 'set': {
+      const items = node.items.map((item) => renderText(item, depth + 1));
+      return `Set(${items.length}) {${items.length ? ` ${items.join(', ')} ` : ''}}`;
+    }
+    case 'object':
+      return renderProperties(node.properties, depth);
+    case 'error': {
+      let formatted = node.stack ?? `${node.name}: ${node.message}`;
+      if (node.properties) {
+        const properties = renderProperties(node.properties, depth);
+        if (properties !== '{}') {
+          formatted += ` ${properties}`;
+        }
+      }
+      if (node.cause) {
+        formatted += `\n[cause]: ${renderText(node.cause, depth + 1)}`;
+      }
+      return formatted;
+    }
+  }
+}
+
+function renderProperties(properties: [string, LogNode][], depth: number): string {
+  const entries = properties.map(
+    ([key, item]) => `${formatKey(key)}: ${renderText(item, depth + 1)}`
+  );
+  return entries.length === 0 ? '{}' : `{ ${entries.join(', ')} }`;
+}
+
+function formatKey(key: string): string {
+  return /^[A-Za-z_$][\w$]*$/.test(key) ? key : `'${key}'`;
+}
+
+function renderJson(node: LogNode): unknown {
+  switch (node.kind) {
+    case 'string':
+    case 'scalar':
+      return node.value;
+    case 'text':
+    case 'marker':
+      return node.text;
+    case 'date':
+      return node.iso;
+    case 'array':
+    case 'set':
+      return node.items.map(renderJson);
+    case 'map':
+      return Object.fromEntries(
+        node.entries.map(([key, item]) => [
+          key.kind === 'string' ? key.value : renderText(key, 0),
+          renderJson(item),
+        ])
+      );
+    case 'object':
+      return Object.fromEntries(node.properties.map(([key, item]) => [key, renderJson(item)]));
+    case 'error':
+      return {
+        name: node.name,
+        message: node.message,
+        stack: node.stack,
+        ...Object.fromEntries(
+          (node.properties ?? []).map(([key, item]) => [key, renderJson(item)])
+        ),
+        ...(node.cause && { cause: renderJson(node.cause) }),
+      };
   }
 }
 
@@ -117,137 +314,45 @@ export function formatLogValue(
     return value;
   }
   try {
-    return formatNested(value, 0, { seen: new Set(), redaction });
+    const node = walk(value, 0, {
+      seen: new Set(),
+      redaction,
+      json: false,
+      maxDepth: MAX_TEXT_DEPTH,
+    });
+    return renderText(node, 0);
   } catch {
     // e.g. a Proxy whose traps throw
     return '[Unformattable value]';
   }
 }
 
-/** Properties of errors printed by the stack, or separately. */
-const ERROR_OWN_KEYS = new Set(['name', 'stack', 'message', 'cause']);
-
-type FormatState = { seen: Set<object>; redaction: ReadonlySet<string> };
-
-function formatNested(value: unknown, depth: number, state: FormatState): string {
-  const { seen } = state;
-  switch (typeof value) {
-    case 'string':
-      return depth === 0 ? value : `'${value.replace(/'/g, "\\'")}'`;
-    case 'bigint':
-      return `${value}n`;
-    case 'symbol':
-      return value.toString();
-    case 'function':
-      return `[Function: ${value.name || '(anonymous)'}]`;
-    case 'object':
-      break;
-    default:
-      return String(value);
-  }
-  if (value === null) {
-    return 'null';
-  }
-  if (seen.has(value)) {
-    return '[Circular]';
-  }
-  if (value instanceof Error) {
-    return formatError(value, depth, state);
-  }
-  if (value instanceof Date) {
-    return Number.isNaN(value.getTime()) ? 'Invalid Date' : value.toISOString();
-  }
-  if (value instanceof RegExp) {
-    return value.toString();
-  }
-
-  seen.add(value);
-  try {
-    if (Array.isArray(value)) {
-      if (depth >= MAX_DEPTH) {
-        return '[Array]';
-      }
-      const items = value.map((item) => formatNested(item, depth + 1, state));
-      return items.length === 0 ? '[]' : `[ ${items.join(', ')} ]`;
-    }
-    if (value instanceof Map) {
-      if (depth >= MAX_DEPTH) {
-        return '[Map]';
-      }
-      const items = [...value].map(
-        ([k, v]) =>
-          `${formatNested(k, depth + 1, state)} => ${
-            isRedacted(k, state.redaction) ? REDACTED : formatNested(v, depth + 1, state)
-          }`
-      );
-      return `Map(${value.size}) {${items.length ? ` ${items.join(', ')} ` : ''}}`;
-    }
-    if (value instanceof Set) {
-      if (depth >= MAX_DEPTH) {
-        return '[Set]';
-      }
-      const items = [...value].map((item) => formatNested(item, depth + 1, state));
-      return `Set(${value.size}) {${items.length ? ` ${items.join(', ')} ` : ''}}`;
-    }
-    if (depth >= MAX_DEPTH) {
-      return '[Object]';
-    }
-    return formatProperties(value, depth, state);
-  } finally {
-    seen.delete(value);
-  }
-}
-
-function formatError(error: Error, depth: number, state: FormatState): string {
-  state.seen.add(error);
-  try {
-    let formatted = error.stack ?? `${error.name}: ${error.message}`;
-    if (depth < MAX_DEPTH) {
-      const properties = formatProperties(error, depth, state, ERROR_OWN_KEYS);
-      if (properties !== '{}') {
-        formatted += ` ${properties}`;
-      }
-    }
-    if (error.cause !== undefined) {
-      formatted += `\n[cause]: ${formatNested(error.cause, depth + 1, state)}`;
-    }
-    return formatted;
-  } finally {
-    state.seen.delete(error);
-  }
-}
-
 /**
- * The own enumerable properties of an object, as `{ key: value, ... }`. A getter that throws does
- * not stop the others from being printed.
+ * The JSON-safe copy of a logged value (the context of a record, a JSON log line), with the values
+ * of the keys of `redaction` replaced with `[Redacted]` at any depth. It follows `toJSON` as
+ * `JSON.stringify` does, then redacts what it returns; errors become `{ name, message, stack }`
+ * with their own properties and their `cause`; BigInts become `10n`; a reference to an ancestor
+ * becomes `[Circular]`. It never throws.
  */
-function formatProperties(
-  value: object,
-  depth: number,
-  state: FormatState,
-  excluded?: Set<string>
-): string {
-  const entries: string[] = [];
-  for (const key of Object.keys(value)) {
-    if (excluded?.has(key)) {
-      continue;
-    }
-    if (isRedacted(key, state.redaction)) {
-      entries.push(`${formatKey(key)}: ${REDACTED}`);
-      continue;
-    }
-    let item: unknown;
-    try {
-      item = (value as Record<string, unknown>)[key];
-    } catch {
-      entries.push(`${formatKey(key)}: [Getter threw]`);
-      continue;
-    }
-    entries.push(`${formatKey(key)}: ${formatNested(item, depth + 1, state)}`);
+export function toLogJson(
+  value: unknown,
+  redaction: ReadonlySet<string> = DEFAULT_REDACTION
+): unknown {
+  try {
+    return renderJson(
+      walk(value, 0, { seen: new Set(), redaction, json: true, maxDepth: MAX_JSON_DEPTH })
+    );
+  } catch {
+    // e.g. a getter of a nested value or a Proxy trap that throws
+    return '[Unformattable value]';
   }
-  return entries.length === 0 ? '{}' : `{ ${entries.join(', ')} }`;
 }
 
-function formatKey(key: string): string {
-  return /^[A-Za-z_$][\w$]*$/.test(key) ? key : `'${key}'`;
+/** `JSON.stringify` that never throws, over {@link toLogJson} without redaction. */
+export function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(toLogJson(value, NO_REDACTION)) ?? 'undefined';
+  } catch {
+    return '"[Unserializable]"';
+  }
 }

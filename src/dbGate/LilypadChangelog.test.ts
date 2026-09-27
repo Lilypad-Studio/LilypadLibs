@@ -26,8 +26,8 @@ describe('lilypadChangelogSql prune option', () => {
     expect(sql).toContain('LIMIT 1000');
     expect(sql).toContain('SECURITY DEFINER');
     expect(sql).not.toContain('DROP FUNCTION');
-    // The TRUNCATE, statement and row branches
-    expect(sql.match(/PERFORM "lilypad_cache_changes_prune"\(\);/g)).toHaveLength(3);
+    // The TRUNCATE and statement branches
+    expect(sql.match(/PERFORM "lilypad_cache_changes_prune"\(\);/g)).toHaveLength(2);
     expect(sql).toContain('IF random() * 20 < 1 AND');
   });
 

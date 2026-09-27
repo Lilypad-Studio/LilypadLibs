@@ -87,7 +87,15 @@ export type LilypadDbCacheChangelogSync = LilypadDbCacheTrustedSyncOptions & {
   /** The changelog table, if not `lilypad_cache_changes`. */
   table?: string;
   /**
-   * How the old changelog rows are deleted, for the schema check. `detect` (default): it looks for
+   * Also checks at runtime how the changelog is pruned (the `pg_cron` jobs, the `prune` option of
+   * the trigger, the age of the oldest row), with the other checks of `verify`. Defaults to false:
+   * run `npx lilypad-doctor` (or `checkLilypadSchema`) in a deployment step instead, which checks
+   * it without slowing the start of the caches.
+   */
+  checkPruning?: boolean;
+  /**
+   * How the old changelog rows are deleted, for the pruning check (`checkPruning`, or
+   * `lilypad-doctor`). `detect` (default): it looks for
    * the `prune` option of the trigger and for a pg_cron job, and warns with the best one for the
    * database if it finds neither. `trigger` / `cron`: the same, but it always suggests the `prune`
    * option of the trigger / a pg_cron job. `external`: a job it cannot see deletes them (e.g.
@@ -149,7 +157,7 @@ export interface LilypadDbSyncHost<K extends LilypadCacheKey> {
   readonly gate: LilypadDbGate;
   readonly tableName: string;
   readonly platform?: LilypadPlatform;
-  log(level: LilypadLibLogLevel, ...message: unknown[]): void;
+  log(level: LilypadLibLogLevel, message: string, detail?: unknown): void;
   isDisposed(): boolean;
   /** Applies a change of a row made elsewhere. @returns The key of the row. */
   applyChange(

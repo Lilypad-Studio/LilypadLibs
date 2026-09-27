@@ -1,14 +1,21 @@
-import { LilypadCacheCore } from '@/cache/LilypadCacheCore';
-import type {
-  LilypadCachedValueType,
-  LilypadCacheGetOptions,
-  LilypadCacheKey,
-  LilypadCacheOptions,
-  LilypadCacheResult,
-  LilypadCacheValueFn,
+import { LilypadCacheEngine } from '@/cache/LilypadCacheEngine';
+import {
+  LilypadDisposedError,
+  type LilypadCachedValueType,
+  type LilypadCacheGetOptions,
+  type LilypadCacheKey,
+  type LilypadCacheOptions,
+  type LilypadCachePeek,
+  type LilypadCacheResult,
+  type LilypadCacheSyncFn,
+  type LilypadCacheValueFn,
 } from '@/cache/LilypadCacheTypes';
+import { LilypadFlowControl } from '@/flow/LilypadFlowControl';
+import { assertNumberOption } from '@/internal/LilypadValidation';
 
 export * from '@/cache/LilypadCacheTypes';
+
+const DEFAULT_BULK_SYNC_TIMEOUT = 30_000;
 
 /**
  * A generic in-memory cache with time-to-live (TTL) support, error fallback, and protection for
@@ -29,7 +36,9 @@ export * from '@/cache/LilypadCacheTypes';
  *
  * Asynchronous writes (`getOrSet`, `bulkSync`) are ordered by the time they started: a result that
  * arrives after a write started later is discarded, so a slow, older read can never overwrite a
- * newer value.
+ * newer value. A read never joins a fetch that started before the last change of its key.
+ *
+ * Every method throws a {@link LilypadDisposedError} once the cache is disposed, except `dispose`.
  *
  * @typeParam K - The type of the cache keys.
  * @typeParam V - The type of the cache values.
@@ -49,28 +58,94 @@ export * from '@/cache/LilypadCacheTypes';
  * });
  * ```
  */
-export class LilypadCache<K extends LilypadCacheKey, V> extends LilypadCacheCore<K, V> {
-  public constructor(options: LilypadCacheOptions<K, V> = {}) {
-    super(options);
+export class LilypadCache<K extends LilypadCacheKey, V> {
+  private readonly engine: LilypadCacheEngine<K, V>;
+  private readonly bulkSyncFn?: LilypadCacheSyncFn<K, V>;
+  private readonly bulkSyncTtl: number;
+  private readonly bulkSyncFlowControl: LilypadFlowControl;
+  /**
+   * When the last bulk sync stops counting as fresh. `entries()` returns every entry of the source
+   * only while it is fresh.
+   */
+  private bulkSyncExpirationTime = 0;
+  /** Ticket of the last bulk sync invalidation, which a bulk sync started earlier must not undo. */
+  private bulkSyncInvalidationTicket = 0;
+
+  /** @throws If an option is not valid. */
+  constructor(options: LilypadCacheOptions<K, V> = {}) {
+    const { bulkSync, ...engineOptions } = options;
+    assertNumberOption('LilypadCache', 'bulkSync.ttl', bulkSync?.ttl, 'non-negative');
+    assertNumberOption('LilypadCache', 'bulkSync.timeout', bulkSync?.timeout, 'positive-delay');
+    this.engine = new LilypadCacheEngine<K, V>(engineOptions, {
+      onValueStored: (entry) => {
+        // Otherwise entries() would leave the key out while the bulk sync still counts as fresh
+        if (entry.expirationTime < this.bulkSyncExpirationTime) {
+          this.forceNextBulkSync();
+        }
+      },
+      onEntriesIncomplete: () => this.forceNextBulkSync(),
+    });
+    this.bulkSyncFn = bulkSync?.fn;
+    this.bulkSyncTtl = bulkSync?.ttl ?? this.engine.defaultTtl;
+    this.bulkSyncFlowControl = new LilypadFlowControl({
+      timeout: bulkSync?.timeout ?? DEFAULT_BULK_SYNC_TIMEOUT,
+    });
+  }
+
+  /** A unique id of the instance. */
+  get id(): string {
+    return this.engine.id;
+  }
+
+  /** The name given in the options, or the id. */
+  get name(): string {
+    return this.engine.name;
+  }
+
+  /** @throws {LilypadDisposedError} If the cache is disposed. */
+  private assertNotDisposed() {
+    if (this.engine.disposed) {
+      throw new LilypadDisposedError(`LilypadCache "${this.name}"`);
+    }
+  }
+
+  /**
+   * Returns the value of the key if it is cached and fresh, otherwise `undefined`. It reads the
+   * memory of this instance only: `getOrSet` also reads the shared level.
+   *
+   * @param options.removeExpired - If true, an expired value is also removed. Defaults to false, so
+   * that the old value stays available as a fallback (`onError: { fallback: 'stale' }`).
+   */
+  get(key: K, options?: { removeExpired?: boolean }): LilypadCachedValueType<V> | undefined {
+    this.assertNotDisposed();
+    return this.engine.get(key, options);
+  }
+
+  /**
+   * Tells whether the key is cached, and whether its value is fresh or expired, without side
+   * effects (no cleanup, no change of the order of use).
+   */
+  peek(key: K): LilypadCachePeek<V> {
+    this.assertNotDisposed();
+    return this.engine.peek(key);
   }
 
   /**
    * Stores a value in the cache, and in the shared level (in the background).
    *
    * @param ttl - Time to live in milliseconds; defaults to the cache's TTL.
-   * @throws If the cache is disposed.
    */
-  public override set(key: K, value: LilypadCachedValueType<V>, ttl?: number): void {
-    super.set(key, value, ttl);
+  set(key: K, value: LilypadCachedValueType<V>, ttl?: number): void {
+    this.assertNotDisposed();
+    this.engine.set(key, value, ttl);
   }
 
-  /**
-   * Stores several values at once, like `set` (so also in the shared level).
-   *
-   * @throws If the cache is disposed.
-   */
-  public override bulkSet(entries: Iterable<readonly [K, LilypadCachedValueType<V>]>): void {
-    super.bulkSet(entries);
+  /** Stores several values at once, like `set` (so also in the shared level). */
+  bulkSet(entries: Iterable<readonly [K, LilypadCachedValueType<V>]>): void {
+    this.assertNotDisposed();
+    for (const [key, value] of entries) {
+      this.engine.set(key, value);
+    }
   }
 
   /**
@@ -78,16 +153,15 @@ export class LilypadCache<K extends LilypadCacheKey, V> extends LilypadCacheCore
    * the same key share one fetch; the `onError` options still apply separately to each caller.
    *
    * @param valueFn - Produces the value; it receives a signal aborted when the fetch times out.
-   * @throws The error of `valueFn` (or the timeout error) when `onError` gives no fallback value,
-   * or if the cache is disposed.
+   * @throws The error of `valueFn` (or the timeout error) when `onError` gives no fallback value.
    * @see {@link getOrSetDetailed} to also know where the value comes from
    */
-  public override getOrSet(
+  async getOrSet(
     key: K,
     valueFn: LilypadCacheValueFn<V>,
     options?: LilypadCacheGetOptions<K, V>
   ): Promise<LilypadCachedValueType<V>> {
-    return super.getOrSet(key, valueFn, options);
+    return (await this.getOrSetDetailed(key, valueFn, options)).value;
   }
 
   /**
@@ -96,65 +170,213 @@ export class LilypadCache<K extends LilypadCacheKey, V> extends LilypadCacheCore
    *
    * The lookup order is: memory of this instance, shared level, stale value (returned at once and
    * refreshed in the background, within `staleWhileRevalidate`), fetch.
-   *
-   * @throws If the cache is disposed.
    */
-  public override getOrSetDetailed(
+  getOrSetDetailed(
     key: K,
     valueFn: LilypadCacheValueFn<V>,
     options?: LilypadCacheGetOptions<K, V>
   ): Promise<LilypadCacheResult<V>> {
-    return super.getOrSetDetailed(key, valueFn, options);
+    try {
+      this.assertNotDisposed();
+    } catch (error) {
+      return Promise.reject(error as Error);
+    }
+    return this.engine.getOrSetDetailed(key, valueFn, options);
   }
 
-  /**
-   * Synchronizes the cache in bulk with `bulkSync.fn`. Concurrent calls share one sync. Errors are
-   * logged; unless `throwOnError` is set they are not rethrown.
-   *
-   * @returns `true` if the cache is synced (now or by a recent sync), `false` if the sync failed,
-   * returned no data, or there is no `bulkSync.fn`.
-   * @throws If the cache is disposed.
-   */
-  public override bulkSync(options?: { throwOnError?: boolean }): Promise<boolean> {
-    return super.bulkSync(options);
-  }
-
-  /**
-   * Returns the fresh values of `keys`, keyed as given. Missing and expired keys are left out.
-   *
-   * @throws If the cache is disposed.
-   */
-  public override getMany(keys: Iterable<K>): Map<K, LilypadCachedValueType<V>> {
-    return super.getMany(keys);
+  /** Returns the fresh values of `keys`, keyed as given. Missing and expired keys are left out. */
+  getMany(keys: Iterable<K>): Map<K, LilypadCachedValueType<V>> {
+    this.assertNotDisposed();
+    return this.engine.getMany(keys);
   }
 
   /**
    * Returns every fresh entry, keyed by the key it was stored with. It is the whole source only
    * while the last `bulkSync` is fresh: use `getAll` to sync first.
-   *
-   * @throws If the cache is disposed.
    */
-  public override entries(): Map<K, LilypadCachedValueType<V>> {
-    return super.entries();
+  entries(): Map<K, LilypadCachedValueType<V>> {
+    this.assertNotDisposed();
+    return this.engine.entries();
   }
 
+  /** Like `entries()`, after a `bulkSync` (unless `sync` is false). */
+  async getAll({ sync = true }: { sync?: boolean } = {}): Promise<
+    Map<K, LilypadCachedValueType<V>>
+  > {
+    if (sync) {
+      await this.bulkSync();
+    }
+    return this.entries();
+  }
+
+  // BULK SYNC
+
   /**
-   * Like `entries()`, after a `bulkSync` (unless `sync` is false).
+   * Synchronizes the cache in bulk with `bulkSync.fn`.
    *
-   * @throws If the cache is disposed.
+   * Concurrent calls share one sync. Errors are logged; unless `throwOnError` is set they are not
+   * rethrown: the cache keeps its current content, and the next call retries the sync.
+   * Bulk syncs fill the memory of this instance only, not the shared level.
+   *
+   * @param options.throwOnError - If true, a failed sync rejects instead of resolving to `false`.
+   * @returns `true` if the cache is synced (now or by a recent sync), `false` if the sync failed,
+   * returned no data, or there is no `bulkSync.fn`.
    */
-  public getAll(options?: { sync?: boolean }): Promise<Map<K, LilypadCachedValueType<V>>> {
-    return this.getAllEntries(options);
+  async bulkSync(options: { throwOnError?: boolean } = {}): Promise<boolean> {
+    this.assertNotDisposed();
+    const bulkSyncFn = this.bulkSyncFn;
+    if (!bulkSyncFn) {
+      if (options.throwOnError) {
+        throw new Error(`LilypadCache "${this.name}" has no bulkSync.fn.`);
+      }
+      return false;
+    }
+    try {
+      return await this.bulkSyncFlowControl.singleFlight('LilypadCache-bulkSync', () =>
+        this.bulkSyncFlowControl
+          .executeWithTimeout((signal) => this.runBulkSync(bulkSyncFn, signal))
+          .catch((error: unknown) => {
+            this.engine.log('error', 'Error during bulk sync:', error);
+            throw error;
+          })
+      );
+    } catch (error) {
+      if (options.throwOnError) {
+        throw error;
+      }
+      return false;
+    }
+  }
+
+  private async runBulkSync(
+    bulkSyncFn: LilypadCacheSyncFn<K, V>,
+    signal: AbortSignal
+  ): Promise<boolean> {
+    if (Date.now() < this.bulkSyncExpirationTime) {
+      return true;
+    }
+    const read = this.engine.beginRead();
+    const data = await bulkSyncFn(signal);
+    if (signal.aborted) {
+      // Timed out: the caller already got an error, and a newer sync may be running
+      return false;
+    }
+    if (!data) {
+      this.engine.log('warn', 'Bulk sync function returned no data');
+      return false;
+    }
+    // Taken before the entries are written, which expire at the earliest `defaultTtl` after it
+    const storedAt = Date.now();
+    this.engine.replaceEntries(read, data);
+
+    // An invalidation that happened while the sync was running may not be reflected in its data
+    if (this.bulkSyncInvalidationTicket < read.ticket) {
+      // Never beyond the expiration of the entries: `entries()` would then return an incomplete
+      // (or empty) set while the sync still counts as fresh
+      this.bulkSyncExpirationTime = storedAt + Math.min(this.bulkSyncTtl, this.engine.defaultTtl);
+    }
+    return true;
   }
 
   /**
    * Forces the next `bulkSync` call to fetch fresh data, even if a sync is currently running (that
    * sync then does not count as fresh).
-   *
-   * @throws If the cache is disposed.
    */
-  public invalidateBulkSync(): void {
+  invalidateBulkSync(): void {
     this.assertNotDisposed();
     this.forceNextBulkSync();
+  }
+
+  private forceNextBulkSync() {
+    this.bulkSyncExpirationTime = 0;
+    this.bulkSyncInvalidationTicket = this.engine.nextTicket();
+  }
+
+  // PROTECTED KEYS
+
+  /**
+   * Protects keys from `delete`, `clear`, eviction and `purgeExpired`, unless `force` is passed.
+   *
+   * @returns The cache, for chaining.
+   */
+  addProtectedKeys(keys: K[]): this {
+    this.assertNotDisposed();
+    this.engine.addProtectedKeys(keys);
+    return this;
+  }
+
+  /** @returns The cache, for chaining. */
+  removeProtectedKeys(keys: K[]): this {
+    this.assertNotDisposed();
+    this.engine.removeProtectedKeys(keys);
+    return this;
+  }
+
+  // INVALIDATION AND REMOVAL
+
+  /**
+   * Invalidates the entry of the key.
+   *
+   * The entry is marked as expired: it is no longer returned, not even as a stale value, but it
+   * stays available as a fallback (`onError: { fallback: 'stale' }`). A fetch of the key already
+   * in flight is not cached, and later reads do not join it. The key is also removed from the
+   * shared level, and `platform.onInvalidate` receives a `manual` event.
+   *
+   * @param options.invalidateBulkSync - If true (default), forces the next bulk sync. With false,
+   * `entries()` leaves the key out until the next bulk sync.
+   */
+  invalidate(key: K, { invalidateBulkSync = true }: { invalidateBulkSync?: boolean } = {}): void {
+    this.assertNotDisposed();
+    this.engine.invalidate(key);
+    if (invalidateBulkSync) {
+      this.forceNextBulkSync();
+    }
+  }
+
+  /**
+   * Deletes the key from the cache, and from the shared level. To cache the key as "does not
+   * exist" instead, write `null`.
+   *
+   * @param options.force - If true, also deletes a protected key.
+   * @returns `false` if the key is protected and was left untouched.
+   */
+  delete(key: K, options?: { force?: boolean }): boolean {
+    this.assertNotDisposed();
+    return this.engine.delete(key, options);
+  }
+
+  /**
+   * Removes all entries from the memory of this instance (not from the shared level), and forces
+   * the next bulk sync. Protected keys are kept, unless `force` is set.
+   */
+  clear(options?: { force?: boolean }): void {
+    this.assertNotDisposed();
+    this.engine.clear(options);
+  }
+
+  /**
+   * Removes all expired entries, except those still within the `staleWhileRevalidate` window of
+   * the cache, and the bookkeeping that no longer serves.
+   *
+   * @param options.force - If true, also removes the expired protected keys.
+   */
+  purgeExpired(options?: { force?: boolean }): void {
+    this.assertNotDisposed();
+    this.engine.purgeExpired(options);
+  }
+
+  /**
+   * Disposes of the cache: stops the cleanup timer and removes every entry. A disposed cache
+   * ignores every later internal write, including the ones of fetches still in flight, and its
+   * methods throw. The shared level is left untouched. Calling it again does nothing.
+   */
+  dispose(): Promise<void> {
+    this.engine.dispose();
+    return Promise.resolve();
+  }
+
+  /** `await using cache = ...` disposes of the cache at the end of the scope. */
+  [Symbol.asyncDispose](): Promise<void> {
+    return this.dispose();
   }
 }

@@ -21,11 +21,13 @@ export type LilypadSchemaVerifierOptions = {
   changelogTable?: string;
   /** How the changelog is pruned, with the `changelog` strategy. */
   pruning?: LilypadChangelogPruning;
+  /** Whether the check also looks at the pruning of the changelog (`sync.checkPruning`). */
+  checkPruning?: boolean;
   /** The shortest retention of the changelog the cache accepts: its `maxGap` and `lookback`. */
   minRetention?: number;
   mode: LilypadDbCacheSchemaVerification;
   platform?: LilypadPlatform;
-  log: (level: LilypadLibLogLevel, ...message: unknown[]) => void;
+  log: (level: LilypadLibLogLevel, message: string, detail?: unknown) => void;
   /** Whether the logger has a `warn` method; otherwise problems go to `console.warn`. */
   canWarn: () => boolean;
   /** Receives the schema the table resolves to. */
@@ -108,8 +110,17 @@ export class LilypadSchemaVerifier {
 
   /** @returns `false` if the check could not run (with `warn`; `throw` rejects). */
   private async run(mode: 'warn' | 'throw'): Promise<boolean> {
-    const { gate, tableName, primaryKey, strategy, changelogTable, pruning, minRetention, log } =
-      this.options;
+    const {
+      gate,
+      tableName,
+      primaryKey,
+      strategy,
+      changelogTable,
+      pruning,
+      checkPruning,
+      minRetention,
+      log,
+    } = this.options;
     const subject = `LilypadDbCache "${tableName}" (sync: ${strategy})`;
     try {
       const result = await checkLilypadSchema(
@@ -117,7 +128,14 @@ export class LilypadSchemaVerifier {
         {
           tables: [{ table: tableName, primaryKey }],
           changelog:
-            strategy === 'changelog' ? { table: changelogTable, pruning, minRetention } : false,
+            strategy === 'changelog'
+              ? {
+                  table: changelogTable,
+                  pruning,
+                  minRetention,
+                  checkPruning: checkPruning ?? false,
+                }
+              : false,
           notifyChannel: strategy === 'listen' ? LILYPAD_DEFAULT_NOTIFY_CHANNEL : false,
         },
         // The caches of a gate check the same changelog: its facts are read once

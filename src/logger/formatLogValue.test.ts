@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatLogValue } from './formatLogValue';
+import { formatLogValue, toLogJson } from './formatLogValue';
 
 describe('formatLogValue', () => {
   it.each([
@@ -99,5 +99,53 @@ describe('formatLogValue robustness', () => {
     );
 
     expect(formatLogValue(hostile)).toBe('[Unformattable value]');
+  });
+});
+
+describe('toLogJson', () => {
+  it('should redact at any depth, also inside errors and what toJSON returns', () => {
+    const error = Object.assign(new Error('request failed'), {
+      config: { headers: { Authorization: 'Bearer secret' } },
+      cause: new Error('socket closed'),
+    });
+    const json = toLogJson({
+      error,
+      request: { toJSON: () => ({ headers: { cookie: 'sid=1' }, url: '/users' }) },
+    }) as Record<string, Record<string, unknown>>;
+
+    expect(JSON.stringify(json)).not.toContain('secret');
+    expect(json.error).toMatchObject({
+      name: 'Error',
+      message: 'request failed',
+      config: { headers: { Authorization: '[Redacted]' } },
+      cause: { message: 'socket closed' },
+    });
+    expect(json.request).toEqual({ headers: { cookie: '[Redacted]' }, url: '/users' });
+  });
+
+  it('should turn what JSON cannot hold into plain values', () => {
+    const node: Record<string, unknown> = { big: 10n, at: new Date(0), invalid: new Date(NaN) };
+    node.self = node;
+    node.map = new Map<unknown, unknown>([
+      ['token', 'secret'],
+      [1, 'one'],
+    ]);
+    node.set = new Set(['a']);
+
+    expect(toLogJson(node)).toEqual({
+      big: '10n',
+      at: '1970-01-01T00:00:00.000Z',
+      invalid: null,
+      self: '[Circular]',
+      map: { token: '[Redacted]', 1: 'one' },
+      set: ['a'],
+    });
+  });
+
+  it('should keep the depth the text form abbreviates', () => {
+    const deep = { a: { b: { c: { d: { e: 'deep' } } } } };
+
+    expect(formatLogValue(deep)).toBe('{ a: { b: { c: { d: [Object] } } } }');
+    expect(toLogJson(deep)).toEqual(deep);
   });
 });

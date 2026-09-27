@@ -27,7 +27,7 @@ const changelogRow: LilypadTriggerInfo = {
   source: '',
 };
 const changelogTruncate: LilypadTriggerInfo = { ...changelogRow, type: TRUNCATE_TRIGGER };
-/** The statement triggers installed by version 4, one per event, with their transition tables. */
+/** The statement triggers of the changelog, one per event, with their transition tables. */
 const changelogStatements: LilypadTriggerInfo[] = [
   { ...changelogRow, type: 4, newTable: 'lilypad_new' },
   { ...changelogRow, type: 16, oldTable: 'lilypad_old', newTable: 'lilypad_new' },
@@ -64,7 +64,7 @@ function facts(overrides: Partial<LilypadSchemaFacts> = {}): LilypadSchemaFacts 
       deletedRows: 0,
     },
     cron: { available: true, installed: true, database: 'app', jobs: [pruneJob] },
-    tables: [{ schema: 'public', triggers: [changelogRow, changelogTruncate] }],
+    tables: [{ schema: 'public', triggers: [...changelogStatements, changelogTruncate] }],
     ...overrides,
   };
 }
@@ -226,8 +226,16 @@ describe('evaluateLilypadSchema', () => {
 
   it.each([
     ['no trigger', []],
-    ['a disabled trigger', [{ ...changelogRow, enabled: false }, changelogTruncate]],
-    ['a trigger without DELETE', [{ ...changelogRow, type: 1 | 4 | 16 }, changelogTruncate]],
+    [
+      'a disabled trigger',
+      [
+        { ...changelogStatements[0]!, enabled: false },
+        ...changelogStatements.slice(1),
+        changelogTruncate,
+      ],
+    ],
+    ['a trigger without DELETE', [...changelogStatements.slice(0, 2), changelogTruncate]],
+    ['the row trigger of version 3', [changelogRow, changelogTruncate]],
     [
       'statement triggers without UPDATE',
       [changelogStatements[0]!, changelogStatements[2]!, changelogTruncate],
@@ -279,7 +287,10 @@ describe('evaluateLilypadSchema', () => {
         tables: [
           {
             schema: 'public',
-            triggers: [{ ...changelogRow, args: 'uuid\\000' }, changelogTruncate],
+            triggers: [
+              ...changelogStatements.map((trigger) => ({ ...trigger, args: 'uuid\\000' })),
+              changelogTruncate,
+            ],
           },
         ],
       }),
@@ -307,7 +318,7 @@ describe('evaluateLilypadSchema', () => {
 
   it('should report a table whose TRUNCATE is not recorded', () => {
     const result = evaluateLilypadSchema(
-      facts({ tables: [{ schema: 'public', triggers: [changelogRow] }] }),
+      facts({ tables: [{ schema: 'public', triggers: changelogStatements }] }),
       changelogOptions
     );
 
@@ -778,6 +789,25 @@ describe('the pruning of the changelog', () => {
       expect(result.problems[0]!.fix).toBe(
         lilypadChangelogSql({ prune: { olderThan: DAY, every: 10, batchSize: 500 } })
       );
+    });
+
+    it('should skip the pruning checks with checkPruning: false, keeping the installed pruning in the fix', () => {
+      const outdated = {
+        ...triggerPrune(30 * 60_000),
+        changelog: {
+          ...triggerPrune(30 * 60_000).changelog,
+          functionComment: 'lilypad-changelog:2',
+        },
+      };
+
+      const result = evaluateLilypadSchema(outdated, {
+        ...changelogOptions,
+        changelog: { checkPruning: false },
+      });
+
+      // No short-changelog-retention: only the problem that the caches need solved
+      expect(codes(result)).toEqual(['outdated-changelog']);
+      expect(result.problems[0]!.fix).toContain('lilypad-prune: olderThan=1800000');
     });
 
     it('should compare the retention with the minRetention of the caches', () => {

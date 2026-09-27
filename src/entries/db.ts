@@ -2,26 +2,28 @@
  * `@lilypad/libs/db`: the PostgreSQL gateway and the database-backed cache. Node.js only: it needs
  * TCP connections (postgres.js), which must be installed next to the library.
  */
+export { LilypadDbGate, lilypadServerlessPool } from '../dbGate/LilypadDbGate';
+export type {
+  LilypadDbGateOptions,
+  LilypadDbListener,
+  LilypadDbPoolOptions,
+} from '../dbGate/LilypadDbGate';
+export { LilypadDbTable } from '../dbGate/LilypadDbTable';
 export {
   LilypadDbEmptyWriteError,
-  LilypadDbGate,
   LilypadDbMissingPrimaryKeyError,
   LilypadDbNotFoundError,
-  lilypadServerlessPool,
-} from '../dbGate/LilypadDbGate';
-export { LilypadDisposedError } from '../cache/LilypadCacheTypes';
+} from '../dbGate/LilypadDbSchema';
 export type {
   LilypadDbColumn,
   LilypadDbColumnType,
   LilypadDbDeleteResult,
-  LilypadDbGateOptions,
   LilypadDbInsertData,
-  LilypadDbListener,
-  LilypadDbPoolOptions,
   LilypadDbSchema,
   LilypadDbUpdateData,
   LilypadDbWriteResult,
-} from '../dbGate/LilypadDbGate';
+} from '../dbGate/LilypadDbSchema';
+export { LilypadDisposedError } from '../cache/LilypadCacheTypes';
 
 export { LilypadDbCache } from '../cache/LilypadDbCache';
 export type {
@@ -55,6 +57,8 @@ export type {
 } from '../dbGate/LilypadChangelog';
 
 export { checkLilypadSchema, LilypadSchemaCheckError } from '../dbGate/LilypadSchemaCheck';
+export { runLilypadDoctor } from '../dbGate/LilypadDoctor';
+export type { LilypadDoctorOptions, LilypadDoctorReport } from '../dbGate/LilypadDoctor';
 export type {
   LilypadChangelogPruning,
   LilypadSchemaCheckOptions,

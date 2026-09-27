@@ -6,14 +6,14 @@ const singletonMap = (globalThis.__lilypadSingletonMap ??= new Map<string, unkno
 // Kept apart from singletonMap, so that bundles of older versions sharing the registry still read it
 const signatureMap = (globalThis.__lilypadSingletonSignatureMap ??= new Map<string, string>());
 
-export type LilypadSingletonAble =
-  | {
-      singleton: true;
-      singletonIdentifier: string;
-    }
-  | {
-      singleton?: false;
-    };
+/**
+ * The singleton option of the `create` methods: with an identifier, a later `create` with the same
+ * identifier returns the same instance; without one, each call creates a new instance.
+ */
+export type LilypadSingletonAble = {
+  /** The identifier of the singleton, unique among the instances of the class. */
+  singleton?: string;
+};
 
 /**
  * Describes the options a singleton was created with. When a later call asks for the same
@@ -112,7 +112,7 @@ export type LilypadSingletonRelease = () => void;
 
 function registryKeyOf(namespace: string, options: LilypadSingletonAble): string | undefined {
   // The namespace keeps singletons of different classes apart even when they share an identifier
-  return options.singleton ? `${namespace}:${options.singletonIdentifier}` : undefined;
+  return options.singleton !== undefined ? `${namespace}:${options.singleton}` : undefined;
 }
 
 /** What a factory registered under a key: the instance, or the promise of it while it is created. */
@@ -141,7 +141,7 @@ function releaseFor(
 
 /**
  * Shared implementation of the synchronous `create` methods: builds a new instance, or returns the
- * singleton registered under `namespace:singletonIdentifier`.
+ * singleton registered under `namespace:singleton`.
  *
  * @param createInstanceFn - Receives the function that removes the instance from the registry.
  */
@@ -169,7 +169,7 @@ export function createLilypadSingletonAble<T>(
 
 /**
  * Shared implementation of the async `create` methods: builds a new instance, or returns the
- * singleton registered under `namespace:singletonIdentifier`.
+ * singleton registered under `namespace:singleton`.
  *
  * @param createInstanceFn - Receives the function that removes the instance from the registry.
  */

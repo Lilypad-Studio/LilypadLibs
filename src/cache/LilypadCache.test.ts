@@ -337,7 +337,7 @@ describe('LilypadCache', () => {
     it('should clear all entries on dispose', () => {
       cache.set('key1', 42);
       void cache.dispose();
-      expect(cache['store'].size).toBe(0);
+      expect(cache['engine'].store.size).toBe(0);
     });
 
     it('should make every public method throw after dispose, except dispose itself', async () => {
@@ -380,7 +380,7 @@ describe('LilypadCache', () => {
       cache.set('key2', 99);
       cache.addProtectedKeys(['key1', 'key2']);
       void cache.dispose();
-      expect(cache['store'].size).toBe(0);
+      expect(cache['engine'].store.size).toBe(0);
     });
   });
 
@@ -1098,7 +1098,7 @@ describe('LilypadCache', () => {
       fetch.resolve(1);
       await promise;
 
-      expect(cache['store'].size).toBe(0);
+      expect(cache['engine'].store.size).toBe(0);
     });
   });
 
@@ -1217,7 +1217,7 @@ describe('LilypadCache', () => {
 
       expect([...lru.entries().keys()].sort()).toEqual(['c', 'p1', 'p2']);
       // Only the evictable keys are ordered: an eviction never scans the protected ones
-      expect([...lru['evictionOrder']]).toEqual(['c']);
+      expect([...lru['engine']['evictionOrder']]).toEqual(['c']);
       lru.set('d', 6);
       expect(lru.get('c')).toBeUndefined();
       expect([...lru.entries().keys()].sort()).toEqual(['d', 'p1', 'p2']);
@@ -1319,7 +1319,7 @@ describe('LilypadCache', () => {
       fetch.resolve('old');
       await pending;
 
-      expect(target['store'].get('k')?.value).not.toBe('old');
+      expect(target['engine'].store.get('k')?.value).not.toBe('old');
     }
 
     it('should not store an older read after purgeExpired removed the invalidated entry', async () => {
@@ -1377,7 +1377,7 @@ describe('LilypadCache', () => {
   describe('fallback age', () => {
     it('should keep the age of the stale value used as a fallback', async () => {
       cache.set('key1', 42, 10);
-      const fetchedAt = cache['store'].get('key1')!.fetchedAt;
+      const fetchedAt = cache['engine'].store.get('key1')!.fetchedAt;
       await vi.advanceTimersByTimeAsync(20);
 
       await cache.getOrSet(
@@ -1388,7 +1388,7 @@ describe('LilypadCache', () => {
         { onError: { fallback: 'stale' } }
       );
 
-      expect(cache['store'].get('key1')).toMatchObject({
+      expect(cache['engine'].store.get('key1')).toMatchObject({
         value: 42,
         origin: 'fallback',
         fetchedAt,
@@ -1405,7 +1405,7 @@ describe('LilypadCache', () => {
         { onError: { fallback: () => 7 } }
       );
 
-      expect(cache['store'].get('key1')).toMatchObject({ value: 7, fetchedAt: Date.now() });
+      expect(cache['engine'].store.get('key1')).toMatchObject({ value: 7, fetchedAt: Date.now() });
     });
 
     it('should pass the stale value and the error to the fallback function', async () => {
@@ -1615,9 +1615,8 @@ describe('LilypadCache reads after a change', () => {
 
     expect(logger.error).not.toHaveBeenCalled();
     expect(logger.warn).toHaveBeenCalledWith(
-      target.name,
       expect.stringContaining('platform could not keep the instance alive'),
-      expect.objectContaining({ message: 'outside a request' })
+      { source: target.name, error: expect.objectContaining({ message: 'outside a request' }) }
     );
     await target.dispose();
   });

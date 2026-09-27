@@ -13,6 +13,16 @@
 | `runInBackground` and `runAfterResponse` no longer pass the error of `platform.background` / `platform.afterResponse` itself to `onError` (it is not an error of the task), but to a new optional `onPlatformError`. The caches log it as a warning. | Pass `onPlatformError` if you called them directly. |
 | `updateToTable` (and `sqlUpdate`) leaves the primary key out of the `SET` list; data with only the primary key throws `LilypadDbEmptyWriteError`. | None, unless a trigger relied on `UPDATE OF <primary key>`. |
 | The caches of a gate share one listener on `cache_events` (`callbackId: 'lilypad_notification_router'`), instead of one per cache. | None. |
+| **ES modules only** (`.mjs`/`.d.mts`), and Node.js 22.12 or later: CommonJS code loads them with `require()`, which Node.js 22.12+ supports. One format means one copy of each class (`instanceof` works whatever the importer). | Upgrade Node.js to 22.12+; bundlers resolve the `default` condition of `exports`. |
+| The singleton option is `singleton: '<identifier>'` instead of `singleton: true, singletonIdentifier: '<identifier>'`. | `{ singleton: true, singletonIdentifier: 'x' }` → `{ singleton: 'x' }`. |
+| The CRUD helpers of the gate moved to a table handle: `gate.table(schema)` returns a `LilypadDbTable` with `selectAll`, `selectByPrimaryKey(s)`, `insert`, `update`, `delete`. The schema types and errors are in `LilypadDbSchema.ts` (still exported by `@lilypad/libs/db`). | `gate.insertToTable(schema, data)` → `gate.table(schema).insert(data)`, and so on. |
+| `LilypadDbCache.getAll()` and `getAll(keys)` resolve to a `Map` of the rows keyed by primary key (like `LilypadCache.getAll()`), instead of an array. `LilypadDbCache` has no third type parameter, and its `invalidate(key)` no longer takes `{ invalidateBulkSync }` (it has no bulk sync). | `[...(await cache.getAll()).values()]` for the array. |
+| Logger channel methods return `void` instead of a promise (they never rejected). | Drop the `void`/`await` in front of `logger.info(...)`; `await logger.flush()` where the messages must be sent first. |
+| `LilypadLibLogger` methods receive `(message, meta)`, with `meta = { source, error?, detail? }`, instead of `(source, ...parts)`. `console` and `LilypadLogger` still work as they are. | For pino, pass `lilypadPinoLogger(pino)`. A custom logger reads the source and the error from `meta`. |
+| The context of a record (`record.context`) is its JSON-safe copy (`toLogJson`): errors become `{ name, message, stack, ...own properties, cause }`, dates ISO strings, BigInts `10n`. `redactLogValue` is replaced by `toLogJson`. | A custom component that read `Error` instances from the context reads plain objects. |
+| `LilypadCache` and `LilypadDbCache` wrap an internal engine instead of extending `LilypadCacheCore` (no longer exported by an entry, it never was). | None, unless code reached protected members. |
+| The changelog trigger function no longer serves the row triggers of versions 3 and earlier (they record nothing, with a `WARNING` of the database, and the schema check reports `missing-changelog-trigger`), and the changelog reads ignore the rows recorded without a schema by version 1. | Run `lilypadChangelogSql()` and `lilypadChangelogTriggerSql()` for each table, in one transaction. |
+| The caches no longer check how the changelog is pruned at runtime, unless `sync.checkPruning: true`. | Run `npx lilypad-doctor` in a deployment step (or keep the check with `checkPruning: true`). |
 
 ### Fixed
 
@@ -25,6 +35,8 @@
 
 ### Added
 
+- **`lilypad-doctor`**: `npx lilypad-doctor --url "$DATABASE_URL" --table users` checks everything the caches need, including how the changelog is pruned, and exits with 1 when the database is not set up (for a deployment step). `runLilypadDoctor(options)` does the same from code. `sync.checkPruning: true` keeps the pruning check at runtime in the caches.
+- `gate.table(schema)` and `LilypadDbTable`; `lilypadPinoLogger(pino)`; `toLogJson(value)`.
 - `shouldRetry(error, attempt)` in the options of `executeFn` and `executeWithRetries`.
 - Typed errors: `LilypadDisposedError` (a disposed cache, a closed gate), `LilypadDbMissingPrimaryKeyError`, `LilypadDbEmptyWriteError`.
 - `Symbol.asyncDispose` on the caches and the gate: `await using cache = ...`.

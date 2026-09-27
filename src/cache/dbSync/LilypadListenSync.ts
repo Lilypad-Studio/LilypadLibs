@@ -58,7 +58,7 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
           this.listenTrustedSince = Date.now();
         }
       },
-      log: (level, ...message) => host.log(level, ...message),
+      log: (level, message, detail) => host.log(level, message, detail),
     };
   }
 

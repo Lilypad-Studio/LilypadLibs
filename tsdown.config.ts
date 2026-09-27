@@ -10,16 +10,16 @@ export default defineConfig({
     platform: 'src/entries/platform.ts',
     serializer: 'src/entries/serializer.ts',
     singleton: 'src/entries/singleton.ts',
+    // The `lilypad-doctor` command (package.json `bin`)
+    'lilypad-doctor': 'src/cli/lilypad-doctor.ts',
   },
-  // .cjs/.d.cts and .mjs/.d.mts; the modules shared by several entries go to common chunks, in both
-  // formats: every entry uses the same copy of each module (e.g. of the logger classes)
-  format: ['cjs', 'esm'],
+  // ES modules only (.mjs/.d.mts): Node.js 22.12+ also loads them with require(). One format means
+  // one copy of each class, so `instanceof` works whatever the importer. The modules shared by
+  // several entries go to common chunks: every entry uses the same copy of each module
+  format: ['esm'],
   dts: true,
   sourcemap: true,
   outputOptions(options) {
-    // The sources are ES modules, so strict: the CJS output must be too ("use strict" is not
-    // emitted by default, as no source file contains it)
-    options.strict = true;
     // Shared chunks go to a subfolder, so that dist/ lists only the entries
     const chunkFileNames = options.chunkFileNames;
     options.chunkFileNames =

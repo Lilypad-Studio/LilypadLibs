@@ -1,10 +1,11 @@
-import { a as LilypadDisposedError, i as LilypadCacheCooldownError } from "./chunks/LilypadCacheCore-BXcw-MjR.mjs";
-import { n as LilypadRateLimitError, r as LilypadTimeoutError, t as LilypadFlowControl } from "./chunks/LilypadFlowControl-hGoane8R.mjs";
-import { t as LilypadCache } from "./chunks/cache-Dje5QDG-.mjs";
+import { n as LilypadDisposedError, t as LilypadCacheCooldownError } from "./chunks/LilypadCacheTypes-DuzvYfI8.mjs";
+import { n as LilypadRateLimitError, r as LilypadTimeoutError, t as LilypadFlowControl } from "./chunks/LilypadFlowControl-vVbPn-4y.mjs";
+import { n as lilypadPinoLogger } from "./chunks/LilypadLibLogger-D2eacfBb.mjs";
+import { t as LilypadCache } from "./chunks/cache-XcCUYurS.mjs";
 import "./flow.mjs";
-import { a as removeLilypadSingletonInstance, i as getLilypadSingletonInstanceAsync, r as getLilypadSingletonInstance } from "./chunks/LilypadSingleton-w0oZfBDG.mjs";
-import { a as LilypadLogger, i as LilypadLoggerComponent, n as LilypadJsonConsoleLogger, o as LILYPAD_DEFAULT_REDACTED_KEYS, r as LilypadConsoleLogger, t as LilypadDiscordLogger } from "./chunks/logger-CTjpj6W8.mjs";
+import { a as removeLilypadSingletonInstance, i as getLilypadSingletonInstanceAsync, r as getLilypadSingletonInstance } from "./chunks/LilypadSingleton-D729uyb5.mjs";
+import { a as LilypadLogger, i as LilypadLoggerComponent, n as LilypadJsonConsoleLogger, o as LILYPAD_DEFAULT_REDACTED_KEYS, r as LilypadConsoleLogger, s as toLogJson, t as LilypadDiscordLogger } from "./chunks/logger-DSifF8sg.mjs";
 import "./platform.mjs";
 import { t as LilypadSerializer } from "./chunks/serializer-DAGRw90L.mjs";
 import "./singleton.mjs";
-export { LILYPAD_DEFAULT_REDACTED_KEYS, LilypadCache, LilypadCacheCooldownError, LilypadConsoleLogger, LilypadDiscordLogger, LilypadDisposedError, LilypadFlowControl, LilypadJsonConsoleLogger, LilypadLogger, LilypadLoggerComponent, LilypadRateLimitError, LilypadSerializer, LilypadTimeoutError, getLilypadSingletonInstance, getLilypadSingletonInstanceAsync, removeLilypadSingletonInstance };
+export { LILYPAD_DEFAULT_REDACTED_KEYS, LilypadCache, LilypadCacheCooldownError, LilypadConsoleLogger, LilypadDiscordLogger, LilypadDisposedError, LilypadFlowControl, LilypadJsonConsoleLogger, LilypadLogger, LilypadLoggerComponent, LilypadRateLimitError, LilypadSerializer, LilypadTimeoutError, getLilypadSingletonInstance, getLilypadSingletonInstanceAsync, lilypadPinoLogger, removeLilypadSingletonInstance, toLogJson };

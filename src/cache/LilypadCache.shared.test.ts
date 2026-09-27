@@ -235,9 +235,8 @@ describe('LilypadCache platform features', () => {
 
       expect(result).toMatchObject({ value: 2, status: 'MISS', refreshFailed: false });
       expect(logger.warn).toHaveBeenCalledWith(
-        'products',
         'Ignoring a shared entry the codec could not decode: "p1"',
-        expect.any(Error)
+        { source: 'products', error: expect.any(Error) }
       );
     });
 
@@ -460,7 +459,7 @@ describe('LilypadCache platform features', () => {
 
       await vi.advanceTimersByTimeAsync(60_000);
       // From now on the platform runs the work at once
-      (cache as unknown as { platform: undefined }).platform = undefined;
+      (cache['engine'] as unknown as { platform: undefined }).platform = undefined;
       await cache.getOrSetDetailed('p1', retried);
       await settle();
 
@@ -657,11 +656,10 @@ describe('LilypadCache platform features', () => {
       expect(() => cache.invalidate('p1')).not.toThrow();
       await settle();
 
-      expect(logger.error).toHaveBeenCalledWith(
-        cache.name,
-        'Error in onInvalidate:',
-        expect.any(Error)
-      );
+      expect(logger.error).toHaveBeenCalledWith('Error in onInvalidate:', {
+        source: cache.name,
+        error: expect.any(Error),
+      });
     });
   });
 

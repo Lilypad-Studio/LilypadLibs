@@ -49,7 +49,8 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
  * ```typescript
  * const discordLogger = new LilypadDiscordLogger<'info' | 'error' | 'warn'>('https://discordapp.com/api/webhooks/...');
  * const logger = LilypadLogger.create({ components: { error: [discordLogger] } });
- * await logger.error('An important log message');
+ * logger.error('An important log message');
+ * await logger.flush();
  * ```
  *
  * @remarks

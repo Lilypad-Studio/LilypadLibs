@@ -37,7 +37,7 @@ export type LilypadSharedLevelOptions<V> = {
   tagPrefix: string;
   platform?: LilypadPlatform;
   /** Logs a failed operation (the cache's logger may change, e.g. on dispose). */
-  warn: (...message: unknown[]) => void;
+  warn: (message: string, detail?: unknown) => void;
   /** Receives the failure of `platform.background` itself (the operation still runs). */
   onPlatformError?: (error: unknown) => void;
 };
