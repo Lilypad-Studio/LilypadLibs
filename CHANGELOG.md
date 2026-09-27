@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `pruning: 'trigger'` and `pruning: 'cron'` (cache `sync` options, or the `changelog` options of `checkLilypadSchema`): the `no-changelog-pruning` warning then always suggests the `prune` option of the trigger, or a pg_cron job, instead of the best one it can tell. With `'cron'`, where the role cannot read `cron.database_name` (e.g. on Neon), it suggests a job in this database, and says that pg_cron must run there.
+
+### Changed
+
+- When pg_cron runs in another database, the `no-changelog-pruning` warning also suggests the `prune` option of `lilypadChangelogSql`, for when that database cannot be reached (e.g. the `postgres` database of a managed host).
+
 ## 0.5.0
 
 ### Added

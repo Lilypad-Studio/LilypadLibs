@@ -528,6 +528,10 @@ describe('the pruning of the changelog', () => {
       );
 
       expect(result.problems[0]!.message).toContain('pg_cron runs in the database "postgres"');
+      // The alternative when the pg_cron database cannot be reached
+      expect(result.problems[0]!.message).toContain(
+        `lilypadChangelogSql({ prune: { olderThan: ${DAY} } })`
+      );
       expect(result.problems[0]!.fix).toBe(
         '-- Run in the database "postgres", where pg_cron runs:\n' +
           'CREATE EXTENSION IF NOT EXISTS pg_cron;\n' +
@@ -537,6 +541,107 @@ describe('the pruning of the changelog', () => {
             database: 'app',
           })
       );
+    });
+
+    it('should tell how to choose the suggestion', () => {
+      const result = evaluateLilypadSchema(unpruned(), changelogOptions);
+
+      expect(result.problems[0]!.message).toContain("set pruning: 'trigger' or 'cron'");
+    });
+
+    describe("with pruning: 'trigger'", () => {
+      const options = { ...changelogOptions, changelog: { pruning: 'trigger' as const } };
+
+      it.each([
+        ['pg_cron is installed', { available: true, installed: true, database: 'app', jobs: [] }],
+        ['pg_cron runs in another database', { available: true, database: 'postgres' }],
+        ['pg_cron is available', { available: true }],
+      ])('should suggest the prune option of the trigger when %s', (_, cron) => {
+        const result = evaluateLilypadSchema(unpruned(cron), options);
+
+        expect(codes(result)).toEqual(['no-changelog-pruning']);
+        expect(result.problems[0]!.fix).toBe(
+          lilypadChangelogSql({ notifyChannel: false, prune: { olderThan: DAY } })
+        );
+        expect(result.problems[0]!.message).not.toContain('pg_cron');
+        expect(result.problems[0]!.message).not.toContain("set pruning: 'trigger' or 'cron'");
+      });
+
+      it('should install the changelog with the prune option when it is missing', () => {
+        const result = evaluateLilypadSchema(
+          facts({
+            changelog: noChangelog,
+            cron: { available: true, installed: true, database: 'app', jobs: [] },
+          }),
+          options
+        );
+
+        expect(codes(result)).toEqual(['missing-changelog', 'no-changelog-pruning']);
+        expect(result.problems[0]!.fix).toContain('PERFORM "lilypad_cache_changes_prune"()');
+      });
+
+      it('should still accept a pg_cron job found', () => {
+        expect(evaluateLilypadSchema(facts(), options).problems).toEqual([]);
+      });
+    });
+
+    describe("with pruning: 'cron'", () => {
+      const options = { ...changelogOptions, changelog: { pruning: 'cron' as const } };
+
+      it('should suggest a job in this database when it cannot tell where pg_cron runs', () => {
+        const result = evaluateLilypadSchema(unpruned({ available: true }), options);
+
+        expect(codes(result)).toEqual(['no-changelog-pruning']);
+        expect(result.problems[0]!.fix).toBe(
+          'CREATE EXTENSION IF NOT EXISTS pg_cron;\n' +
+            lilypadChangelogPruneScheduleSql({ olderThan: DAY })
+        );
+        expect(result.problems[0]!.message).toContain('must be this one, "app"');
+        expect(result.problems[0]!.message).toContain(
+          `lilypadChangelogPruneScheduleSql({ olderThan: ${DAY}, changelogTable: 'public.lilypad_cache_changes', database: 'app' })`
+        );
+        expect(result.problems[0]!.message).not.toContain('lilypadChangelogSql');
+        expect(result.problems[0]!.message).not.toContain('not available');
+      });
+
+      it('should say when the server does not have pg_cron', () => {
+        const result = evaluateLilypadSchema(unpruned(), options);
+
+        expect(result.problems[0]!.fix).toContain('CREATE EXTENSION IF NOT EXISTS pg_cron;\n');
+        expect(result.problems[0]!.message).toContain('pg_cron is not available on this server');
+      });
+
+      it('should schedule from the database pg_cron runs in, without the trigger alternative', () => {
+        const result = evaluateLilypadSchema(
+          unpruned({ available: true, database: 'postgres' }),
+          options
+        );
+
+        expect(result.problems[0]!.message).not.toContain('lilypadChangelogSql');
+        expect(result.problems[0]!.fix).toContain('-- Run in the database "postgres"');
+      });
+
+      it('should schedule from there even if the schema of the changelog is unknown', () => {
+        const result = evaluateLilypadSchema(
+          facts({
+            changelog: noChangelog,
+            cron: { available: true, installed: false, database: 'postgres', jobs: null },
+          }),
+          options
+        );
+
+        expect(codes(result)).toEqual(['missing-changelog', 'no-changelog-pruning']);
+        // The changelog is installed without the prune option
+        expect(result.problems[0]!.fix).not.toContain('PERFORM "lilypad_cache_changes_prune"()');
+        expect(result.problems[1]!.fix).toContain(
+          lilypadChangelogPruneScheduleSql({
+            olderThan: DAY,
+            changelogTable: 'lilypad_cache_changes',
+            database: 'app',
+          })
+        );
+        expect(result.problems[1]!.message).toContain('Qualify the changelog table');
+      });
     });
 
     it('should install the changelog with the suggested pruning when it is missing', () => {

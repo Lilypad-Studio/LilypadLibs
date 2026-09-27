@@ -1431,12 +1431,12 @@ function evaluatePruning(facts, changelog, options, changelogSql) {
 	const external = options?.pruning === "external" || facts.changelog.deletedRows > 0;
 	let prune = installed;
 	if (detected.length === 0 && !external) {
-		const suggestion = suggestPruning(facts, changelog, recommended, changelogSql);
+		const suggestion = suggestPruning(facts, changelog, recommended, changelogSql, options?.pruning ?? "detect");
 		const inactive = cronJobs.find((job) => !job.active);
 		problems.push({
 			code: "no-changelog-pruning",
 			severity: "warning",
-			message: `Nothing deletes the old rows of the changelog "${changelog.table}"` + (age !== null && age > DAY ? ` (the oldest is ${formatDuration(age)} old)` : "") + `: it grows with every change. ` + (inactive ? `The pg_cron job "${inactive.name ?? inactive.id ?? ""}" deletes them, but is inactive. ` : "") + `${suggestion.message} If a job of your own deletes them (e.g. pruneLilypadChangelog from a scheduled function), set pruning: 'external'.`,
+			message: `Nothing deletes the old rows of the changelog "${changelog.table}"` + (age !== null && age > DAY ? ` (the oldest is ${formatDuration(age)} old)` : "") + `: it grows with every change. ` + (inactive ? `The pg_cron job "${inactive.name ?? inactive.id ?? ""}" deletes them, but is inactive. ` : "") + `${suggestion.message} If a job of your own deletes them (e.g. pruneLilypadChangelog from a scheduled function), set pruning: 'external'.` + (options?.pruning === "trigger" || options?.pruning === "cron" ? "" : ` To choose the suggested pruning, set pruning: 'trigger' or 'cron'.`),
 			fix: suggestion.fix
 		});
 		prune = suggestion.prune ?? installed;
@@ -1464,10 +1464,20 @@ function capitalize(text) {
 /**
 * The best pruning for the database: a pg_cron job, which keeps the deletions out of the writes,
 * when pg_cron is known to run; otherwise the `prune` option of the trigger, which needs nothing.
+* `pruning: 'trigger'` or `'cron'` asks for one of them whatever the database.
 */
-function suggestPruning(facts, changelog, olderThan, changelogSql) {
+function suggestPruning(facts, changelog, olderThan, changelogSql, pruning) {
 	const { cron } = facts;
 	const retention = formatDuration(olderThan);
+	const trigger = `The fix makes the changelog trigger delete the rows older than ${retention} as it records changes (the prune option of lilypadChangelogSql).`;
+	if (pruning === "trigger") {
+		const prune = { olderThan };
+		return {
+			message: trigger,
+			fix: changelogSql(prune),
+			prune
+		};
+	}
 	if (cron.installed || cron.database === facts.database) return {
 		message: cron.installed ? `pg_cron is installed, with no job of this role that deletes them (the jobs of the other roles are not visible): the fix schedules a daily one, which deletes the rows older than ${retention}.` : `pg_cron runs in this database: the fix installs it and schedules a daily job that deletes the rows older than ${retention}.`,
 		fix: (cron.installed ? "" : "CREATE EXTENSION IF NOT EXISTS pg_cron;\n") + lilypadChangelogPruneScheduleSql({
@@ -1475,9 +1485,10 @@ function suggestPruning(facts, changelog, olderThan, changelogSql) {
 			changelogTable: changelog.custom
 		})
 	};
-	const schema = changelog.table.includes(".") ? void 0 : facts.changelog.schema;
-	if (cron.database !== null && (schema || changelog.table.includes("."))) return {
-		message: `pg_cron runs in the database "${cron.database}": the fix, to run there, schedules a daily job that deletes the rows older than ${retention} in this one.`,
+	const qualified = changelog.table.includes(".");
+	const schema = qualified ? void 0 : facts.changelog.schema;
+	if (cron.database !== null && (schema || qualified || pruning === "cron")) return {
+		message: `pg_cron runs in the database "${cron.database}": the fix, to run there, schedules a daily job that deletes the rows older than ${retention} in this one.` + (schema || qualified ? "" : ` Qualify the changelog table with its schema if it is not on the search_path of the role of the job.`) + (pruning === "cron" ? "" : ` If you cannot run SQL there (e.g. on a managed host), make the changelog trigger delete them as it records changes, from this database: lilypadChangelogSql({ prune: { olderThan: ${olderThan} } }).`),
 		fix: `-- Run in the database "${cron.database}", where pg_cron runs:\nCREATE EXTENSION IF NOT EXISTS pg_cron;
 ` + lilypadChangelogPruneScheduleSql({
 			olderThan,
@@ -1485,9 +1496,19 @@ function suggestPruning(facts, changelog, olderThan, changelogSql) {
 			database: facts.database
 		})
 	};
+	if (pruning === "cron") {
+		const table = qualified ? changelog.table : `${schema ?? "<schema>"}.${changelog.table}`;
+		return {
+			message: `The fix installs pg_cron and schedules a daily job that deletes the rows older than ${retention}.` + (cron.available ? "" : " pg_cron is not available on this server yet.") + ` pg_cron runs in the one database set by cron.database_name, which must be this one, "${facts.database}" (on a managed host such as Neon, set it in the settings of the host first). If it is another one, schedule the job from there instead: lilypadChangelogPruneScheduleSql({ olderThan: ${olderThan}, changelogTable: '${table}', database: '${facts.database}' }).`,
+			fix: "CREATE EXTENSION IF NOT EXISTS pg_cron;\n" + lilypadChangelogPruneScheduleSql({
+				olderThan,
+				changelogTable: changelog.custom
+			})
+		};
+	}
 	const prune = { olderThan };
 	return {
-		message: `The fix makes the changelog trigger delete the rows older than ${retention} as it records changes (the prune option of lilypadChangelogSql).` + (cron.available ? ` pg_cron is available on this server: if it is enabled (shared_preload_libraries), a pg_cron job keeps the deletions out of the writes: lilypadChangelogPruneScheduleSql({ olderThan: ${olderThan} }).` : ""),
+		message: trigger + (cron.available ? ` pg_cron is available on this server: if it is enabled (shared_preload_libraries), a pg_cron job keeps the deletions out of the writes: lilypadChangelogPruneScheduleSql({ olderThan: ${olderThan} }).` : ""),
 		fix: changelogSql(prune),
 		prune
 	};

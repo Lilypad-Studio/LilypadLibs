@@ -21,10 +21,13 @@ import { assertNumberOption } from '@/internal/LilypadValidation';
  * How the old changelog rows are deleted:
  * - `detect`: the check looks for the `prune` option of the trigger and for a pg_cron job that
  *   deletes them, and suggests the best one for the database if it finds neither;
+ * - `trigger`: the same, but it always suggests the `prune` option of the trigger;
+ * - `cron`: the same, but it always suggests a pg_cron job, even where it cannot tell whether
+ *   pg_cron runs in this database (e.g. when the role cannot read `cron.database_name`);
  * - `external`: a job the database cannot show deletes them (e.g. `pruneLilypadChangelog` called
  *   from a scheduled function): nothing is suggested, only the age of the oldest row is checked.
  */
-export type LilypadChangelogPruning = 'detect' | 'external';
+export type LilypadChangelogPruning = 'detect' | 'trigger' | 'cron' | 'external';
 
 export type LilypadSchemaCheckOptions = {
   /** The cached tables, as in their `LilypadDbSchema` (`tableName`, `primaryKey`). */
@@ -87,7 +90,8 @@ export type LilypadSchemaProblemCode =
   /**
    * A warning: nothing is known to delete the old changelog rows. Neither the `prune` option of
    * the trigger nor a pg_cron job was found, no row was ever deleted from the changelog, and
-   * `pruning` is not `external`. The fix is the best pruning for the database.
+   * `pruning` is not `external`. The fix is the best pruning for the database, or the one
+   * `pruning` asks for (`trigger` or `cron`).
    */
   | 'no-changelog-pruning'
   /**
@@ -488,7 +492,13 @@ function evaluatePruning(
   const external = options?.pruning === 'external' || facts.changelog.deletedRows > 0;
   let prune = installed;
   if (detected.length === 0 && !external) {
-    const suggestion = suggestPruning(facts, changelog, recommended, changelogSql);
+    const suggestion = suggestPruning(
+      facts,
+      changelog,
+      recommended,
+      changelogSql,
+      options?.pruning ?? 'detect'
+    );
     const inactive = cronJobs.find((job) => !job.active);
     problems.push({
       code: 'no-changelog-pruning',
@@ -500,7 +510,10 @@ function evaluatePruning(
         (inactive
           ? `The pg_cron job "${inactive.name ?? inactive.id ?? ''}" deletes them, but is inactive. `
           : '') +
-        `${suggestion.message} If a job of your own deletes them (e.g. pruneLilypadChangelog from a scheduled function), set pruning: 'external'.`,
+        `${suggestion.message} If a job of your own deletes them (e.g. pruneLilypadChangelog from a scheduled function), set pruning: 'external'.` +
+        (options?.pruning === 'trigger' || options?.pruning === 'cron'
+          ? ''
+          : ` To choose the suggested pruning, set pruning: 'trigger' or 'cron'.`),
       fix: suggestion.fix,
     });
     prune = suggestion.prune ?? installed;
@@ -538,15 +551,22 @@ function capitalize(text: string): string {
 /**
  * The best pruning for the database: a pg_cron job, which keeps the deletions out of the writes,
  * when pg_cron is known to run; otherwise the `prune` option of the trigger, which needs nothing.
+ * `pruning: 'trigger'` or `'cron'` asks for one of them whatever the database.
  */
 function suggestPruning(
   facts: LilypadSchemaFacts,
   changelog: NonNullable<ReturnType<typeof changelogTarget>>,
   olderThan: number,
-  changelogSql: (prune: LilypadChangelogPruneOptions | false) => string
+  changelogSql: (prune: LilypadChangelogPruneOptions | false) => string,
+  pruning: LilypadChangelogPruning
 ): { message: string; fix: string; prune?: LilypadChangelogPruneOptions } {
   const { cron } = facts;
   const retention = formatDuration(olderThan);
+  const trigger = `The fix makes the changelog trigger delete the rows older than ${retention} as it records changes (the prune option of lilypadChangelogSql).`;
+  if (pruning === 'trigger') {
+    const prune = { olderThan };
+    return { message: trigger, fix: changelogSql(prune), prune };
+  }
   if (cron.installed || cron.database === facts.database) {
     return {
       message: cron.installed
@@ -557,11 +577,21 @@ function suggestPruning(
         lilypadChangelogPruneScheduleSql({ olderThan, changelogTable: changelog.custom }),
     };
   }
-  // pg_cron runs in another database: the job is scheduled there, and runs in this one
-  const schema = changelog.table.includes('.') ? undefined : facts.changelog.schema;
-  if (cron.database !== null && (schema || changelog.table.includes('.'))) {
+  // pg_cron runs in another database: the job is scheduled there, and runs in this one. With
+  // `detect`, only if the table can be qualified with its schema (the job has the search_path of
+  // its role); else the trigger, which needs neither
+  const qualified = changelog.table.includes('.');
+  const schema = qualified ? undefined : facts.changelog.schema;
+  if (cron.database !== null && (schema || qualified || pruning === 'cron')) {
     return {
-      message: `pg_cron runs in the database "${cron.database}": the fix, to run there, schedules a daily job that deletes the rows older than ${retention} in this one.`,
+      message:
+        `pg_cron runs in the database "${cron.database}": the fix, to run there, schedules a daily job that deletes the rows older than ${retention} in this one.` +
+        (schema || qualified
+          ? ''
+          : ` Qualify the changelog table with its schema if it is not on the search_path of the role of the job.`) +
+        (pruning === 'cron'
+          ? ''
+          : ` If you cannot run SQL there (e.g. on a managed host), make the changelog trigger delete them as it records changes, from this database: lilypadChangelogSql({ prune: { olderThan: ${olderThan} } }).`),
       fix:
         `-- Run in the database "${cron.database}", where pg_cron runs:\n` +
         'CREATE EXTENSION IF NOT EXISTS pg_cron;\n' +
@@ -572,10 +602,24 @@ function suggestPruning(
         }),
     };
   }
+  // Where pg_cron runs is unknown (e.g. `cron.database_name` is hidden from the role): this one
+  if (pruning === 'cron') {
+    const table = qualified ? changelog.table : `${schema ?? '<schema>'}.${changelog.table}`;
+    return {
+      message:
+        `The fix installs pg_cron and schedules a daily job that deletes the rows older than ${retention}.` +
+        (cron.available ? '' : ' pg_cron is not available on this server yet.') +
+        ` pg_cron runs in the one database set by cron.database_name, which must be this one, "${facts.database}" (on a managed host such as Neon, set it in the settings of the host first).` +
+        ` If it is another one, schedule the job from there instead: lilypadChangelogPruneScheduleSql({ olderThan: ${olderThan}, changelogTable: '${table}', database: '${facts.database}' }).`,
+      fix:
+        'CREATE EXTENSION IF NOT EXISTS pg_cron;\n' +
+        lilypadChangelogPruneScheduleSql({ olderThan, changelogTable: changelog.custom }),
+    };
+  }
   const prune = { olderThan };
   return {
     message:
-      `The fix makes the changelog trigger delete the rows older than ${retention} as it records changes (the prune option of lilypadChangelogSql).` +
+      trigger +
       (cron.available
         ? ` pg_cron is available on this server: if it is enabled (shared_preload_libraries), a pg_cron job keeps the deletions out of the writes: lilypadChangelogPruneScheduleSql({ olderThan: ${olderThan} }).`
         : ''),

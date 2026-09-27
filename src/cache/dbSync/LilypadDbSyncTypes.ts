@@ -85,7 +85,8 @@ export type LilypadDbCacheChangelogSync = LilypadDbCacheTrustedSyncOptions & {
   /**
    * How the old changelog rows are deleted, for the schema check. `detect` (default): it looks for
    * the `prune` option of the trigger and for a pg_cron job, and warns with the best one for the
-   * database if it finds neither. `external`: a job it cannot see deletes them (e.g.
+   * database if it finds neither. `trigger` / `cron`: the same, but it always suggests the `prune`
+   * option of the trigger / a pg_cron job. `external`: a job it cannot see deletes them (e.g.
    * `pruneLilypadChangelog` from a scheduled function), so it suggests nothing.
    */
   pruning?: LilypadChangelogPruning;

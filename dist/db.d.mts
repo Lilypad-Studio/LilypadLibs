@@ -453,10 +453,13 @@ export declare function pruneLilypadChangelog(gate: LilypadDbGate, options: {
  * How the old changelog rows are deleted:
  * - `detect`: the check looks for the `prune` option of the trigger and for a pg_cron job that
  *   deletes them, and suggests the best one for the database if it finds neither;
+ * - `trigger`: the same, but it always suggests the `prune` option of the trigger;
+ * - `cron`: the same, but it always suggests a pg_cron job, even where it cannot tell whether
+ *   pg_cron runs in this database (e.g. when the role cannot read `cron.database_name`);
  * - `external`: a job the database cannot show deletes them (e.g. `pruneLilypadChangelog` called
  *   from a scheduled function): nothing is suggested, only the age of the oldest row is checked.
  */
-type LilypadChangelogPruning = 'detect' | 'external';
+type LilypadChangelogPruning = 'detect' | 'trigger' | 'cron' | 'external';
 type LilypadSchemaCheckOptions = {
   /** The cached tables, as in their `LilypadDbSchema` (`tableName`, `primaryKey`). */
   tables: {
@@ -518,7 +521,8 @@ type LilypadSchemaProblemCode =
 /**
  * A warning: nothing is known to delete the old changelog rows. Neither the `prune` option of
  * the trigger nor a pg_cron job was found, no row was ever deleted from the changelog, and
- * `pruning` is not `external`. The fix is the best pruning for the database.
+ * `pruning` is not `external`. The fix is the best pruning for the database, or the one
+ * `pruning` asks for (`trigger` or `cron`).
  */
 'no-changelog-pruning' |
 /**
@@ -651,7 +655,8 @@ type LilypadDbCacheChangelogSync = LilypadDbCacheTrustedSyncOptions & {
   /**
    * How the old changelog rows are deleted, for the schema check. `detect` (default): it looks for
    * the `prune` option of the trigger and for a pg_cron job, and warns with the best one for the
-   * database if it finds neither. `external`: a job it cannot see deletes them (e.g.
+   * database if it finds neither. `trigger` / `cron`: the same, but it always suggests the `prune`
+   * option of the trigger / a pg_cron job. `external`: a job it cannot see deletes them (e.g.
    * `pruneLilypadChangelog` from a scheduled function), so it suggests nothing.
    */
   pruning?: LilypadChangelogPruning;
