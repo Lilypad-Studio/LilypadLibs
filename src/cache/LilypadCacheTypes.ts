@@ -19,7 +19,7 @@ export type LilypadCacheErrorContext<K extends LilypadCacheKey, V> = {
   /** The error of the fetch, or a `LilypadCacheCooldownError`. */
   error: unknown;
   /** The last value of the key, expired or invalidated, if the cache still holds one. */
-  stale?: { value: LilypadCachedValueType<V>; fetchedAt: number };
+  stale?: { value: LilypadCachedValueType<V>; fetchedAt: number } | undefined;
 };
 
 /** What `getOrSet` returns when the fetch fails. */
@@ -33,9 +33,10 @@ export type LilypadCacheErrorOptions<K extends LilypadCacheKey, V> = {
    */
   fallback?:
     | 'stale'
-    | ((context: LilypadCacheErrorContext<K, V>) => LilypadCachedValueType<V> | undefined);
+    | ((context: LilypadCacheErrorContext<K, V>) => LilypadCachedValueType<V> | undefined)
+    | undefined;
   /** TTL of the cached fallback, in ms. Defaults to the cache's `errorTtl`. */
-  ttl?: number;
+  ttl?: number | undefined;
 };
 
 export type LilypadCacheGetOptions<K extends LilypadCacheKey, V> = {
@@ -43,24 +44,24 @@ export type LilypadCacheGetOptions<K extends LilypadCacheKey, V> = {
    * TTL in milliseconds of the fetched value; defaults to the cache's TTL. Concurrent calls share
    * one fetch: the value is cached with the TTL of the call that started it.
    */
-  ttl?: number;
+  ttl?: number | undefined;
   /**
    * If true, skips the lookup (memory, shared level, stale value) and fetches with `valueFn`. A
    * fetch of the key already in flight is joined instead of starting another one.
    */
-  skipCache?: boolean;
+  skipCache?: boolean | undefined;
   /**
    * How long after its expiration a value is still returned at once, while it is refreshed in the
    * background. Overrides the cache's `staleWhileRevalidate`.
    */
-  staleWhileRevalidate?: number;
+  staleWhileRevalidate?: number | undefined;
   /**
    * Timeout of the fetch, in milliseconds. Overrides the cache's `fetchTimeout`. Concurrent calls
    * share the timeout of the call that started the fetch.
    */
-  timeout?: number;
+  timeout?: number | undefined;
   /** The value returned (and briefly cached) when the fetch fails; applied to each caller. */
-  onError?: LilypadCacheErrorOptions<K, V>;
+  onError?: LilypadCacheErrorOptions<K, V> | undefined;
 };
 
 /**
@@ -94,27 +95,27 @@ export type LilypadSharedCodec<V> = {
 
 export type LilypadCacheSharedOptions<V> = {
   /** Defaults to the `shared` store of the cache's `platform`. */
-  store?: LilypadSharedStore;
+  store?: LilypadSharedStore | undefined;
   /**
    * Without a codec, values are stored as they are: this suits JSON-compatible values only
    * (e.g. a `Date` comes back as a string). A codec also validates what comes back.
    */
-  codec?: LilypadSharedCodec<V>;
+  codec?: LilypadSharedCodec<V> | undefined;
   /** Beyond this time (ms) a shared store operation counts as failed. Defaults to 300 ms. */
-  timeout?: number;
+  timeout?: number | undefined;
   /**
    * If set, a background refresh holds a lock in the shared store for this long (ms), so that the
    * other instances do not refresh the same key at the same time. It is a soft lock (read and
    * write are not atomic): rarely, two instances still refresh together. Set it to the maximum
    * duration of a fetch.
    */
-  refreshLockTtl?: number;
+  refreshLockTtl?: number | undefined;
   /**
    * If true, each write first reads the shared entry, and leaves it alone when it holds a value
    * fetched later. It costs one more round-trip per write, and the check is soft (read and write
    * are not atomic). Defaults to false.
    */
-  checkBeforeWrite?: boolean;
+  checkBeforeWrite?: boolean | undefined;
 };
 
 /**
@@ -161,7 +162,7 @@ export type LilypadCacheEntry<K, V> = {
   fetchedAt: number;
   ticket: number;
   origin: LilypadCacheEntryOrigin;
-  invalidatedAt?: number;
+  invalidatedAt?: number | undefined;
 };
 
 /**
@@ -207,56 +208,56 @@ export type LilypadCacheBulkSyncOptions<K, V> = {
    * Loads every entry of the source, for `bulkSync` and `getAll`. It receives a signal that
    * is aborted when the sync times out. Without it, `bulkSync` resolves to `false`.
    */
-  fn?: LilypadCacheSyncFn<K, V>;
+  fn?: LilypadCacheSyncFn<K, V> | undefined;
   /**
    * How long a bulk sync stays fresh (ms). Defaults to `ttl`, and never exceeds it: the entries of
    * the sync expire after `ttl`.
    */
-  ttl?: number;
+  ttl?: number | undefined;
   /** Timeout of a bulk sync, in milliseconds. Defaults to 30 seconds. */
-  timeout?: number;
+  timeout?: number | undefined;
 };
 
 export type LilypadCacheOptions<K extends LilypadCacheKey, V> = {
   /** Time to live of the entries, in milliseconds. Defaults to 60 seconds. */
-  ttl?: number;
+  ttl?: number | undefined;
   /**
    * Identifies the cache in the shared level, in invalidation events and in logs. Required with
    * `shared`, and unique among the caches that use the same shared store.
    */
-  name?: string;
+  name?: string | undefined;
   /** Platform capabilities: background work, shared store, invalidation hook. */
-  platform?: LilypadPlatform;
+  platform?: LilypadPlatform | undefined;
   /** Adds a level shared by every instance (e.g. the Vercel Runtime Cache). */
-  shared?: LilypadCacheSharedOptions<V>;
+  shared?: LilypadCacheSharedOptions<V> | undefined;
   /**
    * How long after its expiration a value is still returned at once by `getOrSet`, while it is
    * refreshed in the background. Defaults to 0 (disabled).
    */
-  staleWhileRevalidate?: number;
+  staleWhileRevalidate?: number | undefined;
   /**
    * After a failed fetch, the key is not fetched again for this long (ms): the stale value or the
    * fallback is used, or `LilypadCacheCooldownError` is thrown. Shared through the shared level.
    * Defaults to 0 (disabled).
    */
-  failureCooldown?: number;
+  failureCooldown?: number | undefined;
   /** Maximum number of entries in memory; the least recently used are removed first. */
-  maxEntries?: number;
+  maxEntries?: number | undefined;
   /**
    * Removes expired entries during cache accesses, at most once per this interval (ms). Unlike
    * `autoCleanupInterval` it needs no timer, so it also works on instances that are suspended
    * between requests.
    */
-  cleanupOnAccessEvery?: number;
+  cleanupOnAccessEvery?: number | undefined;
   /** Removes expired entries with a timer. On serverless platforms prefer `cleanupOnAccessEvery`. */
-  autoCleanupInterval?: number;
+  autoCleanupInterval?: number | undefined;
   /** TTL of the fallbacks cached after a failed fetch. Defaults to the smaller of `ttl` and 5 minutes. */
-  errorTtl?: number;
+  errorTtl?: number | undefined;
   /** Timeout of the fetches of `getOrSet`, in milliseconds. Defaults to 5 seconds. */
-  fetchTimeout?: number;
+  fetchTimeout?: number | undefined;
   /** Loading the whole source at once (`bulkSync`, `getAll`). */
-  bulkSync?: LilypadCacheBulkSyncOptions<K, V>;
-  logger?: LilypadLibLogger;
+  bulkSync?: LilypadCacheBulkSyncOptions<K, V> | undefined;
+  logger?: LilypadLibLogger | undefined;
   /** Prefix of the tags of the invalidation events. Defaults to `lilypad`. */
-  tagPrefix?: string;
+  tagPrefix?: string | undefined;
 };

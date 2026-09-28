@@ -6,6 +6,7 @@ import {
   LilypadDbNotFoundError,
   type LilypadDbDeleteResult,
   type LilypadDbInsertData,
+  type LilypadDbPartialRow,
   type LilypadDbUpdateData,
   type LilypadDbWriteResult,
 } from '@/dbGate/LilypadDbSchema';
@@ -105,10 +106,10 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
    * - leaves the primary key out of the `SET` of an update: it identifies the row;
    * - skips `undefined` values, which postgres.js rejects.
    */
-  private prepareWrite(data: Partial<T>, operation: 'insert' | 'update') {
+  private prepareWrite(data: LilypadDbPartialRow<T>, operation: 'insert' | 'update') {
     const { definition: schema } = this;
     const write = schema.hooks?.write;
-    const writeData: Partial<T> = write ? { ...write({ ...data }) } : { ...data };
+    const writeData: LilypadDbPartialRow<T> = write ? { ...write({ ...data }) } : { ...data };
 
     const primaryKeyValue = writeData[schema.primaryKey];
     const primaryKeyRequired = operation === 'update' || !schema.generatedPrimaryKey;
@@ -116,6 +117,7 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
       throw new LilypadDbMissingPrimaryKeyError(schema, operation);
     }
     if (schema.generatedPrimaryKey) {
+      // eslint-disable-next-line @typescript-eslint/no-dynamic-delete -- writeData is a copy
       delete writeData[schema.primaryKey];
     }
 
@@ -147,7 +149,7 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
    * @param options.signal - Stops reading (and closes the cursor) once aborted: the promise then
    * rejects with the reason of the signal.
    */
-  async selectAll(options: { signal?: AbortSignal } = {}): Promise<T[]> {
+  async selectAll(options: { signal?: AbortSignal | undefined } = {}): Promise<T[]> {
     this.gate.assertOpen();
     const { signal } = options;
     signal?.throwIfAborted();
@@ -206,7 +208,10 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
    */
   async insert(data: LilypadDbInsertData<T, PK>): Promise<LilypadDbWriteResult<T>> {
     this.gate.assertOpen();
-    const { data: insertData, columns } = this.prepareWrite(data as Partial<T>, 'insert');
+    const { data: insertData, columns } = this.prepareWrite(
+      data as LilypadDbPartialRow<T>,
+      'insert'
+    );
     return this.writeResult(
       await this.sql`
         INSERT INTO ${this.tableName} ${this.sql(insertData, columns)}

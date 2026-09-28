@@ -86,7 +86,7 @@ describe('runLilypadInitCli', () => {
     const content = fs.written.get(resolve(cwd, 'lilypad.analytics.config.ts'))!;
     expect(content).toContain("name: 'analytics',");
     expect(content).toContain('tables: {},');
-    expect(content).toContain("import { defineLilypadDb } from '@lilypad/libs/schema';");
+    expect(content).toContain("import { defineLilypadDb } from '@lilypad-studio/libs/schema';");
     expect(out.log).toHaveBeenCalledWith(
       expect.stringContaining('npx lilypad-doctor --config analytics --url')
     );
@@ -186,7 +186,10 @@ describe('lilypadDbConfigTemplate', () => {
   ])('should define a valid config (%s)', async (_case, extension, typescript, empty) => {
     const file = join(dir, `lilypad.template-${extension}-${String(empty)}.config.${extension}`);
     const content = lilypadDbConfigTemplate({ name: 'template', typescript, empty });
-    writeFileSync(file, content.replaceAll("from '@lilypad/libs/schema'", `from '${schemaEntry}'`));
+    writeFileSync(
+      file,
+      content.replaceAll("from '@lilypad-studio/libs/schema'", `from '${schemaEntry}'`)
+    );
 
     const module = (await import(pathToFileURL(file).href)) as { default: LilypadDbConfig };
 
@@ -194,6 +197,7 @@ describe('lilypadDbConfigTemplate', () => {
     expect(module.default.name).toBe('template');
     expect(Object.keys(module.default.tables)).toEqual(empty ? [] : ['example']);
     if (!empty) {
+      // eslint-disable-next-line vitest/no-conditional-expect -- the empty template has no table
       expect(module.default.tables.example).toMatchObject({
         qualifiedName: 'public.example',
         primaryKey: 'id',

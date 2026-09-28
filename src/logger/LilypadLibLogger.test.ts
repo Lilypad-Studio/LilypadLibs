@@ -12,7 +12,7 @@ describe('libLog', () => {
       },
     };
 
-    libLog(logger as LilypadLibLogger, 'info', 'cache', 'hello');
+    libLog(logger, 'info', 'cache', 'hello');
 
     expect(logger.lines).toEqual(['app: [cache] hello']);
   });

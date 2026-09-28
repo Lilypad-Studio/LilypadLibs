@@ -54,8 +54,7 @@ describe('LilypadChangelogReader', () => {
 
     await reader.read(users.value);
 
-    expect(batch.read).toHaveBeenCalledOnce();
-    expect(batch.read).toHaveBeenCalledWith(gate, {
+    expect(batch.read).toHaveBeenCalledExactlyOnceWith(gate, {
       changelogTable: 'changes',
       requests: [
         { tableName: 'users', since: { lookback: 0 } },

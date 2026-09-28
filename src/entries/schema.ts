@@ -1,5 +1,5 @@
 /**
- * `@lilypad/libs/schema`: the database configs (`defineLilypadDb`, `defineLilypadTable`), the
+ * `@lilypad-studio/libs/schema`: the database configs (`defineLilypadDb`, `defineLilypadTable`), the
  * description of the tables, and `bindLilypadDbHooks`, with which the application binds its
  * functions to a config. Runs in Node.js and in edge runtimes, without postgres.js: a config file
  * imports only this entry, so that the application and `lilypad-doctor` can both load it.
@@ -62,6 +62,7 @@ export type {
   LilypadDbIndex,
   LilypadDbIndexMethod,
   LilypadDbInsertData,
+  LilypadDbPartialRow,
   LilypadDbReference,
   LilypadDbReferentialAction,
   LilypadDbSchema,

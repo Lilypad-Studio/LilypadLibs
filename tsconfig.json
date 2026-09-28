@@ -1,19 +1,26 @@
 {
+  // Type checking only (`tsc`): tsdown builds dist/, so the sources are written for a bundler
   "compilerOptions": {
-    "module": "nodenext",
-    "outDir": "dist",
-    "moduleResolution": "nodenext",
+    "target": "es2023",
+    "lib": ["es2023"],
+    "types": ["node"],
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "noEmit": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
     "declaration": true,
+    "isolatedDeclarations": true,
     "strict": true,
-    "esModuleInterop": true,
+    "exactOptionalPropertyTypes": true,
     "noImplicitOverride": true,
-    "noImplicitAny": true,
     "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
     "noUncheckedIndexedAccess": true,
     "skipLibCheck": true,
     "paths": {
       "@/*": ["./src/*"]
     }
   },
-  "include": ["src", "vitest.config.ts", "tsdown.config.ts"],
+  "include": ["src", "*.config.ts"]
 }

@@ -11,7 +11,7 @@ import {
 const SHARED_FORMAT_VERSION = 2;
 
 /** What the cache stores in the shared level. */
-export type LilypadSharedEnvelope = {
+type LilypadSharedEnvelope = {
   lilypad: typeof SHARED_FORMAT_VERSION;
   value: unknown;
   fetchedAt: number;
@@ -27,19 +27,19 @@ export type LilypadSharedEntry<V> = {
 
 export type LilypadSharedLevelOptions<V> = {
   store: LilypadSharedStore;
-  codec?: LilypadSharedCodec<V>;
+  codec?: LilypadSharedCodec<V> | undefined;
   /** Beyond this time (ms) an operation counts as failed. */
   timeout: number;
-  refreshLockTtl?: number;
+  refreshLockTtl?: number | undefined;
   checkBeforeWrite: boolean;
   /** The name of the cache: it namespaces the keys. */
   name: string;
   tagPrefix: string;
-  platform?: LilypadPlatform;
+  platform?: LilypadPlatform | undefined;
   /** Logs a failed operation (the cache's logger may change, e.g. on dispose). */
   warn: (message: string, detail?: unknown) => void;
   /** Receives the failure of `platform.background` itself (the operation still runs). */
-  onPlatformError?: (error: unknown) => void;
+  onPlatformError?: ((error: unknown) => void) | undefined;
 };
 
 /**
@@ -123,7 +123,11 @@ export class LilypadSharedLevel<V> {
   async read(
     normalizedKey: string,
     withFailure: boolean
-  ): Promise<{ entry?: LilypadSharedEntry<V>; failedAt?: number; locked: boolean }> {
+  ): Promise<{
+    entry?: LilypadSharedEntry<V> | undefined;
+    failedAt?: number | undefined;
+    locked: boolean;
+  }> {
     const [raw, failedAt, lock] = await Promise.all([
       this.operation(
         `read of "${normalizedKey}"`,

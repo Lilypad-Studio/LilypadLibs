@@ -23,7 +23,7 @@ Create this file in your application. It is the only place that imports Next.js 
 import { after } from 'next/server';
 import { getCache } from '@vercel/functions';
 import { revalidateTag } from 'next/cache';
-import type { LilypadPlatform } from '@lilypad/libs/platform';
+import type { LilypadPlatform } from '@lilypad-studio/libs/platform';
 
 export const platform: LilypadPlatform = {
   // Keeps the function alive until the task settles (logs, cache writes)
@@ -54,8 +54,8 @@ Pass `platform` to every module you create (see below).
 ```ts
 // lib/db.ts
 import 'server-only';
-import { LilypadDbGate, lilypadServerlessPool } from '@lilypad/libs/db';
-import { bindLilypadDbHooks } from '@lilypad/libs/schema';
+import { LilypadDbGate, lilypadServerlessPool } from '@lilypad-studio/libs/db';
+import { bindLilypadDbHooks } from '@lilypad-studio/libs/schema';
 import db from '../lilypad.config';
 import { parseUser, sanitizeUser } from '@/lib/users'; // application code: aliases, server-only...
 
@@ -76,7 +76,7 @@ export const getGate = () =>
 - **Use the pooled connection string** (with Neon, the host that contains `-pooler`). Every instance opens its own pool, and a pooler lets many of them share few database connections. The gate already disables prepared statements (`prepare: false`), which transaction-mode poolers require.
 - **`lilypadServerlessPool`** keeps few connections per instance (`max: 3`) and closes them after 5 idle seconds, so a suspended instance does not hold connections. Raise `max` if a single request runs many queries in parallel.
 - **`statementTimeout`** (default: 30 s) makes Postgres stop queries that take too long, so that slow queries whose callers already gave up do not hold the few connections of the pool. Keep it below the `maxDuration` of your functions.
-- **`config: appDb`**: the gate finds the tables by key (`table: 'users'`) and applies the hooks to them, even to a definition taken from the original config (`db.tables.users`). The config file itself imports only `@lilypad/libs/schema` and types (`import type`): see [Functions applied to the rows](../README.md#functions-applied-to-the-rows-bindlilypaddbhooks).
+- **`config: appDb`**: the gate finds the tables by key (`table: 'users'`) and applies the hooks to them, even to a definition taken from the original config (`db.tables.users`). The config file itself imports only `@lilypad-studio/libs/schema` and types (`import type`): see [Functions applied to the rows](../README.md#functions-applied-to-the-rows-bindlilypaddbhooks).
 - `listenerConnectionString` (a direct, non-pooled connection) is only needed by the `listen` strategy, which is not recommended on Vercel (see section 5).
 
 ## 3. Creating instances without connecting at build time
@@ -102,7 +102,7 @@ With a `singleton` identifier, every call returns the same instance for the life
 ## 4. Caches
 
 ```ts
-import { LilypadCache } from '@lilypad/libs/cache';
+import { LilypadCache } from '@lilypad-studio/libs/cache';
 import { platform } from './lilypad-platform';
 
 const prices = new LilypadCache<string, Price>({
@@ -138,11 +138,11 @@ The lookup order of `getOrSet` is: memory of the instance (**L1**), shared level
 
 A `LilypadDbCache` must learn about the changes made by other instances and by other programs (scripts, admin tools, other services). The `sync` option chooses how:
 
-| Strategy | How | Delay | Suited to |
-| --- | --- | --- | --- |
+| Strategy    | How                                                                                                                                 | Delay            | Suited to                           |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------- | ---------------- | ----------------------------------- |
 | `changelog` | A trigger records each change in a table; each instance reads the new rows, at most once per `pollInterval`, when the cache is used | ≤ `pollInterval` | **Vercel**, any serverless platform |
-| `listen` | `LISTEN/NOTIFY` on a dedicated connection | Near real time | Long-running servers only |
-| `none` | Only the writes of this instance, and the TTL | ≤ TTL | Data that no one else changes |
+| `listen`    | `LISTEN/NOTIFY` on a dedicated connection                                                                                           | Near real time   | Long-running servers only           |
+| `none`      | Only the writes of this instance, and the TTL                                                                                       | ≤ TTL            | Data that no one else changes       |
 
 `listen` is not suited to Vercel: it needs a connection that stays open, it does not work through a pooler, and the notifications sent while an instance is suspended are lost.
 
@@ -155,7 +155,7 @@ Give the tables the `changelog` sync in the [config](../README.md#database-confi
 const users = defineLilypadTable<User, 'id'>({
   tableName: 'users',
   primaryKey: 'id',
-  cols: { /* ... */ },
+  cols: {/* ... */},
   sync: { strategy: 'changelog', pollInterval: 5_000 },
 });
 
@@ -213,7 +213,7 @@ The changelog keeps one row per change until it is pruned. The database can prun
 - **pg_cron**, if your provider offers it (Supabase, Neon, RDS, Cloud SQL, Azure): a nightly job in the database. Run this once, in a migration, after `CREATE EXTENSION pg_cron`:
 
   ```ts
-  import { lilypadChangelogPruneScheduleSql } from '@lilypad/libs/db';
+  import { lilypadChangelogPruneScheduleSql } from '@lilypad-studio/libs/db';
 
   await sql.unsafe(lilypadChangelogPruneScheduleSql({ olderThan: 24 * 60 * 60_000 })); // daily at 3:00 UTC
   ```
@@ -234,7 +234,7 @@ Or delete the rows from the application, for example daily with Vercel Cron. The
 
 ```ts
 // app/api/cron/lilypad-changelog/route.ts
-import { pruneLilypadChangelog } from '@lilypad/libs/db';
+import { pruneLilypadChangelog } from '@lilypad-studio/libs/db';
 import { getGate } from '@/lib/db';
 
 export async function GET(request: Request) {
@@ -257,12 +257,12 @@ The retention (`olderThan`) must be much longer than `maxGap` and `lookback`. Wi
 
 Every change that reaches a cache calls `platform.onInvalidate` with a `source`:
 
-| `source` | When | Sent by |
-| --- | --- | --- |
-| `write` | `sqlCreate`, `sqlUpdate`, `sqlDelete` | The instance that wrote |
-| `changelog` | A change read from the changelog | **Every** instance that reads it |
-| `notification` | A `LISTEN/NOTIFY` notification | Every listening instance |
-| `manual` | `invalidate()` | The instance that called it |
+| `source`       | When                                  | Sent by                          |
+| -------------- | ------------------------------------- | -------------------------------- |
+| `write`        | `sqlCreate`, `sqlUpdate`, `sqlDelete` | The instance that wrote          |
+| `changelog`    | A change read from the changelog      | **Every** instance that reads it |
+| `notification` | A `LISTEN/NOTIFY` notification        | Every listening instance         |
+| `manual`       | `invalidate()`                        | The instance that called it      |
 
 Filter on `source` so that a change triggers your action (for example `revalidateTag`) only once. The tags are `lilypad:<table>` and `lilypad:<table>:<key>`, with the table and the key URI-encoded (`encodeURIComponent`); `tagPrefix` changes `lilypad`.
 
@@ -270,7 +270,11 @@ Filter on `source` so that a change triggers your action (for example `revalidat
 
 ```ts
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { LilypadLogger, LilypadJsonConsoleLogger, LilypadDiscordLogger } from '@lilypad/libs/logger';
+import {
+  LilypadLogger,
+  LilypadJsonConsoleLogger,
+  LilypadDiscordLogger,
+} from '@lilypad-studio/libs/logger';
 import { platform } from './lilypad-platform';
 
 export const requestContext = new AsyncLocalStorage<{ requestId: string }>();
@@ -298,35 +302,35 @@ export const getLogger = () =>
 
 Import the subpaths, not the package root, in edge code:
 
-| Import | Edge runtime |
-| --- | --- |
-| `@lilypad/libs/logger`, `/cache`, `/flow`, `/serializer`, `/singleton`, `/platform` | Yes |
-| `@lilypad/libs/db` (`LilypadDbGate`, `LilypadDbCache`, changelog) | No: it needs TCP connections |
-| `@lilypad/libs` (the root) | Yes: it leaves out `/db` |
+| Import                                                                                     | Edge runtime                 |
+| ------------------------------------------------------------------------------------------ | ---------------------------- |
+| `@lilypad-studio/libs/logger`, `/cache`, `/flow`, `/serializer`, `/singleton`, `/platform` | Yes                          |
+| `@lilypad-studio/libs/db` (`LilypadDbGate`, `LilypadDbCache`, changelog)                   | No: it needs TCP connections |
+| `@lilypad-studio/libs` (the root)                                                          | Yes: it leaves out `/db`     |
 
 The subpaths also keep the bundles small, since `postgres` is only pulled in by `/db`. `postgres` is an optional peer dependency: install it in the application that uses `/db`.
 
 ## 8. Recommended options at a glance
 
-| Module | Option | On Vercel | Why |
-| --- | --- | --- | --- |
-| All | `platform` | The adapter of section 1 | Background work survives the end of the request |
-| `LilypadDbGate` | `connectionString` | Pooled | Many instances, few database connections |
-| | `pool` | `lilypadServerlessPool` | Few connections per instance, closed when idle |
-| | `statementTimeout` | Below `maxDuration`, e.g. `10_000` | Slow queries stop instead of piling up |
-| | `listen` | Leave empty | `LISTEN` needs a long-lived direct connection |
-| `LilypadCache`, `LilypadDbCache` | `shared` | `{}` (store from `platform`), with a `codec` for non-JSON values | Cold instances find the values of the others |
-| | `shared.timeout` | `300` | The shared level never slows a response down much |
-| | `shared.refreshLockTtl` | The `maxDuration` of your functions | One instance refreshes a key at a time |
-| | `staleWhileRevalidate` | The largest age you accept to show | Responses do not wait for refreshes |
-| | `failureCooldown` | `30_000` | A source that is down is not retried by every request |
-| | `cleanupOnAccessEvery` | `60_000` (and no `autoCleanupInterval`) | No timers |
-| | `maxEntries` | According to the memory of your functions | Bounded memory on long-lived instances |
-| `LilypadDbCache` | `sync` | `{ strategy: 'changelog', pollInterval: 5_000 }` | Works without long-lived connections, sees external changes |
-| | TTL (with `shared`) | ≤ `60_000` | Bounds the rare race described in section 9 |
-| Changelog | Retention | 24 h: `lilypadChangelogPruneScheduleSql` (pg_cron), or the `prune` option of `lilypadChangelogSql` | Keeps the table small, with no job in the application; much longer than `maxGap` |
-| `LilypadLogger` | `platform`, `context` | The adapter; your request context | Logs are not lost and can be correlated |
-| | Components | `LilypadJsonConsoleLogger` | Structured, filterable logs |
+| Module                           | Option                  | On Vercel                                                                                          | Why                                                                              |
+| -------------------------------- | ----------------------- | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| All                              | `platform`              | The adapter of section 1                                                                           | Background work survives the end of the request                                  |
+| `LilypadDbGate`                  | `connectionString`      | Pooled                                                                                             | Many instances, few database connections                                         |
+|                                  | `pool`                  | `lilypadServerlessPool`                                                                            | Few connections per instance, closed when idle                                   |
+|                                  | `statementTimeout`      | Below `maxDuration`, e.g. `10_000`                                                                 | Slow queries stop instead of piling up                                           |
+|                                  | `listen`                | Leave empty                                                                                        | `LISTEN` needs a long-lived direct connection                                    |
+| `LilypadCache`, `LilypadDbCache` | `shared`                | `{}` (store from `platform`), with a `codec` for non-JSON values                                   | Cold instances find the values of the others                                     |
+|                                  | `shared.timeout`        | `300`                                                                                              | The shared level never slows a response down much                                |
+|                                  | `shared.refreshLockTtl` | The `maxDuration` of your functions                                                                | One instance refreshes a key at a time                                           |
+|                                  | `staleWhileRevalidate`  | The largest age you accept to show                                                                 | Responses do not wait for refreshes                                              |
+|                                  | `failureCooldown`       | `30_000`                                                                                           | A source that is down is not retried by every request                            |
+|                                  | `cleanupOnAccessEvery`  | `60_000` (and no `autoCleanupInterval`)                                                            | No timers                                                                        |
+|                                  | `maxEntries`            | According to the memory of your functions                                                          | Bounded memory on long-lived instances                                           |
+| `LilypadDbCache`                 | `sync`                  | `{ strategy: 'changelog', pollInterval: 5_000 }`                                                   | Works without long-lived connections, sees external changes                      |
+|                                  | TTL (with `shared`)     | ≤ `60_000`                                                                                         | Bounds the rare race described in section 9                                      |
+| Changelog                        | Retention               | 24 h: `lilypadChangelogPruneScheduleSql` (pg_cron), or the `prune` option of `lilypadChangelogSql` | Keeps the table small, with no job in the application; much longer than `maxGap` |
+| `LilypadLogger`                  | `platform`, `context`   | The adapter; your request context                                                                  | Logs are not lost and can be correlated                                          |
+|                                  | Components              | `LilypadJsonConsoleLogger`                                                                         | Structured, filterable logs                                                      |
 
 ## 9. Known limits
 

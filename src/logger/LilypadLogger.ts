@@ -2,7 +2,10 @@ import {
   createLilypadSingletonAble,
   type LilypadSingletonAble,
 } from '@/singleton/LilypadSingleton';
-import { LilypadLoggerComponent, type LilypadLogRecord } from '@/logger/LilypadLoggerComponent';
+import {
+  type LilypadLoggerComponent,
+  type LilypadLogRecord,
+} from '@/logger/LilypadLoggerComponent';
 import {
   formatLogValue,
   LILYPAD_DEFAULT_REDACTED_KEYS,
@@ -23,18 +26,18 @@ import type { LilypadLibLogLevel } from '@/logger/LilypadLibLogger';
  */
 export type LilypadLoggerConstructorOptions<T extends string> = {
   components: Record<T, LilypadLoggerComponent<T>[]>;
-  name?: string;
-  errorLogging?: (error: unknown) => void | Promise<void>;
+  name?: string | undefined;
+  errorLogging?: ((error: unknown) => void | Promise<void>) | undefined;
   /**
    * `platform.background` receives every message being sent, so that the instance stays alive
    * until it is sent even after the response (serverless platforms).
    */
-  platform?: Pick<LilypadPlatform, 'background'>;
+  platform?: Pick<LilypadPlatform, 'background'> | undefined;
   /**
    * Called synchronously for every message: its fields are added to the record (e.g. a request id
    * read from `AsyncLocalStorage`). If it throws, the message is logged without context.
    */
-  context?: () => Record<string, unknown> | undefined;
+  context?: (() => Record<string, unknown> | undefined) | undefined;
   /**
    * The keys whose values are replaced with `[Redacted]` in the messages and in the context, at
    * any depth (compared ignoring case, `-` and `_`). Defaults to
@@ -42,7 +45,7 @@ export type LilypadLoggerConstructorOptions<T extends string> = {
    * extend it with `[...LILYPAD_DEFAULT_REDACTED_KEYS, 'ssn']`, or pass `false` to redact nothing.
    * The `parts` of a record are never redacted.
    */
-  redact?: readonly string[] | false;
+  redact?: readonly string[] | false | undefined;
 } & LilypadSingletonAble;
 
 /**
@@ -50,9 +53,7 @@ export type LilypadLoggerConstructorOptions<T extends string> = {
  * `errorLogging`). Await `logger.flush()` to wait until the messages are sent.
  */
 type ChannelMethodFunction = (...message: unknown[]) => void;
-type ChannelMethods<T extends string> = {
-  [K in T]: ChannelMethodFunction;
-};
+type ChannelMethods<T extends string> = Record<T, ChannelMethodFunction>;
 
 /**
  * A generic logger that dynamically creates logging methods based on component types.
@@ -87,18 +88,18 @@ export class LilypadLogger<T extends string> {
   >;
 
   /** The name given in the options, added to each record. */
-  readonly name?: string;
+  readonly name?: string | undefined;
 
   /** The messages still being sent, awaited by `flush`. */
-  private _pending: Set<Promise<void>> = new Set();
+  private _pending = new Set<Promise<void>>();
 
   /**
    * Creates a new LilypadLogger instance or retrieves a singleton instance.
    *
    * @template T - The log level type, defaults to the levels the other Lilypad modules log on
    * ('error' | 'warn' | 'info' | 'debug'), so that the logger can be passed to them
-   * @param options - Configuration options for the logger
-   * @param options.singleton - The identifier of the singleton instance, if one is wanted
+   * @param options - Configuration options for the logger, and `singleton`: the identifier of the
+   * singleton instance, if one is wanted
    * @returns A LilypadLogger instance typed according to the generic parameter T
    *
    * @example

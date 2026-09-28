@@ -2,17 +2,17 @@ import { describe, it, expect } from 'vitest';
 import { LilypadSerializer } from './LilypadSerializer';
 
 describe('LilypadSerializer', () => {
-  interface Source {
+  type Source = {
     id: number;
     name: string;
     active: boolean;
-  }
+  };
 
-  interface Target {
+  type Target = {
     userId: number;
     userName: string;
     isActive: boolean;
-  }
+  };
 
   type StringWrapper = {
     value: string;
@@ -20,11 +20,11 @@ describe('LilypadSerializer', () => {
   type NumberWrapper = {
     value: number;
   };
-  interface InvertedTarget {
+  type InvertedTarget = {
     isActive: boolean;
     userName: StringWrapper;
     userId: NumberWrapper;
-  }
+  };
 
   //const test = { id: 'userId', name: 'userName', active: 'isActive' };
 
@@ -256,18 +256,18 @@ describe('LilypadSerializer', () => {
 
   describe('defaults', () => {
     it('should not share object defaults between deserialized items', () => {
-      interface Tagged {
+      type Tagged = {
         tags: string[];
-      }
-      interface PackedTagged {
+      };
+      type PackedTagged = {
         t?: string[];
-      }
+      };
       const serializer = new LilypadSerializer<Tagged, PackedTagged, { tags: 't' }>({
         serialization: {
           tags: {
             target: 't',
             serialize: (item) => item.tags,
-            deserialize: (item) => item.t as string[],
+            deserialize: (item) => item.t!,
             default: [],
           },
         },
@@ -283,13 +283,13 @@ describe('LilypadSerializer', () => {
   // These cases are checked at compile time by `npm run typecheck`: an unused @ts-expect-error fails it
   describe('key mapping type checks', () => {
     it('should reject key mappings that are not injective', () => {
-      interface TwoKeys {
+      type TwoKeys = {
         a: number;
         b: number;
-      }
-      interface OneKey {
+      };
+      type OneKey = {
         x: number;
-      }
+      };
       const create = () =>
         new LilypadSerializer<TwoKeys, OneKey, { a: 'x'; b: 'x' }>({
           serialization: {
@@ -313,13 +313,13 @@ describe('LilypadSerializer', () => {
     });
 
     it('should reject key mappings that are not surjective', () => {
-      interface OneKey {
+      type OneKey = {
         a: number;
-      }
-      interface TwoKeys {
+      };
+      type TwoKeys = {
         x: number;
         y: number;
-      }
+      };
       const create = () =>
         new LilypadSerializer<OneKey, TwoKeys, { a: 'x' }>({
           serialization: {

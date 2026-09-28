@@ -23,7 +23,7 @@ import { runInBackground } from '@/platform/LilypadPlatform';
  * Above this number of changed keys in one read, the table is expired as a whole instead of key by
  * key: following each key would remove each one from the shared level, on every instance.
  */
-export const LILYPAD_BULK_CHANGE_THRESHOLD = 1000;
+const LILYPAD_BULK_CHANGE_THRESHOLD = 1000;
 
 /**
  * The changes to apply, in order: whether the table was emptied, and the last change of each row
@@ -63,10 +63,10 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
   private readonly reader: LilypadChangelogReader;
   private readonly subscriber: LilypadChangelogSubscriber;
   private readonly unsubscribe: () => void;
-  private cursor?: LilypadChangelogCursor;
+  private cursor?: LilypadChangelogCursor | undefined;
   private lastRead = 0;
   /** Since when the chain of reads is unbroken. */
-  private chainStartedAt?: number;
+  private chainStartedAt?: number | undefined;
   private readonly backoff: LilypadBackoff;
 
   constructor(

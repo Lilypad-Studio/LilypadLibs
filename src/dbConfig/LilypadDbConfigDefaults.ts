@@ -6,4 +6,4 @@ export const LILYPAD_DEFAULT_NOTIFY_CHANNEL = 'cache_events';
 export const LILYPAD_DEFAULT_DB_CONFIG_NAME = 'default';
 export const LILYPAD_DEFAULT_DB_SCHEMA = 'public';
 /** The default `maxGap` of the `changelog` strategy, and the default `minRetention` of the changelog. */
-export const LILYPAD_DEFAULT_MAX_GAP = 60 * 60 * 1000; // 1 hour
+export const LILYPAD_DEFAULT_MAX_GAP: number = 60 * 60 * 1000; // 1 hour

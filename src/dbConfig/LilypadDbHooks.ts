@@ -5,6 +5,7 @@ import {
   type LilypadDbTableDefinitionBase,
   type LilypadDbTableName,
 } from '@/dbConfig/LilypadDbConfig';
+import type { LilypadDbPartialRow } from '@/dbGate/LilypadDbSchema';
 
 /**
  * The functions applied to the rows of a table. They are not part of the config file, which
@@ -19,19 +20,19 @@ export type LilypadDbTableHooks<T> = {
    * Transforms the data of inserts and updates, before the columns of `cols` are picked from it.
    * Its result replaces the data: omitting a property removes it from the write.
    */
-  readonly write?: (data: Partial<T>) => Partial<T>;
+  readonly write?: ((data: LilypadDbPartialRow<T>) => LilypadDbPartialRow<T>) | undefined;
   /**
    * Builds a row from what the database returned. It receives the whole row (`SELECT *`, and
    * `RETURNING *` for the writes), since it may read columns that are not in `cols`, and can
    * return `null` to leave the row out of the results.
    */
-  readonly select?: (row: Record<string, unknown>) => T | null;
+  readonly select?: ((row: Record<string, unknown>) => T | null) | undefined;
 };
 
 /** The hooks of a table, whatever its row type. */
 export type LilypadDbTableHooksBase = {
-  readonly write?: (data: never) => unknown;
-  readonly select?: (row: Record<string, unknown>) => unknown;
+  readonly write?: ((data: never) => unknown) | undefined;
+  readonly select?: ((row: Record<string, unknown>) => unknown) | undefined;
 };
 
 /** The hooks of some tables of a config, by key, typed with the rows of each table. */

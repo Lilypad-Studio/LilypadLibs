@@ -60,7 +60,7 @@ const DEFAULT_BULK_SYNC_TIMEOUT = 30_000;
  */
 export class LilypadCache<K extends LilypadCacheKey, V> {
   private readonly engine: LilypadCacheEngine<K, V>;
-  private readonly bulkSyncFn?: LilypadCacheSyncFn<K, V>;
+  private readonly bulkSyncFn?: LilypadCacheSyncFn<K, V> | undefined;
   private readonly bulkSyncTtl: number;
   private readonly bulkSyncFlowControl: LilypadFlowControl;
   /**
@@ -116,7 +116,10 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
    * @param options.removeExpired - If true, an expired value is also removed. Defaults to false, so
    * that the old value stays available as a fallback (`onError: { fallback: 'stale' }`).
    */
-  get(key: K, options?: { removeExpired?: boolean }): LilypadCachedValueType<V> | undefined {
+  get(
+    key: K,
+    options?: { removeExpired?: boolean | undefined }
+  ): LilypadCachedValueType<V> | undefined {
     this.assertNotDisposed();
     return this.engine.get(key, options);
   }
@@ -179,7 +182,7 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
     try {
       this.assertNotDisposed();
     } catch (error) {
-      return Promise.reject(error as Error);
+      return Promise.reject(error);
     }
     return this.engine.getOrSetDetailed(key, valueFn, options);
   }
@@ -200,7 +203,7 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
   }
 
   /** Like `entries()`, after a `bulkSync` (unless `sync` is false). */
-  async getAll({ sync = true }: { sync?: boolean } = {}): Promise<
+  async getAll({ sync = true }: { sync?: boolean | undefined } = {}): Promise<
     Map<K, LilypadCachedValueType<V>>
   > {
     if (sync) {
@@ -222,7 +225,7 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
    * @returns `true` if the cache is synced (now or by a recent sync), `false` if the sync failed,
    * returned no data, or there is no `bulkSync.fn`.
    */
-  async bulkSync(options: { throwOnError?: boolean } = {}): Promise<boolean> {
+  async bulkSync(options: { throwOnError?: boolean | undefined } = {}): Promise<boolean> {
     this.assertNotDisposed();
     const bulkSyncFn = this.bulkSyncFn;
     if (!bulkSyncFn) {
@@ -322,10 +325,12 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
    * in flight is not cached, and later reads do not join it. The key is also removed from the
    * shared level, and `platform.onInvalidate` receives a `manual` event.
    *
+   * @param key - The key to invalidate.
    * @param options.invalidateBulkSync - If true (default), forces the next bulk sync. With false,
    * `entries()` leaves the key out until the next bulk sync.
    */
-  invalidate(key: K, { invalidateBulkSync = true }: { invalidateBulkSync?: boolean } = {}): void {
+  invalidate(key: K, options: { invalidateBulkSync?: boolean | undefined } = {}): void {
+    const { invalidateBulkSync = true } = options;
     this.assertNotDisposed();
     this.engine.invalidate(key);
     if (invalidateBulkSync) {
@@ -340,7 +345,7 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
    * @param options.force - If true, also deletes a protected key.
    * @returns `false` if the key is protected and was left untouched.
    */
-  delete(key: K, options?: { force?: boolean }): boolean {
+  delete(key: K, options?: { force?: boolean | undefined }): boolean {
     this.assertNotDisposed();
     return this.engine.delete(key, options);
   }
@@ -349,7 +354,7 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
    * Removes all entries from the memory of this instance (not from the shared level), and forces
    * the next bulk sync. Protected keys are kept, unless `force` is set.
    */
-  clear(options?: { force?: boolean }): void {
+  clear(options?: { force?: boolean | undefined }): void {
     this.assertNotDisposed();
     this.engine.clear(options);
   }
@@ -360,7 +365,7 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
    *
    * @param options.force - If true, also removes the expired protected keys.
    */
-  purgeExpired(options?: { force?: boolean }): void {
+  purgeExpired(options?: { force?: boolean | undefined }): void {
     this.assertNotDisposed();
     this.engine.purgeExpired(options);
   }

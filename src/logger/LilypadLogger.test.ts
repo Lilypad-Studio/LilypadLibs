@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { LilypadLoggerComponent } from './LilypadLoggerComponent';
+import { type LilypadLoggerComponent } from './LilypadLoggerComponent';
 import { LilypadLogger } from './LilypadLogger';
 import { LilypadJsonConsoleLogger } from './components/JsonConsoleLogger';
 import {
@@ -367,7 +367,7 @@ describe('LilypadLogger', () => {
       const logger = LilypadLogger.create<mockType>({
         components: { info: [mockComponent], error: [] },
       });
-      void logger.info('pending');
+      logger.info('pending');
 
       let flushed = false;
       const flushing = logger.flush().then(() => (flushed = true));

@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { LilypadCache, LilypadDisposedError, type LilypadCacheKey } from './LilypadCache';
-import { LilypadLoggerType } from '@/logger/LilypadLogger';
+import type { LilypadLoggerType } from '@/logger/LilypadLogger';
 
 describe('LilypadCache', () => {
   let cache: LilypadCache<string, number>;
@@ -906,6 +906,7 @@ describe('LilypadCache', () => {
         'key1',
         () => new Promise((resolve) => setTimeout(() => resolve(1), 500))
       );
+      // eslint-disable-next-line vitest/valid-expect -- awaited once the fake timers have advanced
       const assertion = expect(promise).rejects.toThrow('Operation timed out');
       await vi.advanceTimersByTimeAsync(100);
       await assertion;
@@ -987,6 +988,7 @@ describe('LilypadCache', () => {
         received = signal;
         return new Promise<number>(() => {});
       });
+      // eslint-disable-next-line vitest/valid-expect -- awaited once the fake timers have advanced
       const assertion = expect(promise).rejects.toThrow('Operation timed out');
 
       await vi.advanceTimersByTimeAsync(100);

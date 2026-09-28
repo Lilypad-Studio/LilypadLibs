@@ -50,7 +50,7 @@ export type LilypadDoctorArgs =
       sql: boolean;
       connectionString: string;
       /** The name or path of the config (`undefined`: the default one). */
-      config?: string;
+      config?: string | undefined;
     };
 
 /** Reads the variables of an env file (`--env-file`), replaceable in tests. */
@@ -89,7 +89,7 @@ export function parseLilypadDoctorArgs(
   if (values.url !== undefined && urlEnv !== undefined) {
     throw new Error('--url and --url-env cannot be used together.');
   }
-  if (urlEnv !== undefined && urlEnv.trim() === '') {
+  if (urlEnv?.trim() === '') {
     throw new Error('--url-env needs the name of an environment variable.');
   }
   const envFiles = values['env-file'] ?? [];
@@ -121,7 +121,7 @@ export function parseLilypadDoctorArgs(
   if (values.sql && values.json) {
     throw new Error('--sql and --json cannot be used together.');
   }
-  if (values.config !== undefined && values.config.trim() === '') {
+  if (values.config?.trim() === '') {
     throw new Error('--config needs the name or the path of a config.');
   }
   return {
@@ -135,12 +135,16 @@ export function parseLilypadDoctorArgs(
 
 /** What the command uses, replaceable in tests. */
 export type LilypadDoctorCliDependencies = {
-  run?: (options: LilypadDoctorOptions) => Promise<LilypadDoctorReport>;
-  load?: (options: { config?: string }) => Promise<{ path: string; config: LilypadDbConfig }>;
+  run?: ((options: LilypadDoctorOptions) => Promise<LilypadDoctorReport>) | undefined;
+  load?:
+    | ((options: {
+        config?: string | undefined;
+      }) => Promise<{ path: string; config: LilypadDbConfig }>)
+    | undefined;
   /** Reads the files of `--env-file`. */
-  readEnv?: LilypadEnvFileReader;
+  readEnv?: LilypadEnvFileReader | undefined;
   /** The file system of `init`. */
-  init?: LilypadInitDependencies;
+  init?: LilypadInitDependencies | undefined;
 };
 
 /** The SQL that fixes the problems, once each, in the order of the problems. */

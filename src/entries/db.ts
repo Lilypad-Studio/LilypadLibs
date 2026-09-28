@@ -1,5 +1,5 @@
 /**
- * `@lilypad/libs/db`: the PostgreSQL gateway and the database-backed cache. Node.js only: it needs
+ * `@lilypad-studio/libs/db`: the PostgreSQL gateway and the database-backed cache. Node.js only: it needs
  * TCP connections (postgres.js), which must be installed next to the library.
  */
 export { LilypadDbGate, lilypadServerlessPool } from '../dbGate/LilypadDbGate';

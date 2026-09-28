@@ -1,6 +1,6 @@
 /**
- * `@lilypad/libs/cache`: the in-memory cache, with its optional shared level. Runs in Node.js and
- * in edge runtimes. The database-backed cache is in `@lilypad/libs/db`.
+ * `@lilypad-studio/libs/cache`: the in-memory cache, with its optional shared level. Runs in Node.js and
+ * in edge runtimes. The database-backed cache is in `@lilypad-studio/libs/db`.
  */
 export { LilypadCache } from '../cache/LilypadCache';
 export { LilypadCacheCooldownError, LilypadDisposedError } from '../cache/LilypadCacheTypes';

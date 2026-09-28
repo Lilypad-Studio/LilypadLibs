@@ -68,8 +68,7 @@ describe('LilypadNotificationRouter', () => {
     await callback('not json');
     await callback('{"table":"items","id":"1","op":"UPDATE"}');
 
-    expect(first.log).toHaveBeenCalledOnce();
-    expect(first.log).toHaveBeenCalledWith(
+    expect(first.log).toHaveBeenCalledExactlyOnceWith(
       'warn',
       expect.stringContaining('malformed'),
       'not json'

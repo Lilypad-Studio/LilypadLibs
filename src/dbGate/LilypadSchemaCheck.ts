@@ -29,12 +29,8 @@ import {
 export type { LilypadChangelogPruning } from '@/dbConfig/LilypadDbConfig';
 export {
   readLilypadSchemaFacts,
-  type LilypadColumnInfo,
-  type LilypadConstraintInfo,
   type LilypadCronJobInfo,
-  type LilypadIndexInfo,
   type LilypadSchemaFacts,
-  type LilypadTableFacts,
   type LilypadTriggerInfo,
 } from '@/dbGate/LilypadSchemaFacts';
 export { normalizeLilypadPgType } from '@/dbConfig/LilypadPgTypes';
@@ -53,17 +49,17 @@ export type LilypadSchemaCheckTable = {
    * Whether the table needs the changelog triggers (the `changelog` strategy). Defaults to true
    * when the options check the changelog.
    */
-  changelog?: boolean;
+  changelog?: boolean | undefined;
   /**
    * The channel on which the table needs notifying triggers (the `listen` strategy), or `false`.
    * Defaults to the `notifyChannel` of the options.
    */
-  notifyChannel?: string | false;
+  notifyChannel?: string | false | undefined;
   /**
    * The columns, keys, indexes and checks the table must have (a table definition of a config is
    * one). Without it, only the table and its triggers are checked.
    */
-  shape?: LilypadSchemaTableShape;
+  shape?: LilypadSchemaTableShape | undefined;
 };
 
 export type LilypadSchemaCheckOptions = {
@@ -75,27 +71,28 @@ export type LilypadSchemaCheckOptions = {
    */
   changelog?:
     | {
-        table?: string;
+        table?: string | undefined;
         /** How the old rows are deleted (see {@link LilypadChangelogPruning}). Defaults to `detect`. */
-        pruning?: LilypadChangelogPruning;
+        pruning?: LilypadChangelogPruning | undefined;
         /**
          * The shortest retention the caches accept, in ms: the largest `maxGap` and `lookback` of
          * the caches that read this changelog. A pruning found with a retention that is not longer
          * is an error. Defaults to 1 hour (the default `maxGap`).
          */
-        minRetention?: number;
+        minRetention?: number | undefined;
         /**
          * Whether to check how the changelog is pruned (reads `cron.job` and the age of the oldest
          * row). Defaults to true.
          */
-        checkPruning?: boolean;
+        checkPruning?: boolean | undefined;
       }
-    | false;
+    | false
+    | undefined;
   /**
    * With `changelog: false`, the changelog table whose trigger function the SQL that fixes the
    * notifying triggers installs (it notifies too). Defaults to `lilypad_cache_changes`.
    */
-  changelogTable?: string;
+  changelogTable?: string | undefined;
   /**
    * Checks that the tables have a trigger that sends notifications on this channel (the `listen`
    * strategy), unless a table sets its own `notifyChannel`. The trigger may be the changelog trigger
@@ -105,7 +102,7 @@ export type LilypadSchemaCheckOptions = {
    * The SQL that fixes a missing or outdated changelog notifies on this channel, or, with `false`,
    * on the channel the installed trigger function notifies on (none if it sends none).
    */
-  notifyChannel?: string | false;
+  notifyChannel?: string | false | undefined;
 };
 
 export type LilypadSchemaProblemCode =
@@ -203,10 +200,10 @@ export type LilypadSchemaProblem = {
   code: LilypadSchemaProblemCode;
   severity: LilypadSchemaProblemSeverity;
   /** The cached table concerned, for the per-table problems. */
-  table?: string;
+  table?: string | undefined;
   message: string;
   /** SQL that fixes the problem, to run in a migration. */
-  fix?: string;
+  fix?: string | undefined;
 };
 
 export type LilypadSchemaCheckResult = {
@@ -375,7 +372,12 @@ export function evaluateLilypadSchema(
     const pruning =
       options.changelog && options.changelog.checkPruning === false
         ? { problems: [], prune: installedPrune }
-        : evaluatePruning(facts, changelog, options.changelog || undefined, sqlWith);
+        : evaluatePruning(
+            facts,
+            changelog,
+            options.changelog === false ? undefined : options.changelog,
+            sqlWith
+          );
     pruningProblems = pruning.problems;
     const changelogSql = sqlWith(pruning.prune);
     const { hasTable, hasSchemaColumn, hasFunction, functionComment } = facts.changelog;
@@ -417,6 +419,7 @@ export function evaluateLilypadSchema(
     const needsChangelog = changelog !== undefined && requirement.changelog !== false;
     const tableChannel = requirement.notifyChannel ?? notifyChannel;
     const found = facts.tables[index];
+    // eslint-disable-next-line @typescript-eslint/prefer-optional-chain -- a missing table has no facts
     if (!found || found.schema === null) {
       tables.push({ table, schema: null });
       // The table, then the triggers it needs

@@ -621,6 +621,7 @@ describe('LilypadCache platform features', () => {
       const cache = createInstance<number>({ fetchTimeout: 60_000 });
 
       const result = cache.getOrSet('p1', () => new Promise<number>(() => {}), { timeout: 50 });
+      // eslint-disable-next-line vitest/valid-expect -- awaited once the fake timers have advanced
       const assertion = expect(result).rejects.toThrow('Operation timed out');
       await vi.advanceTimersByTimeAsync(50);
 

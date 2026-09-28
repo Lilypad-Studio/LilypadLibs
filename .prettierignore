@@ -1,0 +1,6 @@
+dist/
+coverage/
+api-docs/
+package-lock.json
+# Written by changesets
+CHANGELOG.md

@@ -12,7 +12,7 @@ export class LilypadOwnWrites {
   private writes = new Map<string, { ticket: number; xids: Set<bigint>; at: number }>();
 
   /** Remembers a write of the key by transaction `xid`, whose result the entry `ticket` holds. */
-  record(normalizedKey: string, xid: bigint, ticket: number) {
+  record(normalizedKey: string, xid: bigint, ticket: number): void {
     const now = Date.now();
     // In the order of the last write, so the oldest come first
     for (const [key, own] of this.writes) {
@@ -44,7 +44,7 @@ export class LilypadOwnWrites {
   }
 
   /** Forgets the writes whose changes a read of the changelog from this cursor no longer returns. */
-  forgetCoveredBy(cursor: LilypadChangelogCursor) {
+  forgetCoveredBy(cursor: LilypadChangelogCursor): void {
     for (const [normalizedKey, own] of this.writes) {
       for (const xid of own.xids) {
         if (lilypadCursorCovers(cursor, xid)) {
@@ -57,7 +57,7 @@ export class LilypadOwnWrites {
     }
   }
 
-  clear() {
+  clear(): void {
     this.writes.clear();
   }
 }

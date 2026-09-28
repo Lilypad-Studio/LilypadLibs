@@ -53,7 +53,7 @@ export type LilypadDbTableTrustedSync = {
    * do not see (disabled triggers, `session_replication_role = replica`) goes unnoticed. The TTL
    * still bounds the shared level. `0` queries the row again at each TTL. Defaults to 1 hour.
    */
-  maxAge?: number;
+  maxAge?: number | undefined;
 };
 
 export type LilypadDbTableListenSync = LilypadDbTableTrustedSync & {
@@ -62,13 +62,13 @@ export type LilypadDbTableListenSync = LilypadDbTableTrustedSync & {
    * `eager` (default): `create` resolves once `LISTEN` is active, and rejects if it fails.
    * `lazy`: `LISTEN` starts on the first read, so creating the cache opens no connection.
    */
-  connect?: 'eager' | 'lazy';
+  connect?: 'eager' | 'lazy' | undefined;
   /**
    * If false, the cache does not apply the notifications: keeping it up to date is then up to
    * `onNotification` (an option of `LilypadDbCache.create`), and entries are never kept past their
    * TTL. Defaults to true.
    */
-  applyChanges?: boolean;
+  applyChanges?: boolean | undefined;
 };
 
 export type LilypadDbTableChangelogSync = LilypadDbTableTrustedSync & {
@@ -80,20 +80,20 @@ export type LilypadDbTableChangelogSync = LilypadDbTableTrustedSync & {
    * older than `pollInterval`. `background`: the read does not wait, and may return data one
    * interval older.
    */
-  poll?: 'await' | 'background';
+  poll?: 'await' | 'background' | undefined;
   /**
    * If the changelog has not been read for this long (ms), the instance no longer trusts it:
    * every entry is expired instead. It must be much shorter than the retention of the
    * changelog: `lilypad-doctor` reports a pruning with a shorter one. Defaults to 1 hour.
    */
-  maxGap?: number;
+  maxGap?: number | undefined;
   /**
    * On the first read, or after `maxGap`, the changes of this many ms are applied, so that
    * copies in the shared level older than those changes are removed too. It must cover the
    * lifetime of a shared entry. Defaults to the TTL plus `staleWhileRevalidate`, plus 1 minute:
    * declare it when that exceeds `maxGap`, so that `lilypad-doctor` checks the retention for it.
    */
-  lookback?: number;
+  lookback?: number | undefined;
 };
 
 /**
@@ -117,9 +117,7 @@ export type LilypadDbTableChangelogSync = LilypadDbTableTrustedSync & {
  * query: an entry that reaches its TTL without a change of its row is kept until `maxAge`.
  */
 export type LilypadDbTableSync =
-  | LilypadDbTableListenSync
-  | LilypadDbTableChangelogSync
-  | { strategy: 'none' };
+  LilypadDbTableListenSync | LilypadDbTableChangelogSync | { strategy: 'none' };
 
 /**
  * A table of a config, before `defineLilypadDb` resolves it: its description, how it is kept in
@@ -127,17 +125,17 @@ export type LilypadDbTableSync =
  */
 export type LilypadDbTableInput<T, PK extends keyof T = keyof T> = LilypadDbSchema<T, PK> & {
   /** Defaults to `{ strategy: 'listen' }`. */
-  sync?: LilypadDbTableSync;
+  sync?: LilypadDbTableSync | undefined;
   /** Overrides the `strict` of the config for this table. */
-  strict?: boolean;
+  strict?: boolean | undefined;
 };
 
 /** A unique key, resolved: its columns, including the `unique` columns. */
-export type LilypadDbResolvedUniqueKey = { name?: string; columns: readonly string[] };
+export type LilypadDbResolvedUniqueKey = { name?: string | undefined; columns: readonly string[] };
 
 /** A foreign key, resolved: the referenced table is qualified, and every default is applied. */
 export type LilypadDbResolvedForeignKey = {
-  name?: string;
+  name?: string | undefined;
   columns: readonly string[];
   references: { table: string; columns: readonly string[] };
   onDelete: LilypadDbReferentialAction;
@@ -145,7 +143,7 @@ export type LilypadDbResolvedForeignKey = {
 };
 
 export type LilypadDbResolvedIndex = {
-  name?: string;
+  name?: string | undefined;
   columns: readonly string[];
   unique: boolean;
   using: LilypadDbIndexMethod;
@@ -175,9 +173,9 @@ export type LilypadDbTableDefinitionBase = {
   /** `schema.table`: every query of the library names the table this way. */
   readonly qualifiedName: string;
   readonly primaryKey: PropertyKey;
-  readonly generatedPrimaryKey?: boolean;
+  readonly generatedPrimaryKey?: boolean | undefined;
   /** The functions bound to the table by `bindLilypadDbHooks`, if any. */
-  readonly hooks?: LilypadDbTableHooksBase;
+  readonly hooks?: LilypadDbTableHooksBase | undefined;
   readonly cols: Readonly<Record<string, LilypadDbColumn>>;
   readonly sync: LilypadDbTableSync;
   readonly strict: boolean;
@@ -200,9 +198,9 @@ export type LilypadDbTableDefinition<T, PK extends keyof T = keyof T> = Omit<
   LilypadDbTableDefinitionBase,
   typeof lilypadRowType | 'primaryKey' | 'hooks' | 'cols'
 > & {
-  readonly [lilypadRowType]?: T;
+  readonly [lilypadRowType]?: T | undefined;
   readonly primaryKey: PK;
-  readonly hooks?: LilypadDbTableHooks<T>;
+  readonly hooks?: LilypadDbTableHooks<T> | undefined;
   readonly cols: { readonly [K in keyof T]: LilypadDbColumn };
 };
 
@@ -214,23 +212,27 @@ export type LilypadDbTableInputBase = Omit<
   readonly [lilypadRowType]?: unknown;
   primaryKey: PropertyKey;
   cols: Readonly<Record<string, LilypadDbColumn>>;
-  unique?: readonly { name?: string; columns: readonly string[] }[];
-  foreignKeys?: readonly {
-    name?: string;
-    columns: readonly string[];
-    references: LilypadDbReference;
-  }[];
-  indexes?: readonly {
-    name?: string;
-    columns: readonly string[];
-    unique?: boolean;
-    using?: LilypadDbIndexMethod;
-  }[];
+  unique?: readonly { name?: string | undefined; columns: readonly string[] }[] | undefined;
+  foreignKeys?:
+    | readonly {
+        name?: string | undefined;
+        columns: readonly string[];
+        references: LilypadDbReference;
+      }[]
+    | undefined;
+  indexes?:
+    | readonly {
+        name?: string | undefined;
+        columns: readonly string[];
+        unique?: boolean | undefined;
+        using?: LilypadDbIndexMethod | undefined;
+      }[]
+    | undefined;
 };
 
 /** A table input made by `defineLilypadTable`, which carries its row type. */
 export type LilypadDbTableDraft<T, PK extends keyof T = keyof T> = LilypadDbTableInput<T, PK> & {
-  readonly [lilypadRowType]?: T;
+  readonly [lilypadRowType]?: T | undefined;
 };
 
 /**
@@ -249,29 +251,31 @@ export type LilypadDbConfigInput<Tables extends Record<string, LilypadDbTableInp
    * The name of the config: `default` (the default) for `lilypad.config.*`, the `<name>` of
    * `lilypad.<name>.config.*` for the others. Letters, digits, `_` and `-`.
    */
-  name?: string;
+  name?: string | undefined;
   /** The schema of the tables whose name is not qualified. Defaults to `public`. */
-  defaultSchema?: string;
+  defaultSchema?: string | undefined;
   /** The channel the triggers notify, for the `listen` tables. Defaults to `cache_events`. */
-  notifyChannel?: string;
+  notifyChannel?: string | undefined;
   /** The changelog, for the `changelog` tables. */
-  changelog?: {
-    /** Defaults to `lilypad_cache_changes`. */
-    table?: string;
-    /** How the old rows are deleted (see {@link LilypadChangelogPruning}). Defaults to `detect`. */
-    pruning?: LilypadChangelogPruning;
-    /**
-     * The shortest retention of the changelog, in ms: a pruning found with a retention that is not
-     * longer is an error. `lilypad-doctor` also raises it to the `maxGap` and `lookback` of each
-     * table. Defaults to 1 hour.
-     */
-    minRetention?: number;
-  };
+  changelog?:
+    | {
+        /** Defaults to `lilypad_cache_changes`. */
+        table?: string | undefined;
+        /** How the old rows are deleted (see {@link LilypadChangelogPruning}). Defaults to `detect`. */
+        pruning?: LilypadChangelogPruning | undefined;
+        /**
+         * The shortest retention of the changelog, in ms: a pruning found with a retention that is not
+         * longer is an error. `lilypad-doctor` also raises it to the `maxGap` and `lookback` of each
+         * table. Defaults to 1 hour.
+         */
+        minRetention?: number | undefined;
+      }
+    | undefined;
   /**
    * `lilypad-doctor` also warns about what the database has and the description lacks: columns,
    * foreign keys, unique keys and indexes. Defaults to false.
    */
-  strict?: boolean;
+  strict?: boolean | undefined;
   /** The tables, by key: `db.tables.<key>`. */
   tables: Tables;
 };

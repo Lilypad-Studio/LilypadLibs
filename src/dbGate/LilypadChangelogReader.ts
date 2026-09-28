@@ -30,9 +30,10 @@ export type LilypadChangelogSubscriber = {
  */
 export class LilypadChangelogReader {
   private subscribers = new Set<LilypadChangelogSubscriber>();
-  private current?: { included: Set<LilypadChangelogSubscriber>; promise: Promise<void> };
+  private current?:
+    { included: Set<LilypadChangelogSubscriber>; promise: Promise<void> } | undefined;
   /** A read queued after the current one, for subscribers that the current one does not include. */
-  private queued?: Promise<void>;
+  private queued?: Promise<void> | undefined;
 
   constructor(
     private readonly gate: LilypadDbGate,
