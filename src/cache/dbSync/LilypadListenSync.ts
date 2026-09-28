@@ -12,8 +12,6 @@ import {
 import type { LilypadCacheKey } from '@/cache/LilypadCacheTypes';
 import { LilypadBackoff } from '@/internal/LilypadBackoff';
 
-export { parseLilypadNotification } from '@/cache/dbSync/LilypadNotificationRouter';
-
 function parseXid(xid: string | undefined): bigint | undefined {
   return xid !== undefined && /^\d+$/.test(xid) ? BigInt(xid) : undefined;
 }
@@ -31,10 +29,10 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
   private readonly router: LilypadNotificationRouter;
   private readonly subscriber: LilypadNotificationSubscriber;
   private readonly applyChanges: boolean;
-  private listening?: Promise<void>;
+  private listening?: Promise<void> | undefined;
   private readonly backoff = new LilypadBackoff(() => 1000);
   /** Since when `LISTEN` delivers every change to this instance. */
-  private listenTrustedSince?: number;
+  private listenTrustedSince?: number | undefined;
 
   constructor(
     private readonly host: LilypadDbSyncHost<K>,
@@ -68,26 +66,24 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
    * lazy `LISTEN` of the reads. If the cache was disposed meanwhile, it unsubscribes again.
    */
   private startListening(): Promise<void> {
-    if (!this.listening) {
-      this.listening = this.router
-        .subscribe(this.subscriber)
-        .then(async () => {
-          if (this.host.isDisposed()) {
-            // dispose() ran while LISTEN was starting: it found no subscription to remove
-            await this.router.unsubscribe(this.subscriber);
-            return;
-          }
-          this.backoff.succeed();
-          if (this.applyChanges) {
-            this.listenTrustedSince = Date.now();
-          }
-        })
-        .catch((error: unknown) => {
-          this.listening = undefined;
-          this.backoff.fail();
-          throw error;
-        });
-    }
+    this.listening ??= this.router
+      .subscribe(this.subscriber)
+      .then(async () => {
+        if (this.host.isDisposed()) {
+          // dispose() ran while LISTEN was starting: it found no subscription to remove
+          await this.router.unsubscribe(this.subscriber);
+          return;
+        }
+        this.backoff.succeed();
+        if (this.applyChanges) {
+          this.listenTrustedSince = Date.now();
+        }
+      })
+      .catch((error: unknown) => {
+        this.listening = undefined;
+        this.backoff.fail();
+        throw error;
+      });
     return this.listening;
   }
 

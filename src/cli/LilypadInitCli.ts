@@ -5,7 +5,7 @@ import { lilypadDbConfigTemplate } from '@/cli/lilypadDbConfigTemplate';
 import { LILYPAD_DEFAULT_DB_CONFIG_NAME } from '@/dbConfig/LilypadDbConfigDefaults';
 import { lilypadDbConfigFileNames } from '@/dbConfig/loadLilypadDbConfig';
 
-export const LILYPAD_INIT_USAGE = `Usage: lilypad-doctor init [options]
+const LILYPAD_INIT_USAGE = `Usage: lilypad-doctor init [options]
 
 Creates a config file (see defineLilypadDb), with an example table and the options of the config.
 
@@ -25,9 +25,9 @@ const CONFIG_FILE = /^lilypad\.(?:([A-Za-z0-9_-]+)\.)?config\.(?:ts|mts|mjs|js)$
 
 /** Where the command writes, and the file system it uses (replaceable in tests). */
 export type LilypadInitDependencies = {
-  cwd?: string;
-  exists?: (path: string) => boolean;
-  writeFile?: (path: string, content: string) => void;
+  cwd?: string | undefined;
+  exists?: ((path: string) => boolean) | undefined;
+  writeFile?: ((path: string, content: string) => void) | undefined;
 };
 
 export type LilypadInitTarget = {
@@ -84,7 +84,12 @@ export function runLilypadInitCli(
     writeFile = (path, content) => writeFileSync(path, content),
   }: LilypadInitDependencies = {}
 ): number {
-  let values: { config?: string; empty?: boolean; force?: boolean; help?: boolean };
+  let values: {
+    config?: string | undefined;
+    empty?: boolean | undefined;
+    force?: boolean | undefined;
+    help?: boolean | undefined;
+  };
   let target: LilypadInitTarget;
   try {
     ({ values } = parseArgs({
@@ -102,7 +107,7 @@ export function runLilypadInitCli(
       output.log(LILYPAD_INIT_USAGE);
       return 0;
     }
-    if (values.config !== undefined && values.config.trim() === '') {
+    if (values.config?.trim() === '') {
       throw new Error('--config needs the name or the path of a config.');
     }
     target = lilypadInitTarget(values.config, cwd, exists);

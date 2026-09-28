@@ -5,7 +5,7 @@ import {
 import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
 import { assertNumberOption } from '@/internal/LilypadValidation';
 
-export { LILYPAD_DEFAULT_CHANGELOG_TABLE, LILYPAD_DEFAULT_NOTIFY_CHANNEL };
+export { LILYPAD_DEFAULT_CHANGELOG_TABLE };
 
 /**
  * The changelog records every change of the cached tables in a table, so that each instance can
@@ -35,7 +35,7 @@ export const LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD = 1000;
  * The shortest retention that {@link pruneLilypadChangelog} accepts without `force`: the default
  * `maxGap` of the caches. A shorter one deletes rows that the caches may still have to read.
  */
-export const LILYPAD_MIN_CHANGELOG_RETENTION = 60 * 60 * 1000;
+export const LILYPAD_MIN_CHANGELOG_RETENTION: number = 60 * 60 * 1000;
 
 /** The transition tables of the statement triggers (version 4): the rows before and after. */
 export const LILYPAD_CHANGELOG_OLD_ROWS = 'lilypad_old';
@@ -73,7 +73,7 @@ export function pruneFunctionName(changelogTable: string): string {
  * and the row trigger that versions 3 and earlier installed instead of the first three (which
  * `lilypadChangelogTriggerSql` drops).
  */
-export function changelogTriggerNames(table: string): {
+function changelogTriggerNames(table: string): {
   insert: string;
   update: string;
   delete: string;
@@ -97,25 +97,25 @@ function escapeFormat(value: string): string {
 
 export type LilypadChangelogSqlOptions = {
   /** Name of the changelog table. Defaults to `lilypad_cache_changes`. */
-  table?: string;
+  table?: string | undefined;
   /**
    * Channel on which the trigger also sends a `NOTIFY` for the `listen` strategy, or `false` to
    * send none. Defaults to `cache_events`.
    */
-  notifyChannel?: string | false;
+  notifyChannel?: string | false | undefined;
   /**
    * With a `notifyChannel`, a statement that changes more rows than this sends one `BULK`
    * notification instead of one per row: the caches then expire every entry of the table instead
    * of re-reading each row, and the `NOTIFY` queue is not flooded. Defaults to 1000.
    */
-  notifyBulkThreshold?: number;
+  notifyBulkThreshold?: number | undefined;
   /**
    * Makes the trigger delete the old changelog rows itself, so that no scheduled job is needed:
    * on about one statement in `every`, it deletes up to `batchSize` rows older than `olderThan`,
    * in the writing transaction. `false` (the default) leaves the pruning to
    * {@link pruneLilypadChangelog} or {@link lilypadChangelogPruneScheduleSql}.
    */
-  prune?: LilypadChangelogPruneOptions | false;
+  prune?: LilypadChangelogPruneOptions | false | undefined;
 };
 
 export type LilypadChangelogPruneOptions = {
@@ -129,9 +129,9 @@ export type LilypadChangelogPruneOptions = {
    * `batchSize / every` is the average number of rows pruned per statement: it must stay above the
    * average number of rows a statement records, or the table keeps growing.
    */
-  every?: number;
+  every?: number | undefined;
   /** The most rows one prune deletes. Defaults to 1000. */
-  batchSize?: number;
+  batchSize?: number | undefined;
 };
 
 /** The comment of the trigger function that records its prune options (read back by the schema check). */
@@ -342,18 +342,18 @@ export type LilypadChangelogPruneScheduleOptions = {
    */
   olderThan: number;
   /** When the job runs, in cron syntax (pg_cron uses UTC). Defaults to `0 3 * * *`: daily at 3:00. */
-  schedule?: string;
+  schedule?: string | undefined;
   /** Name of the changelog table, if not the default one. */
-  changelogTable?: string;
+  changelogTable?: string | undefined;
   /** Name of the job. Defaults to `<changelog table>_prune`. Scheduling it again replaces it. */
-  jobName?: string;
+  jobName?: string | undefined;
   /**
    * The database of the changelog table, when pg_cron is installed in another one (see
    * `cron.database_name`): the SQL then runs in the pg_cron database, and the job resolves
    * `changelogTable` with the search_path of its role, so qualify it with its schema. Without it,
    * the SQL runs in the database of the changelog, which must be the pg_cron one.
    */
-  database?: string;
+  database?: string | undefined;
 };
 
 /**
@@ -406,7 +406,7 @@ WHERE c.oid = ${quoteLiteral(quoteIdentifier(table))}::regclass;
 export function lilypadChangelogTriggerSql(options: {
   table: string;
   primaryKey: string;
-  changelogTable?: string;
+  changelogTable?: string | undefined;
 }): string {
   const changelogTable = options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
   const names = changelogTriggerNames(options.table);
@@ -489,7 +489,7 @@ export function lilypadCursorCovers(cursor: LilypadChangelogCursor, xid: bigint)
  */
 export async function readLilypadChanges(
   gate: LilypadDbGate,
-  options: LilypadChangesRequest & { changelogTable?: string }
+  options: LilypadChangesRequest & { changelogTable?: string | undefined }
 ): Promise<{ changes: LilypadChange[]; cursor: LilypadChangelogCursor }> {
   const { changes, cursor } = await readLilypadChangesBatch(gate, {
     requests: [{ tableName: options.tableName, since: options.since }],
@@ -504,7 +504,7 @@ export async function readLilypadChanges(
  */
 export async function readLilypadChangesBatch(
   gate: LilypadDbGate,
-  options: { requests: LilypadChangesRequest[]; changelogTable?: string }
+  options: { requests: LilypadChangesRequest[]; changelogTable?: string | undefined }
 ): Promise<{ changes: LilypadChange[][]; cursor: LilypadChangelogCursor }> {
   const sql = gate.sql;
   const changelogTable = sql(options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE);
@@ -612,7 +612,12 @@ export function textArrayLiteral(values: readonly string[]): string {
  */
 export async function pruneLilypadChangelog(
   gate: LilypadDbGate,
-  options: { olderThan: number; changelogTable?: string; batchSize?: number; force?: boolean }
+  options: {
+    olderThan: number;
+    changelogTable?: string | undefined;
+    batchSize?: number | undefined;
+    force?: boolean | undefined;
+  }
 ): Promise<number> {
   const owner = 'pruneLilypadChangelog';
   assertNumberOption(owner, 'olderThan', options.olderThan, 'non-negative');

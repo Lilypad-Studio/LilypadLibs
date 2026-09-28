@@ -17,9 +17,9 @@ export type LilypadLogMeta = {
  * The levels it lacks are skipped. For pino, which takes the fields first, wrap it with
  * {@link lilypadPinoLogger}.
  */
-export type LilypadLibLogger = {
-  [L in LilypadLibLogLevel]?: (message: string, meta: LilypadLogMeta) => unknown;
-};
+export type LilypadLibLogger = Partial<
+  Record<LilypadLibLogLevel, (message: string, meta: LilypadLogMeta) => unknown>
+>;
 
 /**
  * Logs a message on a level of a library logger. It never throws, and ignores the rejection of a
@@ -58,9 +58,9 @@ export function libLog(
 }
 
 /** The methods of a pino logger that {@link lilypadPinoLogger} uses. */
-export type LilypadPinoLike = {
-  [L in LilypadLibLogLevel]?: (fields: object, message: string) => unknown;
-};
+export type LilypadPinoLike = Partial<
+  Record<LilypadLibLogLevel, (fields: object, message: string) => unknown>
+>;
 
 /**
  * Adapts a pino logger (or any logger that takes the fields first) to {@link LilypadLibLogger}: the

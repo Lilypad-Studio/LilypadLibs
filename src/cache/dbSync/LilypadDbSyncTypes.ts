@@ -13,13 +13,13 @@ export type LilypadDbNotification = {
    * The schema of the table. Notifications without it match the table in any schema (the triggers
    * of version 1 of the changelog, and custom triggers that do not send it).
    */
-  schema?: string;
+  schema?: string | undefined;
   table: string;
   /**
    * A number when the trigger serializes a numeric primary key as such (e.g. `json_build_object`).
    * Absent for `TRUNCATE` and `BULK`.
    */
-  id?: string | number;
+  id?: string | number | undefined;
   /**
    * `BULK`: one statement changed more rows than the `notifyBulkThreshold` of the trigger, which
    * sends this one notification instead of one per row. The cache expires the whole table.
@@ -29,7 +29,7 @@ export type LilypadDbNotification = {
    * The id of the transaction that made the change (sent by the triggers of version 3). It lets
    * the instance that made the change skip its own writes.
    */
-  xid?: string;
+  xid?: string | undefined;
 };
 
 /**
@@ -39,24 +39,24 @@ export type LilypadDbNotification = {
  */
 export type LilypadDbCacheSyncOverrides = {
   /** See `maxAge` in the sync of the table. */
-  maxAge?: number;
+  maxAge?: number | undefined;
   /** `listen`: see {@link LilypadDbTableListenSync}. */
-  connect?: 'eager' | 'lazy';
+  connect?: 'eager' | 'lazy' | undefined;
   /** `listen`: see {@link LilypadDbTableListenSync}. */
-  applyChanges?: boolean;
+  applyChanges?: boolean | undefined;
   /** `listen`: called with every notification of the table, after the cache has applied it. */
-  onNotification?: (payload: LilypadDbNotification) => Promise<void> | void;
+  onNotification?: ((payload: LilypadDbNotification) => Promise<void> | void) | undefined;
   /** `changelog`: see {@link LilypadDbTableChangelogSync}. */
-  pollInterval?: number;
+  pollInterval?: number | undefined;
   /** `changelog`: see {@link LilypadDbTableChangelogSync}. */
-  poll?: 'await' | 'background';
+  poll?: 'await' | 'background' | undefined;
 };
 
 /** The options of the `listen` strategy of a cache: its table's, with the overrides of the cache. */
 export type LilypadDbCacheListenSync = LilypadDbTableListenSync & {
   /** The channel the triggers notify (the `notifyChannel` of the config). */
   channel: string;
-  onNotification?: (payload: LilypadDbNotification) => Promise<void> | void;
+  onNotification?: ((payload: LilypadDbNotification) => Promise<void> | void) | undefined;
 };
 
 /** The options of the `changelog` strategy of a cache: its table's, with the overrides of the cache. */
@@ -76,13 +76,13 @@ export type LilypadDbRowChange = 'INSERT' | 'UPDATE' | 'DELETE';
 export type LilypadDbChangeMode = 'eager' | 'lazy';
 
 /** What the sync strategies need from the cache. */
-export interface LilypadDbSyncHost<K extends LilypadCacheKey> {
+export type LilypadDbSyncHost<K extends LilypadCacheKey> = {
   readonly id: string;
   readonly name: string;
   readonly gate: LilypadDbGate;
   /** The table, qualified (`schema.table`). */
   readonly tableName: string;
-  readonly platform?: LilypadPlatform;
+  readonly platform?: LilypadPlatform | undefined;
   log(level: LilypadLibLogLevel, message: string, detail?: unknown): void;
   isDisposed(): boolean;
   /** Applies a change of a row made elsewhere. @returns The key of the row. */
@@ -105,7 +105,7 @@ export interface LilypadDbSyncHost<K extends LilypadCacheKey> {
   emitInvalidation(
     source: LilypadInvalidationEvent['source'],
     keys: K[],
-    options?: { wholeCache?: boolean }
+    options?: { wholeCache?: boolean | undefined }
   ): void;
   /** Forgets the writes of this instance whose changes a read from `cursor` no longer returns. */
   forgetOwnWritesCoveredBy(cursor: LilypadChangelogCursor): void;
@@ -113,10 +113,10 @@ export interface LilypadDbSyncHost<K extends LilypadCacheKey> {
   readonly tableSchema: string;
   /** The default `lookback` of the changelog: the TTL plus the stale window, plus 1 minute. */
   defaultLookback(): number;
-}
+};
 
 /** How a cache follows the changes of its table (one implementation per `sync.strategy`). */
-export interface LilypadDbSyncStrategy {
+export type LilypadDbSyncStrategy = {
   /** Called by `create`: starts what must be active before the cache is returned. */
   start(): Promise<void>;
   /**
@@ -133,7 +133,7 @@ export interface LilypadDbSyncStrategy {
   /** Whether the changes of the writes of this instance come back through the sync. */
   readonly seesOwnWrites: boolean;
   dispose(): Promise<void>;
-}
+};
 
 /** The `none` strategy: nothing to follow. */
 export const lilypadNoSync: LilypadDbSyncStrategy = {

@@ -63,7 +63,7 @@ export class LilypadNotificationRouter {
   private readonly subscribers = new Set<LilypadNotificationSubscriber>();
   private readonly listener: LilypadDbListener;
   /** The registration of the listener on the gate, while at least one cache subscribes. */
-  private listening?: Promise<void>;
+  private listening?: Promise<void> | undefined;
 
   constructor(
     private readonly gate: LilypadDbGate,

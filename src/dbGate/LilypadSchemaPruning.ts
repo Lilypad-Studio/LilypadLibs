@@ -255,7 +255,7 @@ function suggestPruning(
   olderThan: number,
   changelogSql: (prune: LilypadChangelogPruneOptions | false) => string,
   pruning: LilypadChangelogPruning
-): { message: string; fix: string; prune?: LilypadChangelogPruneOptions } {
+): { message: string; fix: string; prune?: LilypadChangelogPruneOptions | undefined } {
   const { cron } = facts;
   const retention = formatDuration(olderThan);
   const trigger = `The fix makes the changelog trigger delete the rows older than ${retention} as it records changes (the prune option of lilypadChangelogSql).`;

@@ -7,7 +7,7 @@
  * The longest delay a timer accepts: beyond it, `setTimeout` and `setInterval` fire after 1 ms
  * (Node.js warns with a `TimeoutOverflowWarning`, browsers and edge runtimes stay silent).
  */
-export const LILYPAD_MAX_TIMER_DELAY = 2_147_483_647;
+const LILYPAD_MAX_TIMER_DELAY = 2_147_483_647;
 
 type NumberRule =
   | 'positive'

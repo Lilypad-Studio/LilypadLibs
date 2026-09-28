@@ -8,6 +8,7 @@ import {
   type LilypadDbTableInputBase,
 } from './LilypadDbConfig';
 import { bindLilypadDbHooks } from './LilypadDbHooks';
+import type { LilypadDbPartialRow } from '@/dbGate/LilypadDbSchema';
 
 type Org = { id: number; name: string };
 type Event = { id: string; title: string };
@@ -26,7 +27,7 @@ const events = defineLilypadTable<Event, 'id'>({
 
 const db = defineLilypadDb({ name: 'app', notifyChannel: 'app_events', tables: { orgs, events } });
 
-const trimTitle = (data: Partial<Event>): Partial<Event> => ({
+const trimTitle = (data: LilypadDbPartialRow<Event>): LilypadDbPartialRow<Event> => ({
   ...data,
   title: data.title?.trim(),
 });

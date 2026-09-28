@@ -10,8 +10,9 @@ export class LilypadListenHeartbeat {
   /** Missed beats (as a number of intervals) after which the connection counts as unhealthy. */
   static readonly UNHEALTHY_AFTER_INTERVALS = 2.5;
 
-  private lastBeat?: number;
-  private timer?: ReturnType<typeof setInterval> & { unref?: () => void };
+  private lastBeat?: number | undefined;
+  private timer?:
+    (ReturnType<typeof setInterval> & { unref?: (() => void) | undefined }) | undefined;
 
   /**
    * @param interval - Time between two heartbeats, in ms.

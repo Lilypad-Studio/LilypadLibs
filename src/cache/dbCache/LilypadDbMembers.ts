@@ -14,7 +14,7 @@ type Member<K> = { key: K; ticket: number };
 export class LilypadDbMembers<K extends LilypadCacheKey> {
   private members = new Map<string, Member<K>>();
   /** When the last load of the table started, if one completed (and nothing voided it since). */
-  private loadedAt?: number;
+  private loadedAt?: number | undefined;
   /** Loads started before this ticket (before a `TRUNCATE`) no longer tell which rows exist. */
   private floor = 0;
 
@@ -40,7 +40,7 @@ export class LilypadDbMembers<K extends LilypadCacheKey> {
    * Follows a value stored in the cache: a row is a member, `null` is not. A value older than
    * what the member already knows is ignored.
    */
-  follow(normalizedKey: string, key: K, isRow: boolean, ticket: number) {
+  follow(normalizedKey: string, key: K, isRow: boolean, ticket: number): void {
     if (!this.tracked) {
       return;
     }
@@ -56,13 +56,13 @@ export class LilypadDbMembers<K extends LilypadCacheKey> {
   }
 
   /** Notes a row that exists in the table, without fetching it. */
-  add(normalizedKey: string, key: K, ticket: number) {
+  add(normalizedKey: string, key: K, ticket: number): void {
     if (this.tracked) {
       this.members.set(normalizedKey, { key, ticket });
     }
   }
 
-  delete(normalizedKey: string) {
+  delete(normalizedKey: string): void {
     this.members.delete(normalizedKey);
   }
 
@@ -77,7 +77,7 @@ export class LilypadDbMembers<K extends LilypadCacheKey> {
     ticket: number,
     startedAt: number,
     deletedSince: (normalizedKey: string) => boolean
-  ) {
+  ): void {
     if (ticket < this.floor) {
       return;
     }
@@ -104,7 +104,7 @@ export class LilypadDbMembers<K extends LilypadCacheKey> {
    * @param floor - A ticket taken now: loads started before no longer tell which rows exist.
    * @param empty - The table is known to be empty; otherwise the next `getAll` loads it again.
    */
-  forget(floor: number, empty: boolean) {
+  forget(floor: number, empty: boolean): void {
     this.floor = floor;
     this.members.clear();
     if (!empty) {
@@ -126,7 +126,7 @@ export class LilypadDbMembers<K extends LilypadCacheKey> {
     return Date.now() < this.loadedAt + ttl;
   }
 
-  clear() {
+  clear(): void {
     this.members.clear();
   }
 }

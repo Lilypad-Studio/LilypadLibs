@@ -55,12 +55,12 @@ const RESOLUTION_ERRORS = new Set([
 export function lilypadConfigLoadHint(error: unknown): string {
   const code = (error as { code?: unknown } | null)?.code;
   const message = error instanceof Error ? error.message : '';
-  const cause = /does not provide an export named/.test(message)
+  const cause = message.includes('does not provide an export named')
     ? 'A type is imported without `import type`: the type stripping of Node.js keeps the import, which then fails (`verbatimModuleSyntax` in tsconfig.json reports them). '
     : typeof code === 'string' && RESOLUTION_ERRORS.has(code)
       ? "Node.js loads the config without a bundler: path aliases, relative imports without their extension, and JSON imports without `with { type: 'json' }` do not resolve. "
       : '';
-  return `${cause}A config should import only '@lilypad/libs/schema', its own files, and types (\`import type\`, erased before loading): bind the functions of the application to it with bindLilypadDbHooks where the application creates its gate.`;
+  return `${cause}A config should import only '@lilypad-studio/libs/schema', its own files, and types (\`import type\`, erased before loading): bind the functions of the application to it with bindLilypadDbHooks where the application creates its gate.`;
 }
 
 /**
@@ -77,7 +77,7 @@ export function lilypadConfigLoadHint(error: unknown): string {
  * @throws If the file does not exist, cannot be loaded, or exports no config.
  */
 export async function loadLilypadDbConfig(
-  options: { config?: string; cwd?: string } = {}
+  options: { config?: string | undefined; cwd?: string | undefined } = {}
 ): Promise<{ path: string; config: LilypadDbConfig }> {
   const path = findLilypadDbConfig(options.config, options.cwd ?? process.cwd());
   let module: Record<string, unknown>;

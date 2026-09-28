@@ -12,11 +12,11 @@ export type LilypadDbConfigTemplateOptions = {
 /** The comment at the top of the file. */
 function header(typescript: boolean): string {
   return [
-    '// The database config of @lilypad/libs: the tables the application uses, and what the database',
+    '// The database config of @lilypad-studio/libs: the tables the application uses, and what the database',
     '// must provide for them. The application imports it to create its gates and caches;',
     '// `npx lilypad-doctor` checks the database against it, and prints the SQL that fixes what differs.',
     '//',
-    "// Node.js loads it without a bundler: import only '@lilypad/libs/schema' and relative files with",
+    "// Node.js loads it without a bundler: import only '@lilypad-studio/libs/schema' and relative files with",
     typescript
       ? "// their extension (e.g. './db/users.ts'). Import the row types with `import type` (erased before"
       : "// their extension (e.g. './db/users.mjs'), without path aliases.",
@@ -77,8 +77,8 @@ export function lilypadDbConfigTemplate({
   const lines = [
     header(typescript),
     empty
-      ? "import { defineLilypadDb } from '@lilypad/libs/schema';"
-      : "import { defineLilypadDb, defineLilypadTable } from '@lilypad/libs/schema';",
+      ? "import { defineLilypadDb } from '@lilypad-studio/libs/schema';"
+      : "import { defineLilypadDb, defineLilypadTable } from '@lilypad-studio/libs/schema';",
     '',
     ...(empty
       ? [

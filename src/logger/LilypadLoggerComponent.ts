@@ -13,12 +13,12 @@ export type LilypadLogRecord<T extends string = string> = {
   /** The parts passed to the channel method, as they were (not redacted). */
   parts: unknown[];
   timestamp: Date;
-  loggerName?: string;
+  loggerName?: string | undefined;
   /**
    * The result of the logger's `context` option when the message was logged: its JSON-safe copy,
    * redacted (see `toLogJson`).
    */
-  context?: Record<string, unknown>;
+  context?: Record<string, unknown> | undefined;
 };
 
 /**

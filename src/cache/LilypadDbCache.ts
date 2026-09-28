@@ -65,13 +65,13 @@ export type LilypadDbCacheBaseOptions<V extends object, PK extends keyof V = key
    * Changes the options of the sync of the table for this cache (e.g. `connect: 'lazy'`, an
    * `onNotification` callback). The strategy is the one of the table in its config.
    */
-  sync?: LilypadDbCacheSyncOverrides;
+  sync?: LilypadDbCacheSyncOverrides | undefined;
   /**
    * Loading the whole table (`getAll`): `timeout` bounds each load and each query by primary keys
    * (defaults to 30 seconds); with the `none` strategy, a load stays valid for `ttl` (defaults to
    * the TTL).
    */
-  bulkSync?: Omit<LilypadCacheBulkSyncOptions<LilypadDbKey<V, PK>, V>, 'fn'>;
+  bulkSync?: Omit<LilypadCacheBulkSyncOptions<LilypadDbKey<V, PK>, V>, 'fn'> | undefined;
 };
 
 /** The options of a cache of a table given as a definition (`db.tables.users`). */
@@ -139,7 +139,7 @@ const EAGER_REFRESHES_PER_SECOND = 1000;
  * - `get` reads memory only. `getOrFetch` queries the database on a miss; `refresh` always
  *   re-fetches the key; `getAll` loads the whole table once, then fetches only the rows it does
  *   not hold up to date.
- * - Changes made elsewhere reach the cache through the `sync` strategy ({@link LilypadDbCacheSync}).
+ * - Changes made elsewhere reach the cache through the `sync` strategy ({@link LilypadDbTableSync}).
  *   Only keys the cache holds (or is fetching) are re-fetched or expired; for other keys it only
  *   notes that the row exists, and `getAll` fetches it.
  * - The name of the cache (shared level keys, invalidation events, logs) defaults to the table name.
@@ -158,11 +158,11 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
   /** The keys of the rows of the table, for `getAll`. */
   private members = new LilypadDbMembers<LilypadDbKey<V, PK>>();
   /** The load of the whole table in flight, shared by concurrent callers. */
-  private tableLoad?: Promise<Map<string, V>>;
+  private tableLoad?: Promise<Map<string, V>> | undefined;
   /** The queries of `fetchRows` in flight, by normalized key. */
   private rowFetches = new LilypadReadFlights<Map<string, LilypadCachedValueType<V>>>();
   /** The keys to re-read after a notification, gathered into one query (see `refreshInBatch`). */
-  private eagerBatch?: { keys: Map<string, LilypadDbKey<V, PK>>; done: Promise<void> };
+  private eagerBatch?: { keys: Map<string, LilypadDbKey<V, PK>>; done: Promise<void> } | undefined;
   /** The keys of the batches of `refreshInBatch` pending or running, with their number. */
   private eagerReads = new Map<string, number>();
   /** The keys re-read after notifications in the current second, for the eager budget. */
@@ -171,8 +171,8 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
   private refreshes = new Map<
     string,
     {
-      running?: Promise<LilypadCachedValueType<V>>;
-      queued?: Promise<LilypadCachedValueType<V>>;
+      running?: Promise<LilypadCachedValueType<V>> | undefined;
+      queued?: Promise<LilypadCachedValueType<V>> | undefined;
     }
   >();
   /** The writes of this instance, recognized when their changes come back through the sync. */
@@ -182,7 +182,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
    * rows read. The ids of notifications and of the changelog are then converted to numbers.
    */
   private numericPrimaryKey: boolean;
-  private disposing?: Promise<void>;
+  private disposing?: Promise<void> | undefined;
 
   /**
    * Creates a cache of a table of a config and, with the `listen` strategy (unless
@@ -204,15 +204,17 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
     options: LilypadDbCacheNamedOptions<C, N> & LilypadSingletonAble
   ): Promise<LilypadDbCache<LilypadDbRow<C, N>, LilypadDbPrimaryKey<C, N>>>;
   static async create<C extends LilypadDbConfig, N extends LilypadDbTableName<C>>(
+    // A separate overload, so that a key of the gate's config does not need `config`
+    // eslint-disable-next-line @typescript-eslint/unified-signatures
     options: LilypadDbCacheGateNamedOptions<C, N> & LilypadSingletonAble
   ): Promise<LilypadDbCache<LilypadDbRow<C, N>, LilypadDbPrimaryKey<C, N>>>;
   static async create(
     options: LilypadSingletonAble & {
       gate: LilypadDbGate;
       table: unknown;
-      config?: LilypadDbConfig;
-      ttl?: number;
-      logger?: LilypadLibLogger;
+      config?: LilypadDbConfig | undefined;
+      ttl?: number | undefined;
+      logger?: LilypadLibLogger | undefined;
     }
   ): Promise<unknown> {
     const { table, config, ...rest } = options;
@@ -387,7 +389,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
     const entry = this.engine.store.get(normalizedKey);
     const now = Date.now();
     // An expiration time of 0 marks an entry invalidated by a change
-    if (!entry || entry.origin !== 'source' || entry.expirationTime === 0) {
+    if (entry?.origin !== 'source' || entry.expirationTime === 0) {
       return;
     }
     if (now < entry.expirationTime) {
@@ -635,7 +637,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
   private async queryRows(
     keys: LilypadDbKey<V, PK>[],
     read: LilypadCacheRead<LilypadDbKey<V, PK>, V>,
-    shared: boolean = false
+    shared = false
   ): Promise<Map<string, LilypadCachedValueType<V>>> {
     const { engine } = this;
     const primaryKey = this.definition.primaryKey;
@@ -704,7 +706,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
    */
   get(
     key: LilypadDbKey<V, PK>,
-    options?: { removeExpired?: boolean }
+    options?: { removeExpired?: boolean | undefined }
   ): LilypadCachedValueType<V> | undefined {
     this.assertNotDisposed();
     this.renew(this.engine.normalizeKey(key));
@@ -949,7 +951,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
    * @param options.force - If true, also deletes a protected key.
    * @returns `false` if the key is protected and was left untouched.
    */
-  delete(key: LilypadDbKey<V, PK>, options?: { force?: boolean }): boolean {
+  delete(key: LilypadDbKey<V, PK>, options?: { force?: boolean | undefined }): boolean {
     this.assertNotDisposed();
     return this.engine.delete(key, options);
   }
@@ -958,7 +960,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
    * Removes all entries from the memory of this instance (not from the shared level). Protected
    * keys are kept, unless `force` is set.
    */
-  clear(options?: { force?: boolean }): void {
+  clear(options?: { force?: boolean | undefined }): void {
     this.assertNotDisposed();
     this.engine.clear(options);
   }
@@ -968,7 +970,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
    *
    * @param options.force - If true, also removes the expired protected keys.
    */
-  purgeExpired(options?: { force?: boolean }): void {
+  purgeExpired(options?: { force?: boolean | undefined }): void {
     this.assertNotDisposed();
     this.engine.purgeExpired(options);
   }

@@ -23,8 +23,8 @@ export type LilypadTriggerInfo = {
   enabled: boolean;
   source: string;
   /** The names of its transition tables (`REFERENCING OLD TABLE / NEW TABLE`), if any. */
-  oldTable?: string | null;
-  newTable?: string | null;
+  oldTable?: string | null | undefined;
+  newTable?: string | null | undefined;
 };
 
 /** A column of a table (`pg_attribute`). */
@@ -138,9 +138,9 @@ export type LilypadSchemaFacts = {
 export type LilypadTableFacts = {
   schema: string | null;
   triggers: LilypadTriggerInfo[];
-  columns?: LilypadColumnInfo[];
-  constraints?: LilypadConstraintInfo[];
-  indexes?: LilypadIndexInfo[];
+  columns?: LilypadColumnInfo[] | undefined;
+  constraints?: LilypadConstraintInfo[] | undefined;
+  indexes?: LilypadIndexInfo[] | undefined;
 };
 
 /** A `json` column: postgres.js parses it, unless the type is not registered yet. */
@@ -148,15 +148,24 @@ function parseJsonColumn(value: unknown): unknown {
   return typeof value === 'string' ? JSON.parse(value) : value;
 }
 
+/** A changelog table and its trigger function. */
+export type LilypadChangelogTarget = {
+  table: string;
+  /** The changelog table's name when it is not the default, for the generated SQL. */
+  custom: string | undefined;
+  functionSignature: string;
+};
+
 /** The changelog table and trigger function the options designate, or `undefined` if not checked. */
-export function changelogTarget(options: LilypadSchemaCheckOptions) {
+export function changelogTarget(
+  options: LilypadSchemaCheckOptions
+): LilypadChangelogTarget | undefined {
   if (options.changelog === false) {
     return undefined;
   }
   const table = options.changelog?.table ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
   return {
     table,
-    // The changelog table's name when it is not the default, for the generated SQL
     custom: table === LILYPAD_DEFAULT_CHANGELOG_TABLE ? undefined : table,
     functionSignature: `${quoteIdentifier(triggerFunctionName(table))}()`,
   };
@@ -169,7 +178,7 @@ type LilypadDatabaseFacts = Omit<LilypadSchemaFacts, 'tables'>;
  * The changelog whose facts are read, and whose SQL the fixes install: the checked one, or else
  * `changelogTable` (the default table without it), whose facts only tell the fixes what is installed.
  */
-export function readChangelogTarget(options: LilypadSchemaCheckOptions) {
+export function readChangelogTarget(options: LilypadSchemaCheckOptions): LilypadChangelogTarget {
   return (
     changelogTarget(options) ??
     changelogTarget({ tables: [], changelog: { table: options.changelogTable } })!

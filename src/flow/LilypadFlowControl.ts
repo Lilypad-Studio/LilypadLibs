@@ -1,44 +1,44 @@
 import { withLilypadTimeout } from '@/internal/LilypadTimeout';
 import { assertNumberOption } from '@/internal/LilypadValidation';
 
-export interface LilypadFlowControlOptions {
+export type LilypadFlowControlOptions = {
   /** Minimum time between two executions of each consumer/function pair, in milliseconds. */
-  rate?: number;
+  rate?: number | undefined;
   /**
    * Maximum duration of each attempt, in milliseconds. With retries, the total duration can be up to
    * `(retries + 1) * timeout` plus the backoff times.
    */
-  timeout?: number;
+  timeout?: number | undefined;
   /** How many times a failed attempt is retried. Defaults to 0. */
-  retries?: number;
-}
+  retries?: number | undefined;
+};
 
-export interface LilypadExecuteFnOptions<T> {
+export type LilypadExecuteFnOptions<T> = {
   /** Identifies the execution: concurrent calls with the same identifier share one execution. */
   functionIdentifier: string;
   /**
    * With the `rate` option, the rate limit applies to each consumer/function pair; without a
    * consumer, to the function alone.
    */
-  consumerIdentifier?: string;
+  consumerIdentifier?: string | undefined;
   /**
    * The operation to execute. The received signal is aborted when the operation times out,
    * so the function can stop its work and avoid side effects after the timeout.
    */
   fn: (signal: AbortSignal) => Promise<T>;
-  retries?: number;
-  backOffTime?: (attempt: number) => number;
+  retries?: number | undefined;
+  backOffTime?: ((attempt: number) => number) | undefined;
   /**
    * Whether a failed attempt is retried: return `false` for the errors that another attempt cannot
    * fix (e.g. a validation error). Defaults to retrying every error.
    */
-  shouldRetry?: (error: unknown, attempt: number) => boolean;
+  shouldRetry?: ((error: unknown, attempt: number) => boolean) | undefined;
   /**
    * Timeout of each attempt of this execution, in milliseconds; overrides the instance's `timeout`.
    * Callers that join an in-flight execution share the timeout of the call that started it.
    */
-  timeout?: number;
-}
+  timeout?: number | undefined;
+};
 
 /** Thrown when an attempt exceeds its timeout. */
 export class LilypadTimeoutError extends Error {
@@ -94,12 +94,12 @@ const RATE_MAP_PRUNE_THRESHOLD = 1000;
  *   whole execution.
  */
 export class LilypadFlowControl {
-  private readonly rate?: number;
-  private readonly timeout?: number;
-  private readonly retries?: number;
+  private readonly rate?: number | undefined;
+  private readonly timeout?: number | undefined;
+  private readonly retries?: number | undefined;
 
-  private singleFlightMap: Map<string, Promise<unknown>> = new Map();
-  private rateMap: Map<string, number> = new Map();
+  private singleFlightMap = new Map<string, Promise<unknown>>();
+  private rateMap = new Map<string, number>();
   /** When the rate limit entries were last pruned. */
   private lastRatePrune = 0;
 
@@ -153,9 +153,9 @@ export class LilypadFlowControl {
    */
   async executeWithRetries<T>(options: {
     executionFn: () => Promise<T>;
-    retries?: number;
-    backOffTime?: (attempt: number) => number;
-    shouldRetry?: (error: unknown, attempt: number) => boolean;
+    retries?: number | undefined;
+    backOffTime?: ((attempt: number) => number) | undefined;
+    shouldRetry?: ((error: unknown, attempt: number) => boolean) | undefined;
   }): Promise<T> {
     let attempts = 0;
     while (true) {
@@ -279,7 +279,7 @@ export class LilypadFlowControl {
             : `${consumerIdentifier}#${functionIdentifier}`
         );
       } catch (error) {
-        return Promise.reject(error as Error);
+        return Promise.reject(error);
       }
     }
     return this.singleFlight(functionIdentifier, () =>

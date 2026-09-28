@@ -1,11 +1,21 @@
 # dependencies
 /node_modules
 
-# secrets (connection strings, webhook URLs, ...)
+# build output: built by the release workflow, never committed
+/dist
+/api-docs
+*.tsbuildinfo
+
+# secrets (connection strings, webhook URLs, tokens, ...)
 .env
 .env.*
 !.env.example
+.npmrc
 
 # test and debug output
 /coverage
 *.log
+
+# OS and editors
+.DS_Store
+Thumbs.db

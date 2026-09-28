@@ -1,15 +1,16 @@
-import path from 'path';
-import { defineConfig } from 'vitest/config';
+import { defineConfig, type ViteUserConfig } from 'vitest/config';
 
-export default defineConfig({
+const config: ViteUserConfig = defineConfig({
   resolve: {
-    alias: {
-      '@': path.resolve(__dirname, 'src'),
-    },
+    // The `@/*` alias comes from the `paths` of tsconfig.json
+    tsconfigPaths: true,
   },
   test: {
     coverage: {
-      reporter: ['text', 'json', 'html'],
+      provider: 'v8',
+      include: ['src/**/*.ts'],
+      exclude: ['src/**/*.test.ts', 'src/cli/lilypad-doctor.ts'],
+      reporter: ['text-summary', 'html', 'lcov'],
     },
     projects: [
       {
@@ -54,3 +55,5 @@ export default defineConfig({
     ],
   },
 });
+
+export default config;

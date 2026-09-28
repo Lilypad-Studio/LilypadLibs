@@ -137,6 +137,7 @@ describe('LilypadDiscordLogger', () => {
     stubFetch({ ok: false, status: 429, statusText: 'Too Many Requests' });
 
     const sent = new LilypadDiscordLogger<'info'>(webhookUrl).write(record('info', 'message'));
+    // eslint-disable-next-line vitest/valid-expect -- awaited once the fake timers have advanced
     const assertion = expect(sent).rejects.toThrow('status 429');
     await vi.advanceTimersByTimeAsync(1000);
 

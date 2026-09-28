@@ -13,13 +13,17 @@ export type LilypadBackground = (task: Promise<unknown>) => void;
  * Every operation may fail or never answer: the library bounds them with a timeout and treats a
  * failure as a missing entry.
  */
-export interface LilypadSharedStore {
+export type LilypadSharedStore = {
   /** Resolves to `null` (or `undefined`) when the key is missing. */
   get(key: string): Promise<unknown>;
   /** `ttl` is in **seconds**, as in the Vercel Runtime Cache. */
-  set(key: string, value: unknown, options?: { ttl?: number; tags?: string[] }): Promise<void>;
+  set(
+    key: string,
+    value: unknown,
+    options?: { ttl?: number | undefined; tags?: string[] | undefined }
+  ): Promise<void>;
   delete(key: string): Promise<void>;
-}
+};
 
 export type LilypadInvalidationEvent = {
   /**
@@ -62,15 +66,15 @@ export type LilypadInvalidationEvent = {
  * ```
  */
 export type LilypadPlatform = {
-  background?: LilypadBackground;
+  background?: LilypadBackground | undefined;
   /**
    * Runs `work` once the response has been sent, keeping the instance alive until it settles.
    * Used to start background refreshes, so that starting them does not delay the response.
    * On Next.js: `(work) => after(work)`. Without it, refreshes start at once (through `background`).
    */
-  afterResponse?: (work: () => Promise<unknown>) => void;
-  shared?: LilypadSharedStore;
-  onInvalidate?: (event: LilypadInvalidationEvent) => void | Promise<void>;
+  afterResponse?: ((work: () => Promise<unknown>) => void) | undefined;
+  shared?: LilypadSharedStore | undefined;
+  onInvalidate?: ((event: LilypadInvalidationEvent) => void | Promise<void>) | undefined;
 };
 
 /**

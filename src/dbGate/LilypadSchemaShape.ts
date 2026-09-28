@@ -28,7 +28,7 @@ import type { LilypadSchemaProblem } from '@/dbGate/LilypadSchemaCheck';
  */
 export type LilypadSchemaTableShape = {
   cols: Readonly<Record<string, LilypadDbColumn>>;
-  generatedPrimaryKey?: boolean;
+  generatedPrimaryKey?: boolean | undefined;
   unique: readonly LilypadDbResolvedUniqueKey[];
   foreignKeys: readonly LilypadDbResolvedForeignKey[];
   indexes: readonly LilypadDbResolvedIndex[];
@@ -66,7 +66,7 @@ const ACTION_NAMES = Object.fromEntries(
 ) as Record<string, LilypadDbReferentialAction>;
 
 function columnList(columns: readonly (string | null)[]): string {
-  return columns.map((column) => (column === null ? '<expression>' : column)).join(', ');
+  return columns.map((column) => column ?? '<expression>').join(', ');
 }
 
 function quotedColumns(columns: readonly string[]): string {

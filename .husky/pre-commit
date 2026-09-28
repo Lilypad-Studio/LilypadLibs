@@ -1,22 +1,6 @@
-# The checks and the build run on what is being committed: the unstaged changes and the untracked
-# files are set aside meanwhile, so that dist/ is built from the committed sources only. dist/ is
-# left out of the stash: it is generated, and rebuilt below.
-stashed=0
-if ! git diff --quiet -- . ':(exclude)dist' || [ -n "$(git ls-files --others --exclude-standard -- . ':(exclude)dist')" ]; then
-  git stash push --keep-index --include-untracked --quiet -m "pre-commit: unstaged changes" -- . ':(exclude)dist'
-  stashed=1
-fi
-restore() {
-  if [ "$stashed" = 1 ]; then
-    git stash pop --quiet
-  fi
-}
-trap restore EXIT
-
-npm test -- --run
+# Formats and lints the staged files (lint-staged stages its fixes, and sets the unstaged changes
+# aside meanwhile), then checks the types and runs the unit tests. The build and the integration
+# tests run in CI.
+npx lint-staged
 npm run typecheck
-npx eslint . --max-warnings 0
-npm run build
-# Only the rebuilt bundle is staged: never `git add .`, which would also commit unrelated
-# (possibly secret) files of the working tree
-git add dist
+npm test

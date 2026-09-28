@@ -1,22 +1,5 @@
 # Changelog
 
-## Unreleased
-
-### Upgrading
-
-| Change | What to do |
-| --- | --- |
-| **The columns of `defineLilypadTable<T>` must fit the row type.** A column whose `type`, or known `pgType`, does not fit its property of `T` no longer compiles (e.g. `int8`, which postgres.js returns as a string, on a `number` property), nor does a `pgType` whose type is not known (an enum, a domain) without its `type`. `defineLilypadDb` throws for a `type` that does not fit a known `pgType`. | Fix the column or the row type; add `type` to the columns of enums, domains and extension types; mark `converted: true` the columns the hooks convert. |
-| **A config holds no functions.** `writeSanitizationFn` and `selectSanitizationFn` leave the tables of the config (`defineLilypadDb` throws for them, and for `hooks`): the application binds them with `bindLilypadDbHooks`, so that `lilypad-doctor` loads the config without the application code they import. They are now the `write` and `select` hooks, and `select` receives the row as a `Record<string, unknown>`. | Remove them from `defineLilypadTable`, then, where the gate is created: `const appDb = bindLilypadDbHooks(db, { users: { write: sanitizeUser, select: parseUser } })` and `LilypadDbGate.create({ ..., config: appDb })`. The rest of the application can keep using `db`: the gate applies the hooks of its config to its tables. |
-
-### Added
-
-- The `type` of a column follows from its `pgType` (`int4` is `'number'`, `int8` `'bigint'`, `timestamptz` `'date'`, `jsonb` `'json'`, `text[]` `'array'`...): declare it only for the types postgres.js has no parser for (enums, domains, extension types). `lilypadColumnTypesOfPgType(pgType)` (`@lilypad/libs/schema`) gives the column types of a PostgreSQL type, and `LilypadDbColumnFor<V>`, `LilypadDbColumnTypeOf<V>`, `LilypadDbColumnValues` and `LilypadPgTypeOf<C>` type the columns of a property type. The `column-type-mismatch` warning of `lilypad-doctor` reads the same table (so a `money` column declared `number` is now reported: postgres.js returns it as a string), and names the types to declare.
-- `bindLilypadDbHooks(db, { <table>: { write?, select? } })` (`@lilypad/libs/schema`) binds the functions of the application to the tables of a config, typed with the row type of each table. It returns a copy of the config; a gate created with it applies the hooks to the tables of its config however they are given (by key, or as a definition of the original config).
-- `lilypad-doctor` explains a config that Node.js cannot load: a type imported without `import type`, an import that needs a bundler (path alias, missing extension, JSON without its attribute), and what a config may import.
-- `npx lilypad-doctor init [--config <name|path>] [--empty] [--force]` creates a config file to start from: `lilypad.config.ts` (or `lilypad.<name>.config.ts`, or the path given, in JavaScript for `.mjs`/`.js`), with an example table and the options of the config as comments. It never overwrites an existing config without `--force`, and needs no database.
-- `lilypad-doctor --env-file <path>` reads the connection string from an env file such as `.env` (repeatable; the environment wins over the files), and `--url-env <name>` names the variable that holds it (default `DATABASE_URL`): `lilypad-doctor --env-file .env --url-env POSTGRES_URL` works in a `package.json` script on every OS.
-
 ## 0.6.0
 
 ### Upgrading

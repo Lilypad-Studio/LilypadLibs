@@ -1,38 +1,45 @@
-# @lilypad/libs
+# @lilypad-studio/libs
 
 Server-side TypeScript utilities from Lilypad Studios:
 
-| Module | What it gives you |
-| --- | --- |
-| [`LilypadLogger`](#logger) | A typed logger with named channels (`logger.info(...)`, `logger.error(...)`) and pluggable outputs (console, Discord, your own). |
-| [`LilypadCache`](#lilypadcache) | A TTL cache that deduplicates concurrent fetches, serves stale values while refreshing them, falls back to the old value when a fetch fails, and can share its values between instances. |
-| [Database config](#database-config) | One file that describes the database the application expects (tables, columns, keys, foreign keys, indexes, checks, sync), used by the database modules at runtime and checked against the database by [`lilypad-doctor`](#lilypad-doctor-checking-the-database). |
-| [`LilypadDbGate`](#lilypaddbgate) | A thin PostgreSQL gateway (built on [postgres.js](https://github.com/porsager/postgres)): typed CRUD helpers and `LISTEN/NOTIFY` subscriptions. |
-| [`LilypadDbCache`](#lilypaddbcache) | A cache of the rows of one database table (on the same engine as `LilypadCache`), kept up to date by a changelog table or by Postgres notifications. |
-| [`LilypadFlowControl`](#lilypadflowcontrol) | Timeouts, retries with backoff, rate limiting and single-flight deduplication for async calls. |
-| [`LilypadSerializer`](#lilypadserializer) | Type-checked mapping between two object shapes (for example, compact storage keys) that leaves out default values. |
-| [Singleton helpers](#singletons) | A process-wide registry that survives hot reloads and duplicate bundles. |
+| Module                                      | What it gives you                                                                                                                                                                                                                                                 |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`LilypadLogger`](#logger)                  | A typed logger with named channels (`logger.info(...)`, `logger.error(...)`) and pluggable outputs (console, Discord, your own).                                                                                                                                  |
+| [`LilypadCache`](#lilypadcache)             | A TTL cache that deduplicates concurrent fetches, serves stale values while refreshing them, falls back to the old value when a fetch fails, and can share its values between instances.                                                                          |
+| [Database config](#database-config)         | One file that describes the database the application expects (tables, columns, keys, foreign keys, indexes, checks, sync), used by the database modules at runtime and checked against the database by [`lilypad-doctor`](#lilypad-doctor-checking-the-database). |
+| [`LilypadDbGate`](#lilypaddbgate)           | A thin PostgreSQL gateway (built on [postgres.js](https://github.com/porsager/postgres)): typed CRUD helpers and `LISTEN/NOTIFY` subscriptions.                                                                                                                   |
+| [`LilypadDbCache`](#lilypaddbcache)         | A cache of the rows of one database table (on the same engine as `LilypadCache`), kept up to date by a changelog table or by Postgres notifications.                                                                                                              |
+| [`LilypadFlowControl`](#lilypadflowcontrol) | Timeouts, retries with backoff, rate limiting and single-flight deduplication for async calls.                                                                                                                                                                    |
+| [`LilypadSerializer`](#lilypadserializer)   | Type-checked mapping between two object shapes (for example, compact storage keys) that leaves out default values.                                                                                                                                                |
+| [Singleton helpers](#singletons)            | A process-wide registry that survives hot reloads and duplicate bundles.                                                                                                                                                                                          |
 
 **Running on Next.js or Vercel?** Read [Using Lilypad on Next.js and Vercel](docs/nextjs-vercel.md): it shows how to connect the library to the platform, and the recommended options for each module.
 
-**Want to know how it works inside?** Read [How @lilypad/libs works](docs/how-it-works.md): a top-down tour of the internals, from the general design down to single functions.
+**Want to know how it works inside?** Read [How @lilypad-studio/libs works](docs/how-it-works.md): a top-down tour of the internals, from the general design down to single functions.
 
 **Contents:** [Installation](#installation) · [Quick start](#quick-start) · [Conventions](#conventions-used-across-the-library) · [Next.js / Vercel](docs/nextjs-vercel.md) · [Logger](#logger) · [LilypadCache](#lilypadcache) · [Database config](#database-config) · [LilypadDbGate](#lilypaddbgate) · [LilypadDbCache](#lilypaddbcache) · [lilypad-doctor](#lilypad-doctor-checking-the-database) · [LilypadFlowControl](#lilypadflowcontrol) · [LilypadSerializer](#lilypadserializer) · [Singletons](#singletons) · [Troubleshooting](#troubleshooting) · [Contributing](#contributing)
 
 ## Installation
 
-The built package (`dist/`) is committed to the repository, so you can install it straight from GitHub:
+The package is internal: it is published to the GitHub Packages registry of Lilypad-Studio, which only the people and the repositories given access to it can read. Point the `@lilypad-studio` scope to that registry in the `.npmrc` of the application, give npm a token that can read packages, then install it:
+
+```ini
+# .npmrc of the application (committed: it holds no secret)
+@lilypad-studio:registry=https://npm.pkg.github.com
+```
 
 ```bash
-npm install github:Lilypad-Studio/LilypadLibs
+npm install @lilypad-studio/libs
 ```
+
+[docs/installing.md](docs/installing.md) explains which token to use on a workstation, in GitHub Actions, on Vercel and in Docker, and how to upgrade from `@lilypad/libs` installed from git.
 
 Requirements:
 
 - Node.js 22.12 or later.
 - It is built as ES modules, with type declarations. Node.js 22.12+ also loads them with `require()`, so CommonJS code can use it too.
-- The database modules (`@lilypad/libs/db`) run on Node.js only, since they need TCP connections. The other modules also run in edge runtimes (see [Importing](#importing-the-whole-package-or-one-module)). None of them is meant for browsers.
-- The database modules need PostgreSQL and the [`postgres`](https://github.com/porsager/postgres) driver, an optional peer dependency: install it next to the library (`npm install postgres`) if you use `@lilypad/libs/db`. The other modules do not need it.
+- The database modules (`@lilypad-studio/libs/db`) run on Node.js only, since they need TCP connections. The other modules also run in edge runtimes (see [Importing](#importing-the-whole-package-or-one-module)). None of them is meant for browsers.
+- The database modules need PostgreSQL and the [`postgres`](https://github.com/porsager/postgres) driver, an optional peer dependency: install it next to the library (`npm install postgres`) if you use `@lilypad-studio/libs/db`. The other modules do not need it.
 
 ## Quick start
 
@@ -40,7 +47,7 @@ The database modules start from a config file that describes the tables (see [Da
 
 ```ts
 // lilypad.config.ts
-import { defineLilypadDb, defineLilypadTable } from '@lilypad/libs/schema';
+import { defineLilypadDb, defineLilypadTable } from '@lilypad-studio/libs/schema';
 
 type User = { id: string; name: string; email: string };
 
@@ -61,8 +68,8 @@ export default defineLilypadDb({ tables: { users } });
 This example loads the `users` table into a cache and reads rows through it:
 
 ```ts
-import { LilypadLogger, LilypadConsoleLogger } from '@lilypad/libs/logger';
-import { LilypadDbGate, LilypadDbCache } from '@lilypad/libs/db';
+import { LilypadLogger, LilypadConsoleLogger } from '@lilypad-studio/libs/logger';
+import { LilypadDbGate, LilypadDbCache } from '@lilypad-studio/libs/db';
 import db from './lilypad.config';
 
 // 1. A logger with the four channels the other modules log on (the default channels)
@@ -111,43 +118,43 @@ It prints what is missing (here, the trigger that notifies the cache of the chan
 
 ### Importing the whole package or one module
 
-Each module is available on its own. `@lilypad/libs` exports every module **except `/db`**, so that importing it never pulls in `postgres` and it also runs in edge runtimes:
+Each module is available on its own. `@lilypad-studio/libs` exports every module **except `/db`**, so that importing it never pulls in `postgres` and it also runs in edge runtimes:
 
-| Import | Contents | Edge runtime |
-| --- | --- | --- |
-| `@lilypad/libs/logger` | `LilypadLogger` and the components | Yes |
-| `@lilypad/libs/cache` | `LilypadCache` | Yes |
-| `@lilypad/libs/flow` | `LilypadFlowControl` | Yes |
-| `@lilypad/libs/serializer` | `LilypadSerializer` | Yes |
-| `@lilypad/libs/singleton` | The singleton registry | Yes |
-| `@lilypad/libs/platform` | The platform types (`LilypadPlatform`, ...) | Yes |
-| `@lilypad/libs/schema` | `defineLilypadDb`, `defineLilypadTable` and the table types, for the [config files](#database-config) | Yes |
-| `@lilypad/libs/db` | `LilypadDbGate`, `LilypadDbCache`, the changelog helpers, `lilypad-doctor` from code (it also exports `/schema`) | No |
+| Import                            | Contents                                                                                                         | Edge runtime |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------ |
+| `@lilypad-studio/libs/logger`     | `LilypadLogger` and the components                                                                               | Yes          |
+| `@lilypad-studio/libs/cache`      | `LilypadCache`                                                                                                   | Yes          |
+| `@lilypad-studio/libs/flow`       | `LilypadFlowControl`                                                                                             | Yes          |
+| `@lilypad-studio/libs/serializer` | `LilypadSerializer`                                                                                              | Yes          |
+| `@lilypad-studio/libs/singleton`  | The singleton registry                                                                                           | Yes          |
+| `@lilypad-studio/libs/platform`   | The platform types (`LilypadPlatform`, ...)                                                                      | Yes          |
+| `@lilypad-studio/libs/schema`     | `defineLilypadDb`, `defineLilypadTable` and the table types, for the [config files](#database-config)            | Yes          |
+| `@lilypad-studio/libs/db`         | `LilypadDbGate`, `LilypadDbCache`, the changelog helpers, `lilypad-doctor` from code (it also exports `/schema`) | No           |
 
-Import the database modules from `@lilypad/libs/db`. For the others, importing the module you use keeps bundles smaller. Code that runs in an edge runtime (for example Next.js middleware) must not import `/db`.
+Import the database modules from `@lilypad-studio/libs/db`. For the others, importing the module you use keeps bundles smaller. Code that runs in an edge runtime (for example Next.js middleware) must not import `/db`.
 
 ### Platform capabilities
 
 On serverless platforms, the modules accept a `platform` option (type `LilypadPlatform`). Every field is optional:
 
-| Field | What the library does with it | On Next.js / Vercel |
-| --- | --- | --- |
-| `background(task)` | Keeps the instance alive until `task` settles: log messages being sent, shared level writes, invalidation events | `(task) => after(() => task)` or `waitUntil` |
-| `afterResponse(work)` | Starts stale-while-revalidate refreshes once the response is sent. Without it, they start at once (through `background`) | `(work) => after(work)` |
-| `shared` | The default store of the caches' shared level (`get`, `set` with a `ttl` in **seconds**, `delete`) | `getCache()` from `@vercel/functions` |
-| `onInvalidate(event)` | Called when cached data changes (see [Invalidation events](docs/nextjs-vercel.md#invalidation-events)) | `revalidateTag` |
+| Field                 | What the library does with it                                                                                            | On Next.js / Vercel                          |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------- |
+| `background(task)`    | Keeps the instance alive until `task` settles: log messages being sent, shared level writes, invalidation events         | `(task) => after(() => task)` or `waitUntil` |
+| `afterResponse(work)` | Starts stale-while-revalidate refreshes once the response is sent. Without it, they start at once (through `background`) | `(work) => after(work)`                      |
+| `shared`              | The default store of the caches' shared level (`get`, `set` with a `ttl` in **seconds**, `delete`)                       | `getCache()` from `@vercel/functions`        |
+| `onInvalidate(event)` | Called when cached data changes (see [Invalidation events](docs/nextjs-vercel.md#invalidation-events))                   | `revalidateTag`                              |
 
 If `background` or `afterResponse` throws (for example `after` called outside a request), the work still runs, only without the guarantee. See [Using Lilypad on Next.js and Vercel](docs/nextjs-vercel.md). Without `platform`, the modules behave as on a long-running server.
 
 ### Creating instances: `create()` or `new`
 
-| Class | How to create it |
-| --- | --- |
-| `LilypadLogger` | `LilypadLogger.create(options)` (synchronous) |
-| `LilypadDbGate` | `await LilypadDbGate.create(options)` |
-| `LilypadDbCache` | `await LilypadDbCache.create(options)` |
-| `LilypadCache` | `new LilypadCache(options)` |
-| `LilypadFlowControl`, `LilypadSerializer`, logger components | `new ...` |
+| Class                                                        | How to create it                              |
+| ------------------------------------------------------------ | --------------------------------------------- |
+| `LilypadLogger`                                              | `LilypadLogger.create(options)` (synchronous) |
+| `LilypadDbGate`                                              | `await LilypadDbGate.create(options)`         |
+| `LilypadDbCache`                                             | `await LilypadDbCache.create(options)`        |
+| `LilypadCache`                                               | `new LilypadCache(options)`                   |
+| `LilypadFlowControl`, `LilypadSerializer`, logger components | `new ...`                                     |
 
 The first three classes have private constructors, so `new LilypadLogger(...)` does not compile. `LilypadDbGate.create` and `LilypadDbCache.create` are async: they resolve only after their `LISTEN` subscriptions are active, and they reject if the database cannot be reached.
 
@@ -193,7 +200,7 @@ Use `null` to cache "not found" results. Repeated lookups of a missing id then s
 You choose the channel names. Each channel becomes an async method on the logger:
 
 ```ts
-import { LilypadLogger, LilypadConsoleLogger, LilypadDiscordLogger } from '@lilypad/libs';
+import { LilypadLogger, LilypadConsoleLogger, LilypadDiscordLogger } from '@lilypad-studio/libs';
 
 type Channels = 'error' | 'warn' | 'info' | 'debug';
 
@@ -248,7 +255,7 @@ On a serverless platform an instance can be suspended as soon as the response is
 Use `LilypadLoggerType<Channels>` to type a logger, not `LilypadLogger<Channels>`: only the first type includes the channel methods.
 
 ```ts
-import type { LilypadLibLogger } from '@lilypad/libs';
+import type { LilypadLibLogger } from '@lilypad-studio/libs';
 
 // LilypadLibLogger: any object with some of the methods error, warn, info and debug
 class OrderService {
@@ -273,7 +280,7 @@ logger.register({ debug: [new LilypadConsoleLogger()] });
 Extend `LilypadLoggerComponent` and implement `write(record)`. The record holds `type` (the channel), `message` (the parts formatted and joined), `parts` (as they were logged), `timestamp`, `loggerName` and `context`. `this.formatRecord(record)` formats it as `<ISO timestamp> - [name] [CHANNEL]: <message> <context as JSON>`.
 
 ```ts
-import { LilypadLoggerComponent, type LilypadLogRecord } from '@lilypad/libs';
+import { LilypadLoggerComponent, type LilypadLogRecord } from '@lilypad-studio/libs';
 import { appendFile } from 'node:fs/promises';
 
 class FileLogger<T extends string> extends LilypadLoggerComponent<T> {
@@ -297,7 +304,7 @@ If `write()` throws or rejects, the logger passes the error to `errorLogging`.
 The values of some keys are replaced with `[Redacted]` in the messages and in the context, at any depth: by default `LILYPAD_DEFAULT_REDACTED_KEYS` (authorization headers, cookies, passwords, secrets, tokens, API keys). This keeps, for example, the `Authorization` header of the request attached to an HTTP client error out of the logs, and out of Discord. Keys are compared ignoring case, `-` and `_` (`apiKey` matches `api_key`).
 
 ```ts
-import { LILYPAD_DEFAULT_REDACTED_KEYS, LilypadLogger } from '@lilypad/libs';
+import { LILYPAD_DEFAULT_REDACTED_KEYS, LilypadLogger } from '@lilypad-studio/libs';
 
 LilypadLogger.create({ components, redact: [...LILYPAD_DEFAULT_REDACTED_KEYS, 'ssn'] }); // extend
 LilypadLogger.create({ components, redact: false }); // redact nothing
@@ -326,7 +333,7 @@ The raw `parts` of a record are not redacted: a custom component that prints the
 An in-memory cache with string or number keys and a time to live (TTL) for each entry.
 
 ```ts
-import { LilypadCache } from '@lilypad/libs';
+import { LilypadCache } from '@lilypad-studio/libs';
 
 type Product = { id: string; price: number };
 
@@ -342,22 +349,22 @@ const products = new LilypadCache<string, Product>({
 
 Every constructor option, in one place (the sections below explain them):
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `ttl` | 60 s | Time to live of the entries. It must be a positive finite number |
-| `autoCleanupInterval` | never | Removes expired entries with a timer (which does not keep Node.js running) |
-| `cleanupOnAccessEvery` | never | Removes expired entries during reads and writes, at most once per interval. It needs no timer, so it suits instances suspended between requests |
-| `errorTtl` | the TTL, at most 5 min | TTL of a fallback value cached after a failed fetch |
-| `fetchTimeout` | 5 s | Timeout of the fetches of `getOrSet` |
-| `staleWhileRevalidate` | 0 (off) | [Stale values](#stale-values-cooldown-and-bounded-memory) |
-| `failureCooldown` | 0 (off) | [Cooldown after a failed fetch](#stale-values-cooldown-and-bounded-memory) |
-| `maxEntries` | no limit | [Bounded memory](#stale-values-cooldown-and-bounded-memory) |
-| `name` | a random id | Names the cache in shared level keys and invalidation events. Required with `shared` |
-| `shared` | none | [A level shared by every instance](#a-level-shared-by-every-instance) |
-| `platform` | none | [Platform capabilities](#platform-capabilities) |
-| `tagPrefix` | `'lilypad'` | Prefix of the tags of the invalidation events (`<tagPrefix>:<name>:<key>`, name and key URI-encoded) |
-| `bulkSync: { fn, ttl, timeout }` | none, the TTL, 30 s | [Loading everything at once](#loading-everything-at-once-bulksync) |
-| `logger` | none | See [Passing a logger](#passing-a-logger-to-the-other-modules) |
+| Option                           | Default                | What it does                                                                                                                                    |
+| -------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ttl`                            | 60 s                   | Time to live of the entries. It must be a positive finite number                                                                                |
+| `autoCleanupInterval`            | never                  | Removes expired entries with a timer (which does not keep Node.js running)                                                                      |
+| `cleanupOnAccessEvery`           | never                  | Removes expired entries during reads and writes, at most once per interval. It needs no timer, so it suits instances suspended between requests |
+| `errorTtl`                       | the TTL, at most 5 min | TTL of a fallback value cached after a failed fetch                                                                                             |
+| `fetchTimeout`                   | 5 s                    | Timeout of the fetches of `getOrSet`                                                                                                            |
+| `staleWhileRevalidate`           | 0 (off)                | [Stale values](#stale-values-cooldown-and-bounded-memory)                                                                                       |
+| `failureCooldown`                | 0 (off)                | [Cooldown after a failed fetch](#stale-values-cooldown-and-bounded-memory)                                                                      |
+| `maxEntries`                     | no limit               | [Bounded memory](#stale-values-cooldown-and-bounded-memory)                                                                                     |
+| `name`                           | a random id            | Names the cache in shared level keys and invalidation events. Required with `shared`                                                            |
+| `shared`                         | none                   | [A level shared by every instance](#a-level-shared-by-every-instance)                                                                           |
+| `platform`                       | none                   | [Platform capabilities](#platform-capabilities)                                                                                                 |
+| `tagPrefix`                      | `'lilypad'`            | Prefix of the tags of the invalidation events (`<tagPrefix>:<name>:<key>`, name and key URI-encoded)                                            |
+| `bulkSync: { fn, ttl, timeout }` | none, the TTL, 30 s    | [Loading everything at once](#loading-everything-at-once-bulksync)                                                                              |
+| `logger`                         | none                   | See [Passing a logger](#passing-a-logger-to-the-other-modules)                                                                                  |
 
 Durations and sizes are checked by the constructor: a value that is not a finite number, a negative one, or a `maxEntries` that is not a positive integer throws.
 
@@ -372,7 +379,10 @@ products.get('p1'); // { id: 'p1', price: 10 }
 products.get('p2'); // null      -> known not to exist
 products.get('p4'); // undefined -> not cached
 
-products.bulkSet([['p5', { id: 'p5', price: 7 }], ['p6', null]]); // several `set` at once (also takes a Map)
+products.bulkSet([
+  ['p5', { id: 'p5', price: 7 }],
+  ['p6', null],
+]); // several `set` at once (also takes a Map)
 ```
 
 - `get` reads the memory of this instance only; `getOrSet` also reads the shared level.
@@ -534,7 +544,7 @@ It never overwrites a config (a file of the same config with any extension) unle
 
 ```ts
 // lilypad.config.ts, at the root of the project
-import { defineLilypadDb, defineLilypadTable } from '@lilypad/libs/schema';
+import { defineLilypadDb, defineLilypadTable } from '@lilypad-studio/libs/schema';
 
 type Team = { id: number; slug: string; name: string };
 type Member = {
@@ -563,7 +573,11 @@ const members = defineLilypadTable<Member, 'id'>({
   generatedPrimaryKey: true,
   cols: {
     id: { pgType: 'uuid', default: { sql: 'gen_random_uuid()' } },
-    teamId: { pgType: 'int4', nullable: false, references: { table: 'teams', onDelete: 'cascade' } },
+    teamId: {
+      pgType: 'int4',
+      nullable: false,
+      references: { table: 'teams', onDelete: 'cascade' },
+    },
     email: { pgType: 'text', nullable: false },
     joinedAt: { pgType: 'timestamptz', nullable: false, default: { sql: 'now()' } },
     managerId: { pgType: 'uuid', nullable: true },
@@ -586,55 +600,58 @@ The application imports it:
 ```ts
 import db from './lilypad.config';
 
-const gate = await LilypadDbGate.create({ connectionString: process.env.DATABASE_URL!, config: db });
+const gate = await LilypadDbGate.create({
+  connectionString: process.env.DATABASE_URL!,
+  config: db,
+});
 const members = await LilypadDbCache.create({ ttl: 60_000, gate, table: 'members' });
 const teams = gate.table(db.tables.teams); // the CRUD helpers; gate.table('teams') works too
 ```
 
 `defineLilypadDb` checks the config itself, and throws on the first mistake: a primary key that is not a column, a foreign key whose columns do not match the referenced ones, two keys for the same table, a `changelog` sync without `pollInterval`, a function in a table, and so on. It never queries the database. Its result is frozen, and its `tables` are the definitions that `gate.table()` and `LilypadDbCache.create()` take: they reject a description that does not come from `defineLilypadDb`.
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `tables` | required | The tables, by key: `db.tables.<key>`, `gate.table('<key>')` |
-| `name` | `'default'` | The name of the config, which `lilypad-doctor --config` looks for (see [Several configs](#several-configs)) |
-| `defaultSchema` | `'public'` | The schema of the tables whose name is not qualified. Every query of the library names a table with its schema (`"public"."teams"`), whatever the `search_path` |
-| `notifyChannel` | `'cache_events'` | The channel the triggers notify, for the tables with the `listen` sync |
-| `changelog.table` | `'lilypad_cache_changes'` | The changelog table, for the tables with the `changelog` sync |
-| `changelog.pruning` | `'detect'` | How the old changelog rows are deleted (see [Checking the pruning of the changelog](#checking-the-pruning-of-the-changelog)) |
-| `changelog.minRetention` | 1 hour | The shortest retention the pruning may keep; `lilypad-doctor` raises it to the `maxGap` and `lookback` of the `changelog` tables |
-| `strict` | `false` | `lilypad-doctor` also warns about what the database has and the config lacks: columns, foreign keys, unique keys, checks, indexes. A table can override it |
+| Option                   | Default                   | What it does                                                                                                                                                    |
+| ------------------------ | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tables`                 | required                  | The tables, by key: `db.tables.<key>`, `gate.table('<key>')`                                                                                                    |
+| `name`                   | `'default'`               | The name of the config, which `lilypad-doctor --config` looks for (see [Several configs](#several-configs))                                                     |
+| `defaultSchema`          | `'public'`                | The schema of the tables whose name is not qualified. Every query of the library names a table with its schema (`"public"."teams"`), whatever the `search_path` |
+| `notifyChannel`          | `'cache_events'`          | The channel the triggers notify, for the tables with the `listen` sync                                                                                          |
+| `changelog.table`        | `'lilypad_cache_changes'` | The changelog table, for the tables with the `changelog` sync                                                                                                   |
+| `changelog.pruning`      | `'detect'`                | How the old changelog rows are deleted (see [Checking the pruning of the changelog](#checking-the-pruning-of-the-changelog))                                    |
+| `changelog.minRetention` | 1 hour                    | The shortest retention the pruning may keep; `lilypad-doctor` raises it to the `maxGap` and `lookback` of the `changelog` tables                                |
+| `strict`                 | `false`                   | `lilypad-doctor` also warns about what the database has and the config lacks: columns, foreign keys, unique keys, checks, indexes. A table can override it      |
 
 ### Describing a table
 
 `defineLilypadTable<T, PK>(table)` describes one table and the TypeScript type of its rows. It only returns its input, typed: declaring the primary key column `PK` makes it optional in inserts and allows partial updates. The row type of a table described without it is inferred from `cols`, with `unknown` values.
 
-| Field | Default | What it does |
-| --- | --- | --- |
-| `tableName` | required | `'teams'`, or `'app.teams'` to give its schema |
-| `schemaName` | `defaultSchema` of the config | The schema of the table, instead of qualifying `tableName` |
-| `primaryKey` | required | One column: the keys of `LilypadDbCache`. `lilypad-doctor` checks that it is the primary key of the table |
-| `generatedPrimaryKey` | `false` | The database generates the primary key (serial, identity, default): inserts leave it out and return the generated one. `lilypad-doctor` checks that the column has a default or is an identity |
-| `cols` | required | The columns: see below |
-| `unique` | none | The sets of columns that are unique together: `[{ columns: ['teamId', 'email'], name? }]` |
-| `foreignKeys` | none | `[{ columns, references: { table, columns?, onDelete?, onUpdate? }, name? }]` |
-| `indexes` | none | `[{ columns, unique?, using?, name? }]`, `using` being `'btree'` (default), `'hash'`, `'gin'`, `'gist'`, `'brin'` or `'spgist'` |
-| `checks` | none | `[{ name, expression? }]`: found by name; with an `expression`, the fix creates it |
-| `sync` | `{ strategy: 'listen' }` | How `LilypadDbCache` keeps the table up to date (see [Keeping the cache in sync with the database](#keeping-the-cache-in-sync-with-the-database)) |
-| `strict` | `strict` of the config | See the config options |
+| Field                 | Default                       | What it does                                                                                                                                                                                   |
+| --------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tableName`           | required                      | `'teams'`, or `'app.teams'` to give its schema                                                                                                                                                 |
+| `schemaName`          | `defaultSchema` of the config | The schema of the table, instead of qualifying `tableName`                                                                                                                                     |
+| `primaryKey`          | required                      | One column: the keys of `LilypadDbCache`. `lilypad-doctor` checks that it is the primary key of the table                                                                                      |
+| `generatedPrimaryKey` | `false`                       | The database generates the primary key (serial, identity, default): inserts leave it out and return the generated one. `lilypad-doctor` checks that the column has a default or is an identity |
+| `cols`                | required                      | The columns: see below                                                                                                                                                                         |
+| `unique`              | none                          | The sets of columns that are unique together: `[{ columns: ['teamId', 'email'], name? }]`                                                                                                      |
+| `foreignKeys`         | none                          | `[{ columns, references: { table, columns?, onDelete?, onUpdate? }, name? }]`                                                                                                                  |
+| `indexes`             | none                          | `[{ columns, unique?, using?, name? }]`, `using` being `'btree'` (default), `'hash'`, `'gin'`, `'gist'`, `'brin'` or `'spgist'`                                                                |
+| `checks`              | none                          | `[{ name, expression? }]`: found by name; with an `expression`, the fix creates it                                                                                                             |
+| `sync`                | `{ strategy: 'listen' }`      | How `LilypadDbCache` keeps the table up to date (see [Keeping the cache in sync with the database](#keeping-the-cache-in-sync-with-the-database))                                              |
+| `strict`              | `strict` of the config        | See the config options                                                                                                                                                                         |
 
 A table holds no function: the functions that transform its rows are bound by the application (see [Functions applied to the rows](#functions-applied-to-the-rows-bindlilypaddbhooks)).
 
 The columns of `cols`:
 
-| Field | At runtime | Checked by `lilypad-doctor` |
-| --- | --- | --- |
-| `type` | The `type` of the primary key: with `'number'`, `LilypadDbCache` converts to numbers the ids that notifications and the changelog carry as text | What postgres.js returns for the column: one of `'string'`, `'number'`, `'bigint'` (an `int8`, returned as a string), `'boolean'`, `'date'`, `'json'` and `'array'`. It follows from a known `pgType`: declare it only for the other types (enums, domains, the types of extensions) or without `pgType`. Without `pgType`, checks that the database type is read by postgres.js as this type (a warning: e.g. a `numeric` or `bigint` column declared `'number'`) |
-| `pgType` | Gives the `type` when it is not declared | The exact PostgreSQL type (`'uuid'`, `'int4'`, `'varchar(64)'`, `'timestamptz'`, `'text[]'`...), common aliases accepted (`int4` is `integer`, `timestamptz` is `timestamp with time zone`). Without it, the fix cannot create the column |
-| `converted` | Not used (types only) | The hooks convert the column (see [Functions applied to the rows](#functions-applied-to-the-rows-bindlilypaddbhooks)): its property in `T` is not compared with `type` and `pgType` |
-| `nullable` | Not used | Whether the column accepts `NULL`, when set |
-| `default` | Not used | `true`: the column has a default; `{ sql: 'now()' }`: the same, and the fix uses this expression. The installed expression is not compared |
-| `unique` | Not used | A unique key on this column alone |
-| `references` | Not used | A foreign key of this column: `{ table, column?, onDelete?, onUpdate? }` |
+| Field        | At runtime                                                                                                                                      | Checked by `lilypad-doctor`                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `type`       | The `type` of the primary key: with `'number'`, `LilypadDbCache` converts to numbers the ids that notifications and the changelog carry as text | What postgres.js returns for the column: one of `'string'`, `'number'`, `'bigint'` (an `int8`, returned as a string), `'boolean'`, `'date'`, `'json'` and `'array'`. It follows from a known `pgType`: declare it only for the other types (enums, domains, the types of extensions) or without `pgType`. Without `pgType`, checks that the database type is read by postgres.js as this type (a warning: e.g. a `numeric` or `bigint` column declared `'number'`) |
+| `pgType`     | Gives the `type` when it is not declared                                                                                                        | The exact PostgreSQL type (`'uuid'`, `'int4'`, `'varchar(64)'`, `'timestamptz'`, `'text[]'`...), common aliases accepted (`int4` is `integer`, `timestamptz` is `timestamp with time zone`). Without it, the fix cannot create the column                                                                                                                                                                                                                          |
+| `converted`  | Not used (types only)                                                                                                                           | The hooks convert the column (see [Functions applied to the rows](#functions-applied-to-the-rows-bindlilypaddbhooks)): its property in `T` is not compared with `type` and `pgType`                                                                                                                                                                                                                                                                                |
+| `nullable`   | Not used                                                                                                                                        | Whether the column accepts `NULL`, when set                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `default`    | Not used                                                                                                                                        | `true`: the column has a default; `{ sql: 'now()' }`: the same, and the fix uses this expression. The installed expression is not compared                                                                                                                                                                                                                                                                                                                         |
+| `unique`     | Not used                                                                                                                                        | A unique key on this column alone                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `references` | Not used                                                                                                                                        | A foreign key of this column: `{ table, column?, onDelete?, onUpdate? }`                                                                                                                                                                                                                                                                                                                                                                                           |
 
 - `cols` must list **every property of `T`**. Only these columns are read and written: any other property of the data you pass is ignored. So you can pass a request body directly without the risk of writing columns such as `is_admin`. Properties set to `undefined` are not written either. The table may have other columns: `lilypad-doctor` warns only about a `NOT NULL` column without a default (the inserts of the library would fail), or about every one with `strict`.
 - The library does not validate or convert values at runtime: postgres.js converts them, and `type` says what it returns. The `type` of a known `pgType` is given for you: `int2`/`int4`/`serial`/`real`/`float8` are `'number'`; `int8`/`bigserial` `'bigint'` and `numeric` `'string'` (postgres.js returns them as strings, so type them as `string` in `T`: their keys stay strings); `text`, `varchar`, `uuid`, `time`, `interval`, `inet`... `'string'`; `date`/`timestamp`/`timestamptz` `'date'`; `bool` `'boolean'`; `json`/`jsonb` `'json'`; any array `'array'` (`lilypadColumnTypesOfPgType` tells them). `defineLilypadDb` rejects a declared `type` that does not fit a known `pgType` (`int4` declared `'string'`).
@@ -648,8 +665,8 @@ The config describes the database only, so that `lilypad-doctor` can load it wit
 
 ```ts
 // src/db.ts
-import { bindLilypadDbHooks } from '@lilypad/libs/schema';
-import { LilypadDbGate } from '@lilypad/libs/db';
+import { bindLilypadDbHooks } from '@lilypad-studio/libs/schema';
+import { LilypadDbGate } from '@lilypad-studio/libs/db';
 import db from '../lilypad.config';
 import { parseMember, sanitizeMember } from '@/members/rows';
 
@@ -663,10 +680,10 @@ export const gate = await LilypadDbGate.create({
 });
 ```
 
-| Hook | What it does |
-| --- | --- |
+| Hook          | What it does                                                                                                                                                                    |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `write(data)` | Applied to the data before every insert and update. Its result replaces the data, so a property it leaves out is not written. Only the `cols` columns of the result are written |
-| `select(row)` | Builds `T` from a database row. It receives the whole row (`SELECT *`, and `RETURNING *` for the writes), and can return `null` to leave the row out of the results |
+| `select(row)` | Builds `T` from a database row. It receives the whole row (`SELECT *`, and `RETURNING *` for the writes), and can return `null` to leave the row out of the results             |
 
 - The hooks are typed with the row type of each table: `write: (data: Partial<Member>) => Partial<Member>`, `select: (row: Record<string, unknown>) => Member | null`. A key that is not a table of the config is a type error, and `bindLilypadDbHooks` throws for it.
 - `bindLilypadDbHooks` returns a copy of the config (same name, settings and tables) and leaves `db` untouched. There is still one description of each table, in the config file; the copy only adds the functions.
@@ -702,19 +719,19 @@ const sessions = await LilypadDbCache.create({ ttl, gate, table: analytics.table
 
 `lilypad-doctor` imports the config with Node.js, outside the application (no bundler, no path aliases), so:
 
-- import only `@lilypad/libs/schema` (it runs in edge runtimes too, and does not load postgres.js), the files of the config, and your types with `import type`. Type imports are erased before loading, so they may use path aliases and name application modules: `import type { Member } from '@/members/types'`. A type imported without `type` is kept by the type stripping of Node.js, and fails (`does not provide an export named`): `verbatimModuleSyntax` in `tsconfig.json` reports them;
+- import only `@lilypad-studio/libs/schema` (it runs in edge runtimes too, and does not load postgres.js), the files of the config, and your types with `import type`. Type imports are erased before loading, so they may use path aliases and name application modules: `import type { Member } from '@/members/types'`. A type imported without `type` is kept by the type stripping of Node.js, and fails (`does not provide an export named`): `verbatimModuleSyntax` in `tsconfig.json` reports them;
 - keep application code out of the config: its functions are bound by the application (see [Functions applied to the rows](#functions-applied-to-the-rows-bindlilypaddbhooks)), and `defineLilypadDb` rejects a table with a function;
 - a TypeScript config is loaded by the type stripping of Node.js: Node.js 22.18 or later, or `NODE_OPTIONS=--experimental-strip-types` from 22.12 to 22.17. It may use only erasable syntax (no `enum`, no `namespace`, no parameter properties), and its relative imports need their extension (`import { teams } from './db/teams.ts'`, with `allowImportingTsExtensions` in `tsconfig.json`). Or write it as `.mjs`;
 - the file name decides the config it is (`lilypad.config.ts`, `.mts`, `.mjs` or `.js`; `lilypad.<name>.config.*`), and a config found by name must have that `name`.
 
-When the config does not load, the error says why when it can tell (a type imported as a value, an import Node.js cannot resolve) and what a config may import. `loadLilypadDbConfig({ config, cwd })` (from `@lilypad/libs/db`) loads a config file from code, as the command does.
+When the config does not load, the error says why when it can tell (a type imported as a value, an import Node.js cannot resolve) and what a config may import. `loadLilypadDbConfig({ config, cwd })` (from `@lilypad-studio/libs/db`) loads a config file from code, as the command does.
 
 ## LilypadDbGate
 
 A PostgreSQL gateway: typed CRUD helpers for simple tables, the full postgres.js client for everything else, and `LISTEN/NOTIFY`.
 
 ```ts
-import { LilypadDbGate } from '@lilypad/libs/db';
+import { LilypadDbGate } from '@lilypad-studio/libs/db';
 
 const gate = await LilypadDbGate.create({
   connectionString: process.env.DATABASE_URL!,
@@ -737,12 +754,12 @@ await gate.close(); // waits up to 5 s for the running queries, then closes both
 - The gate connects on the first query: creating it opens no connection, unless `listen` subscribes to channels. If a `listen` subscription fails, `create()` closes the gate and rejects.
 - `pool` configures the query pool. Every duration is in milliseconds, and an option you leave out keeps the postgres.js default:
 
-  | Option | postgres.js default | What it does |
-  | --- | --- | --- |
-  | `max` | 10 | Maximum number of connections |
-  | `idleTimeout` | never | Closes connections idle for this long |
-  | `connectTimeout` | 30 s | Fails a connection attempt after this long |
-  | `maxLifetime` | 30 to 60 min | Closes connections older than this |
+  | Option           | postgres.js default | What it does                               |
+  | ---------------- | ------------------- | ------------------------------------------ |
+  | `max`            | 10                  | Maximum number of connections              |
+  | `idleTimeout`    | never               | Closes connections idle for this long      |
+  | `connectTimeout` | 30 s                | Fails a connection attempt after this long |
+  | `maxLifetime`    | 30 to 60 min        | Closes connections older than this         |
 
 - On serverless platforms, use `pool: lilypadServerlessPool` (`{ max: 3, idleTimeout: 5_000, connectTimeout: 10_000 }`: few connections per instance, closed quickly when idle) with a pooled connection string. Adjust `max` to the number of queries one instance runs in parallel: `pool: { ...lilypadServerlessPool, max: 5 }`.
 - `statementTimeout` (default: 30 s; `false` keeps the setting of the database) is enforced by Postgres on the queries of the pool. A cache that times out (`fetchTimeout`) does not stop its query: this bound frees the connection, instead of leaving slow queries holding the pool while the queries behind them wait.
@@ -858,7 +875,7 @@ const accounts = defineLilypadTable<Account, 'id'>({
 });
 
 // In the application
-import { LilypadDbCache } from '@lilypad/libs/db';
+import { LilypadDbCache } from '@lilypad-studio/libs/db';
 
 const accounts = await LilypadDbCache.create({
   ttl: 5 * 60_000,
@@ -913,16 +930,16 @@ accounts.invalidate(7); // no query: the entry is expired, and the next read fet
 
 If other instances or other programs (a script, an admin tool, a manual `UPDATE`) change the table, the cache would keep serving old rows until they expire. The `sync` of the table, in the config, chooses how the cache learns about those changes (`lilypad-doctor` checks that the database has the triggers it needs):
 
-| Strategy | How | Delay | Suited to |
-| --- | --- | --- | --- |
+| Strategy                                  | How                                                                                                                      | Delay            | Suited to                                         |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------- | ------------------------------------------------- |
 | `{ strategy: 'changelog', pollInterval }` | A trigger records every change in a table; the cache reads the new rows at most once per `pollInterval`, when it is used | ≤ `pollInterval` | Serverless platforms, and any number of instances |
-| `{ strategy: 'listen' }` (default) | `LISTEN/NOTIFY` on a dedicated connection | Near real time | Long-running servers |
-| `{ strategy: 'none' }` | Only the writes of this instance, and the TTL | ≤ TTL | Data no one else changes |
+| `{ strategy: 'listen' }` (default)        | `LISTEN/NOTIFY` on a dedicated connection                                                                                | Near real time   | Long-running servers                              |
+| `{ strategy: 'none' }`                    | Only the writes of this instance, and the TTL                                                                            | ≤ TTL            | Data no one else changes                          |
 
 Both `changelog` and `listen` rely on a trigger. The library provides its SQL; run it once, in a migration:
 
 ```ts
-import { lilypadChangelogSql, lilypadChangelogTriggerSql } from '@lilypad/libs/db';
+import { lilypadChangelogSql, lilypadChangelogTriggerSql } from '@lilypad-studio/libs/db';
 
 await sql.unsafe(lilypadChangelogSql()); // the changelog table and the trigger function
 await sql.unsafe(lilypadChangelogTriggerSql({ table: 'accounts', primaryKey: 'id' })); // per table
@@ -972,20 +989,25 @@ With `listen` or `changelog`, as long as the sync is trusted (`LISTEN` active an
 
 The options of the `changelog` strategy, in the `sync` of the table:
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `pollInterval` | required | Minimum time (ms) between two reads of the changelog. The cache reads it before a `getOrFetch` or `getAll` once this has passed, so changes are seen within it |
-| `poll` | `'await'` | `'await'`: a read that falls due waits for the changelog. `'background'`: it does not wait, and may return data one interval older |
-| `maxGap` | 1 hour | If the changelog has not been read for this long, the instance no longer trusts its memory and expires every entry |
-| `lookback` | TTL + `staleWhileRevalidate` + 1 min | On the first read, or after `maxGap`, the changes of this period are applied, which also removes older copies from the shared level |
-| `maxAge` | 1 hour | How long a row can be kept past its TTL while the sync is trusted: see [The TTL while the cache is in sync](#the-ttl-while-the-cache-is-in-sync). `listen` accepts it too |
+| Option         | Default                              | What it does                                                                                                                                                              |
+| -------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pollInterval` | required                             | Minimum time (ms) between two reads of the changelog. The cache reads it before a `getOrFetch` or `getAll` once this has passed, so changes are seen within it            |
+| `poll`         | `'await'`                            | `'await'`: a read that falls due waits for the changelog. `'background'`: it does not wait, and may return data one interval older                                        |
+| `maxGap`       | 1 hour                               | If the changelog has not been read for this long, the instance no longer trusts its memory and expires every entry                                                        |
+| `lookback`     | TTL + `staleWhileRevalidate` + 1 min | On the first read, or after `maxGap`, the changes of this period are applied, which also removes older copies from the shared level                                       |
+| `maxAge`       | 1 hour                               | How long a row can be kept past its TTL while the sync is trusted: see [The TTL while the cache is in sync](#the-ttl-while-the-cache-is-in-sync). `listen` accepts it too |
 
 The changelog table and its pruning are options of the config (`changelog.table`, `changelog.pruning`), shared by its tables. The options of the `listen` strategy are `connect` (`'eager'`, the default: `create` resolves once `LISTEN` is active; `'lazy'`: on the first read), `applyChanges` and `maxAge`.
 
 `LilypadDbCache.create` can change, for one cache, the options that do not change what the database must provide, with its own `sync` option: `maxAge`, `connect`, `applyChanges`, `onNotification` (see below), `pollInterval` and `poll`. The strategy, `maxGap` and `lookback` stay those of the config, which `lilypad-doctor` checks the database against:
 
 ```ts
-const accounts = await LilypadDbCache.create({ ttl, gate, table: 'accounts', sync: { connect: 'lazy' } });
+const accounts = await LilypadDbCache.create({
+  ttl,
+  gate,
+  table: 'accounts',
+  sync: { connect: 'lazy' },
+});
 ```
 
 The caches of a gate that use the same changelog table read it together, in one query per poll. A failed read of the changelog is logged, and the read of the cache goes on with its current content; the next attempt waits for a backoff (from `pollInterval`, doubling up to one minute) instead of retrying at every read. A failed lazy `LISTEN` backs off the same way, from one second. The [Next.js guide](docs/nextjs-vercel.md#5-database-caches-keeping-every-instance-up-to-date) explains how to choose these values.
@@ -1044,7 +1066,7 @@ When a table uses the `changelog` sync, it also checks the changelog table and i
 From code, `runLilypadDoctor({ connectionString, config })` does the same, and resolves to the result, with its `text` and `assertOk()` (which throws a `LilypadSchemaCheckError` when the check found errors). Or run the check on a gate of your own:
 
 ```ts
-import { checkLilypadSchema, lilypadSchemaCheckOptions } from '@lilypad/libs/db';
+import { checkLilypadSchema, lilypadSchemaCheckOptions } from '@lilypad-studio/libs/db';
 
 const { ok, problems, tables } = await checkLilypadSchema(gate, lilypadSchemaCheckOptions(db));
 for (const { code, severity, table, message, fix } of problems) {
@@ -1057,49 +1079,49 @@ for (const { code, severity, table, message, fix } of problems) {
 
 Each problem has a `severity`. `error`: the database is not what the config describes (the caches may serve stale data, the queries may fail); `ok` is `false`. `warning`: it works, but something needs attention; `ok` stays `true`.
 
-| Code | Severity | When |
-| --- | --- | --- |
-| `unsupported-version` | error | PostgreSQL is older than 13 (the changelog needs `xid8`) |
-| `missing-table` | error | The table does not exist. The fix creates it when every column has a `pgType` |
-| `missing-column` | error | A column of `cols` does not exist |
-| `column-type-mismatch` | error / warning | The type is not the `pgType` (error), or does not fit the `type` (warning) |
-| `column-nullability-mismatch` | error | The column accepts `NULL` although `nullable: false`, or the reverse |
-| `missing-column-default` | error | A column with `default` (or the primary key with `generatedPrimaryKey`) has no default |
-| `wrong-primary-key` | error / warning | `primaryKey` is not the primary key: an error if it is not unique, a warning if a unique index and `NOT NULL` make it a key anyway |
-| `missing-unique-key` | error | No unique constraint or index covers exactly the columns of a unique key |
-| `missing-foreign-key` | error | A foreign key does not exist (same columns, same referenced table and columns) |
-| `foreign-key-mismatch` | error | The foreign key exists, with other `ON DELETE` / `ON UPDATE` actions |
-| `missing-index` | error / warning | An index does not exist: an error for a unique index, a warning otherwise |
-| `missing-check` | error | No check has this name |
-| `undeclared-required-column` | warning | A `NOT NULL` column without a default is not in `cols`: the inserts of the library fail |
-| `undeclared-column`, `undeclared-constraint`, `undeclared-index` | warning | With `strict`: a column, a unique key, foreign key or check, or an index that the config does not describe |
-| `missing-changelog` | error | The changelog table or its trigger function does not exist |
-| `outdated-changelog` | error / warning | Installed by an older version of the library: run `lilypadChangelogSql()` again, with the same `notifyChannel` (the suggested SQL keeps the channel of the installed function, or the one the check requires). A warning when the caches still read it correctly |
-| `missing-changelog-trigger` | error | The changelog triggers are missing, disabled or not on every `INSERT`, `UPDATE` and `DELETE` |
-| `wrong-trigger-primary-key` | error | The changelog trigger records another column than the primary key |
-| `missing-notify-trigger` | error | No trigger notifies on the channel, or not on each of `INSERT`, `UPDATE` and `DELETE` |
-| `missing-truncate-trigger` | error | `TRUNCATE` is not recorded, or not notified: add it with `lilypadChangelogTriggerSql`, or handle `TG_OP = 'TRUNCATE'` in your own trigger |
-| `short-changelog-retention`, `no-changelog-pruning`, `unpruned-changelog` | see below | The pruning of the changelog |
+| Code                                                                      | Severity        | When                                                                                                                                                                                                                                                             |
+| ------------------------------------------------------------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `unsupported-version`                                                     | error           | PostgreSQL is older than 13 (the changelog needs `xid8`)                                                                                                                                                                                                         |
+| `missing-table`                                                           | error           | The table does not exist. The fix creates it when every column has a `pgType`                                                                                                                                                                                    |
+| `missing-column`                                                          | error           | A column of `cols` does not exist                                                                                                                                                                                                                                |
+| `column-type-mismatch`                                                    | error / warning | The type is not the `pgType` (error), or does not fit the `type` (warning)                                                                                                                                                                                       |
+| `column-nullability-mismatch`                                             | error           | The column accepts `NULL` although `nullable: false`, or the reverse                                                                                                                                                                                             |
+| `missing-column-default`                                                  | error           | A column with `default` (or the primary key with `generatedPrimaryKey`) has no default                                                                                                                                                                           |
+| `wrong-primary-key`                                                       | error / warning | `primaryKey` is not the primary key: an error if it is not unique, a warning if a unique index and `NOT NULL` make it a key anyway                                                                                                                               |
+| `missing-unique-key`                                                      | error           | No unique constraint or index covers exactly the columns of a unique key                                                                                                                                                                                         |
+| `missing-foreign-key`                                                     | error           | A foreign key does not exist (same columns, same referenced table and columns)                                                                                                                                                                                   |
+| `foreign-key-mismatch`                                                    | error           | The foreign key exists, with other `ON DELETE` / `ON UPDATE` actions                                                                                                                                                                                             |
+| `missing-index`                                                           | error / warning | An index does not exist: an error for a unique index, a warning otherwise                                                                                                                                                                                        |
+| `missing-check`                                                           | error           | No check has this name                                                                                                                                                                                                                                           |
+| `undeclared-required-column`                                              | warning         | A `NOT NULL` column without a default is not in `cols`: the inserts of the library fail                                                                                                                                                                          |
+| `undeclared-column`, `undeclared-constraint`, `undeclared-index`          | warning         | With `strict`: a column, a unique key, foreign key or check, or an index that the config does not describe                                                                                                                                                       |
+| `missing-changelog`                                                       | error           | The changelog table or its trigger function does not exist                                                                                                                                                                                                       |
+| `outdated-changelog`                                                      | error / warning | Installed by an older version of the library: run `lilypadChangelogSql()` again, with the same `notifyChannel` (the suggested SQL keeps the channel of the installed function, or the one the check requires). A warning when the caches still read it correctly |
+| `missing-changelog-trigger`                                               | error           | The changelog triggers are missing, disabled or not on every `INSERT`, `UPDATE` and `DELETE`                                                                                                                                                                     |
+| `wrong-trigger-primary-key`                                               | error           | The changelog trigger records another column than the primary key                                                                                                                                                                                                |
+| `missing-notify-trigger`                                                  | error           | No trigger notifies on the channel, or not on each of `INSERT`, `UPDATE` and `DELETE`                                                                                                                                                                            |
+| `missing-truncate-trigger`                                                | error           | `TRUNCATE` is not recorded, or not notified: add it with `lilypadChangelogTriggerSql`, or handle `TG_OP = 'TRUNCATE'` in your own trigger                                                                                                                        |
+| `short-changelog-retention`, `no-changelog-pruning`, `unpruned-changelog` | see below       | The pruning of the changelog                                                                                                                                                                                                                                     |
 
 ### Checking the pruning of the changelog
 
 When a table of the config uses the `changelog` sync, `lilypad-doctor` also looks at how the old rows of the changelog are deleted, and suggests the best way for your database when it finds none:
 
-| It finds | How |
-| --- | --- |
-| The `prune` option of the trigger | The `lilypad-prune:` comment in the trigger function, which also gives its retention |
-| A pg_cron job | A job of `cron.job` (in this database) whose command is a `DELETE FROM` the changelog table. The retention is read from `make_interval(secs => ...)` (the SQL of the library) or an interval literal (`interval '7 days'`). Row-level security hides the jobs of the other roles, except from a superuser: create the job with the role of the check |
-| That something deletes rows | `pg_stat_user_tables.n_tup_del` of the changelog is not zero: a job it cannot see, such as `pruneLilypadChangelog` from a scheduled function, prunes it |
+| It finds                          | How                                                                                                                                                                                                                                                                                                                                                  |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The `prune` option of the trigger | The `lilypad-prune:` comment in the trigger function, which also gives its retention                                                                                                                                                                                                                                                                 |
+| A pg_cron job                     | A job of `cron.job` (in this database) whose command is a `DELETE FROM` the changelog table. The retention is read from `make_interval(secs => ...)` (the SQL of the library) or an interval literal (`interval '7 days'`). Row-level security hides the jobs of the other roles, except from a superuser: create the job with the role of the check |
+| That something deletes rows       | `pg_stat_user_tables.n_tup_del` of the changelog is not zero: a job it cannot see, such as `pruneLilypadChangelog` from a scheduled function, prunes it                                                                                                                                                                                              |
 
 It cannot see a pg_cron job in another database (pg_cron often runs in `postgres`), nor a job of your application until it has deleted rows. Set `changelog: { pruning: 'external' }` in the config to tell it that you prune the changelog yourself.
 
 When it finds none, it suggests the best pruning it can tell for the database. To choose it yourself, set `pruning: 'trigger'` (always the `prune` option of the trigger) or `pruning: 'cron'` (always a pg_cron job). With `'cron'`, if the role cannot read `cron.database_name` (managed hosts often hide it), the fix installs pg_cron in this database: on a host that fixes `cron.database_name` in its settings (e.g. Neon), set it to this database first. Both still report a pruning they find, as `'detect'` does.
 
-| Code | Severity | When | The fix |
-| --- | --- | --- | --- |
-| `short-changelog-retention` | error | A pruning found deletes rows that are not older than `minRetention`: a cache could miss changes without knowing it | The same pruning (same `every`/`batchSize`, or same job name and schedule), with a retention of 4 × `minRetention`, at least 24 hours |
-| `no-changelog-pruning` | warning | None of the above, and `pruning` is not `'external'` | With `pruning: 'trigger'`, the `prune` option of the trigger; with `'cron'`, a pg_cron job (scheduled from the database pg_cron runs in, if known to be another one; else in this one). Otherwise the best pruning for the database: a pg_cron job where pg_cron is installed, or known to run in this database; a job scheduled from the database pg_cron runs in, if that is another one (`cron.database_name`, if the role can read it); otherwise the `prune` option of the trigger, which needs nothing (the message mentions pg_cron if the server has it). If the changelog is missing or outdated too, its fix installs it with that option, in one SQL |
-| `unpruned-changelog` | warning | The oldest row of the changelog is older than the retention found (24 hours if unknown) plus 7 days: the pruning does not run, or does not keep up. Checked whatever `pruning` says | A `DELETE` of the old rows, once |
+| Code                        | Severity | When                                                                                                                                                                                | The fix                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| --------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `short-changelog-retention` | error    | A pruning found deletes rows that are not older than `minRetention`: a cache could miss changes without knowing it                                                                  | The same pruning (same `every`/`batchSize`, or same job name and schedule), with a retention of 4 × `minRetention`, at least 24 hours                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `no-changelog-pruning`      | warning  | None of the above, and `pruning` is not `'external'`                                                                                                                                | With `pruning: 'trigger'`, the `prune` option of the trigger; with `'cron'`, a pg_cron job (scheduled from the database pg_cron runs in, if known to be another one; else in this one). Otherwise the best pruning for the database: a pg_cron job where pg_cron is installed, or known to run in this database; a job scheduled from the database pg_cron runs in, if that is another one (`cron.database_name`, if the role can read it); otherwise the `prune` option of the trigger, which needs nothing (the message mentions pg_cron if the server has it). If the changelog is missing or outdated too, its fix installs it with that option, in one SQL |
+| `unpruned-changelog`        | warning  | The oldest row of the changelog is older than the retention found (24 hours if unknown) plus 7 days: the pruning does not run, or does not keep up. Checked whatever `pruning` says | A `DELETE` of the old rows, once                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 `minRetention` is the retention the caches need: the largest of `changelog.minRetention` of the config (default: 1 hour) and the `maxGap` and `lookback` of the `changelog` tables. The default `lookback` depends on the TTL of each cache, which the config does not know: declare `lookback` in the sync of a table whose TTL plus `staleWhileRevalidate` exceeds `maxGap`.
 
@@ -1108,7 +1130,7 @@ When it finds none, it suggests the best pruning it can tell for the database. T
 Wraps an async function with a timeout, retries, rate limiting and single-flight deduplication. `LilypadCache` uses it internally, and you can use it on its own:
 
 ```ts
-import { LilypadFlowControl, LilypadTimeoutError } from '@lilypad/libs';
+import { LilypadFlowControl, LilypadTimeoutError } from '@lilypad-studio/libs';
 
 const payments = new LilypadFlowControl({
   timeout: 3_000, // abort each attempt after 3 s (default: no timeout)
@@ -1141,7 +1163,7 @@ The individual steps are also available: `executeWithTimeout(fn, timeout?)`, `ex
 Maps objects of one shape (`FROM`) to another shape (`TO`) and back. It is useful for compact storage or transport formats, because values equal to their default are left out:
 
 ```ts
-import { LilypadSerializer } from '@lilypad/libs';
+import { LilypadSerializer } from '@lilypad-studio/libs';
 
 type Settings = { theme: 'light' | 'dark'; volume: number; tags: string[] };
 type StoredSettings = { t?: 'l' | 'd'; v?: number; g?: string };
@@ -1198,7 +1220,7 @@ import {
   getLilypadSingletonInstance,
   getLilypadSingletonInstanceAsync,
   removeLilypadSingletonInstance,
-} from '@lilypad/libs';
+} from '@lilypad-studio/libs';
 
 const flags = getLilypadSingletonInstance('feature-flags', () => new Map<string, boolean>());
 
@@ -1244,13 +1266,13 @@ Open database connections keep Node.js running. Call `await dispose()` on every 
 The other modules log only through the logger you pass them, on the levels `error`, `warn`, `info` and `debug`. Check that you passed `logger` and that it has those methods (with a `LilypadLogger`, that those channels have components).
 
 **`lilypad-doctor` cannot load `lilypad.config.ts`.**
-Node.js loads it without a bundler: use Node.js 22.18 or later (or `NODE_OPTIONS=--experimental-strip-types`), import only `@lilypad/libs/schema`, relative files with their extension, and types with `import type` (a type imported without `type` fails with `does not provide an export named`). Functions that need application code do not belong in the config: bind them with [`bindLilypadDbHooks`](#functions-applied-to-the-rows-bindlilypaddbhooks). See [Writing the config file](#writing-the-config-file).
+Node.js loads it without a bundler: use Node.js 22.18 or later (or `NODE_OPTIONS=--experimental-strip-types`), import only `@lilypad-studio/libs/schema`, relative files with their extension, and types with `import type` (a type imported without `type` fails with `does not provide an export named`). Functions that need application code do not belong in the config: bind them with [`bindLilypadDbHooks`](#functions-applied-to-the-rows-bindlilypaddbhooks). See [Writing the config file](#writing-the-config-file).
 
 **`the table must be a table of a config made with defineLilypadDb`.**
 `gate.table()` and `LilypadDbCache.create()` take a table of a config (`db.tables.users`), or its key: pass the result of `defineLilypadDb`, not the object given to `defineLilypadTable`.
 
-**`@lilypad/libs` has no `LilypadDbGate` or `LilypadDbCache`.**
-The database modules are exported by `@lilypad/libs/db` only, so that the root entry never pulls in postgres.js and runs in edge runtimes.
+**`@lilypad-studio/libs` has no `LilypadDbGate` or `LilypadDbCache`.**
+The database modules are exported by `@lilypad-studio/libs/db` only, so that the root entry never pulls in postgres.js and runs in edge runtimes.
 
 **TypeScript: `Property 'info' does not exist on type 'LilypadLogger<...>'`.**
 Type the variable as `LilypadLoggerType<...>`, not `LilypadLogger<...>`.
@@ -1259,11 +1281,14 @@ Type the variable as `LilypadLoggerType<...>`, not `LilypadLogger<...>`.
 
 ```bash
 npm install
-npm test -- --run         # unit tests
+npm test                  # unit tests (npm run test:watch in watch mode)
 npm run test:integration  # needs Docker (starts a PostgreSQL container)
-npm run typecheck
-npm run lint              # eslint --fix, modifies files
-npm run build
+npm run typecheck         # Node.js sources, then the edge entries without the Node.js types
+npm run lint              # eslint (npm run lint:fix applies the fixes)
+npm run format            # prettier (npm run format:check only checks)
+npm run build             # dist/, then publint and arethetypeswrong on the package
+npm run check             # everything the CI checks, except the integration tests
+npx changeset             # describe a change for the changelog (see docs/releasing.md)
 ```
 
-The pre-commit hook runs the unit tests, the typecheck, the lint check and the build on the staged changes (the unstaged ones are stashed meanwhile), then stages `dist/`. The CI (`.github/workflows/ci.yml`) runs the same checks on Node.js 22 and 24, checks that the committed `dist/` matches the sources, and runs the integration tests. See [How @lilypad/libs works](docs/how-it-works.md) for a guided tour of the internals, and [CLAUDE.md](CLAUDE.md) for condensed architecture notes.
+The pre-commit hook formats and lints the staged files (lint-staged), then runs the typecheck and the unit tests; the commit-msg hook requires a [conventional](https://www.conventionalcommits.org) message (`feat:`, `fix:`, `refactor:`, `chore:`...). The CI (`.github/workflows/ci.yml`) runs the checks on Node.js 22, 24 and 26, installs the packed package on Node.js 22.12 (the lowest supported version) to load every entry, and runs the integration tests. `dist/` is not committed: the release workflow builds and publishes it (see [docs/releasing.md](docs/releasing.md)). See [How @lilypad-studio/libs works](docs/how-it-works.md) for a guided tour of the internals, and [CLAUDE.md](CLAUDE.md) for condensed architecture notes.

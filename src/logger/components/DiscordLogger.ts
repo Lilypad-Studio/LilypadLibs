@@ -18,17 +18,17 @@ export type LilypadDiscordLoggerOptions = {
    * Minimum time between two requests to the webhook, in milliseconds. Messages logged in between
    * are sent together in the next request. Defaults to 1000.
    */
-  minRequestInterval?: number;
+  minRequestInterval?: number | undefined;
   /**
    * How many times a request rate limited by Discord (429) is retried, after the `retry-after`
    * time (when it is at most 30 seconds). Defaults to 1.
    */
-  rateLimitRetries?: number;
+  rateLimitRetries?: number | undefined;
   /**
    * Maximum number of messages waiting to be sent. Beyond it the oldest are dropped (their
    * `write` resolves), and the next request says how many were dropped. Defaults to 100.
    */
-  maxQueueSize?: number;
+  maxQueueSize?: number | undefined;
 };
 
 type QueuedMessage = {

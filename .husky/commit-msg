@@ -1,0 +1,3 @@
+# Conventional commit messages (feat:, fix:, refactor:, chore:, ...): see the commitlint config in
+# package.json
+npx --no -- commitlint --edit "$1"

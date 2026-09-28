@@ -12,7 +12,7 @@ const signatureMap = (globalThis.__lilypadSingletonSignatureMap ??= new Map<stri
  */
 export type LilypadSingletonAble = {
   /** The identifier of the singleton, unique among the instances of the class. */
-  singleton?: string;
+  singleton?: string | undefined;
 };
 
 /**

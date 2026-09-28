@@ -27,21 +27,21 @@ type IsInjective<M extends Record<PropertyKey, PropertyKey>> = {
 type IsBijective<A extends object, B extends object, M extends Record<keyof A, keyof B>> =
   IsSurjective<B, M> extends true ? IsInjective<M> : false;
 
-export interface LilypadSerializerConstructorOptions<
+export type LilypadSerializerConstructorOptions<
   FROM extends object,
   TO extends object,
   KeyMap extends Record<keyof FROM, keyof TO>,
-> {
+> = {
   serialization: {
     [K in keyof FROM]: {
       target: IsBijective<FROM, TO, KeyMap> extends true ? KeyMap[K] : never;
       serialize: (item: FROM) => TO[KeyMap[K]];
       deserialize: (item: TO) => FROM[K];
       default: FROM[K];
-      equality?: (value: FROM[K], defaultValue: FROM[K]) => boolean;
+      equality?: ((value: FROM[K], defaultValue: FROM[K]) => boolean) | undefined;
     };
   };
-}
+};
 
 /**
  * A generic serializer/deserializer for mapping objects between two shapes (`FROM` and `TO`)
@@ -113,6 +113,7 @@ export class LilypadSerializer<
         const value = this.options.serialization[fromKey].deserialize(item);
         // Only undefined: null is a value, which the serialization may have written on purpose
         unpackedItem[fromKey] =
+          // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- null is kept
           value === undefined ? cloneDefault(this.options.serialization[fromKey].default) : value;
       });
       return unpackedItem;

@@ -16,11 +16,7 @@ export type LilypadDbColumnDefault = true | { sql: string };
  * Defaults to `no action`.
  */
 export type LilypadDbReferentialAction =
-  | 'no action'
-  | 'restrict'
-  | 'cascade'
-  | 'set null'
-  | 'set default';
+  'no action' | 'restrict' | 'cascade' | 'set null' | 'set default';
 
 /** The access method of an index. Defaults to `btree`. */
 export type LilypadDbIndexMethod = 'btree' | 'hash' | 'gin' | 'gist' | 'brin' | 'spgist';
@@ -38,21 +34,21 @@ export type LilypadDbReference = {
    * The referenced columns, in the order of the columns of the foreign key. Defaults to the primary
    * key of the referenced table, when it is a table of the config.
    */
-  columns?: readonly string[];
-  onDelete?: LilypadDbReferentialAction;
-  onUpdate?: LilypadDbReferentialAction;
+  columns?: readonly string[] | undefined;
+  onDelete?: LilypadDbReferentialAction | undefined;
+  onUpdate?: LilypadDbReferentialAction | undefined;
 };
 
 /** The foreign key of one column (the `references` of a column). */
 export type LilypadDbColumnReference = Omit<LilypadDbReference, 'columns'> & {
   /** The referenced column. Defaults to the primary key of the referenced table. */
-  column?: string;
+  column?: string | undefined;
 };
 
 /** A foreign key of the table, on one or several columns. */
 export type LilypadDbForeignKey<T> = {
   /** The name of the constraint, used by the SQL that creates it. It is not compared. */
-  name?: string;
+  name?: string | undefined;
   columns: readonly LilypadDbColumnName<T>[];
   references: LilypadDbReference;
 };
@@ -63,25 +59,25 @@ export type LilypadDbForeignKey<T> = {
  */
 export type LilypadDbUniqueKey<T> = {
   /** The name of the constraint, used by the SQL that creates it. It is not compared. */
-  name?: string;
+  name?: string | undefined;
   columns: readonly LilypadDbColumnName<T>[];
 };
 
 /** An index on columns of the table (neither partial nor on expressions). */
 export type LilypadDbIndex<T> = {
   /** The name of the index, used by the SQL that creates it. It is not compared. */
-  name?: string;
+  name?: string | undefined;
   /** The columns, in the order of the index. */
   columns: readonly LilypadDbColumnName<T>[];
-  unique?: boolean;
-  using?: LilypadDbIndexMethod;
+  unique?: boolean | undefined;
+  using?: LilypadDbIndexMethod | undefined;
 };
 
 /**
  * A `CHECK` constraint, found by its name (its expression is not compared: PostgreSQL rewrites it).
  * With an `expression`, the SQL that fixes the table creates it.
  */
-export type LilypadDbCheck = { name: string; expression?: string };
+export type LilypadDbCheck = { name: string; expression?: string | undefined };
 
 /**
  * The description of a table: what the library reads and writes, and what `lilypad-doctor`
@@ -97,7 +93,7 @@ export type LilypadDbSchema<T, PK extends keyof T = keyof T> = {
   /** The table, unqualified (`users`), or qualified (`app.users`) instead of `schemaName`. */
   tableName: string;
   /** The PostgreSQL schema of the table. Defaults to the `defaultSchema` of the config. */
-  schemaName?: string;
+  schemaName?: string | undefined;
   /**
    * The primary key: one column, whose values are the keys of `LilypadDbCache`. `lilypad-doctor`
    * checks that it is the primary key of the table.
@@ -107,7 +103,7 @@ export type LilypadDbSchema<T, PK extends keyof T = keyof T> = {
    * The database generates the primary key (e.g. `serial`, `identity`, a default): inserts leave
    * it out, even when the data has one, and return the generated one.
    */
-  generatedPrimaryKey?: boolean;
+  generatedPrimaryKey?: boolean | undefined;
   /**
    * The columns of the table, one for each property of `T`.
    * - Without a `select` hook (see `bindLilypadDbHooks`), only these columns are selected.
@@ -122,11 +118,11 @@ export type LilypadDbSchema<T, PK extends keyof T = keyof T> = {
    */
   cols: { [K in keyof T]: LilypadDbColumnFor<T[K]> };
   /** The sets of columns that are unique together (see also the `unique` of a column). */
-  unique?: readonly LilypadDbUniqueKey<T>[];
+  unique?: readonly LilypadDbUniqueKey<T>[] | undefined;
   /** The foreign keys of the table (see also the `references` of a column). */
-  foreignKeys?: readonly LilypadDbForeignKey<T>[];
-  indexes?: readonly LilypadDbIndex<T>[];
-  checks?: readonly LilypadDbCheck[];
+  foreignKeys?: readonly LilypadDbForeignKey<T>[] | undefined;
+  indexes?: readonly LilypadDbIndex<T>[] | undefined;
+  checks?: readonly LilypadDbCheck[] | undefined;
 };
 
 /**
@@ -140,28 +136,28 @@ export type LilypadDbColumn = {
    * (enums, domains, the types of extensions), or without `pgType`. `defineLilypadDb` rejects a
    * `type` that does not fit a known `pgType`.
    */
-  type?: LilypadDbColumnType;
+  type?: LilypadDbColumnType | undefined;
   /**
    * The exact PostgreSQL type (e.g. `uuid`, `int4`, `varchar(64)`, `timestamptz`, `text[]`),
    * compared with the installed one; common aliases are accepted (`int4` is `integer`). Without it,
    * `lilypad-doctor` only checks that the database type fits `type`, and cannot generate the SQL
    * that creates the column.
    */
-  pgType?: string;
+  pgType?: string | undefined;
   /**
    * The hooks of the table (see `bindLilypadDbHooks`) convert this column between its database
    * value and the property of the row type, so its type in `T` is not compared with `type` and
    * `pgType` (e.g. a `timestamptz` read as an ISO string). Types only: nothing changes at runtime.
    */
-  converted?: boolean;
+  converted?: boolean | undefined;
   /** Whether the column accepts `NULL`. Checked when set. */
-  nullable?: boolean;
+  nullable?: boolean | undefined;
   /** Whether the column has a default (see {@link LilypadDbColumnDefault}). Checked when set. */
-  default?: LilypadDbColumnDefault;
+  default?: LilypadDbColumnDefault | undefined;
   /** The values of the column are unique (a unique key on this column alone). */
-  unique?: boolean;
+  unique?: boolean | undefined;
   /** The column is a foreign key to this table. */
-  references?: LilypadDbColumnReference;
+  references?: LilypadDbColumnReference | undefined;
 };
 
 type LilypadDbColumnFields = Omit<LilypadDbColumn, 'type' | 'pgType' | 'converted'>;
@@ -178,26 +174,33 @@ type LilypadDbColumnFields = Omit<LilypadDbColumn, 'type' | 'pgType' | 'converte
 export type LilypadDbColumnFor<V> =
   | (LilypadDbColumnFields & {
       type: LilypadDbColumnTypeOf<V>;
-      pgType?: string;
-      converted?: false;
+      pgType?: string | undefined;
+      converted?: false | undefined;
     })
   | (LilypadDbColumnFields & {
       type?: undefined;
-      pgType?: LilypadPgTypeOf<LilypadDbColumnTypeOf<V>>;
-      converted?: false;
+      pgType?: LilypadPgTypeOf<LilypadDbColumnTypeOf<V>> | undefined;
+      converted?: false | undefined;
     })
   | (LilypadDbColumnFields & {
-      type?: LilypadDbColumnType;
-      pgType?: string;
+      type?: LilypadDbColumnType | undefined;
+      pgType?: string | undefined;
       converted: true;
     });
 
+/**
+ * Some columns of a row. An `undefined` value is not written, as if the property were absent
+ * (`Partial<T>` would reject it under `exactOptionalPropertyTypes`).
+ */
+export type LilypadDbPartialRow<T> = { [K in keyof T]?: T[K] | undefined };
+
 /** The data of an insert: the primary key can be omitted when the database generates it. */
 export type LilypadDbInsertData<T, PK extends keyof T = keyof T> = Omit<T, PK> &
-  Partial<Pick<T, PK>>;
+  LilypadDbPartialRow<Pick<T, PK>>;
 
 /** The data of an update: the primary key identifies the row, the other columns are optional. */
-export type LilypadDbUpdateData<T, PK extends keyof T = keyof T> = Partial<T> & Pick<T, PK>;
+export type LilypadDbUpdateData<T, PK extends keyof T = keyof T> = LilypadDbPartialRow<T> &
+  Pick<T, PK>;
 
 /**
  * The result of an insert or an update: the row as stored by the database (`null` if the
@@ -210,7 +213,7 @@ export type LilypadDbWriteResult<T> = { row: T | null; xid: bigint };
  * The result of a delete: whether a row had this primary key, and the id of the transaction that
  * deleted it.
  */
-export type LilypadDbDeleteResult = { deleted: boolean; xid?: bigint };
+export type LilypadDbDeleteResult = { deleted: boolean; xid?: bigint | undefined };
 
 /** Thrown by the writes when the data has no primary key where one is needed. */
 export class LilypadDbMissingPrimaryKeyError extends Error {

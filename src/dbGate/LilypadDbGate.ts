@@ -30,22 +30,22 @@ export type LilypadDbListener = {
    * Called when LISTEN is active again after the listener connection was lost and re-established.
    * Notifications sent while the connection was down are lost: use it to resynchronize.
    */
-  onReconnect?: () => void | Promise<void>;
+  onReconnect?: (() => void | Promise<void>) | undefined;
 };
 export type LilypadDbGateOptions<
   C extends LilypadDbConfig | undefined = LilypadDbConfig | undefined,
 > = {
-  logger?: LilypadLibLogger;
+  logger?: LilypadLibLogger | undefined;
   connectionString: string;
   /**
    * The config of the database (see `defineLilypadDb`): `gate.table('users')` and
    * `LilypadDbCache.create({ gate, table: 'users' })` then find the table in it. A table of another
    * config can still be given as a definition (`other.tables.events`), or with its own `config`.
    */
-  config?: C;
+  config?: C | undefined;
   /** The connection used for `LISTEN`, if not `connectionString` (e.g. a direct, unpooled one). */
-  listenerConnectionString?: string;
-  listen?: LilypadDbListener[];
+  listenerConnectionString?: string | undefined;
+  listen?: LilypadDbListener[] | undefined;
   /**
    * Maximum duration of each query of the main client, in milliseconds (Postgres
    * `statement_timeout`): the server cancels longer queries. A caller that times out (e.g. after
@@ -53,26 +53,26 @@ export type LilypadDbGateOptions<
    * keep the connections of the pool busy, and the queries behind them would wait. Defaults to
    * 30 seconds; `false` leaves the setting of the database.
    */
-  statementTimeout?: number | false;
+  statementTimeout?: number | false | undefined;
   /** Connection pool of the main client. Every duration is in milliseconds. */
-  pool?: LilypadDbPoolOptions;
+  pool?: LilypadDbPoolOptions | undefined;
   /**
    * While channels are listened to, a notification is sent to a private channel every this many
    * ms, to detect a `LISTEN` connection that stopped delivering notifications (see
    * `isListenHealthy`). `false` disables it. Defaults to 15 seconds.
    */
-  listenHeartbeat?: number | false;
+  listenHeartbeat?: number | false | undefined;
 };
 
 export type LilypadDbPoolOptions = {
   /** Maximum number of connections (postgres.js default: 10). */
-  max?: number;
+  max?: number | undefined;
   /** Closes connections idle for this long (postgres.js default: never). */
-  idleTimeout?: number;
+  idleTimeout?: number | undefined;
   /** Fails a connection attempt after this long (postgres.js default: 30 s). */
-  connectTimeout?: number;
+  connectTimeout?: number | undefined;
   /** Closes connections older than this (postgres.js default: 30 to 60 minutes). */
-  maxLifetime?: number;
+  maxLifetime?: number | undefined;
 };
 
 /**
@@ -137,21 +137,21 @@ type ChannelListener = {
  * ```
  */
 export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConfig | undefined> {
-  public readonly id = `LilypadDbGate-${globalThis.crypto.randomUUID()}`;
+  public readonly id: string = `LilypadDbGate-${globalThis.crypto.randomUUID()}`;
   public readonly sql: postgres.Sql;
   /** The config given to `create`, if any. */
   public readonly config: C;
   /** Only when `listenerConnectionString` differs: otherwise `sql` listens. */
-  private readonly listenerClient?: postgres.Sql;
-  protected logger?: LilypadLibLogger;
-  private listeners: Map<string, ChannelListener> = new Map();
+  private readonly listenerClient?: postgres.Sql | undefined;
+  protected logger?: LilypadLibLogger | undefined;
+  private listeners = new Map<string, ChannelListener>();
   private releaseSingleton: LilypadSingletonRelease = () => {};
-  private readonly heartbeat?: LilypadListenHeartbeat;
+  private readonly heartbeat?: LilypadListenHeartbeat | undefined;
   private readonly heartbeatChannel = `lilypad_heartbeat_${this.id.slice(-36).replace(/-/g, '')}`;
-  private heartbeatStop?: Promise<() => Promise<void>>;
+  private heartbeatStop?: Promise<() => Promise<void>> | undefined;
   /** A heartbeat that could not start is retried after a backoff (see `isListenHealthy`). */
   private readonly heartbeatBackoff = new LilypadBackoff(() => 1000);
-  private closing?: Promise<void>;
+  private closing?: Promise<void> | undefined;
 
   private constructor(options: LilypadDbGateOptions<C>) {
     if (options.statementTimeout !== false) {
@@ -368,7 +368,7 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
    * @returns A promise that resolves once LISTEN is active on the channel.
    * @throws If LISTEN fails; in that case the callback is not registered.
    */
-  async addListener(identifier: LilypadDbListener) {
+  async addListener(identifier: LilypadDbListener): Promise<void> {
     this.assertOpen();
     const { channel, callbackId } = identifier;
     libLog(
@@ -402,7 +402,7 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
    */
   async removeListener(channel: string, callbackId: string): Promise<boolean> {
     const listener = this.listeners.get(channel);
-    if (!listener || !listener.callbacks.delete(callbackId)) {
+    if (!listener?.callbacks.delete(callbackId)) {
       return false;
     }
     if (listener.callbacks.size === 0) {
@@ -485,7 +485,7 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
   }
 
   /** @throws {LilypadDisposedError} If the gate is closed. */
-  assertOpen() {
+  assertOpen(): void {
     if (this.closing) {
       throw new LilypadDisposedError(`LilypadDbGate "${this.id}"`, 'closed');
     }
@@ -499,7 +499,7 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
    * @param options.timeout - How long to wait for the running queries, in ms. Defaults to 5 s.
    * @throws If the timeout is not valid: the gate then stays open.
    */
-  close(options: { timeout?: number } = {}): Promise<void> {
+  close(options: { timeout?: number | undefined } = {}): Promise<void> {
     // Checked before the gate counts as closed: otherwise it would be closed without ending its pools
     assertNumberOption('LilypadDbGate', 'close timeout', options.timeout, 'non-negative-delay');
     this.closing ??= this.closeConnections(options.timeout ?? DEFAULT_CLOSE_TIMEOUT);

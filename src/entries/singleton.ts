@@ -1,5 +1,5 @@
 /**
- * `@lilypad/libs/singleton`: the process-wide registry. Runs in Node.js and in edge runtimes.
+ * `@lilypad-studio/libs/singleton`: the process-wide registry. Runs in Node.js and in edge runtimes.
  */
 export {
   getLilypadSingletonInstance,

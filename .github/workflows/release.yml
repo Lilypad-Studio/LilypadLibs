@@ -1,0 +1,42 @@
+name: Release
+
+# On main: while changesets are pending, opens (or updates) the "chore: version packages" pull
+# request; once it is merged, publishes the new version to GitHub Packages, with its git tag and
+# its GitHub release. See docs/releasing.md.
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # the version commit, the tags and the GitHub releases
+      pull-requests: write # the version pull request
+      packages: write # the publication to GitHub Packages
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          # Writes an .npmrc that authenticates to GitHub Packages with NODE_AUTH_TOKEN
+          registry-url: https://npm.pkg.github.com
+          scope: '@lilypad-studio'
+      - run: npm ci
+      - uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
+        with:
+          # `npm publish` builds the package first (prepack), with its checks (publint, attw)
+          publish-script: npm run release
+          commit-message: 'chore: version packages'
+          pr-title: 'chore: version packages'
+          create-github-releases: true
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -81,16 +81,20 @@ const PG_TYPES = {
   boolean: { types: ['boolean'], aliases: ['bool'] },
   json: { types: ['json'] },
   jsonb: { types: ['json'] },
-} as const satisfies Record<
-  string,
-  { types: ColumnTypes; aliases?: readonly string[]; serials?: readonly string[] }
->;
+} as const;
 
 type PgTypes = typeof PG_TYPES;
 type PgTypeName = keyof PgTypes;
-type PgTypeEntry = { types: ColumnTypes; aliases?: readonly string[]; serials?: readonly string[] };
+type PgTypeEntry = {
+  types: ColumnTypes;
+  aliases?: readonly string[] | undefined;
+  serials?: readonly string[] | undefined;
+};
 
-const entries = Object.entries(PG_TYPES) as [PgTypeName, PgTypeEntry][];
+// Checks the shape of PG_TYPES (a `satisfies` would keep isolatedDeclarations from inferring its type)
+const PG_TYPE_ENTRIES: Readonly<Record<PgTypeName, PgTypeEntry>> = PG_TYPES;
+
+const entries = Object.entries(PG_TYPE_ENTRIES) as [PgTypeName, PgTypeEntry][];
 
 /** Each alias and serial type, with the name of its type. */
 const ALIASES = new Map<string, string>(
@@ -209,10 +213,7 @@ type WithPrecision<N extends string> =
     : never;
 
 type WithModifiers<N extends string> =
-  | N
-  | `${N}(${number})`
-  | `${N}(${number},${number})`
-  | `${N}(${number}, ${number})`;
+  N | `${N}(${number})` | `${N}(${number},${number})` | `${N}(${number}, ${number})`;
 
 /** The spellings of the known types that fit the column type `C`. */
 type PgTypeSpelling<C extends LilypadDbColumnType> = {

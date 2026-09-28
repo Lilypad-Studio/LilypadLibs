@@ -6,8 +6,8 @@
  * @author Lilypad Studios
  *
  * The root entry exports every module that runs in Node.js and in edge runtimes. The database
- * modules (Node.js only) are exported by `@lilypad/libs/db` alone, so that importing the root entry
- * never pulls in postgres.js. To keep bundles small, import the subpaths (`@lilypad/libs/logger`, ...).
+ * modules (Node.js only) are exported by `@lilypad-studio/libs/db` alone, so that importing the root entry
+ * never pulls in postgres.js. To keep bundles small, import the subpaths (`@lilypad-studio/libs/logger`, ...).
  */
 export * from './entries/cache';
 export * from './entries/flow';

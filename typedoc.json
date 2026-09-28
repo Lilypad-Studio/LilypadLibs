@@ -1,0 +1,40 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "name": "@lilypad-studio/libs",
+  "entryPoints": [
+    "src/entries/cache.ts",
+    "src/entries/db.ts",
+    "src/entries/flow.ts",
+    "src/entries/logger.ts",
+    "src/entries/platform.ts",
+    "src/entries/schema.ts",
+    "src/entries/serializer.ts",
+    "src/entries/singleton.ts"
+  ],
+  "out": "api-docs",
+  "readme": "README.md",
+  "excludePrivate": true,
+  "excludeInternal": true,
+  "highlightLanguages": [
+    "bash",
+    "ini",
+    "json",
+    "sql",
+    "typescript",
+    "javascript",
+    "yaml",
+    "dockerfile"
+  ],
+  "intentionallyNotExported": [
+    "ChannelMethods",
+    "ColumnTypes",
+    "ColumnTypesOfValue",
+    "IsBijective",
+    "LilypadDbColumnFields",
+    "LilypadDbGateOptionsWithSingleton",
+    "LilypadDbTableDefinitionOf",
+    "ListenerCallback",
+    "PgTypeSpelling",
+    "lilypadRowType"
+  ]
+}

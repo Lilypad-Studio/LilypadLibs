@@ -28,7 +28,7 @@ import {
 } from '@/platform/LilypadPlatform';
 
 /** Whether an entry has reached its expiration time. */
-export function isLilypadEntryStale(entry: { expirationTime: number }): boolean {
+function isLilypadEntryStale(entry: { expirationTime: number }): boolean {
   return Date.now() >= entry.expirationTime;
 }
 
@@ -84,19 +84,21 @@ export type LilypadCacheEngineHooks<K extends LilypadCacheKey, V> = {
  * entry keeps the ticket of its last entry in a fence while a read of it is in flight.
  */
 export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
-  readonly id = `LilypadCache-${globalThis.crypto.randomUUID()}`;
+  readonly id: string = `LilypadCache-${globalThis.crypto.randomUUID()}`;
   /** The name given in the options, or the id. */
   readonly name: string;
 
   /** The entries, by normalized key. Read it freely; every write goes through the methods. */
+  // eslint-disable-next-line @typescript-eslint/consistent-generic-constructors -- a public field needs its type (isolatedDeclarations)
   readonly store: Map<string, LilypadCacheEntry<K, V>> = new Map();
   readonly defaultTtl: number;
   readonly defaultStaleWhileRevalidate: number;
   private readonly errorTtl: number;
   private readonly failureCooldown: number;
-  private cleanupIntervalId?: ReturnType<typeof setInterval> & { unref?: () => void };
+  private cleanupIntervalId?:
+    (ReturnType<typeof setInterval> & { unref?: (() => void) | undefined }) | undefined;
 
-  private protectedKeys: Set<string> = new Set();
+  private protectedKeys = new Set<string>();
   /**
    * With `maxEntries`, the stored keys that can be evicted (not protected), least recently used
    * first. The protected keys stay out of it, so that an eviction never scans them.
@@ -104,11 +106,11 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
   private evictionOrder = new Set<string>();
 
   /** Undefined once disposed. */
-  logger?: LilypadLibLogger;
-  readonly platform?: LilypadPlatform;
-  private shared?: LilypadSharedLevel<V>;
-  private readonly maxEntries?: number;
-  private readonly cleanupOnAccessEvery?: number;
+  logger?: LilypadLibLogger | undefined;
+  readonly platform?: LilypadPlatform | undefined;
+  private shared?: LilypadSharedLevel<V> | undefined;
+  private readonly maxEntries?: number | undefined;
+  private readonly cleanupOnAccessEvery?: number | undefined;
   private lastCleanup = Date.now();
   private readonly tagPrefix: string;
 
@@ -211,12 +213,12 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
   }
 
   /** Logs through the logger of the cache, with its name as the source. */
-  log(level: 'error' | 'warn' | 'info' | 'debug', message: string, detail?: unknown) {
+  log(level: 'error' | 'warn' | 'info' | 'debug', message: string, detail?: unknown): void {
     libLog(this.logger, level, this.name, message, detail);
   }
 
   /** Logs a failure of the platform function that keeps the instance alive for background work. */
-  logPlatformError(error: unknown) {
+  logPlatformError(error: unknown): void {
     this.log(
       'warn',
       'The platform could not keep the instance alive for background work (it still runs):',
@@ -279,7 +281,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
    * `onValueStored` is not called.
    * @returns `false` if the cache is disposed, and the entry was not stored.
    */
-  private writeEntry(entry: LilypadCacheEntry<K, V>, newValue: boolean = true): boolean {
+  private writeEntry(entry: LilypadCacheEntry<K, V>, newValue = true): boolean {
     // A disposed cache stays empty, even when in-flight fetches complete
     if (this.isDisposed) {
       return false;
@@ -366,7 +368,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
    *
    * @param ttl - Time to live in milliseconds; defaults to the cache's TTL.
    */
-  set(key: K, value: LilypadCachedValueType<V>, ttl?: number) {
+  set(key: K, value: LilypadCachedValueType<V>, ttl?: number): void {
     this.cleanupOnAccess();
     const entry = this.writeLocal(key, value, ttl);
     if (entry) {
@@ -378,7 +380,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
    * Extends the expiration of an entry that is known to be up to date, without a new ticket (its
    * value does not change). Nothing happens if the key has no entry.
    */
-  extendExpiration(normalizedKey: string, expirationTime: number) {
+  extendExpiration(normalizedKey: string, expirationTime: number): void {
     const entry = this.store.get(normalizedKey);
     if (entry && !this.isDisposed) {
       this.store.set(normalizedKey, { ...entry, expirationTime });
@@ -446,7 +448,10 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
    * @param options.removeExpired - If true, an expired value is also removed. Defaults to false, so
    * that the old value stays available as a fallback (`onError: { fallback: 'stale' }`).
    */
-  get(key: K, options: { removeExpired?: boolean } = {}): LilypadCachedValueType<V> | undefined {
+  get(
+    key: K,
+    options: { removeExpired?: boolean | undefined } = {}
+  ): LilypadCachedValueType<V> | undefined {
     this.cleanupOnAccess();
     const normalizedKey = this.normalizeKey(key);
     const entry = this.store.get(normalizedKey);
@@ -506,12 +511,12 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
     const stale = current && { value: current.value, fetchedAt: current.fetchedAt };
     const fallback = options.onError?.fallback;
     const value =
-      fallback === 'stale' ? stale?.value : fallback?.({ key, error, stale: stale || undefined });
+      fallback === 'stale' ? stale?.value : fallback?.({ key, error, stale: stale ?? undefined });
 
     if (value === undefined) {
       throw error;
     }
-    const fetchedAt = stale && value === stale.value ? stale.fetchedAt : Date.now();
+    const fetchedAt = stale?.value === value ? stale.fetchedAt : Date.now();
     this.writeLocal(key, value, options.onError?.ttl ?? this.errorTtl, 'fallback', fetchedAt);
     return { value, status: 'MISS', refreshFailed: true };
   }
@@ -757,7 +762,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
    * Writes an entry to the shared level in the background, kept through the stale window: the
    * cache's, or a longer one asked by the read that fetched it.
    */
-  private writeShared(entry: LilypadCacheEntry<K, V>, staleWhileRevalidate: number = 0) {
+  private writeShared(entry: LilypadCacheEntry<K, V>, staleWhileRevalidate = 0) {
     const staleWindow = Math.max(staleWhileRevalidate, this.defaultStaleWhileRevalidate);
     this.shared?.write(
       this.normalizeKey(entry.key),
@@ -767,7 +772,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
   }
 
   /** Removes a key from the shared level, in the background. */
-  deleteShared(key: K) {
+  deleteShared(key: K): void {
     this.shared?.delete(this.normalizeKey(key));
   }
 
@@ -782,8 +787,8 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
   emitInvalidation(
     source: LilypadInvalidationEvent['source'],
     keys: K[],
-    options: { wholeCache?: boolean } = {}
-  ) {
+    options: { wholeCache?: boolean | undefined } = {}
+  ): void {
     const onInvalidate = this.platform?.onInvalidate;
     if (!onInvalidate || (keys.length === 0 && !options.wholeCache)) {
       return;
@@ -814,7 +819,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
   replaceEntries(
     read: LilypadCacheRead<K, V>,
     data: Iterable<readonly [K, LilypadCachedValueType<V>]>
-  ) {
+  ): void {
     const incoming = new Map<string, readonly [K, LilypadCachedValueType<V>]>();
     for (const [key, value] of data) {
       incoming.set(this.normalizeKey(key), [key, value]);
@@ -870,7 +875,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
   // PROTECTED KEYS
 
   /** Protects keys from `delete`, `clear`, eviction and `purgeExpired`, unless `force` is passed. */
-  addProtectedKeys(keys: K[]) {
+  addProtectedKeys(keys: K[]): void {
     for (const key of keys) {
       const normalizedKey = this.normalizeKey(key);
       this.protectedKeys.add(normalizedKey);
@@ -879,7 +884,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
     }
   }
 
-  removeProtectedKeys(keys: K[]) {
+  removeProtectedKeys(keys: K[]): void {
     for (const key of keys) {
       const normalizedKey = this.normalizeKey(key);
       if (this.protectedKeys.delete(normalizedKey) && this.store.has(normalizedKey)) {
@@ -896,7 +901,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
    * is not cached, the key is removed from the shared level, and `platform.onInvalidate` receives a
    * `manual` event.
    */
-  invalidate(key: K) {
+  invalidate(key: K): void {
     this.markInvalid(key);
     this.emitInvalidation('manual', [key]);
   }
@@ -905,7 +910,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
    * The effect of `invalidate` on the data, without the invalidation event: expires the entry in
    * this instance and removes it from the shared level.
    */
-  markInvalid(key: K) {
+  markInvalid(key: K): void {
     this.expire(key);
     this.deleteShared(key);
   }
@@ -915,7 +920,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
    * value either. Only this instance is affected. A read of the key already in flight is
    * discarded, since it may predate the change.
    */
-  expire(key: K) {
+  expire(key: K): void {
     this.expireNormalized(this.normalizeKey(key));
   }
 
@@ -939,7 +944,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
    * Expires every entry and discards the results of the reads started before (fetches and loads):
    * the source may have changed in any way.
    */
-  expireEverything() {
+  expireEverything(): void {
     for (const normalizedKey of [...this.store.keys()]) {
       this.expireNormalized(normalizedKey);
     }
@@ -952,7 +957,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
    * From now on, the values of the shared level produced before `time` are ignored (e.g. the
    * source was emptied at that time, and the shared level may still hold older copies).
    */
-  rejectSharedBefore(time: number) {
+  rejectSharedBefore(time: number): void {
     this.sharedNotBefore = Math.max(this.sharedNotBefore, time);
   }
 
@@ -963,7 +968,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
    * @param options.force - If true, also deletes a protected key.
    * @returns `false` if the key is protected and was left untouched.
    */
-  delete(key: K, options: { force?: boolean } = {}): boolean {
+  delete(key: K, options: { force?: boolean | undefined } = {}): boolean {
     const deleted = this.removeEntry(this.normalizeKey(key), options.force);
     if (deleted) {
       this.deleteShared(key);
@@ -972,7 +977,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
   }
 
   /** @returns `false` if the key is protected (and `force` is not set). */
-  private removeEntry(normalizedKey: string, force: boolean = false): boolean {
+  private removeEntry(normalizedKey: string, force = false): boolean {
     if (this.protectedKeys.has(normalizedKey) && !force) {
       return false;
     }
@@ -987,7 +992,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
    * Removes all entries from the memory of this instance (not from the shared level). Protected
    * keys are kept, unless `force` is set.
    */
-  clear(options: { force?: boolean } = {}) {
+  clear(options: { force?: boolean | undefined } = {}): void {
     for (const normalizedKey of [...this.store.keys()]) {
       this.removeEntry(normalizedKey, options.force);
     }
@@ -1000,7 +1005,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
    *
    * @param options.force - If true, also removes the expired protected keys.
    */
-  purgeExpired(options: { force?: boolean } = {}) {
+  purgeExpired(options: { force?: boolean | undefined } = {}): void {
     if (this.isDisposed) {
       return;
     }
@@ -1045,7 +1050,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
    * ones of fetches still in flight. The shared level is left untouched. Calling it again does
    * nothing.
    */
-  dispose() {
+  dispose(): void {
     if (this.isDisposed) {
       return;
     }

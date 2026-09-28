@@ -205,7 +205,7 @@ function assertTable(key: string, table: LilypadDbTableInputBase, defaultSchema:
     }
   });
   assertSync(table.sync, `${what}.sync`);
-  assertNoHooks(key, table as Record<string, unknown>);
+  assertNoHooks(key, table);
   return qualified ? table.tableName : `${table.schemaName ?? defaultSchema}.${table.tableName}`;
 }
 
