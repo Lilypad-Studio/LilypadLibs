@@ -1,12 +1,194 @@
-//#region src/dbGate/LilypadDbSchema.d.ts
+//#region src/dbConfig/LilypadPgTypes.d.ts
 /**
- * The type of a column, as the application sees it. For a primary key it tells `LilypadDbCache` how
- * to read the ids that notifications and the changelog carry as text: `number` converts them to
- * numbers; `string` and `bigint` keep them as strings. Declare `bigint`/`bigserial` columns as
- * `bigint`: postgres.js returns them as strings, so their keys and the row property are strings
- * (type them as such). `lilypad-doctor` also checks that the database type fits it (see `pgType`).
+ * What the library knows about the PostgreSQL types, in one place: their spellings, and what
+ * postgres.js returns for them. `defineLilypadDb`, the types of `defineLilypadTable` and
+ * `lilypad-doctor` all read it from here.
  */
-type LilypadDbColumnType = 'string' | 'number' | 'bigint' | 'boolean' | 'date' | 'json' | 'array';
+/**
+ * The type of a column, as postgres.js returns it (it converts the values; the library does not),
+ * with the type of those values: a `bigint` is an `int8`, which postgres.js returns as a string.
+ * For a primary key it tells `LilypadDbCache` how to read the ids that notifications and the
+ * changelog carry as text: `number` converts them to numbers, the others keep them as strings.
+ */
+type LilypadDbColumnValues = {
+  string: string;
+  number: number;
+  bigint: string;
+  boolean: boolean;
+  date: Date;
+  json: string | number | boolean | object;
+  array: readonly unknown[];
+};
+/**
+ * The type of a column (see {@link LilypadDbColumnValues}). It follows from a known `pgType`;
+ * `lilypad-doctor` checks that the database type fits it.
+ */
+type LilypadDbColumnType = keyof LilypadDbColumnValues;
+type ColumnTypes = readonly [LilypadDbColumnType, ...LilypadDbColumnType[]];
+/**
+ * The PostgreSQL types whose JavaScript type is known, by the name `format_type` gives them:
+ * - `types`: the column type postgres.js returns them as, then the others that fit them (an
+ *   `int8` is a string, which a `string` column describes too);
+ * - `aliases`: their other spellings;
+ * - `serials`: the serial types of this integer type (which only integer types have).
+ *
+ * Enums, domains and the types of extensions (except `citext`) are not here.
+ */
+declare const PG_TYPES: {
+  readonly smallint: {
+    readonly types: readonly ["number"];
+    readonly aliases: readonly ["int2"];
+    readonly serials: readonly ["smallserial", "serial2"];
+  };
+  readonly integer: {
+    readonly types: readonly ["number"];
+    readonly aliases: readonly ["int", "int4"];
+    readonly serials: readonly ["serial", "serial4"];
+  };
+  readonly bigint: {
+    readonly types: readonly ["bigint", "string"];
+    readonly aliases: readonly ["int8"];
+    readonly serials: readonly ["bigserial", "serial8"];
+  };
+  readonly real: {
+    readonly types: readonly ["number"];
+    readonly aliases: readonly ["float4"];
+  };
+  readonly 'double precision': {
+    readonly types: readonly ["number"];
+    readonly aliases: readonly ["float8", "float"];
+  };
+  readonly numeric: {
+    readonly types: readonly ["string", "bigint"];
+    readonly aliases: readonly ["decimal"];
+  };
+  readonly money: {
+    readonly types: readonly ["string"];
+  };
+  readonly text: {
+    readonly types: readonly ["string"];
+  };
+  readonly 'character varying': {
+    readonly types: readonly ["string"];
+    readonly aliases: readonly ["varchar"];
+  };
+  readonly character: {
+    readonly types: readonly ["string"];
+    readonly aliases: readonly ["char", "bpchar"];
+  };
+  readonly name: {
+    readonly types: readonly ["string"];
+  };
+  readonly citext: {
+    readonly types: readonly ["string"];
+  };
+  readonly uuid: {
+    readonly types: readonly ["string"];
+  };
+  readonly xml: {
+    readonly types: readonly ["string"];
+  };
+  readonly inet: {
+    readonly types: readonly ["string"];
+  };
+  readonly cidr: {
+    readonly types: readonly ["string"];
+  };
+  readonly macaddr: {
+    readonly types: readonly ["string"];
+  };
+  readonly macaddr8: {
+    readonly types: readonly ["string"];
+  };
+  readonly interval: {
+    readonly types: readonly ["string"];
+  };
+  readonly bit: {
+    readonly types: readonly ["string"];
+  };
+  readonly 'bit varying': {
+    readonly types: readonly ["string"];
+    readonly aliases: readonly ["varbit"];
+  };
+  readonly tsvector: {
+    readonly types: readonly ["string"];
+  };
+  readonly tsquery: {
+    readonly types: readonly ["string"];
+  };
+  readonly 'time without time zone': {
+    readonly types: readonly ["string"];
+    readonly aliases: readonly ["time"];
+  };
+  readonly 'time with time zone': {
+    readonly types: readonly ["string"];
+    readonly aliases: readonly ["timetz"];
+  };
+  readonly date: {
+    readonly types: readonly ["date"];
+  };
+  readonly 'timestamp without time zone': {
+    readonly types: readonly ["date"];
+    readonly aliases: readonly ["timestamp"];
+  };
+  readonly 'timestamp with time zone': {
+    readonly types: readonly ["date"];
+    readonly aliases: readonly ["timestamptz"];
+  };
+  readonly boolean: {
+    readonly types: readonly ["boolean"];
+    readonly aliases: readonly ["bool"];
+  };
+  readonly json: {
+    readonly types: readonly ["json"];
+  };
+  readonly jsonb: {
+    readonly types: readonly ["json"];
+  };
+};
+type PgTypes = typeof PG_TYPES;
+type PgTypeName = keyof PgTypes;
+/**
+ * A PostgreSQL type as `format_type` writes it: lower case, aliases resolved (`int4` is
+ * `integer`, `varchar(64)` is `character varying(64)`, `timestamptz(3)` is
+ * `timestamp(3) with time zone`), array suffixes kept.
+ */
+declare function normalizeLilypadPgType(type: string): string;
+/**
+ * The column types that describe a `pgType`, the one postgres.js returns it as first (e.g.
+ * `['bigint', 'string']` for `int8`); `undefined` for a type whose JavaScript type is not known
+ * (an enum, a domain, the type of an extension). Any array is `['array']`. It reads the spellings
+ * of `normalizeLilypadPgType`.
+ */
+declare function lilypadColumnTypesOfPgType(pgType: string): ColumnTypes | undefined;
+/** The spellings of a known type: its name, its aliases, its serial types. */
+type Spellings<N extends PgTypeName> = N | (PgTypes[N] extends {
+  aliases: readonly (infer A extends string)[];
+} ? A : never) | (PgTypes[N] extends {
+  serials: readonly (infer S extends string)[];
+} ? S : never);
+/** `timestamp(3) with time zone`: the precision of a time type goes before its zone. */
+type WithPrecision<N extends string> = N extends `${infer Base} ${infer Zone extends `with${string}`}` ? `${Base}(${number}) ${Zone}` : never;
+type WithModifiers<N extends string> = N | `${N}(${number})` | `${N}(${number},${number})` | `${N}(${number}, ${number})`;
+/** The spellings of the known types that fit the column type `C`. */
+type PgTypeSpelling<C extends LilypadDbColumnType> = { [N in PgTypeName]: C extends PgTypes[N]['types'][number] ? WithModifiers<Spellings<N>> | WithPrecision<N> : never; }[PgTypeName];
+/**
+ * The `pgType`s whose column type is known to fit `C` (see {@link lilypadColumnTypesOfPgType}), in
+ * lower case: `'int4'`, `'varchar(64)'`, `'numeric(10, 2)'`, `'timestamp(3) with time zone'`...
+ * Any array (`'text[]'`, `'mood[]'`) fits `array`.
+ */
+type LilypadPgTypeOf<C extends LilypadDbColumnType> = C extends 'array' ? `${string}[]` : PgTypeSpelling<C>;
+/**
+ * The column types that fit a property of the row type: those whose values
+ * ({@link LilypadDbColumnValues}) it accepts. `null` and `undefined` are left out (see
+ * `nullable`); `unknown` fits every type, and a JavaScript `bigint` none (postgres.js returns
+ * `int8` as a string).
+ */
+type LilypadDbColumnTypeOf<V> = unknown extends V ? LilypadDbColumnType : [Exclude<V, null | undefined>] extends [never] ? LilypadDbColumnType : ColumnTypesOfValue<Exclude<V, null | undefined>>;
+/** Distributed over a union: the column types of each of its members. */
+type ColumnTypesOfValue<V> = { [C in LilypadDbColumnType]: V extends LilypadDbColumnValues[C] ? C : never; }[LilypadDbColumnType];
+//#endregion
+//#region src/dbGate/LilypadDbSchema.d.ts
 /**
  * The default of a column: `true` when the database has one (whatever it is), or its SQL
  * expression (e.g. `{ sql: 'now()' }`), which `lilypad-doctor` uses in the SQL that fixes the table.
@@ -109,8 +291,11 @@ type LilypadDbSchema<T, PK extends keyof T = keyof T> = {
    * At runtime, only the `type` of the primary key is used: with `number`, `LilypadDbCache` converts
    * to numbers the ids that notifications and the changelog carry as text. `lilypad-doctor` checks
    * the rest against the database.
+   *
+   * The `type` or `pgType` of each column must fit the property of `T` (see
+   * {@link LilypadDbColumnFor}).
    */
-  cols: { [K in keyof T]: LilypadDbColumn; };
+  cols: { [K in keyof T]: LilypadDbColumnFor<T[K]>; };
   /** The sets of columns that are unique together (see also the `unique` of a column). */
   unique?: readonly LilypadDbUniqueKey<T>[];
   /** The foreign keys of the table (see also the `references` of a column). */
@@ -123,6 +308,12 @@ type LilypadDbSchema<T, PK extends keyof T = keyof T> = {
  * `lilypad-doctor` compares the rest with the database.
  */
 type LilypadDbColumn = {
+  /**
+   * What postgres.js returns for the column. It follows from a known `pgType` (`int4` is a
+   * `number`, `timestamptz` a `date`, `int8` a `bigint`...): declare it only for the other types
+   * (enums, domains, the types of extensions), or without `pgType`. `defineLilypadDb` rejects a
+   * `type` that does not fit a known `pgType`.
+   */
   type?: LilypadDbColumnType;
   /**
    * The exact PostgreSQL type (e.g. `uuid`, `int4`, `varchar(64)`, `timestamptz`, `text[]`),
@@ -131,6 +322,12 @@ type LilypadDbColumn = {
    * that creates the column.
    */
   pgType?: string;
+  /**
+   * The hooks of the table (see `bindLilypadDbHooks`) convert this column between its database
+   * value and the property of the row type, so its type in `T` is not compared with `type` and
+   * `pgType` (e.g. a `timestamptz` read as an ISO string). Types only: nothing changes at runtime.
+   */
+  converted?: boolean;
   /** Whether the column accepts `NULL`. Checked when set. */
   nullable?: boolean;
   /** Whether the column has a default (see {@link LilypadDbColumnDefault}). Checked when set. */
@@ -140,6 +337,29 @@ type LilypadDbColumn = {
   /** The column is a foreign key to this table. */
   references?: LilypadDbColumnReference;
 };
+type LilypadDbColumnFields = Omit<LilypadDbColumn, 'type' | 'pgType' | 'converted'>;
+/**
+ * The description of a column whose row property has the type `V` (the `cols` of
+ * `defineLilypadTable`):
+ * - with a `type`, it must fit `V` (see {@link LilypadDbColumnTypeOf}), and `defineLilypadDb`
+ *   checks that it fits the `pgType`, which may be any type (an enum, a domain...);
+ * - without a `type`, the `pgType` must be a known type that fits `V` (see
+ *   {@link LilypadPgTypeOf}): `int4` for a `number`, `uuid` for a `string`, `jsonb` for an object;
+ * - with `converted: true` (the hooks convert it), neither is compared with `V`.
+ */
+type LilypadDbColumnFor<V> = (LilypadDbColumnFields & {
+  type: LilypadDbColumnTypeOf<V>;
+  pgType?: string;
+  converted?: false;
+}) | (LilypadDbColumnFields & {
+  type?: undefined;
+  pgType?: LilypadPgTypeOf<LilypadDbColumnTypeOf<V>>;
+  converted?: false;
+}) | (LilypadDbColumnFields & {
+  type?: LilypadDbColumnType;
+  pgType?: string;
+  converted: true;
+});
 /** The data of an insert: the primary key can be omitted when the database generates it. */
 type LilypadDbInsertData<T, PK extends keyof T = keyof T> = Omit<T, PK> & Partial<Pick<T, PK>>;
 /** The data of an update: the primary key identifies the row, the other columns are optional. */
@@ -518,9 +738,10 @@ type LilypadDbPrimaryKey<C, N> = C extends LilypadDbConfig<infer Tables> ? N ext
  *   primaryKey: 'id',
  *   generatedPrimaryKey: true,
  *   cols: {
- *     id: { type: 'number', pgType: 'int4' },
- *     orgId: { type: 'number', pgType: 'int4', references: { table: 'orgs', onDelete: 'cascade' } },
- *     email: { type: 'string', pgType: 'text', nullable: false, unique: true },
+ *     id: { pgType: 'int4' },
+ *     orgId: { pgType: 'int4', references: { table: 'orgs', onDelete: 'cascade' } },
+ *     email: { pgType: 'text', nullable: false, unique: true },
+ *     role: { type: 'string', pgType: 'user_role' }, // an enum: declare its type
  *   },
  *   indexes: [{ columns: ['orgId'] }],
  *   sync: { strategy: 'changelog', pollInterval: 1000 },
@@ -557,5 +778,5 @@ declare const LILYPAD_DEFAULT_CHANGELOG_TABLE = "lilypad_cache_changes";
 /** The name of the config of `lilypad.config.*`: the others are `lilypad.<name>.config.*`. */
 declare const LILYPAD_DEFAULT_DB_CONFIG_NAME = "default";
 //#endregion
-export { LilypadDbCheck as A, LilypadDbIndexMethod as B, defineLilypadTable as C, LilypadDbTableHooks as D, LilypadDbHooks as E, LilypadDbColumnType as F, LilypadDbReferentialAction as G, LilypadDbMissingPrimaryKeyError as H, LilypadDbDeleteResult as I, LilypadDbUpdateData as J, LilypadDbSchema as K, LilypadDbEmptyWriteError as L, LilypadDbColumnDefault as M, LilypadDbColumnName as N, LilypadDbTableHooksBase as O, LilypadDbColumnReference as P, LilypadDbForeignKey as R, defineLilypadDb as S, isLilypadDbTableDefinition as T, LilypadDbNotFoundError as U, LilypadDbInsertData as V, LilypadDbReference as W, LilypadDbWriteResult as Y, LilypadDbTableInputBase as _, LilypadDbConfigInput as a, LilypadDbTableSync as b, LilypadDbResolvedForeignKey as c, LilypadDbRow as d, LilypadDbTableChangelogSync as f, LilypadDbTableInput as g, LilypadDbTableDraft as h, LilypadDbConfig as i, LilypadDbColumn as j, bindLilypadDbHooks as k, LilypadDbResolvedIndex as l, LilypadDbTableDefinitionBase as m, LILYPAD_DEFAULT_DB_CONFIG_NAME as n, LilypadDbConfigSettings as o, LilypadDbTableDefinition as p, LilypadDbUniqueKey as q, LilypadChangelogPruning as r, LilypadDbPrimaryKey as s, LILYPAD_DEFAULT_CHANGELOG_TABLE as t, LilypadDbResolvedUniqueKey as u, LilypadDbTableListenSync as v, isLilypadDbConfig as w, LilypadDbTableTrustedSync as x, LilypadDbTableName as y, LilypadDbIndex as z };
-//# sourceMappingURL=schema-BaNQHPRH.d.mts.map
+export { LilypadPgTypeOf as $, LilypadDbCheck as A, LilypadDbIndexMethod as B, defineLilypadTable as C, LilypadDbTableHooks as D, LilypadDbHooks as E, LilypadDbColumnReference as F, LilypadDbReferentialAction as G, LilypadDbMissingPrimaryKeyError as H, LilypadDbDeleteResult as I, LilypadDbUpdateData as J, LilypadDbSchema as K, LilypadDbEmptyWriteError as L, LilypadDbColumnDefault as M, LilypadDbColumnFor as N, LilypadDbTableHooksBase as O, LilypadDbColumnName as P, LilypadDbColumnValues as Q, LilypadDbForeignKey as R, defineLilypadDb as S, isLilypadDbTableDefinition as T, LilypadDbNotFoundError as U, LilypadDbInsertData as V, LilypadDbReference as W, LilypadDbColumnType as X, LilypadDbWriteResult as Y, LilypadDbColumnTypeOf as Z, LilypadDbTableInputBase as _, LilypadDbConfigInput as a, LilypadDbTableSync as b, LilypadDbResolvedForeignKey as c, LilypadDbRow as d, lilypadColumnTypesOfPgType as et, LilypadDbTableChangelogSync as f, LilypadDbTableInput as g, LilypadDbTableDraft as h, LilypadDbConfig as i, LilypadDbColumn as j, bindLilypadDbHooks as k, LilypadDbResolvedIndex as l, LilypadDbTableDefinitionBase as m, LILYPAD_DEFAULT_DB_CONFIG_NAME as n, LilypadDbConfigSettings as o, LilypadDbTableDefinition as p, LilypadDbUniqueKey as q, LilypadChangelogPruning as r, LilypadDbPrimaryKey as s, LILYPAD_DEFAULT_CHANGELOG_TABLE as t, normalizeLilypadPgType as tt, LilypadDbResolvedUniqueKey as u, LilypadDbTableListenSync as v, isLilypadDbConfig as w, LilypadDbTableTrustedSync as x, LilypadDbTableName as y, LilypadDbIndex as z };
+//# sourceMappingURL=schema-CJt1dr5N.d.mts.map

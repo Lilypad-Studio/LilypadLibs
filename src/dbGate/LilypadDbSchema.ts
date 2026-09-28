@@ -1,18 +1,8 @@
-/**
- * The type of a column, as the application sees it. For a primary key it tells `LilypadDbCache` how
- * to read the ids that notifications and the changelog carry as text: `number` converts them to
- * numbers; `string` and `bigint` keep them as strings. Declare `bigint`/`bigserial` columns as
- * `bigint`: postgres.js returns them as strings, so their keys and the row property are strings
- * (type them as such). `lilypad-doctor` also checks that the database type fits it (see `pgType`).
- */
-export type LilypadDbColumnType =
-  | 'string'
-  | 'number'
-  | 'bigint'
-  | 'boolean'
-  | 'date'
-  | 'json'
-  | 'array';
+import type {
+  LilypadDbColumnType,
+  LilypadDbColumnTypeOf,
+  LilypadPgTypeOf,
+} from '@/dbConfig/LilypadPgTypes';
 
 /**
  * The default of a column: `true` when the database has one (whatever it is), or its SQL
@@ -126,8 +116,11 @@ export type LilypadDbSchema<T, PK extends keyof T = keyof T> = {
    * At runtime, only the `type` of the primary key is used: with `number`, `LilypadDbCache` converts
    * to numbers the ids that notifications and the changelog carry as text. `lilypad-doctor` checks
    * the rest against the database.
+   *
+   * The `type` or `pgType` of each column must fit the property of `T` (see
+   * {@link LilypadDbColumnFor}).
    */
-  cols: { [K in keyof T]: LilypadDbColumn };
+  cols: { [K in keyof T]: LilypadDbColumnFor<T[K]> };
   /** The sets of columns that are unique together (see also the `unique` of a column). */
   unique?: readonly LilypadDbUniqueKey<T>[];
   /** The foreign keys of the table (see also the `references` of a column). */
@@ -141,6 +134,12 @@ export type LilypadDbSchema<T, PK extends keyof T = keyof T> = {
  * `lilypad-doctor` compares the rest with the database.
  */
 export type LilypadDbColumn = {
+  /**
+   * What postgres.js returns for the column. It follows from a known `pgType` (`int4` is a
+   * `number`, `timestamptz` a `date`, `int8` a `bigint`...): declare it only for the other types
+   * (enums, domains, the types of extensions), or without `pgType`. `defineLilypadDb` rejects a
+   * `type` that does not fit a known `pgType`.
+   */
   type?: LilypadDbColumnType;
   /**
    * The exact PostgreSQL type (e.g. `uuid`, `int4`, `varchar(64)`, `timestamptz`, `text[]`),
@@ -149,6 +148,12 @@ export type LilypadDbColumn = {
    * that creates the column.
    */
   pgType?: string;
+  /**
+   * The hooks of the table (see `bindLilypadDbHooks`) convert this column between its database
+   * value and the property of the row type, so its type in `T` is not compared with `type` and
+   * `pgType` (e.g. a `timestamptz` read as an ISO string). Types only: nothing changes at runtime.
+   */
+  converted?: boolean;
   /** Whether the column accepts `NULL`. Checked when set. */
   nullable?: boolean;
   /** Whether the column has a default (see {@link LilypadDbColumnDefault}). Checked when set. */
@@ -158,6 +163,34 @@ export type LilypadDbColumn = {
   /** The column is a foreign key to this table. */
   references?: LilypadDbColumnReference;
 };
+
+type LilypadDbColumnFields = Omit<LilypadDbColumn, 'type' | 'pgType' | 'converted'>;
+
+/**
+ * The description of a column whose row property has the type `V` (the `cols` of
+ * `defineLilypadTable`):
+ * - with a `type`, it must fit `V` (see {@link LilypadDbColumnTypeOf}), and `defineLilypadDb`
+ *   checks that it fits the `pgType`, which may be any type (an enum, a domain...);
+ * - without a `type`, the `pgType` must be a known type that fits `V` (see
+ *   {@link LilypadPgTypeOf}): `int4` for a `number`, `uuid` for a `string`, `jsonb` for an object;
+ * - with `converted: true` (the hooks convert it), neither is compared with `V`.
+ */
+export type LilypadDbColumnFor<V> =
+  | (LilypadDbColumnFields & {
+      type: LilypadDbColumnTypeOf<V>;
+      pgType?: string;
+      converted?: false;
+    })
+  | (LilypadDbColumnFields & {
+      type?: undefined;
+      pgType?: LilypadPgTypeOf<LilypadDbColumnTypeOf<V>>;
+      converted?: false;
+    })
+  | (LilypadDbColumnFields & {
+      type?: LilypadDbColumnType;
+      pgType?: string;
+      converted: true;
+    });
 
 /** The data of an insert: the primary key can be omitted when the database generates it. */
 export type LilypadDbInsertData<T, PK extends keyof T = keyof T> = Omit<T, PK> &

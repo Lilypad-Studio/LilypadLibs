@@ -31,6 +31,7 @@ export default defineConfig({
             'src/cache/LilypadCache*.test.ts',
             'src/dbConfig/LilypadDbConfig*.test.ts',
             'src/dbConfig/LilypadDbHooks.test.ts',
+            'src/dbConfig/LilypadPgTypes.test.ts',
             'src/flow/**/*.test.ts',
             'src/internal/**/*.test.ts',
             'src/logger/**/*.test.ts',

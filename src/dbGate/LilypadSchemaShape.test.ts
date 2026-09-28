@@ -9,7 +9,6 @@ import type {
 import {
   evaluateLilypadTableShape,
   lilypadCreateTableSql,
-  normalizeLilypadPgType,
   type LilypadSchemaTableShape,
 } from './LilypadSchemaShape';
 
@@ -124,34 +123,6 @@ const evaluate = (facts: LilypadTableFacts, tableShape: LilypadSchemaTableShape 
 const codes = ({ problems, deferred }: ReturnType<typeof evaluate>) =>
   [...problems, ...deferred].map((problem) => `${problem.severity}:${problem.code}`);
 
-describe('normalizeLilypadPgType', () => {
-  it.each([
-    ['int4', 'integer'],
-    ['INT', 'integer'],
-    ['serial', 'integer'],
-    ['bigserial', 'bigint'],
-    ['int8[]', 'bigint[]'],
-    ['bool', 'boolean'],
-    ['varchar(64)', 'character varying(64)'],
-    ['varchar', 'character varying'],
-    ['char', 'character(1)'],
-    ['numeric(10, 2)', 'numeric(10,2)'],
-    ['decimal', 'numeric'],
-    ['float8', 'double precision'],
-    ['timestamptz', 'timestamp with time zone'],
-    ['timestamptz(3)', 'timestamp(3) with time zone'],
-    ['timestamp', 'timestamp without time zone'],
-    ['timestamp(3) with time zone', 'timestamp(3) with time zone'],
-    ['time', 'time without time zone'],
-    ['timetz', 'time with time zone'],
-    ['text[][]', 'text[][]'],
-    ['uuid', 'uuid'],
-    ['Public.CITEXT', 'public.citext'],
-  ])('should read %s as %s', (declared, expected) => {
-    expect(normalizeLilypadPgType(declared)).toBe(expected);
-  });
-});
-
 describe('evaluateLilypadTableShape', () => {
   it('should find nothing to report in a table that matches its description', () => {
     expect(codes(evaluate(usersFacts()))).toEqual([]);
@@ -212,11 +183,11 @@ describe('evaluateLilypadTableShape', () => {
     expect(looseProblems.map((problem) => [problem.severity, problem.message])).toEqual([
       [
         'warning',
-        'The column "amount" of "public.t" is numeric(10,2), declared as number: postgres.js returns it as a string: declare the column as `bigint` or `string`.',
+        'The column "amount" of "public.t" is numeric(10,2), declared as number: postgres.js reads it as string (declare string or bigint).',
       ],
       [
         'warning',
-        'The column "at" of "public.t" is time without time zone, declared as date: postgres.js does not return it as a Date.',
+        'The column "at" of "public.t" is time without time zone, declared as date: postgres.js reads it as string (declare string).',
       ],
     ]);
   });

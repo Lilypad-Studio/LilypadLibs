@@ -1,4 +1,4 @@
-import { o as isLilypadDbConfig } from "./LilypadDbSchema-Aqkz2mc3.mjs";
+import { o as isLilypadDbConfig } from "./LilypadDbSchema-DgMfYKbD.mjs";
 //#region src/dbConfig/LilypadDbHooks.ts
 const OWNER = "bindLilypadDbHooks";
 const HOOK_NAMES = /* @__PURE__ */ new Set(["write", "select"]);
@@ -58,4 +58,4 @@ function bindLilypadDbHooks(config, hooks) {
 //#endregion
 export { bindLilypadDbHooks as t };
 
-//# sourceMappingURL=schema-BGXrFKxG.mjs.map
+//# sourceMappingURL=schema-6Wc929rg.mjs.map

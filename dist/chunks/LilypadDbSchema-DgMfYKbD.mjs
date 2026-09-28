@@ -8,18 +8,183 @@ const LILYPAD_DEFAULT_DB_CONFIG_NAME = "default";
 /** The default `maxGap` of the `changelog` strategy, and the default `minRetention` of the changelog. */
 const LILYPAD_DEFAULT_MAX_GAP = 36e5;
 //#endregion
+//#region src/dbConfig/LilypadPgTypes.ts
+/** Every column type. */
+const LILYPAD_DB_COLUMN_TYPES = Object.keys({
+	string: true,
+	number: true,
+	bigint: true,
+	boolean: true,
+	date: true,
+	json: true,
+	array: true
+});
+/**
+* The PostgreSQL types whose JavaScript type is known, by the name `format_type` gives them:
+* - `types`: the column type postgres.js returns them as, then the others that fit them (an
+*   `int8` is a string, which a `string` column describes too);
+* - `aliases`: their other spellings;
+* - `serials`: the serial types of this integer type (which only integer types have).
+*
+* Enums, domains and the types of extensions (except `citext`) are not here.
+*/
+const PG_TYPES = {
+	smallint: {
+		types: ["number"],
+		aliases: ["int2"],
+		serials: ["smallserial", "serial2"]
+	},
+	integer: {
+		types: ["number"],
+		aliases: ["int", "int4"],
+		serials: ["serial", "serial4"]
+	},
+	bigint: {
+		types: ["bigint", "string"],
+		aliases: ["int8"],
+		serials: ["bigserial", "serial8"]
+	},
+	real: {
+		types: ["number"],
+		aliases: ["float4"]
+	},
+	"double precision": {
+		types: ["number"],
+		aliases: ["float8", "float"]
+	},
+	numeric: {
+		types: ["string", "bigint"],
+		aliases: ["decimal"]
+	},
+	money: { types: ["string"] },
+	text: { types: ["string"] },
+	"character varying": {
+		types: ["string"],
+		aliases: ["varchar"]
+	},
+	character: {
+		types: ["string"],
+		aliases: ["char", "bpchar"]
+	},
+	name: { types: ["string"] },
+	citext: { types: ["string"] },
+	uuid: { types: ["string"] },
+	xml: { types: ["string"] },
+	inet: { types: ["string"] },
+	cidr: { types: ["string"] },
+	macaddr: { types: ["string"] },
+	macaddr8: { types: ["string"] },
+	interval: { types: ["string"] },
+	bit: { types: ["string"] },
+	"bit varying": {
+		types: ["string"],
+		aliases: ["varbit"]
+	},
+	tsvector: { types: ["string"] },
+	tsquery: { types: ["string"] },
+	"time without time zone": {
+		types: ["string"],
+		aliases: ["time"]
+	},
+	"time with time zone": {
+		types: ["string"],
+		aliases: ["timetz"]
+	},
+	date: { types: ["date"] },
+	"timestamp without time zone": {
+		types: ["date"],
+		aliases: ["timestamp"]
+	},
+	"timestamp with time zone": {
+		types: ["date"],
+		aliases: ["timestamptz"]
+	},
+	boolean: {
+		types: ["boolean"],
+		aliases: ["bool"]
+	},
+	json: { types: ["json"] },
+	jsonb: { types: ["json"] }
+};
+const entries = Object.entries(PG_TYPES);
+/** Each alias and serial type, with the name of its type. */
+const ALIASES = new Map(entries.flatMap(([name, type]) => [...type.aliases ?? [], ...type.serials ?? []].map((alias) => [alias, name])));
+const SERIAL_TYPES = new Set(entries.flatMap(([, type]) => type.serials ?? []));
+/**
+* The column types that fit a column of unknown type, by `pg_type.typcategory`: a domain has the
+* category of its base type, and PostgreSQL sends its values as those of its base type.
+*/
+const CATEGORY_TYPES = {
+	A: ["array"],
+	B: ["boolean"],
+	D: ["date"],
+	N: ["number"],
+	S: ["string"],
+	E: ["string"],
+	I: ["string"],
+	V: ["string"],
+	T: ["string"]
+};
+/**
+* A PostgreSQL type as `format_type` writes it: lower case, aliases resolved (`int4` is
+* `integer`, `varchar(64)` is `character varying(64)`, `timestamptz(3)` is
+* `timestamp(3) with time zone`), array suffixes kept.
+*/
+function normalizeLilypadPgType(type) {
+	let text = type.trim().toLowerCase().replace(/\s+/g, " ");
+	let arrays = "";
+	while (text.endsWith("[]")) {
+		arrays += "[]";
+		text = text.slice(0, -2).trimEnd();
+	}
+	const open = text.indexOf("(");
+	const close = open < 0 ? -1 : text.indexOf(")", open);
+	const name = (close < 0 ? text : text.slice(0, open)).trim();
+	const args = close < 0 ? "" : text.slice(open, close + 1).replace(/\s+/g, "");
+	const rest = close < 0 ? "" : text.slice(close + 1).trim();
+	if (name === "timestamp" || name === "time") return `${name}${args} ${rest || "without time zone"}${arrays}`;
+	const resolved = ALIASES.get(name) ?? name;
+	if (resolved === "character" && !args) return `character(1)${arrays}`;
+	const zone = /^(timestamp|time) (with|without) time zone$/.exec(resolved);
+	if (zone) return `${zone[1]}${args} ${zone[2]} time zone${arrays}`;
+	return `${resolved}${args}${rest ? ` ${rest}` : ""}${arrays}`;
+}
+/** The known type of a `pgType`, without its modifiers (`character varying(64)` is `character varying`). */
+function knownType(pgType) {
+	const name = normalizeLilypadPgType(pgType).replace(/\([^)]*\)/, "");
+	return Object.hasOwn(PG_TYPES, name) ? PG_TYPES[name] : void 0;
+}
+/**
+* The column types that describe a `pgType`, the one postgres.js returns it as first (e.g.
+* `['bigint', 'string']` for `int8`); `undefined` for a type whose JavaScript type is not known
+* (an enum, a domain, the type of an extension). Any array is `['array']`. It reads the spellings
+* of `normalizeLilypadPgType`.
+*/
+function lilypadColumnTypesOfPgType(pgType) {
+	return normalizeLilypadPgType(pgType).endsWith("[]") ? ["array"] : knownType(pgType)?.types;
+}
+/**
+* When postgres.js does not return a column of `pgType` as `type`, the column types that fit it
+* (the one it returns first); otherwise, or when the type is not known, `undefined`. A type that
+* is not known is judged by its `pg_type.typcategory`, when given.
+*/
+function lilypadColumnTypeMismatch(type, pgType, category) {
+	const fitting = lilypadColumnTypesOfPgType(pgType) ?? (category !== void 0 && Object.hasOwn(CATEGORY_TYPES, category) ? CATEGORY_TYPES[category] : void 0);
+	return fitting && !fitting.includes(type) ? fitting : void 0;
+}
+/** Whether a `pgType` is a serial type (`serial`, `bigserial`...), which has a default. */
+function isLilypadSerialPgType(pgType) {
+	return SERIAL_TYPES.has(pgType.trim().toLowerCase());
+}
+/** Whether a `pgType` is an integer type (one that has serial types), which can be an identity. */
+function isLilypadIntegerPgType(pgType) {
+	return knownType(pgType)?.serials !== void 0 && !normalizeLilypadPgType(pgType).endsWith("[]");
+}
+//#endregion
 //#region src/dbConfig/LilypadDbConfigValidation.ts
 const OWNER = "defineLilypadDb";
 const CONFIG_NAME = /^[A-Za-z0-9_-]+$/;
-const COLUMN_TYPES = /* @__PURE__ */ new Set([
-	"string",
-	"number",
-	"bigint",
-	"boolean",
-	"date",
-	"json",
-	"array"
-]);
+const COLUMN_TYPES = new Set(LILYPAD_DB_COLUMN_TYPES);
 const ACTIONS = /* @__PURE__ */ new Set([
 	"no action",
 	"restrict",
@@ -72,7 +237,12 @@ function assertReference(reference, what) {
 function assertColumn(column, what) {
 	if (typeof column !== "object" || column === null) fail(`${what} must be an object (e.g. { type: 'string' }).`);
 	assertOneOf(column.type, COLUMN_TYPES, `${what}.type`);
-	if (column.pgType !== void 0) assertName(column.pgType, `${what}.pgType`);
+	if (column.pgType !== void 0) {
+		assertName(column.pgType, `${what}.pgType`);
+		const fitting = column.type === void 0 ? void 0 : lilypadColumnTypeMismatch(column.type, column.pgType);
+		if (fitting) fail(`${what}.type "${String(column.type)}" does not fit its pgType "${column.pgType}", which postgres.js returns as ${fitting[0]}: declare ${fitting.map((type) => `"${type}"`).join(" or ")}, or leave type out.`);
+	}
+	if (column.converted !== void 0 && typeof column.converted !== "boolean") fail(`${what}.converted must be a boolean.`);
 	const columnDefault = column.default;
 	if (columnDefault !== void 0 && columnDefault !== true && !(typeof columnDefault === "object" && columnDefault !== null && isNonEmptyString(columnDefault.sql))) fail(`${what}.default must be true or { sql: '<expression>' }.`);
 	if (column.references !== void 0) {
@@ -201,9 +371,10 @@ const LILYPAD_DB_TABLE = Symbol.for("lilypad.dbTable");
 *   primaryKey: 'id',
 *   generatedPrimaryKey: true,
 *   cols: {
-*     id: { type: 'number', pgType: 'int4' },
-*     orgId: { type: 'number', pgType: 'int4', references: { table: 'orgs', onDelete: 'cascade' } },
-*     email: { type: 'string', pgType: 'text', nullable: false, unique: true },
+*     id: { pgType: 'int4' },
+*     orgId: { pgType: 'int4', references: { table: 'orgs', onDelete: 'cascade' } },
+*     email: { pgType: 'text', nullable: false, unique: true },
+*     role: { type: 'string', pgType: 'user_role' }, // an enum: declare its type
 *   },
 *   indexes: [{ columns: ['orgId'] }],
 *   sync: { strategy: 'changelog', pollInterval: 1000 },
@@ -252,6 +423,16 @@ function withConfigHooks(definition, config) {
 		...definition,
 		hooks: bound.hooks
 	});
+}
+/** The columns, each with the `type` that follows from its `pgType` when it has none. */
+function resolveColumns(cols) {
+	return Object.fromEntries(Object.entries(cols).map(([name, column]) => {
+		const type = column.type ?? (column.pgType === void 0 ? void 0 : lilypadColumnTypesOfPgType(column.pgType)?.[0]);
+		return [name, type === column.type ? column : {
+			...column,
+			type
+		}];
+	}));
 }
 /** Splits `schema.table`, or applies the default schema. */
 function qualify(name, defaultSchema) {
@@ -348,6 +529,7 @@ function defineLilypadDb(input) {
 			tableName,
 			schemaName: schema,
 			qualifiedName,
+			cols: resolveColumns(table.cols),
 			sync: Object.freeze({ ...sync ?? { strategy: "listen" } }),
 			strict: strict ?? input.strict ?? false,
 			unique: resolvedUnique,
@@ -405,6 +587,6 @@ var LilypadDbNotFoundError = class extends Error {
 	}
 };
 //#endregion
-export { defineLilypadTable as a, resolveLilypadDbTable as c, LILYPAD_DEFAULT_MAX_GAP as d, LILYPAD_DEFAULT_NOTIFY_CHANNEL as f, defineLilypadDb as i, LILYPAD_DEFAULT_CHANGELOG_TABLE as l, LilypadDbMissingPrimaryKeyError as n, isLilypadDbConfig as o, LilypadDbNotFoundError as r, isLilypadDbTableDefinition as s, LilypadDbEmptyWriteError as t, LILYPAD_DEFAULT_DB_CONFIG_NAME as u };
+export { LILYPAD_DEFAULT_NOTIFY_CHANNEL as _, defineLilypadTable as a, resolveLilypadDbTable as c, lilypadColumnTypeMismatch as d, lilypadColumnTypesOfPgType as f, LILYPAD_DEFAULT_MAX_GAP as g, LILYPAD_DEFAULT_DB_CONFIG_NAME as h, defineLilypadDb as i, isLilypadIntegerPgType as l, LILYPAD_DEFAULT_CHANGELOG_TABLE as m, LilypadDbMissingPrimaryKeyError as n, isLilypadDbConfig as o, normalizeLilypadPgType as p, LilypadDbNotFoundError as r, isLilypadDbTableDefinition as s, LilypadDbEmptyWriteError as t, isLilypadSerialPgType as u };
 
-//# sourceMappingURL=LilypadDbSchema-Aqkz2mc3.mjs.map
+//# sourceMappingURL=LilypadDbSchema-DgMfYKbD.mjs.map

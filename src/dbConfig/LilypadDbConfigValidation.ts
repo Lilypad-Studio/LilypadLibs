@@ -4,12 +4,13 @@ import type {
   LilypadDbTableSync,
 } from '@/dbConfig/LilypadDbConfig';
 import { LILYPAD_DEFAULT_DB_SCHEMA } from '@/dbConfig/LilypadDbConfigDefaults';
+import { LILYPAD_DB_COLUMN_TYPES, lilypadColumnTypeMismatch } from '@/dbConfig/LilypadPgTypes';
 import type { LilypadDbColumn, LilypadDbReference } from '@/dbGate/LilypadDbSchema';
 import { assertNumberOption } from '@/internal/LilypadValidation';
 
 const OWNER = 'defineLilypadDb';
 const CONFIG_NAME = /^[A-Za-z0-9_-]+$/;
-const COLUMN_TYPES = new Set(['string', 'number', 'bigint', 'boolean', 'date', 'json', 'array']);
+const COLUMN_TYPES = new Set<string>(LILYPAD_DB_COLUMN_TYPES);
 const ACTIONS = new Set(['no action', 'restrict', 'cascade', 'set null', 'set default']);
 const INDEX_METHODS = new Set(['btree', 'hash', 'gin', 'gist', 'brin', 'spgist']);
 const PRUNING_MODES = new Set(['detect', 'trigger', 'cron', 'external']);
@@ -74,6 +75,16 @@ function assertColumn(column: LilypadDbColumn, what: string): void {
   assertOneOf(column.type, COLUMN_TYPES, `${what}.type`);
   if (column.pgType !== undefined) {
     assertName(column.pgType, `${what}.pgType`);
+    const fitting =
+      column.type === undefined ? undefined : lilypadColumnTypeMismatch(column.type, column.pgType);
+    if (fitting) {
+      fail(
+        `${what}.type "${String(column.type)}" does not fit its pgType "${column.pgType}", which postgres.js returns as ${fitting[0]}: declare ${fitting.map((type) => `"${type}"`).join(' or ')}, or leave type out.`
+      );
+    }
+  }
+  if (column.converted !== undefined && typeof column.converted !== 'boolean') {
+    fail(`${what}.converted must be a boolean.`);
   }
   const columnDefault: unknown = column.default;
   if (

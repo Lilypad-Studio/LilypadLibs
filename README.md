@@ -48,9 +48,9 @@ const users = defineLilypadTable<User, 'id'>({
   tableName: 'users',
   primaryKey: 'id',
   cols: {
-    id: { type: 'string', pgType: 'uuid' },
-    name: { type: 'string', pgType: 'text', nullable: false },
-    email: { type: 'string', pgType: 'text', nullable: false, unique: true },
+    id: { pgType: 'uuid' },
+    name: { pgType: 'text', nullable: false },
+    email: { pgType: 'text', nullable: false, unique: true },
   },
   sync: { strategy: 'listen' }, // the default
 });
@@ -550,9 +550,9 @@ const teams = defineLilypadTable<Team, 'id'>({
   primaryKey: 'id',
   generatedPrimaryKey: true, // the database generates the id
   cols: {
-    id: { type: 'number', pgType: 'int4' },
-    slug: { type: 'string', pgType: 'varchar(64)', nullable: false, unique: true },
-    name: { type: 'string', pgType: 'text', nullable: false },
+    id: { pgType: 'int4' },
+    slug: { pgType: 'varchar(64)', nullable: false, unique: true },
+    name: { pgType: 'text', nullable: false },
   },
   sync: { strategy: 'changelog', pollInterval: 5_000 },
 });
@@ -562,16 +562,11 @@ const members = defineLilypadTable<Member, 'id'>({
   primaryKey: 'id',
   generatedPrimaryKey: true,
   cols: {
-    id: { type: 'string', pgType: 'uuid', default: { sql: 'gen_random_uuid()' } },
-    teamId: {
-      type: 'number',
-      pgType: 'int4',
-      nullable: false,
-      references: { table: 'teams', onDelete: 'cascade' },
-    },
-    email: { type: 'string', pgType: 'text', nullable: false },
-    joinedAt: { type: 'date', pgType: 'timestamptz', nullable: false, default: { sql: 'now()' } },
-    managerId: { type: 'string', pgType: 'uuid', nullable: true },
+    id: { pgType: 'uuid', default: { sql: 'gen_random_uuid()' } },
+    teamId: { pgType: 'int4', nullable: false, references: { table: 'teams', onDelete: 'cascade' } },
+    email: { pgType: 'text', nullable: false },
+    joinedAt: { pgType: 'timestamptz', nullable: false, default: { sql: 'now()' } },
+    managerId: { pgType: 'uuid', nullable: true },
   },
   unique: [{ columns: ['teamId', 'email'] }],
   foreignKeys: [{ columns: ['managerId'], references: { table: 'members', onDelete: 'set null' } }],
@@ -633,15 +628,17 @@ The columns of `cols`:
 
 | Field | At runtime | Checked by `lilypad-doctor` |
 | --- | --- | --- |
-| `type` | The `type` of the primary key: with `'number'`, `LilypadDbCache` converts to numbers the ids that notifications and the changelog carry as text | That the database type is read by postgres.js as this type (a warning: e.g. a `numeric` or `bigint` column declared `'number'`, which postgres.js returns as a string). One of `'string'`, `'number'`, `'bigint'`, `'boolean'`, `'date'`, `'json'` and `'array'` |
-| `pgType` | Not used | The exact PostgreSQL type (`'uuid'`, `'int4'`, `'varchar(64)'`, `'timestamptz'`, `'text[]'`...), common aliases accepted (`int4` is `integer`, `timestamptz` is `timestamp with time zone`). Without it, the fix cannot create the column |
+| `type` | The `type` of the primary key: with `'number'`, `LilypadDbCache` converts to numbers the ids that notifications and the changelog carry as text | What postgres.js returns for the column: one of `'string'`, `'number'`, `'bigint'` (an `int8`, returned as a string), `'boolean'`, `'date'`, `'json'` and `'array'`. It follows from a known `pgType`: declare it only for the other types (enums, domains, the types of extensions) or without `pgType`. Without `pgType`, checks that the database type is read by postgres.js as this type (a warning: e.g. a `numeric` or `bigint` column declared `'number'`) |
+| `pgType` | Gives the `type` when it is not declared | The exact PostgreSQL type (`'uuid'`, `'int4'`, `'varchar(64)'`, `'timestamptz'`, `'text[]'`...), common aliases accepted (`int4` is `integer`, `timestamptz` is `timestamp with time zone`). Without it, the fix cannot create the column |
+| `converted` | Not used (types only) | The hooks convert the column (see [Functions applied to the rows](#functions-applied-to-the-rows-bindlilypaddbhooks)): its property in `T` is not compared with `type` and `pgType` |
 | `nullable` | Not used | Whether the column accepts `NULL`, when set |
 | `default` | Not used | `true`: the column has a default; `{ sql: 'now()' }`: the same, and the fix uses this expression. The installed expression is not compared |
 | `unique` | Not used | A unique key on this column alone |
 | `references` | Not used | A foreign key of this column: `{ table, column?, onDelete?, onUpdate? }` |
 
 - `cols` must list **every property of `T`**. Only these columns are read and written: any other property of the data you pass is ignored. So you can pass a request body directly without the risk of writing columns such as `is_admin`. Properties set to `undefined` are not written either. The table may have other columns: `lilypad-doctor` warns only about a `NOT NULL` column without a default (the inserts of the library would fail), or about every one with `strict`.
-- The library does not validate or convert values at runtime: postgres.js converts them. Declare `bigint`/`bigserial` keys as `'bigint'`, and type them as `string` in `T`: postgres.js returns them as strings, so their keys stay strings.
+- The library does not validate or convert values at runtime: postgres.js converts them, and `type` says what it returns. The `type` of a known `pgType` is given for you: `int2`/`int4`/`serial`/`real`/`float8` are `'number'`; `int8`/`bigserial` `'bigint'` and `numeric` `'string'` (postgres.js returns them as strings, so type them as `string` in `T`: their keys stay strings); `text`, `varchar`, `uuid`, `time`, `interval`, `inet`... `'string'`; `date`/`timestamp`/`timestamptz` `'date'`; `bool` `'boolean'`; `json`/`jsonb` `'json'`; any array `'array'` (`lilypadColumnTypesOfPgType` tells them). `defineLilypadDb` rejects a declared `type` that does not fit a known `pgType` (`int4` declared `'string'`).
+- With `defineLilypadTable<T>`, TypeScript checks each column against its property of `T`: a `number` property needs `'number'` or a numeric `pgType` (`int4`, not `int8`), a `string` one `'string'`/`'bigint'` or a text, `uuid`, `int8`, `numeric`... `pgType`, a `Date` one a date or timestamp, an array an array or `json`, another object `json`. A `pgType` whose type is not known (an enum) needs its `type`: `{ type: 'string', pgType: 'user_role' }`. When the hooks convert a column (e.g. a `timestamptz` read as an ISO string), mark it `converted: true`.
 - A foreign key references `table`, a table of the config with this `tableName`, or else a table of `defaultSchema` (or `'schema.table'`). The referenced columns default to the primary key of a table of the config; give them for another table. The actions (`'no action'`, the default, `'restrict'`, `'cascade'`, `'set null'`, `'set default'`) are checked.
 - The unique keys, foreign keys and indexes are found by their columns, not by their `name`, which only names what the fix creates. A unique key is satisfied by the primary key, a unique constraint or a unique index (neither partial nor on expressions) on the same columns; an index by one with the same columns in the same order, and the same method.
 

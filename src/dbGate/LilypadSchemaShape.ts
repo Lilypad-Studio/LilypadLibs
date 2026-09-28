@@ -4,14 +4,18 @@ import type {
   LilypadDbResolvedUniqueKey,
 } from '@/dbConfig/LilypadDbConfig';
 import { quoteIdentifier } from '@/dbGate/LilypadChangelog';
+import {
+  isLilypadIntegerPgType,
+  isLilypadSerialPgType,
+  lilypadColumnTypeMismatch,
+  normalizeLilypadPgType,
+} from '@/dbConfig/LilypadPgTypes';
 import type {
   LilypadDbCheck,
   LilypadDbColumn,
-  LilypadDbColumnType,
   LilypadDbReferentialAction,
 } from '@/dbGate/LilypadDbSchema';
 import type {
-  LilypadColumnInfo,
   LilypadConstraintInfo,
   LilypadIndexInfo,
   LilypadTableFacts,
@@ -43,113 +47,11 @@ export type LilypadShapeProblems = {
   deferred: LilypadSchemaProblem[];
 };
 
-const TYPE_ALIASES: Record<string, string> = {
-  int: 'integer',
-  int4: 'integer',
-  serial: 'integer',
-  serial4: 'integer',
-  int2: 'smallint',
-  smallserial: 'smallint',
-  serial2: 'smallint',
-  int8: 'bigint',
-  bigserial: 'bigint',
-  serial8: 'bigint',
-  float4: 'real',
-  float8: 'double precision',
-  float: 'double precision',
-  bool: 'boolean',
-  varchar: 'character varying',
-  char: 'character',
-  bpchar: 'character',
-  decimal: 'numeric',
-  timestamptz: 'timestamp with time zone',
-  timetz: 'time with time zone',
-  varbit: 'bit varying',
-};
-
-const SERIAL_TYPES = new Set([
-  'serial',
-  'serial4',
-  'smallserial',
-  'serial2',
-  'bigserial',
-  'serial8',
-]);
-
-/**
- * A PostgreSQL type as `format_type` writes it: lower case, aliases resolved (`int4` is
- * `integer`, `varchar(64)` is `character varying(64)`, `timestamptz(3)` is
- * `timestamp(3) with time zone`), array suffixes kept.
- */
-export function normalizeLilypadPgType(type: string): string {
-  let text = type.trim().toLowerCase().replace(/\s+/g, ' ');
-  let arrays = '';
-  while (text.endsWith('[]')) {
-    arrays += '[]';
-    text = text.slice(0, -2).trimEnd();
-  }
-  // `name(args) rest`, e.g. `timestamp(3) with time zone`
-  const open = text.indexOf('(');
-  const close = open < 0 ? -1 : text.indexOf(')', open);
-  const name = (close < 0 ? text : text.slice(0, open)).trim();
-  const args = close < 0 ? '' : text.slice(open, close + 1).replace(/\s+/g, '');
-  const rest = close < 0 ? '' : text.slice(close + 1).trim();
-  if (name === 'timestamp' || name === 'time') {
-    return `${name}${args} ${rest || 'without time zone'}${arrays}`;
-  }
-  const resolved = TYPE_ALIASES[name] ?? name;
-  if (resolved === 'character' && !args) {
-    return `character(1)${arrays}`;
-  }
-  // `timestamptz(3)`: the precision goes before the time zone
-  const zone = /^(timestamp|time) (with|without) time zone$/.exec(resolved);
-  if (zone) {
-    return `${zone[1]}${args} ${zone[2]} time zone${arrays}`;
-  }
-  return `${resolved}${args}${rest ? ` ${rest}` : ''}${arrays}`;
-}
-
 /** Whether a declared type names the installed one (`format_type` qualifies the types of schemas off the `search_path`). */
 function sameType(declared: string, installed: string): boolean {
   const expected = normalizeLilypadPgType(declared);
   const actual = normalizeLilypadPgType(installed);
   return actual === expected || actual.endsWith(`.${expected}`) || expected.endsWith(`.${actual}`);
-}
-
-const TIME_TYPES = /^time(\(\d+\))? with(out)? time zone$/;
-
-/**
- * Whether a column of this type is read by postgres.js as the declared `type`, or `undefined` if it
- * fits; otherwise, why not.
- */
-function typeMismatch(type: LilypadDbColumnType, column: LilypadColumnInfo): string | undefined {
-  const installed = normalizeLilypadPgType(column.type);
-  const base = installed.replace(/\(.*$/, '');
-  switch (type) {
-    case 'string':
-      return ['S', 'E', 'I', 'V', 'T'].includes(column.category) ||
-        ['uuid', 'xml', 'numeric', 'bigint'].includes(base) ||
-        TIME_TYPES.test(installed)
-        ? undefined
-        : 'postgres.js does not return it as a string';
-    case 'number':
-      if (base === 'bigint' || base === 'numeric') {
-        return 'postgres.js returns it as a string: declare the column as `bigint` or `string`';
-      }
-      return column.category === 'N' ? undefined : 'it is not a numeric type';
-    case 'bigint':
-      return base === 'bigint' || base === 'numeric' ? undefined : 'it is not a bigint';
-    case 'boolean':
-      return column.category === 'B' ? undefined : 'it is not a boolean';
-    case 'date':
-      return column.category === 'D' && !TIME_TYPES.test(installed)
-        ? undefined
-        : 'postgres.js does not return it as a Date';
-    case 'json':
-      return base === 'json' || base === 'jsonb' ? undefined : 'it is not json or jsonb';
-    case 'array':
-      return column.category === 'A' ? undefined : 'it is not an array';
-  }
 }
 
 const ACTION_CODES: Record<LilypadDbReferentialAction, string> = {
@@ -188,7 +90,7 @@ function expectsDefault(
 ): boolean {
   return (
     column.default !== undefined ||
-    (column.pgType !== undefined && SERIAL_TYPES.has(column.pgType.trim().toLowerCase())) ||
+    (column.pgType !== undefined && isLilypadSerialPgType(column.pgType)) ||
     (shape.generatedPrimaryKey === true && name === primaryKey)
   );
 }
@@ -201,13 +103,12 @@ function columnSql(
   primaryKey: string
 ): string {
   const parts = [quoteIdentifier(name), column.pgType];
-  const normalized = normalizeLilypadPgType(column.pgType);
   const generated = shape.generatedPrimaryKey === true && name === primaryKey;
   if (
     generated &&
     typeof column.default !== 'object' &&
-    !SERIAL_TYPES.has(column.pgType.trim().toLowerCase()) &&
-    ['integer', 'smallint', 'bigint'].includes(normalized)
+    !isLilypadSerialPgType(column.pgType) &&
+    isLilypadIntegerPgType(column.pgType)
   ) {
     parts.push('GENERATED BY DEFAULT AS IDENTITY');
   }
@@ -349,12 +250,12 @@ export function evaluateLilypadTableShape(
         );
       }
     } else if (column.type !== undefined) {
-      const mismatch = typeMismatch(column.type, installed);
-      if (mismatch) {
+      const fitting = lilypadColumnTypeMismatch(column.type, installed.type, installed.category);
+      if (fitting) {
         push(
           'column-type-mismatch',
           'warning',
-          `The column "${name}" of "${table}" is ${installed.type}, declared as ${column.type}: ${mismatch}.`
+          `The column "${name}" of "${table}" is ${installed.type}, declared as ${column.type}: postgres.js reads it as ${fitting[0]} (declare ${fitting.join(' or ')}).`
         );
       }
     }

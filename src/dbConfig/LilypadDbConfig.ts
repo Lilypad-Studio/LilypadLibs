@@ -15,6 +15,7 @@ import {
 } from '@/dbConfig/LilypadDbConfigDefaults';
 import { validateLilypadDbConfigInput } from '@/dbConfig/LilypadDbConfigValidation';
 import type { LilypadDbTableHooks, LilypadDbTableHooksBase } from '@/dbConfig/LilypadDbHooks';
+import { lilypadColumnTypesOfPgType } from '@/dbConfig/LilypadPgTypes';
 
 /**
  * The config of a database: the tables the library reads and writes, how each one is kept in sync,
@@ -333,9 +334,10 @@ export type LilypadDbPrimaryKey<C, N> =
  *   primaryKey: 'id',
  *   generatedPrimaryKey: true,
  *   cols: {
- *     id: { type: 'number', pgType: 'int4' },
- *     orgId: { type: 'number', pgType: 'int4', references: { table: 'orgs', onDelete: 'cascade' } },
- *     email: { type: 'string', pgType: 'text', nullable: false, unique: true },
+ *     id: { pgType: 'int4' },
+ *     orgId: { pgType: 'int4', references: { table: 'orgs', onDelete: 'cascade' } },
+ *     email: { pgType: 'text', nullable: false, unique: true },
+ *     role: { type: 'string', pgType: 'user_role' }, // an enum: declare its type
  *   },
  *   indexes: [{ columns: ['orgId'] }],
  *   sync: { strategy: 'changelog', pollInterval: 1000 },
@@ -420,6 +422,20 @@ function withConfigHooks(
     return definition;
   }
   return Object.freeze({ ...definition, hooks: bound.hooks });
+}
+
+/** The columns, each with the `type` that follows from its `pgType` when it has none. */
+function resolveColumns(
+  cols: Readonly<Record<string, LilypadDbColumn>>
+): Record<string, LilypadDbColumn> {
+  return Object.fromEntries(
+    Object.entries(cols).map(([name, column]) => {
+      const type =
+        column.type ??
+        (column.pgType === undefined ? undefined : lilypadColumnTypesOfPgType(column.pgType)?.[0]);
+      return [name, type === column.type ? column : { ...column, type }];
+    })
+  );
 }
 
 /** Splits `schema.table`, or applies the default schema. */
@@ -557,6 +573,7 @@ export function defineLilypadDb<Tables extends Record<string, LilypadDbTableInpu
       tableName,
       schemaName: schema,
       qualifiedName,
+      cols: resolveColumns(table.cols),
       sync: Object.freeze({ ...(sync ?? { strategy: 'listen' }) }),
       strict: strict ?? input.strict ?? false,
       unique: resolvedUnique,

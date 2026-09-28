@@ -37,7 +37,8 @@ export {
   type LilypadTableFacts,
   type LilypadTriggerInfo,
 } from '@/dbGate/LilypadSchemaFacts';
-export { normalizeLilypadPgType, type LilypadSchemaTableShape } from '@/dbGate/LilypadSchemaShape';
+export { normalizeLilypadPgType } from '@/dbConfig/LilypadPgTypes';
+export type { LilypadSchemaTableShape } from '@/dbGate/LilypadSchemaShape';
 export {
   lilypadCommandDeletesFrom,
   lilypadPruneCommandRetention,

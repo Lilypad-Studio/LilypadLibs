@@ -180,6 +180,89 @@ describe('defineLilypadDb', () => {
     expect(db.tables.plain.primaryKey).toBe('id');
   });
 
+  it('should give each column the type of its pgType, unless it declares one', () => {
+    const { tables } = defineLilypadDb({
+      tables: {
+        items: {
+          tableName: 'items',
+          primaryKey: 'id',
+          cols: {
+            id: { pgType: 'int4' },
+            big: { pgType: 'int8' },
+            code: { type: 'string', pgType: 'int8' },
+            role: { type: 'string', pgType: 'user_role' },
+            mood: { pgType: 'mood' },
+            loose: {},
+          },
+        },
+      },
+    });
+
+    expect(tables.items.cols).toEqual({
+      id: { type: 'number', pgType: 'int4' },
+      big: { type: 'bigint', pgType: 'int8' },
+      code: { type: 'string', pgType: 'int8' },
+      role: { type: 'string', pgType: 'user_role' },
+      mood: { pgType: 'mood' },
+      loose: {},
+    });
+  });
+
+  it('should check the columns against the row type', () => {
+    type Row = {
+      id: number;
+      big: string;
+      at: Date | null;
+      tags: string[];
+      data: { a: number };
+      role: 'admin' | 'user';
+      iso: string;
+      free: unknown;
+    };
+    const table = defineLilypadTable<Row, 'id'>({
+      tableName: 'rows',
+      primaryKey: 'id',
+      cols: {
+        id: { pgType: 'serial' },
+        big: { pgType: 'int8' },
+        at: { pgType: 'timestamp(3) with time zone', nullable: true },
+        tags: { pgType: 'text[]' },
+        data: { pgType: 'jsonb' },
+        role: { type: 'string', pgType: 'user_role' },
+        iso: { pgType: 'timestamptz', converted: true },
+        free: { pgType: 'bytea', converted: true },
+      },
+    });
+
+    defineLilypadTable<Row, 'id'>({
+      ...table,
+      // @ts-expect-error: postgres.js returns an int8 as a string
+      cols: { ...table.cols, id: { pgType: 'int8' } },
+    });
+    defineLilypadTable<Row, 'id'>({
+      ...table,
+      // @ts-expect-error: an int4 is not a string
+      cols: { ...table.cols, big: { pgType: 'int4' } },
+    });
+    defineLilypadTable<Row, 'id'>({
+      ...table,
+      // @ts-expect-error: a string is not a number
+      cols: { ...table.cols, id: { type: 'string' } },
+    });
+    defineLilypadTable<Row, 'id'>({
+      ...table,
+      // @ts-expect-error: the type of an enum must be declared
+      cols: { ...table.cols, role: { pgType: 'user_role' } },
+    });
+    defineLilypadTable<Row, 'id'>({
+      ...table,
+      // @ts-expect-error: a timestamptz is a Date, unless the hooks convert it
+      cols: { ...table.cols, iso: { pgType: 'timestamptz' } },
+    });
+
+    expect(defineLilypadDb({ tables: { table } }).tables.table.cols.id.type).toBe('number');
+  });
+
   it.each<[string, Record<string, unknown>, string]>([
     ['a name with a dot', { name: 'a.b' }, 'name must contain only'],
     [
@@ -210,6 +293,16 @@ describe('defineLilypadDb', () => {
       'an unknown column type',
       { cols: { id: { type: 'uuid' as never } } },
       'cols.id.type must be one of',
+    ],
+    [
+      'a type that does not fit the pgType',
+      { cols: { id: { type: 'string', pgType: 'int4' } } },
+      'cols.id.type "string" does not fit its pgType "int4", which postgres.js returns as number: declare "number", or leave type out.',
+    ],
+    [
+      'a converted flag that is not a boolean',
+      { cols: { id: { converted: 'yes' as never } } },
+      'cols.id.converted must be a boolean',
     ],
     [
       'a default that is not SQL',

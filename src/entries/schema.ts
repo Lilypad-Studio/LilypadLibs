@@ -38,6 +38,13 @@ export type {
   LilypadDbTableHooksBase,
 } from '../dbConfig/LilypadDbHooks';
 export { LILYPAD_DEFAULT_DB_CONFIG_NAME } from '../dbConfig/LilypadDbConfigDefaults';
+export { lilypadColumnTypesOfPgType } from '../dbConfig/LilypadPgTypes';
+export type {
+  LilypadDbColumnType,
+  LilypadDbColumnTypeOf,
+  LilypadDbColumnValues,
+  LilypadPgTypeOf,
+} from '../dbConfig/LilypadPgTypes';
 export {
   LilypadDbEmptyWriteError,
   LilypadDbMissingPrimaryKeyError,
@@ -47,9 +54,9 @@ export type {
   LilypadDbCheck,
   LilypadDbColumn,
   LilypadDbColumnDefault,
+  LilypadDbColumnFor,
   LilypadDbColumnName,
   LilypadDbColumnReference,
-  LilypadDbColumnType,
   LilypadDbDeleteResult,
   LilypadDbForeignKey,
   LilypadDbIndex,

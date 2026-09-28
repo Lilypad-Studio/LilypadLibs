@@ -2,7 +2,7 @@ import { n as LilypadDisposedError } from "./LilypadCacheTypes-DuzvYfI8.mjs";
 import { t as assertNumberOption } from "./LilypadValidation-ByfswRPE.mjs";
 import { t as libLog } from "./LilypadLibLogger-D2eacfBb.mjs";
 import { n as createLilypadSingletonAbleAsync } from "./LilypadSingleton-D729uyb5.mjs";
-import { c as resolveLilypadDbTable, n as LilypadDbMissingPrimaryKeyError, o as isLilypadDbConfig, r as LilypadDbNotFoundError, t as LilypadDbEmptyWriteError } from "./LilypadDbSchema-Aqkz2mc3.mjs";
+import { c as resolveLilypadDbTable, d as lilypadColumnTypeMismatch, l as isLilypadIntegerPgType, n as LilypadDbMissingPrimaryKeyError, o as isLilypadDbConfig, p as normalizeLilypadPgType, r as LilypadDbNotFoundError, t as LilypadDbEmptyWriteError, u as isLilypadSerialPgType } from "./LilypadDbSchema-DgMfYKbD.mjs";
 import { createHash } from "node:crypto";
 import postgres from "postgres";
 import { existsSync } from "node:fs";
@@ -1501,97 +1501,11 @@ function suggestPruning(facts, changelog, olderThan, changelogSql, pruning) {
 }
 //#endregion
 //#region src/dbGate/LilypadSchemaShape.ts
-const TYPE_ALIASES = {
-	int: "integer",
-	int4: "integer",
-	serial: "integer",
-	serial4: "integer",
-	int2: "smallint",
-	smallserial: "smallint",
-	serial2: "smallint",
-	int8: "bigint",
-	bigserial: "bigint",
-	serial8: "bigint",
-	float4: "real",
-	float8: "double precision",
-	float: "double precision",
-	bool: "boolean",
-	varchar: "character varying",
-	char: "character",
-	bpchar: "character",
-	decimal: "numeric",
-	timestamptz: "timestamp with time zone",
-	timetz: "time with time zone",
-	varbit: "bit varying"
-};
-const SERIAL_TYPES = /* @__PURE__ */ new Set([
-	"serial",
-	"serial4",
-	"smallserial",
-	"serial2",
-	"bigserial",
-	"serial8"
-]);
-/**
-* A PostgreSQL type as `format_type` writes it: lower case, aliases resolved (`int4` is
-* `integer`, `varchar(64)` is `character varying(64)`, `timestamptz(3)` is
-* `timestamp(3) with time zone`), array suffixes kept.
-*/
-function normalizeLilypadPgType(type) {
-	let text = type.trim().toLowerCase().replace(/\s+/g, " ");
-	let arrays = "";
-	while (text.endsWith("[]")) {
-		arrays += "[]";
-		text = text.slice(0, -2).trimEnd();
-	}
-	const open = text.indexOf("(");
-	const close = open < 0 ? -1 : text.indexOf(")", open);
-	const name = (close < 0 ? text : text.slice(0, open)).trim();
-	const args = close < 0 ? "" : text.slice(open, close + 1).replace(/\s+/g, "");
-	const rest = close < 0 ? "" : text.slice(close + 1).trim();
-	if (name === "timestamp" || name === "time") return `${name}${args} ${rest || "without time zone"}${arrays}`;
-	const resolved = TYPE_ALIASES[name] ?? name;
-	if (resolved === "character" && !args) return `character(1)${arrays}`;
-	const zone = /^(timestamp|time) (with|without) time zone$/.exec(resolved);
-	if (zone) return `${zone[1]}${args} ${zone[2]} time zone${arrays}`;
-	return `${resolved}${args}${rest ? ` ${rest}` : ""}${arrays}`;
-}
 /** Whether a declared type names the installed one (`format_type` qualifies the types of schemas off the `search_path`). */
 function sameType(declared, installed) {
 	const expected = normalizeLilypadPgType(declared);
 	const actual = normalizeLilypadPgType(installed);
 	return actual === expected || actual.endsWith(`.${expected}`) || expected.endsWith(`.${actual}`);
-}
-const TIME_TYPES = /^time(\(\d+\))? with(out)? time zone$/;
-/**
-* Whether a column of this type is read by postgres.js as the declared `type`, or `undefined` if it
-* fits; otherwise, why not.
-*/
-function typeMismatch(type, column) {
-	const installed = normalizeLilypadPgType(column.type);
-	const base = installed.replace(/\(.*$/, "");
-	switch (type) {
-		case "string": return [
-			"S",
-			"E",
-			"I",
-			"V",
-			"T"
-		].includes(column.category) || [
-			"uuid",
-			"xml",
-			"numeric",
-			"bigint"
-		].includes(base) || TIME_TYPES.test(installed) ? void 0 : "postgres.js does not return it as a string";
-		case "number":
-			if (base === "bigint" || base === "numeric") return "postgres.js returns it as a string: declare the column as `bigint` or `string`";
-			return column.category === "N" ? void 0 : "it is not a numeric type";
-		case "bigint": return base === "bigint" || base === "numeric" ? void 0 : "it is not a bigint";
-		case "boolean": return column.category === "B" ? void 0 : "it is not a boolean";
-		case "date": return column.category === "D" && !TIME_TYPES.test(installed) ? void 0 : "postgres.js does not return it as a Date";
-		case "json": return base === "json" || base === "jsonb" ? void 0 : "it is not json or jsonb";
-		case "array": return column.category === "A" ? void 0 : "it is not an array";
-	}
 }
 const ACTION_NAMES = Object.fromEntries(Object.entries({
 	"no action": "a",
@@ -1614,17 +1528,12 @@ function sameList(a, b) {
 }
 /** Whether a declared column has a generating default: `default`, a serial type, or the generated primary key. */
 function expectsDefault(name, column, shape, primaryKey) {
-	return column.default !== void 0 || column.pgType !== void 0 && SERIAL_TYPES.has(column.pgType.trim().toLowerCase()) || shape.generatedPrimaryKey === true && name === primaryKey;
+	return column.default !== void 0 || column.pgType !== void 0 && isLilypadSerialPgType(column.pgType) || shape.generatedPrimaryKey === true && name === primaryKey;
 }
 /** The SQL of a column, for `CREATE TABLE` and `ADD COLUMN` (its type must be known). */
 function columnSql(name, column, shape, primaryKey) {
 	const parts = [quoteIdentifier(name), column.pgType];
-	const normalized = normalizeLilypadPgType(column.pgType);
-	if (shape.generatedPrimaryKey === true && name === primaryKey && typeof column.default !== "object" && !SERIAL_TYPES.has(column.pgType.trim().toLowerCase()) && [
-		"integer",
-		"smallint",
-		"bigint"
-	].includes(normalized)) parts.push("GENERATED BY DEFAULT AS IDENTITY");
+	if (shape.generatedPrimaryKey === true && name === primaryKey && typeof column.default !== "object" && !isLilypadSerialPgType(column.pgType) && isLilypadIntegerPgType(column.pgType)) parts.push("GENERATED BY DEFAULT AS IDENTITY");
 	if (column.nullable === false || name === primaryKey) parts.push("NOT NULL");
 	if (typeof column.default === "object") parts.push(`DEFAULT ${column.default.sql}`);
 	return parts.join(" ");
@@ -1705,8 +1614,8 @@ function evaluateLilypadTableShape(table, primaryKey, shape, facts) {
 		if (column.pgType !== void 0) {
 			if (!sameType(column.pgType, installed.type)) push("column-type-mismatch", "error", `The column "${name}" of "${table}" is ${installed.type}, not ${normalizeLilypadPgType(column.pgType)}.`, `ALTER TABLE ${quotedTable} ALTER COLUMN ${quoteIdentifier(name)} TYPE ${column.pgType};`);
 		} else if (column.type !== void 0) {
-			const mismatch = typeMismatch(column.type, installed);
-			if (mismatch) push("column-type-mismatch", "warning", `The column "${name}" of "${table}" is ${installed.type}, declared as ${column.type}: ${mismatch}.`);
+			const fitting = lilypadColumnTypeMismatch(column.type, installed.type, installed.category);
+			if (fitting) push("column-type-mismatch", "warning", `The column "${name}" of "${table}" is ${installed.type}, declared as ${column.type}: postgres.js reads it as ${fitting[0]} (declare ${fitting.join(" or ")}).`);
 		}
 		if (column.nullable === false && !installed.notNull) push("column-nullability-mismatch", "error", `The column "${name}" of "${table}" accepts NULL, but is declared not nullable.`, `ALTER TABLE ${quotedTable} ALTER COLUMN ${quoteIdentifier(name)} SET NOT NULL;`);
 		else if (column.nullable === true && installed.notNull) push("column-nullability-mismatch", "error", `The column "${name}" of "${table}" is NOT NULL, but is declared nullable.`, name === primaryKey ? void 0 : `ALTER TABLE ${quotedTable} ALTER COLUMN ${quoteIdentifier(name)} DROP NOT NULL;`);
@@ -2075,6 +1984,6 @@ async function runLilypadDoctor(options) {
 	}
 }
 //#endregion
-export { LilypadDbGate as _, normalizeLilypadPgType as a, LilypadDbTable as b, LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD as c, lilypadChangelogSql as d, lilypadChangelogTriggerSql as f, readLilypadChangesBatch as g, readLilypadChanges as h, checkLilypadSchema as i, LILYPAD_MIN_CHANGELOG_RETENTION as l, pruneLilypadChangelog as m, runLilypadDoctor as n, lilypadDbConfigFileNames as o, lilypadCursorCovers as p, LilypadSchemaCheckError as r, loadLilypadDbConfig as s, lilypadSchemaCheckOptions as t, lilypadChangelogPruneScheduleSql as u, lilypadServerlessPool as v, LilypadBackoff as y };
+export { lilypadServerlessPool as _, lilypadDbConfigFileNames as a, LILYPAD_MIN_CHANGELOG_RETENTION as c, lilypadChangelogTriggerSql as d, lilypadCursorCovers as f, LilypadDbGate as g, readLilypadChangesBatch as h, checkLilypadSchema as i, lilypadChangelogPruneScheduleSql as l, readLilypadChanges as m, runLilypadDoctor as n, loadLilypadDbConfig as o, pruneLilypadChangelog as p, LilypadSchemaCheckError as r, LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD as s, lilypadSchemaCheckOptions as t, lilypadChangelogSql as u, LilypadBackoff as v, LilypadDbTable as y };
 
-//# sourceMappingURL=LilypadDoctor-CnFyP25Z.mjs.map
+//# sourceMappingURL=LilypadDoctor-hudlx4Y1.mjs.map

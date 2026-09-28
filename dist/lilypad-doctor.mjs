@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import "./chunks/LilypadDbSchema-Aqkz2mc3.mjs";
-import { n as runLilypadDoctor, o as lilypadDbConfigFileNames, s as loadLilypadDbConfig } from "./chunks/LilypadDoctor-CnFyP25Z.mjs";
+import "./chunks/LilypadDbSchema-DgMfYKbD.mjs";
+import { a as lilypadDbConfigFileNames, n as runLilypadDoctor, o as loadLilypadDbConfig } from "./chunks/LilypadDoctor-hudlx4Y1.mjs";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, extname, isAbsolute, relative, resolve } from "node:path";
 import { parseArgs, parseEnv } from "node:util";
@@ -35,10 +35,12 @@ function exampleTable(typescript) {
 		"  tableName: 'example', // or 'schema.example'",
 		"  primaryKey: 'id',",
 		"  generatedPrimaryKey: true, // the database generates the id",
+		"  // pgType gives the type of the row property (int4: number, text: string, timestamptz: Date...);",
+		"  // declare it for the other types: { type: 'string', pgType: 'user_role' } (an enum)",
 		"  cols: {",
-		"    id: { type: 'number', pgType: 'int4' },",
-		"    name: { type: 'string', pgType: 'text', nullable: false, unique: true },",
-		"    createdAt: { type: 'date', pgType: 'timestamptz', nullable: false, default: { sql: 'now()' } },",
+		"    id: { pgType: 'int4' },",
+		"    name: { pgType: 'text', nullable: false, unique: true },",
+		"    createdAt: { pgType: 'timestamptz', nullable: false, default: { sql: 'now()' } },",
 		"  },",
 		"  // unique: [{ columns: ['name', 'createdAt'] }],",
 		"  // foreignKeys: [{ columns: ['ownerId'], references: { table: 'owners', onDelete: 'cascade' } }],",
