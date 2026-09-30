@@ -20,13 +20,15 @@ Make `LilypadChangelogSync` measure `pollInterval` and `maxGap` with `performanc
     if (now - this.lastRead < this.options.pollInterval || !this.backoff.ready()) {
   ...
   trustedSince(): number | undefined {
-    if (this.cursor === undefined || Date.now() - this.lastRead > this.maxGap) {
+    ...
+    if (this.cursor === undefined || Date.now() - this.lastRead > this.maxGap || !current) {
   ...
   private request(readAt: number): LilypadChangesRequest {
     if (this.cursor !== undefined && readAt - this.lastRead <= this.maxGap) {
   ...
       this.lastRead = readAt;   // in apply()
   ```
+  The `!current` condition (finding DBC-1 of `060-db-cache`, applied) already uses the monotonic clock: `lastApplied = performance.now()`, set at the end of `apply()`, is compared with `pollInterval`. Only the `lastRead` comparisons remain on the wall clock.
   `readAt` is `Date.now()`, taken in `LilypadChangelogReader.readAll` (`src/dbGate/LilypadChangelogReader.ts`: `const readAt = Date.now(); const requests = subscribers.map((subscriber) => subscriber.request(readAt));`) and passed back in `LilypadChangelogReadResult`.
 - Problem: when the wall clock steps back (NTP correction, VM resume) by more than `pollInterval`, `now - this.lastRead` stays negative, so `beforeRead` skips every read until the clock catches up: the cache stops applying changes and serves stale rows for up to the size of the step. The same step makes `readAt - this.lastRead` and `Date.now() - this.lastRead` smaller, so a chain broken for longer than `maxGap` is still trusted (the cursor is reused instead of a lookback, and `trustedSince()` stays defined). A step forward does the reverse: an extra lookback that expires everything, which is safe.
 - Fix: two clocks, one per use.

@@ -2,6 +2,12 @@ import { lilypadCursorCovers, type LilypadChangelogCursor } from '@/dbGate/Lilyp
 
 /** How long the writes of an instance are remembered, to recognize their changes. */
 const OWN_WRITE_RETENTION = 10 * 60 * 1000;
+/**
+ * The most transactions remembered per key. A key written again and again is never older than the
+ * retention, and the changes of some of its writes may never come back (a notification lost, or
+ * received before the write returned): forgetting one only costs a query when it does come back.
+ */
+const MAX_XIDS_PER_KEY = 32;
 
 /**
  * The writes of a `LilypadDbCache` instance, by normalized key: their transaction ids, and the
@@ -9,11 +15,12 @@ const OWN_WRITE_RETENTION = 10 * 60 * 1000;
  * writes are already reflected in it, and coming back through the sync they need no query.
  */
 export class LilypadOwnWrites {
+  /** `at`: when the last write of the key was recorded (`performance.now()`). */
   private writes = new Map<string, { ticket: number; xids: Set<bigint>; at: number }>();
 
   /** Remembers a write of the key by transaction `xid`, whose result the entry `ticket` holds. */
   record(normalizedKey: string, xid: bigint, ticket: number): void {
-    const now = Date.now();
+    const now = performance.now();
     // In the order of the last write, so the oldest come first
     for (const [key, own] of this.writes) {
       if (now - own.at <= OWN_WRITE_RETENTION) {
@@ -23,6 +30,10 @@ export class LilypadOwnWrites {
     }
     const xids = this.writes.get(normalizedKey)?.xids ?? new Set<bigint>();
     xids.add(xid);
+    if (xids.size > MAX_XIDS_PER_KEY) {
+      // The oldest first: a Set keeps the insertion order
+      xids.delete(xids.values().next().value!);
+    }
     this.writes.delete(normalizedKey);
     this.writes.set(normalizedKey, { ticket, xids, at: now });
   }

@@ -57,6 +57,61 @@ describe('LilypadDbMembers', () => {
     expect(members.isLoaded(undefined, 60_000)).toBe(false);
   });
 
+  it('should track the members while the first load runs, and keep them after it', () => {
+    const members = new LilypadDbMembers<string>();
+    members.beginLoad();
+
+    members.add('inserted', 'inserted', 5); // after the load started (ticket 3)
+    members.follow('fetched', 'fetched', true, 6);
+    members.replace(loaded('a'), 3, Date.now(), () => false);
+    members.endLoad();
+
+    expect(members.keys().sort()).toEqual(['a', 'fetched', 'inserted']);
+  });
+
+  it('should not track the members once a failed load ended', () => {
+    const members = new LilypadDbMembers<string>();
+    members.beginLoad();
+    members.endLoad();
+
+    members.add('a', 'a', 1);
+
+    expect(members.tracked).toBe(false);
+    expect(members.keys()).toEqual([]);
+  });
+
+  it('should forget the members noted beyond a quarter of the table, at least 1000', () => {
+    const members = new LilypadDbMembers<string>();
+    members.replace(loaded('a', 'b'), 1, Date.now(), () => false);
+
+    for (let index = 0; index < 1000; index++) {
+      members.add(`n${index}`, `n${index}`, 2 + index);
+    }
+    expect(members.size).toBe(1002);
+    // A fetched member is verified: it no longer counts
+    members.follow('n0', 'n0', true, 5000);
+    members.add('n1000', 'n1000', 5001);
+    expect(members.size).toBe(1003);
+
+    members.add('n1001', 'n1001', 5002);
+    expect(members.size).toBe(0);
+    expect(members.isLoaded(undefined, 60_000)).toBe(false);
+  });
+
+  it('should not forget the members while a load runs, but at the next add after it', () => {
+    const members = new LilypadDbMembers<string>();
+    members.beginLoad();
+    for (let index = 0; index < 1001; index++) {
+      members.add(`n${index}`, `n${index}`, 5 + index);
+    }
+    members.replace(loaded('a'), 3, Date.now(), () => false);
+    members.endLoad();
+    expect(members.size).toBe(1002);
+
+    members.add('late', 'late', 2000);
+    expect(members.size).toBe(0);
+  });
+
   it('should count as loaded since the sync became trusted, or for the ttl without it', async () => {
     const members = new LilypadDbMembers<string>();
     const loadedAt = Date.now();

@@ -1499,6 +1499,22 @@ describe('LilypadDbCache', () => {
       expect(cache['members'].keys()).toContain(42);
       await cache.dispose();
     });
+
+    it('should key the rows of getAll(keys) as first given, when a key is given twice', async () => {
+      const numericFake = createFakeGate();
+      numericFake.mocks.selectByPrimaryKeys.mockResolvedValueOnce([
+        { id: 7, name: 'seven' } as unknown as Item,
+      ]);
+      const cache = await LilypadDbCache.create({
+        gate: numericFake.gate,
+        table: numericTable(numericInput),
+      });
+
+      const rows = await cache.getAll([7, '7' as unknown as number]);
+
+      expect([...rows.keys()]).toEqual([7]);
+      await cache.dispose();
+    });
   });
 
   describe('disposed cache', () => {
@@ -1529,6 +1545,24 @@ describe('LilypadDbCache', () => {
 
       await expect(writing).resolves.toEqual({ id: '1', name: 'renamed' });
       expect(cache['engine'].store.size).toBe(0);
+    });
+
+    it('should not run a refresh queued before dispose', async () => {
+      const cache = await createCache();
+      let finishQuery!: () => void;
+      fake.mocks.selectByPrimaryKey.mockImplementationOnce(async (key) => {
+        await new Promise<void>((resolve) => (finishQuery = resolve));
+        return fake.rows.get(key) ?? null;
+      });
+      const running = cache.refresh('1');
+      const queued = cache.refresh('1');
+
+      await cache.dispose();
+      finishQuery();
+
+      await expect(running).resolves.toEqual({ id: '1', name: 'one' });
+      await expect(queued).rejects.toThrow('is disposed');
+      expect(fake.mocks.selectByPrimaryKey).toHaveBeenCalledOnce();
     });
 
     it('should remove the listener of a lazy LISTEN still starting when disposed', async () => {
@@ -1905,6 +1939,322 @@ describe('LilypadDbCache', () => {
       release();
       await second;
       expect(fake.listeners.size).toBe(0);
+    });
+  });
+
+  describe('trust in the changelog', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      changelog.read.mockReset();
+      changelog.read.mockResolvedValue({ changes: [], cursor: at(100n) });
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    /** Row 1 changed elsewhere: the next read of the changelog returns it. */
+    const changeRowOne = () => {
+      fake.rows.set('1', { id: '1', name: 'ONE' });
+      changelog.read.mockResolvedValue({
+        changes: [{ id: '5', xid: 100n, rowId: '1', op: 'UPDATE' }],
+        cursor: at(101n),
+      });
+    };
+
+    it('should not keep a row past its TTL in get when no read applied the changes since', async () => {
+      const cache = await createCache({ sync: { strategy: 'changelog', pollInterval: 1000 } });
+      await cache.getOrFetch('1');
+      changeRowOne();
+
+      await vi.advanceTimersByTimeAsync(30 * 60_000);
+
+      expect(cache.get('1')).toBeUndefined();
+      expect(cache.peek('1').type).toBe('expired');
+      expect(await cache.getOrFetch('1')).toEqual({ id: '1', name: 'ONE' });
+    });
+
+    it('should query a row again after its TTL while the changelog cannot be read', async () => {
+      const cache = await createCache({ sync: { strategy: 'changelog', pollInterval: 1000 } });
+      await cache.getOrFetch('1');
+      changelog.read.mockRejectedValue(new Error('changelog unreadable'));
+
+      await vi.advanceTimersByTimeAsync(61_000);
+      await cache.getOrFetch('1');
+
+      expect(fake.mocks.selectByPrimaryKey).toHaveBeenCalledTimes(2);
+    });
+
+    it('should keep a row past its TTL with background reads made within two intervals', async () => {
+      const cache = await createCache({
+        sync: { strategy: 'changelog', pollInterval: 1000, poll: 'background' },
+      });
+      await cache.getOrFetch('1');
+      // The first read, which did not wait, expired every entry: the row is fetched again
+      await vi.advanceTimersByTimeAsync(1000);
+      await cache.getOrFetch('1');
+      fake.mocks.selectByPrimaryKey.mockClear();
+
+      for (let second = 0; second < 61; second++) {
+        await vi.advanceTimersByTimeAsync(1000);
+        await cache.getOrFetch('1');
+      }
+
+      expect(fake.mocks.selectByPrimaryKey).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('changes during a load of the table', () => {
+    /** Makes the next load of the table wait: it returns the rows of the table now. */
+    const holdNextLoad = () => {
+      const snapshot = [...fake.rows.values()];
+      let release!: () => void;
+      fake.mocks.selectAll.mockReturnValueOnce(
+        new Promise<Item[]>((resolve) => (release = () => resolve(snapshot)))
+      );
+      return () => release();
+    };
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      changelog.read.mockReset();
+      changelog.read.mockResolvedValue({ changes: [], cursor: at(100n) });
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('should return the new row of an UPDATE notified during the first load', async () => {
+      const cache = await createCache();
+      const release = holdNextLoad();
+      const loading = cache.getAll();
+      await vi.advanceTimersByTimeAsync(0);
+
+      fake.rows.set('1', { id: '1', name: 'ONE' });
+      await fake.notify({ table: 'items', id: '1', op: 'UPDATE' });
+      release();
+
+      expect((await loading).get('1')).toEqual({ id: '1', name: 'ONE' });
+      await vi.advanceTimersByTimeAsync(120_000); // renewed: LISTEN is trusted
+      expect(cache.get('1')).toEqual({ id: '1', name: 'ONE' });
+      expect((await cache.getAll()).get('1')).toEqual({ id: '1', name: 'ONE' });
+    });
+
+    it('should return in the next getAll a row inserted during the first load', async () => {
+      const cache = await createCache();
+      const release = holdNextLoad();
+      const loading = cache.getAll();
+      await vi.advanceTimersByTimeAsync(0);
+
+      fake.rows.set('3', { id: '3', name: 'three' });
+      await fake.notify({ table: 'items', id: '3', op: 'INSERT' });
+      release();
+      await loading;
+
+      expect((await cache.getAll()).get('3')).toEqual({ id: '3', name: 'three' });
+      expect(fake.mocks.selectAll).toHaveBeenCalledOnce();
+    });
+
+    it('should not re-read the ids notified during a load that it does not hold', async () => {
+      const cache = await createCache();
+      const release = holdNextLoad();
+      const loading = cache.getAll();
+      await vi.advanceTimersByTimeAsync(0);
+
+      await fake.notify({ table: 'items', id: 'forged', op: 'UPDATE' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fake.mocks.selectByPrimaryKeys).not.toHaveBeenCalled();
+      release();
+
+      // getAll checks the row noted by the notification once, as outside a load
+      expect([...(await loading).keys()].sort()).toEqual(['1', '2']);
+      expect(fake.mocks.selectByPrimaryKeys).toHaveBeenCalledExactlyOnceWith(['forged']);
+    });
+
+    it('should return every row of a first load during which many ids were notified', async () => {
+      const cache = await createCache();
+      const release = holdNextLoad();
+      const loading = cache.getAll();
+      await vi.advanceTimersByTimeAsync(0);
+
+      for (let index = 0; index < 1001; index++) {
+        await fake.notify({ table: 'items', id: `unknown-${index}`, op: 'INSERT' });
+      }
+      release();
+
+      expect([...(await loading).keys()]).toEqual(expect.arrayContaining(['1', '2']));
+    });
+
+    it('should leave no fence after a load evicted rows beyond maxEntries', async () => {
+      fake = createFakeGate(['1', '2', '3', '4', '5'].map((id) => ({ id, name: `row ${id}` })));
+      const cache = await createCache({ maxEntries: 2 });
+
+      expect(await rowsOf(cache.getAll())).toHaveLength(5);
+      expect(cache['engine']['fences'].size).toBe(0);
+    });
+
+    it('should not load the table twice for a change read from the changelog during its load', async () => {
+      fake = createFakeGate(['1', '2', '3', '4'].map((id) => ({ id, name: `row ${id}` })));
+      const cache = await createCache({ sync: { strategy: 'changelog', pollInterval: 1000 } });
+      const release = holdNextLoad();
+      const loading = cache.getAll();
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Rows 1 and 2 change while the table is loading: another read applies the changes
+      fake.rows.set('1', { id: '1', name: 'ONE' });
+      fake.rows.set('2', { id: '2', name: 'TWO' });
+      changelog.read.mockResolvedValueOnce({
+        changes: [
+          { id: '9', xid: 100n, rowId: '1', op: 'UPDATE' },
+          { id: '10', xid: 100n, rowId: '2', op: 'UPDATE' },
+        ],
+        cursor: at(101n),
+      });
+      await vi.advanceTimersByTimeAsync(1000);
+      await cache.getOrFetch('3');
+      release();
+
+      const rows = await loading;
+      expect(rows.get('1')).toEqual({ id: '1', name: 'ONE' });
+      expect(rows.get('2')).toEqual({ id: '2', name: 'TWO' });
+      expect(cache.get('1')).toEqual({ id: '1', name: 'ONE' });
+      // The changed rows are fetched by key: the load is not repeated
+      expect(fake.mocks.selectAll).toHaveBeenCalledOnce();
+      expect(fake.mocks.selectByPrimaryKeys).toHaveBeenCalledExactlyOnceWith(['1', '2']);
+    });
+  });
+
+  describe('changes during a write', () => {
+    /** Makes the next call of this mock wait until `finish` gives its result. */
+    const hold = <R>(mock: { mockReturnValueOnce(value: Promise<R>): unknown }) => {
+      let finish!: (result: R) => void;
+      mock.mockReturnValueOnce(new Promise<R>((resolve) => (finish = resolve)));
+      return (result: R) => finish(result);
+    };
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      changelog.read.mockReset();
+      changelog.read.mockResolvedValue({ changes: [], cursor: at(100n) });
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('should not cache its row over a newer change notified before the write returned', async () => {
+      const cache = await createCache();
+      const finish = hold<{ row: Item; xid: bigint }>(fake.mocks.update);
+      const writing = cache.sqlUpdate({ id: '1', name: 'mine' });
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Transaction 1001 committed the write; 1002 changed the row after it
+      fake.rows.set('1', { id: '1', name: 'theirs' });
+      await fake.notify({ table: 'items', id: '1', op: 'UPDATE', xid: '1002' });
+      finish({ row: { id: '1', name: 'mine' }, xid: 1001n });
+      await writing;
+      await fake.notify({ table: 'items', id: '1', op: 'UPDATE', xid: '1001' });
+
+      expect(await cache.getOrFetch('1')).toEqual({ id: '1', name: 'theirs' });
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(cache.get('1')).toEqual({ id: '1', name: 'theirs' });
+    });
+
+    it('should not cache a created row over a newer change notified before the insert returned', async () => {
+      const cache = await createCache();
+      const finish = hold<{ row: Item; xid: bigint }>(fake.mocks.insert);
+      const creating = cache.sqlCreate({ id: '9', name: 'mine' });
+      await vi.advanceTimersByTimeAsync(0);
+
+      fake.rows.set('9', { id: '9', name: 'theirs' });
+      await fake.notify({ table: 'items', id: '9', op: 'UPDATE', xid: '1002' });
+      finish({ row: { id: '9', name: 'mine' }, xid: 1001n });
+
+      await expect(creating).resolves.toEqual({ id: '9', name: 'mine' });
+      expect(await cache.getOrFetch('9')).toEqual({ id: '9', name: 'theirs' });
+    });
+
+    it('should not cache a deletion over a row inserted again before the write returned', async () => {
+      const cache = await createCache();
+      const finish = hold<{ deleted: boolean; xid: bigint }>(fake.mocks.delete);
+      const deleting = cache.sqlDelete('1');
+      await vi.advanceTimersByTimeAsync(0);
+
+      fake.rows.set('1', { id: '1', name: 'again' });
+      await fake.notify({ table: 'items', id: '1', op: 'INSERT', xid: '1002' });
+      finish({ deleted: true, xid: 1001n });
+
+      await expect(deleting).resolves.toBe(true);
+      expect(await cache.getOrFetch('1')).toEqual({ id: '1', name: 'again' });
+    });
+
+    it('should not cache its row over a change read from the changelog during the write', async () => {
+      const cache = await createCache({ sync: { strategy: 'changelog', pollInterval: 1000 } });
+      await cache.getOrFetch('2');
+      const finish = hold<{ row: Item; xid: bigint }>(fake.mocks.update);
+      const writing = cache.sqlUpdate({ id: '1', name: 'mine' });
+      await vi.advanceTimersByTimeAsync(0);
+
+      fake.rows.set('1', { id: '1', name: 'theirs' });
+      changelog.read.mockResolvedValueOnce({
+        changes: [{ id: '9', xid: 1002n, rowId: '1', op: 'UPDATE' }],
+        cursor: at(1003n),
+      });
+      await vi.advanceTimersByTimeAsync(1000);
+      await cache.getOrFetch('2');
+      finish({ row: { id: '1', name: 'mine' }, xid: 1001n });
+      await writing;
+
+      expect(await cache.getOrFetch('1')).toEqual({ id: '1', name: 'theirs' });
+    });
+
+    it('should still cache its row when no change came during the write', async () => {
+      const cache = await createCache();
+
+      await cache.sqlUpdate({ id: '1', name: 'mine' });
+
+      expect(cache.get('1')).toEqual({ id: '1', name: 'mine' });
+      expect(fake.mocks.selectByPrimaryKey).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('bounded bookkeeping', () => {
+    it('should not remember its writes with applyChanges: false, which never applies them', async () => {
+      const cache = await createCache({ sync: { strategy: 'listen', applyChanges: false } });
+
+      await cache.sqlUpdate({ id: '1', name: 'renamed' });
+
+      expect(cache['ownWrites']['writes'].size).toBe(0);
+    });
+
+    it('should forget the rows notified beyond a quarter of the table, and load it again', async () => {
+      const cache = await createCache();
+      await cache.getAll();
+
+      for (let index = 0; index < 1001; index++) {
+        await fake.notify({ table: 'items', id: `unknown-${index}`, op: 'INSERT' });
+      }
+
+      expect(cache['members'].size).toBeLessThan(1000);
+      expect(await rowsOf(cache.getAll())).toHaveLength(2);
+      expect(fake.mocks.selectAll).toHaveBeenCalledTimes(2);
+    });
+
+    it('should not charge the eager budget again for a key already in the batch', async () => {
+      const cache = await createCache();
+      await cache.getAll();
+
+      const notified = [
+        ...Array.from({ length: 1000 }, () =>
+          fake.notify({ table: 'items', id: '1', op: 'UPDATE' })
+        ),
+        fake.notify({ table: 'items', id: '2', op: 'UPDATE' }),
+      ];
+      await Promise.all(notified);
+
+      expect(fake.mocks.selectByPrimaryKeys).toHaveBeenCalledExactlyOnceWith(['1', '2']);
+      expect(cache.peek('2').type).toBe('hit');
     });
   });
 });

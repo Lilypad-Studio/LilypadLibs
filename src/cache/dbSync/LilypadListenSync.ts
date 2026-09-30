@@ -25,7 +25,8 @@ function parseXid(xid: string | undefined): bigint | undefined {
  * before postgres.js re-establishes it.
  */
 export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSyncStrategy {
-  readonly seesOwnWrites = true;
+  /** With `applyChanges: false`, the notifications of the writes of this instance are not applied. */
+  readonly seesOwnWrites: boolean;
   private readonly router: LilypadNotificationRouter;
   private readonly subscriber: LilypadNotificationSubscriber;
   private readonly applyChanges: boolean;
@@ -39,6 +40,7 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
     private readonly options: LilypadDbCacheListenSync
   ) {
     this.applyChanges = options.applyChanges !== false;
+    this.seesOwnWrites = this.applyChanges;
     this.router = getLilypadNotificationRouter(host.gate, options.channel);
     this.subscriber = {
       table: host.tableName.split('.').pop()!,

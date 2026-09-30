@@ -54,9 +54,11 @@ export function lilypadNetChanges(changes: LilypadChange[]): {
  * changes of its table (with the other caches of the gate, see `LilypadChangelogReader`) and
  * applies them without a query.
  *
- * It trusts that it sees every change while its chain of reads is unbroken: each read starts from
- * the cursor of the previous one, and the previous one is at most `maxGap` old. Otherwise it reads
- * a `lookback` and expires every entry.
+ * Its chain of reads is unbroken while each read starts from the cursor of the previous one, and
+ * the previous one is at most `maxGap` old; otherwise it reads a `lookback` and expires every
+ * entry. It trusts that it sees every change while the chain is unbroken and its last read was
+ * applied less than `pollInterval` ago (two with `poll: 'background'`, whose reads do not wait):
+ * a change committed since is only applied by the next read.
  */
 export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadDbSyncStrategy {
   readonly seesOwnWrites = true;
@@ -65,6 +67,11 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
   private readonly unsubscribe: () => void;
   private cursor?: LilypadChangelogCursor | undefined;
   private lastRead = 0;
+  /**
+   * When the last read was applied (`performance.now()`): from its end, not its start, so that a
+   * read awaited just before counts as current whatever its duration.
+   */
+  private lastApplied = -Infinity;
   /** Since when the chain of reads is unbroken. */
   private chainStartedAt?: number | undefined;
   private readonly backoff: LilypadBackoff;
@@ -104,7 +111,11 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
   }
 
   trustedSince(): number | undefined {
-    if (this.cursor === undefined || Date.now() - this.lastRead > this.maxGap) {
+    const { poll, pollInterval } = this.options;
+    // A read that fails, or that no read triggers (`get` does not read), leaves changes unapplied
+    const current =
+      performance.now() - this.lastApplied <= (poll === 'background' ? 2 : 1) * pollInterval;
+    if (this.cursor === undefined || Date.now() - this.lastRead > this.maxGap || !current) {
       return undefined;
     }
     return this.chainStartedAt;
@@ -170,6 +181,7 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
       host.forgetOwnWritesCoveredBy(cursor);
       this.cursor = cursor;
       this.lastRead = readAt;
+      this.lastApplied = performance.now();
       this.backoff.succeed();
       host.emitInvalidation('changelog', [...changedKeys], { wholeCache });
     } catch (error) {

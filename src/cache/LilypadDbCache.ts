@@ -1,4 +1,5 @@
-import { LilypadDbMembers } from '@/cache/dbCache/LilypadDbMembers';
+import { LILYPAD_FULL_LOAD_RATIO, LilypadDbMembers } from '@/cache/dbCache/LilypadDbMembers';
+import { LilypadEagerRefresh } from '@/cache/dbCache/LilypadEagerRefresh';
 import { LilypadOwnWrites } from '@/cache/dbCache/LilypadOwnWrites';
 import { LilypadChangelogSync } from '@/cache/dbSync/LilypadChangelogSync';
 import {
@@ -106,14 +107,6 @@ export type LilypadDbCacheGateNamedOptions<
 
 const DEFAULT_MAX_AGE = 60 * 60 * 1000; // 1 hour
 const DEFAULT_LOAD_TIMEOUT = 30_000;
-/** Beyond this share of the rows to fetch, `getAll` loads the whole table in one query instead. */
-const FULL_LOAD_RATIO = 0.25;
-/**
- * The most keys that notifications make this instance re-read per second. Anyone can send a
- * notification: beyond this budget, the notified keys are only expired, and read again when the
- * application asks for them, so that a flood of notifications cannot flood the database.
- */
-const EAGER_REFRESHES_PER_SECOND = 1000;
 
 /**
  * A cache of the rows of one table, kept up to date with the changes made elsewhere.
@@ -159,14 +152,24 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
   private members = new LilypadDbMembers<LilypadDbKey<V, PK>>();
   /** The load of the whole table in flight, shared by concurrent callers. */
   private tableLoad?: Promise<Map<string, V>> | undefined;
+  /**
+   * The loads of the table waiting for their rows: meanwhile every key counts as read, so that a
+   * change applied then leaves a fence that discards the row loaded before it.
+   */
+  private loadsReading = 0;
+  /** Set while `isHeld` asks whether a read other than a load of the table holds a key. */
+  private askingHeld = false;
   /** The queries of `fetchRows` in flight, by normalized key. */
   private rowFetches = new LilypadReadFlights<Map<string, LilypadCachedValueType<V>>>();
-  /** The keys to re-read after a notification, gathered into one query (see `refreshInBatch`). */
-  private eagerBatch?: { keys: Map<string, LilypadDbKey<V, PK>>; done: Promise<void> } | undefined;
-  /** The keys of the batches of `refreshInBatch` pending or running, with their number. */
-  private eagerReads = new Map<string, number>();
-  /** The keys re-read after notifications in the current second, for the eager budget. */
-  private eagerWindow = { start: 0, count: 0 };
+  /** The re-reads of the keys notified, gathered into batches (see `rereadNotified`). */
+  private eagerRefresh = new LilypadEagerRefresh<LilypadDbKey<V, PK>>((keys) =>
+    this.rereadNotified(keys)
+  );
+  /**
+   * The writes of this instance in flight, by normalized key, with their number: a change applied
+   * meanwhile must leave a mark newer than the write (see `storeWritten`).
+   */
+  private writesInFlight = new Map<string, number>();
   /** The refreshes of `refresh` in flight, and the one queued after each (normalized keys). */
   private refreshes = new Map<
     string,
@@ -272,10 +275,13 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
       { ...cacheOptions, name: options.name ?? definition.tableName },
       {
         onValueStored: (entry) => this.followValue(entry),
+        // A load of the table reads every key; a write stores the key once it returns
         hasReadInFlight: (normalizedKey) =>
+          (this.loadsReading > 0 && !this.askingHeld) ||
           this.rowFetches.has(normalizedKey) ||
           this.refreshes.has(normalizedKey) ||
-          this.eagerReads.has(normalizedKey),
+          this.eagerRefresh.has(normalizedKey) ||
+          this.writesInFlight.has(normalizedKey),
       }
     );
     this.table = gate.table(definition);
@@ -417,7 +423,9 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
    *   (with the other keys notified meanwhile, in one query, within the eager budget); `lazy`
    *   expires it with no query, which also discards a read in flight (it may predate the change):
    *   the next read fetches it. A `lazy` DELETE caches the key as `null` at once.
-   * - A change of any other key: no query, and no entry. The shared level entry is removed.
+   * - A change of any other key: no query, and no entry. The shared level entry is removed. While
+   *   a load of the table waits for its rows, the key is also fenced, so that the row the load
+   *   may have read before the change is not stored.
    * INSERT and UPDATE note the key as a row of the table, which `getAll` returns. An `eager`
    * DELETE of a key not held leaves it there: `getAll` reads it again, and learns whether it is
    * gone. A notification is thus never trusted without a query (any role can send one).
@@ -440,7 +448,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
     ) {
       return key;
     }
-    const held = engine.store.has(normalizedKey) || engine.hasReadInFlight(normalizedKey);
+    const held = this.isHeld(normalizedKey);
     if (op === 'DELETE' && mode === 'lazy') {
       if (held) {
         // The null entry also keeps an older, in-flight read from caching the row
@@ -448,7 +456,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
       } else {
         // No entry: it would only take the place of the rows this instance reads
         this.members.delete(normalizedKey);
-        engine.deleteShared(key);
+        this.forgetUnheld(key);
       }
       return key;
     }
@@ -456,15 +464,44 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
       this.members.add(normalizedKey, key, engine.nextTicket());
     }
     if (!held) {
-      // Nobody asked for this row here: no query, but other instances may have shared it
-      engine.deleteShared(key);
-    } else if (mode === 'eager' && this.takeEagerRefresh()) {
-      await this.refreshInBatch(key);
+      // Nobody asked for this row here: no query (any role can send a notification)
+      this.forgetUnheld(key);
+      return key;
+    }
+    const rereading = mode === 'eager' ? this.eagerRefresh.refresh(normalizedKey, key) : undefined;
+    if (rereading) {
+      await rereading;
     } else {
       // A change read from the changelog, or a notification beyond the eager budget
       engine.markInvalid(key);
     }
     return key;
+  }
+
+  /**
+   * Whether the key has an entry or a read in flight, a load of the table apart: a load reads
+   * every key, and a change of a key only it reads needs no query.
+   */
+  private isHeld(normalizedKey: string): boolean {
+    this.askingHeld = true;
+    try {
+      return this.engine.store.has(normalizedKey) || this.engine.hasReadInFlight(normalizedKey);
+    } finally {
+      this.askingHeld = false;
+    }
+  }
+
+  /**
+   * Applies a change of a key this instance does not hold: other instances may have shared the
+   * row, and a load of the table waiting for its rows may have read it before the change.
+   */
+  private forgetUnheld(key: LilypadDbKey<V, PK>) {
+    if (this.loadsReading > 0) {
+      // Expires with no entry: a fence (the load counts as a read of the key), and the L2 removal
+      this.engine.markInvalid(key);
+    } else {
+      this.engine.deleteShared(key);
+    }
   }
 
   /**
@@ -498,22 +535,15 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
     this.members.forget(this.engine.nextTicket(), empty);
   }
 
-  /** Takes one key of the eager budget: `false` once the budget of this second is spent. */
-  private takeEagerRefresh(): boolean {
-    const now = Date.now();
-    if (now - this.eagerWindow.start >= 1000) {
-      this.eagerWindow = { start: now, count: 0 };
-    }
-    this.eagerWindow.count++;
-    return this.eagerWindow.count <= EAGER_REFRESHES_PER_SECOND;
-  }
-
   // ROWS OF THE TABLE
 
   /**
-   * Loads every row of the table and replaces the content of the cache with them.
+   * Loads every row of the table and replaces the content of the cache with them. While it waits
+   * for the rows, every key counts as read (`hasReadInFlight`), and until it ends the members are
+   * tracked: a change applied meanwhile, which the load may predate, is newer than it.
    *
-   * @returns The rows loaded, by normalized key: with `maxEntries`, the cache may not hold them all.
+   * @returns The rows loaded that no change superseded, by normalized key: with `maxEntries`, the
+   * cache may not hold them all.
    */
   private async loadRows(signal: AbortSignal): Promise<Map<string, V>> {
     const { engine } = this;
@@ -521,28 +551,47 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
     const primaryKey = this.definition.primaryKey;
     const rows = new Map<string, V>();
     const entries: [LilypadDbKey<V, PK>, V][] = [];
-    for (const row of await this.table.selectAll({ signal })) {
-      const key = row[primaryKey] as LilypadDbKey<V, PK>;
-      rows.set(engine.normalizeKey(key), row);
-      entries.push([key, row]);
-    }
-    // After a timeout the caller already got an error, and a newer load may be running
-    if (!signal.aborted && !engine.disposed) {
-      this.members.replace(
-        entries.map(([key]) => [engine.normalizeKey(key), key] as const),
-        read.ticket,
-        read.startedAt,
-        (normalizedKey) => {
-          const entry = engine.store.get(normalizedKey);
-          return (
-            entry !== undefined &&
-            entry.ticket > read.ticket &&
-            entry.value === null &&
-            entry.origin !== 'fallback'
-          );
+    this.members.beginLoad();
+    try {
+      let loaded: V[];
+      // Not while the rows are stored: evictions and removals must leave no fence
+      this.loadsReading++;
+      try {
+        loaded = await this.table.selectAll({ signal });
+      } finally {
+        this.loadsReading--;
+      }
+      for (const row of loaded) {
+        const key = row[primaryKey] as LilypadDbKey<V, PK>;
+        rows.set(engine.normalizeKey(key), row);
+        entries.push([key, row]);
+      }
+      // After a timeout the caller already got an error, and a newer load may be running
+      if (!signal.aborted && !engine.disposed) {
+        this.members.replace(
+          entries.map(([key]) => [engine.normalizeKey(key), key] as const),
+          read.ticket,
+          read.startedAt,
+          (normalizedKey) => {
+            const entry = engine.store.get(normalizedKey);
+            return (
+              entry !== undefined &&
+              entry.ticket > read.ticket &&
+              entry.value === null &&
+              entry.origin !== 'fallback'
+            );
+          }
+        );
+        engine.replaceEntries(read, entries);
+        // A row changed since the load started: its loaded value may be the old one
+        for (const normalizedKey of [...rows.keys()]) {
+          if (engine.currentTicket(normalizedKey) > read.ticket) {
+            rows.delete(normalizedKey);
+          }
         }
-      );
-      engine.replaceEntries(read, entries);
+      }
+    } finally {
+      this.members.endLoad();
     }
     return rows;
   }
@@ -779,7 +828,10 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
     }
     const current = state;
     const start = () => {
-      const running = this.fetchRow(key);
+      // A refresh queued before dispose() runs no query after it
+      const running = this.engine.disposed
+        ? Promise.reject(new LilypadDisposedError(`LilypadCache "${this.name}"`))
+        : this.fetchRow(key);
       current.running = running;
       current.queued = undefined;
       const settle = () => {
@@ -814,56 +866,19 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
   }
 
   /**
-   * Re-reads a key after a notification, together with the other keys notified meanwhile: a change
-   * of many rows notifies each of them, and one query per row would flood the pool. The batch is
-   * sent once the notifications received together have been handled (a microtask later). The keys
-   * of a failed query are expired instead.
-   *
-   * The query of a batch starts after the notifications of its keys: it sees their changes, even
-   * when an older read of the key is still running.
+   * Re-reads a batch of notified keys (see `LilypadEagerRefresh`), here and in the shared level.
+   * The keys of a failed query are expired instead. It never rejects.
    */
-  private refreshInBatch(key: LilypadDbKey<V, PK>): Promise<void> {
-    let batch = this.eagerBatch;
-    if (!batch) {
-      const keys = new Map<string, LilypadDbKey<V, PK>>();
-      const done = new Promise<void>((resolve) => {
-        queueMicrotask(() => {
-          if (this.eagerBatch?.keys === keys) {
-            this.eagerBatch = undefined;
-          }
-          resolve(this.runEagerBatch(keys));
-        });
-      });
-      batch = { keys, done };
-      this.eagerBatch = batch;
-    }
-    const normalizedKey = this.engine.normalizeKey(key);
-    if (!batch.keys.has(normalizedKey)) {
-      batch.keys.set(normalizedKey, key);
-      this.eagerReads.set(normalizedKey, (this.eagerReads.get(normalizedKey) ?? 0) + 1);
-    }
-    return batch.done;
-  }
-
-  private async runEagerBatch(keys: Map<string, LilypadDbKey<V, PK>>): Promise<void> {
+  private async rereadNotified(keys: LilypadDbKey<V, PK>[]): Promise<void> {
     try {
       if (!this.engine.disposed) {
-        await this.queryRows([...keys.values()], this.engine.beginRead(), true);
+        await this.queryRows(keys, this.engine.beginRead(), true);
       }
     } catch {
       // Logged by queryRows: the next read of these keys fetches them
       if (!this.engine.disposed) {
-        for (const key of keys.values()) {
+        for (const key of keys) {
           this.engine.markInvalid(key);
-        }
-      }
-    } finally {
-      for (const normalizedKey of keys.keys()) {
-        const count = (this.eagerReads.get(normalizedKey) ?? 1) - 1;
-        if (count > 0) {
-          this.eagerReads.set(normalizedKey, count);
-        } else {
-          this.eagerReads.delete(normalizedKey);
         }
       }
     }
@@ -890,18 +905,24 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
       await syncing;
     }
     if (keys) {
-      const uniqueKeys = [
-        ...new Map(keys.map((key) => [this.engine.normalizeKey(key), key])).values(),
-      ];
-      const fetched = await this.fetchRows(this.staleKeys(uniqueKeys));
-      return this.rowsOf(uniqueKeys, fetched);
+      // Each key once, as first given
+      const uniqueKeys = new Map<string, LilypadDbKey<V, PK>>();
+      for (const key of keys) {
+        const normalizedKey = this.engine.normalizeKey(key);
+        if (!uniqueKeys.has(normalizedKey)) {
+          uniqueKeys.set(normalizedKey, key);
+        }
+      }
+      const fetched = await this.fetchRows(this.staleKeys([...uniqueKeys.values()]));
+      return this.rowsOf([...uniqueKeys.values()], fetched);
     }
     let loaded: Map<string, V> | undefined;
     if (!this.members.isLoaded(this.sync.trustedSince(), this.loadTtl)) {
       loaded = await this.loadTable();
     }
     let staleKeys = this.staleKeys(this.members.keys(), loaded);
-    if (staleKeys.length > this.members.size * FULL_LOAD_RATIO) {
+    // Not again after a load of this call: what is still stale changed while it ran
+    if (!loaded && staleKeys.length > this.members.size * LILYPAD_FULL_LOAD_RATIO) {
       loaded = await this.loadTable();
       staleKeys = this.staleKeys(this.members.keys(), loaded);
     }
@@ -1027,12 +1048,44 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
   }
 
   /**
+   * Runs a write of the key (when known before the write), counted in `writesInFlight` meanwhile:
+   * a change of the key applied while it runs then leaves a mark newer than its start ticket (an
+   * entry, or a fence), even when the cache does not hold the key. A generated primary key is not
+   * known before the insert: a change of the new row made elsewhere before the insert returns is
+   * not detected (another transaction would have to find the row in that interval).
+   *
+   * @param write - Receives the start ticket, taken once the write is counted.
+   */
+  private async writing<R>(
+    key: LilypadDbKey<V, PK> | undefined,
+    write: (startTicket: number) => Promise<R>
+  ): Promise<R> {
+    const normalizedKey = key === undefined ? undefined : this.engine.normalizeKey(key);
+    if (normalizedKey !== undefined) {
+      this.writesInFlight.set(normalizedKey, (this.writesInFlight.get(normalizedKey) ?? 0) + 1);
+    }
+    try {
+      return await write(this.engine.nextTicket());
+    } finally {
+      if (normalizedKey !== undefined) {
+        const count = (this.writesInFlight.get(normalizedKey) ?? 1) - 1;
+        if (count > 0) {
+          this.writesInFlight.set(normalizedKey, count);
+        } else {
+          this.writesInFlight.delete(normalizedKey);
+        }
+      }
+    }
+  }
+
+  /**
    * Caches the row returned by a write of this instance, and remembers the write, so that its
    * change is not applied again when it comes back through the sync.
-   * If the entry changed while the write was running (a change applied meanwhile, or a fetch that
-   * may have read the row before the write), it is expired instead: the next read fetches the row.
+   * If the key changed while the write was running (a change applied meanwhile, which may be newer
+   * than the write, or a fetch that may have read the row before it), it is expired instead: the
+   * next read fetches the row.
    *
-   * @param startTicket - A ticket taken before the write.
+   * @param startTicket - A ticket taken before the write, while it is counted in `writesInFlight`.
    * @param xid - The transaction of the write, if it changed a row.
    */
   private storeWritten(
@@ -1046,8 +1099,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
       return;
     }
     const normalizedKey = engine.normalizeKey(key);
-    const entry = engine.store.get(normalizedKey);
-    if (entry && entry.ticket > startTicket) {
+    if (engine.currentTicket(normalizedKey) > startTicket) {
       engine.markInvalid(key);
       return;
     }
@@ -1068,21 +1120,27 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
    */
   async sqlCreate(item: LilypadDbInsertData<V, PK>): Promise<V | null> {
     this.assertNotDisposed();
-    const startTicket = this.engine.nextTicket();
-    const { row, xid } = await this.table.insert(item);
+    const primaryKey = this.definition.primaryKey;
+    const given = (item as Partial<V>)[primaryKey] as LilypadDbKey<V, PK> | undefined;
+    const { row, key } = await this.writing(given, async (startTicket) => {
+      const { row, xid } = await this.table.insert(item);
+      const key = row?.[primaryKey] as LilypadDbKey<V, PK> | undefined;
+      if (row !== null && key !== undefined) {
+        this.storeWritten(key, row, startTicket, xid);
+      }
+      return { row, key };
+    });
     if (row === null) {
       return row;
     }
-    const key = row[this.definition.primaryKey] as LilypadDbKey<V, PK> | undefined;
     if (key === undefined) {
       // The row is inserted: failing now would make the caller insert it again
       this.engine.log(
         'warn',
-        `The row created in "${this.definition.tableName}" has no primary key "${String(this.definition.primaryKey)}" after its select hook: it is not cached.`
+        `The row created in "${this.definition.tableName}" has no primary key "${String(primaryKey)}" after its select hook: it is not cached.`
       );
       return row;
     }
-    this.storeWritten(key, row, startTicket, xid);
     this.engine.emitInvalidation('write', [key]);
     return row;
   }
@@ -1097,9 +1155,11 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
   async sqlUpdate(item: LilypadDbUpdateData<V, PK>): Promise<V | null> {
     this.assertNotDisposed();
     const key = this.getItemPrimaryKeyValue(item);
-    const startTicket = this.engine.nextTicket();
-    const { row, xid } = await this.table.update(item);
-    this.storeWritten(key, row, startTicket, xid);
+    const row = await this.writing(key, async (startTicket) => {
+      const { row, xid } = await this.table.update(item);
+      this.storeWritten(key, row, startTicket, xid);
+      return row;
+    });
     this.engine.emitInvalidation('write', [key]);
     return row;
   }
@@ -1112,9 +1172,11 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
    */
   async sqlDelete(key: LilypadDbKey<V, PK>): Promise<boolean> {
     this.assertNotDisposed();
-    const startTicket = this.engine.nextTicket();
-    const { deleted, xid } = await this.table.delete(key);
-    this.storeWritten(key, null, startTicket, xid);
+    const deleted = await this.writing(key, async (startTicket) => {
+      const { deleted, xid } = await this.table.delete(key);
+      this.storeWritten(key, null, startTicket, xid);
+      return deleted;
+    });
     this.engine.emitInvalidation('write', [key]);
     return deleted;
   }

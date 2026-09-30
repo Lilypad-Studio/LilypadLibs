@@ -112,9 +112,10 @@ export type LilypadDbTableChangelogSync = LilypadDbTableTrustedSync & {
  * `listen` and `changelog` rely on triggers that the library does not install at runtime (see
  * `lilypadChangelogSql`): `lilypad-doctor` checks them, and prints the SQL that installs them.
  *
- * While `listen` or `changelog` is trusted (`LISTEN` active and its heartbeat recent, changelog
- * read within `maxGap`), the cache sees every change of the table, so the TTL no longer needs a
- * query: an entry that reaches its TTL without a change of its row is kept until `maxAge`.
+ * While `listen` or `changelog` is trusted (`LISTEN` active and its heartbeat recent; changelog
+ * read within `maxGap`, and a read applied within `pollInterval`, two with `poll: 'background'`),
+ * the cache sees every change of the table, so the TTL no longer needs a query: an entry that
+ * reaches its TTL without a change of its row is kept until `maxAge`.
  */
 export type LilypadDbTableSync =
   LilypadDbTableListenSync | LilypadDbTableChangelogSync | { strategy: 'none' };

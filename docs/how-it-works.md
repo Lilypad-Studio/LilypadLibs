@@ -782,7 +782,7 @@ A strategy ([`LilypadDbSyncStrategy`, LilypadDbSyncTypes.ts:165](../src/cache/db
 
 - **`lilypadNoSync`**: nothing to start, nothing to wait for, never trusted.
 - **`LilypadListenSync`** ([LilypadListenSync.ts](../src/cache/dbSync/LilypadListenSync.ts)): subscribes to the `LilypadNotificationRouter` of its gate ([LilypadNotificationRouter.ts](../src/cache/dbSync/LilypadNotificationRouter.ts)), which registers **one** callback on the channel of the config (`cache_events` by default) for every cache of the gate (`callbackId: 'lilypad_notification_router'`), parses each notification once, and hands it to the caches of its table (the last cache to unsubscribe removes the listener). `startListening` subscribes; if the cache was disposed while `LISTEN` was starting, it unsubscribes again (otherwise a lazy `LISTEN` started by a read just before `dispose()` would leave a callback registered forever on the gate). `dispose` waits for a `LISTEN` still starting before removing the listener, for the same reason. `trustedSince` is the time `LISTEN` became active (reset by `onReconnect`), but only **while `gate.isListenHealthy()`**: without recent heartbeats, the cache does not trust it.
-- **`LilypadChangelogSync`** ([LilypadChangelogSync.ts](../src/cache/dbSync/LilypadChangelogSync.ts)): subscribes to the gate's reader, keeps the cursor, and reads the changelog before a read when `pollInterval` has passed. `trustedSince` is the start of the unbroken chain of cursor reads; `undefined` without a cursor or when the last read is older than `maxGap`. The whole strategy is described in [4.11](#411-the-changelog-strategy-end-to-end).
+- **`LilypadChangelogSync`** ([LilypadChangelogSync.ts](../src/cache/dbSync/LilypadChangelogSync.ts)): subscribes to the gate's reader, keeps the cursor, and reads the changelog before a read when `pollInterval` has passed. `trustedSince` is the start of the unbroken chain of cursor reads; `undefined` without a cursor, when the last read is older than `maxGap`, or when no read was applied within `pollInterval` (two intervals with `poll: 'background'`): a change committed since is still unapplied. The whole strategy is described in [4.11](#411-the-changelog-strategy-end-to-end).
 
 #### Syncing before a read
 
@@ -803,7 +803,7 @@ return this.getOrSetDetailed(key, valueFn, options);
 
 Failures are logged and turned into a backoff ([3.8](#38-retries-back-off)).
 
-`get()` (synchronous) cannot sync; it only renews.
+`get()` (synchronous) cannot sync; it only renews. With `changelog`, it renews only while the last applied read is at most one `pollInterval` old, since a read is what applies the changes.
 
 #### Trust and renewal
 
@@ -839,8 +839,8 @@ The two modes differ in **how much the cache trusts the change**. A changelog ro
 2. `ownWrites.consume(key, xid)`: skip changes this instance made itself (next section).
 3. `DELETE` from the changelog: if the key is held (an entry, or a read in flight), cache it as `null` (the `null` entry also blocks a fetch in flight from storing the deleted row), even for a protected key. Otherwise, no entry: remove the key from `members` and from L2. A mass delete, or the lookback of a cold start, thus creates no entries, which would evict the rows the instance holds.
 4. Otherwise, `INSERT`/`UPDATE` note the key as a member of the table. Then:
-   - key **not held** (no entry, no read in flight): no query at all. Nobody asked for this row here. Remove it from L2 (other instances may have cached an old copy). An eager `DELETE` of such a key leaves it among the members: `getAll` will fetch it, and learn whether it is really gone.
-   - held, `eager` (notifications, including `DELETE`): `refreshInBatch` re-fetches it now, together with the other keys notified meanwhile: the batch is sent a microtask later, once the notifications received in the same chunk have been handled, with one `selectByPrimaryKeys` (a statement that changes many rows notifies each of them, and one query per row would flood the pool). The keys of a failed batch are expired. `eagerReads` counts the keys of the pending and running batches, for `hasReadInFlight`. The query of a batch starts after the notifications of its keys, so it sees their changes even if an older read of the key is still running (the older result loses by its ticket). A forged `DELETE` thus costs part of one query and changes nothing; a real one caches `null`.
+   - key **not held** (no entry, no read in flight; a write of the key in flight counts as a read, a load of the table does not: `isHeld`): no query at all. Nobody asked for this row here. Remove it from L2 (other instances may have cached an old copy), and, while a load of the table waits for its rows, expire it too (`forgetUnheld`): its fence discards the row the load may have read before the change. An eager `DELETE` of such a key leaves it among the members: `getAll` will fetch it, and learn whether it is really gone.
+   - held, `eager` (notifications, including `DELETE`): `eagerRefresh`, a `LilypadEagerRefresh` ([LilypadEagerRefresh.ts](../src/cache/dbCache/LilypadEagerRefresh.ts)), re-fetches it now, together with the other keys notified meanwhile: the batch is sent a microtask later, once the notifications received in the same chunk have been handled, with one `selectByPrimaryKeys` (`rereadNotified`; a statement that changes many rows notifies each of them, and one query per row would flood the pool). The keys of a failed batch are expired. It counts the keys of the pending and running batches (`has`), for `hasReadInFlight`. The query of a batch starts after the notifications of its keys, so it sees their changes even if an older read of the key is still running (the older result loses by its ticket). A forged `DELETE` thus costs part of one query and changes nothing; a real one caches `null`.
    - held, `lazy` (changelog): `markInvalid`, no query; the next read fetches it. The new ticket also discards a read in flight.
 
 Why lazy for the changelog? A changelog read can return hundreds of changes at once (on a lookback, for instance); re-fetching them all eagerly would turn a poll into hundreds of queries, most of them for rows no one will ask for again.
@@ -849,7 +849,7 @@ Why lazy for the changelog? A changelog read can return hundreds of changes at o
 
 `applyBulkChange()` is the same as an eager `TRUNCATE` without the L2 removal of each key (the older L2 copies are ignored through `rejectSharedBefore`): it applies a `BULK` notification (a statement changed more rows than the `notifyBulkThreshold` of the trigger), and a changelog read with more than 1000 keys (`LILYPAD_BULK_CHANGE_THRESHOLD`). Following each key would cost, on every instance, one L2 removal and one tag per key.
 
-Notifications are untrusted, so their re-reads have a budget: at most 1000 keys per second per cache (`takeEagerRefresh`). Beyond it, a notified key is only expired (`markInvalid`, no query), and read again when the application asks for it.
+Notifications are untrusted, so their re-reads have a budget: at most 1000 keys per second per cache (`LilypadEagerRefresh`, on the monotonic clock; a key already in the batch being gathered costs nothing). Beyond it, a notified key is only expired (`markInvalid`, no query), and read again when the application asks for it.
 
 `LilypadChangelogSync.apply` ([LilypadChangelogSync.ts](../src/cache/dbSync/LilypadChangelogSync.ts)) wraps it for a changelog read:
 
@@ -865,10 +865,10 @@ The **notification** path is `LilypadListenSync.handleNotification` ([LilypadLis
 
 When this instance runs `sqlUpdate`, it caches the row the database returned. Seconds later, its own change comes back through the changelog or a notification. Applying it would expire the fresh row and cost a query, for nothing.
 
-- `storeWritten` records `(key, xid, ticket of the stored entry)` in `ownWrites` (`ownWrites.record`, [LilypadOwnWrites.ts](../src/cache/dbCache/LilypadOwnWrites.ts)), if the strategy `seesOwnWrites`.
+- `storeWritten` records `(key, xid, ticket of the stored entry)` in `ownWrites` (`ownWrites.record`, [LilypadOwnWrites.ts](../src/cache/dbCache/LilypadOwnWrites.ts)), if the strategy `seesOwnWrites` (not `listen` with `applyChanges: false`, which applies no change).
 - `ownWrites.consume(key, xid)` removes the xid from the set and returns `true` only if the entry **still has the ticket** of that write. If anything replaced the entry since (another change, a fetch), the change is applied normally.
 
-`ownWrites` is bounded two ways: by the changelog cursor (`lilypadCursorCovers`: a transaction still in `xip` is kept, so a write whose transaction was still running at a read is recognised when its change comes later), and, for `listen` where there is no cursor, by a 10-minute retention. The map is kept in the order of the last write (delete + set), so pruning stops at the first recent entry.
+`ownWrites` is bounded two ways: by the changelog cursor (`lilypadCursorCovers`: a transaction still in `xip` is kept, so a write whose transaction was still running at a read is recognised when its change comes later), and, for `listen` where there is no cursor, by a 10-minute retention (on the monotonic clock). The map is kept in the order of the last write (delete + set), so pruning stops at the first recent entry. A key written again and again is never older than the retention, and the change of some of its writes may never come back (a lost notification, or one received before the write returned): each key keeps its last 32 transactions only.
 
 #### Writing through
 
@@ -876,13 +876,17 @@ When this instance runs `sqlUpdate`, it caches the row the database returned. Se
 
 ```ts
 this.assertNotDisposed();
-const startTicket = this.nextTicket(); // before the write
-const { row, xid } = await table.update(item);
-this.storeWritten(key, row, startTicket, xid);
+const row = await this.writing(key, async (startTicket) => {
+  const { row, xid } = await table.update(item);
+  this.storeWritten(key, row, startTicket, xid);
+  return row;
+});
 this.emitInvalidation('write', [key]);
 ```
 
-`storeWritten`: nothing if the cache was disposed during the write. If the entry's ticket is now greater than `startTicket`, something touched the key _while the write was running_ (a change applied, a fetch that may have read the row before the write). The library cannot tell which of the two happened last in the database, so it does not guess: it expires the key, and the next read fetches the truth. Otherwise, `engine.set(key, row)` (new ticket, L2 write) and record the own write.
+`writing` counts the write in `writesInFlight` (by key, when the key is known before the write: not for a generated primary key) and takes `startTicket` once it is counted. While it runs, the key counts as read (`hasReadInFlight`), so a change of the key applied meanwhile always leaves a mark newer than `startTicket`, even when the cache does not hold the key: an entry, or a fence.
+
+`storeWritten`: nothing if the cache was disposed during the write. If `currentTicket(key)` (the entry's ticket, or else the fence and the floor) is now greater than `startTicket`, something touched the key _while the write was running_ (a change applied, possibly newer than the write, a fetch that may have read the row before the write). The library cannot tell which of the two happened last in the database, so it does not guess: it expires the key, and the next read fetches the truth. Otherwise, `engine.set(key, row)` (new ticket, L2 write) and record the own write. It runs inside `writing`, before the fences of the key can be pruned.
 
 #### refresh
 
@@ -892,7 +896,7 @@ this.emitInvalidation('write', [key]);
 
 `getAll()` must return every row of the table. Loading the whole table each time is correct but expensive; returning the cached entries is cheap but wrong (the cache may hold only some rows). The solution is to track **which keys exist** separately from their values:
 
-- `members`, a `LilypadDbMembers`: the keys of the rows, each with a ticket, set by each table load (`members.replace`) and kept up to date afterwards by the `onValueStored` hook of the engine (`members.follow`: a row → member, `null` → removed; fallbacks ignored; an older ticket never overrides a newer one), `members.add` (INSERT/UPDATE of an uncached key) and `members.forget` (a `TRUNCATE` or a bulk change). Evicting an entry does **not** remove its member: the row still exists.
+- `members`, a `LilypadDbMembers`: the keys of the rows, each with a ticket, set by each table load (`members.replace`) and kept up to date afterwards by the `onValueStored` hook of the engine (`members.follow`: a row → member, `null` → removed; fallbacks ignored; an older ticket never overrides a newer one), `members.add` (INSERT/UPDATE of an uncached key) and `members.forget` (a `TRUNCATE` or a bulk change). Evicting an entry does **not** remove its member: the row still exists. The members are tracked once a load completed, and **while a load runs** (`beginLoad`/`endLoad`): a row inserted during the very first load is newer than the load, and `replace` keeps it. The members noted by `add` and not yet seen in a load or a stored value are counted: beyond a quarter of the table (and at least 1000), since anyone can send a notification, they are forgotten (`forget`) and the next `getAll` loads the table, as it would anyway. Never while a load runs: that would void the load, and its `getAll` would return only the rows noted since; the next `add` after the load checks again.
 - `members.isLoaded(trustedSince, ttl)`: the members are reliable if the last load happened after the sync became trusted, or, without a trusted sync, less than `bulkSync.ttl` ago.
 
 `getAll()`:
@@ -901,14 +905,15 @@ this.emitInvalidation('write', [key]);
 sync.beforeRead
 members not reliable?  ──> loadTable()            (one full query)
 stale = members whose entry is missing or expired (after renew)
-stale > 25% of members? ──> loadTable() again     (one full query beats many key lookups)
+stale > 25% of members, and no load yet? ──> loadTable()   (one full query beats many key lookups)
 fetchRows(stale)                                  (one IN query per 1000 keys)
 return rowsOf(members, fetched, loaded)
 ```
 
-Two subtleties:
+Three subtleties:
 
 - **With `maxEntries`**, a load may store more rows than the cache can hold; the evicted ones would then count as stale and be fetched again immediately. So `loadTable` does not rely on the store: `loadRows` (with `beginRead`, `replaceMembers` and the engine's `replaceEntries`) returns the loaded rows, and concurrent callers share the promise of one load (`tableLoad`), bounded by `bulkSync.timeout`. `staleKeys` treats a key missing from the store but present in `loaded` as fresh, and `rowsOf` takes each value from, in order: the fresh entry, the rows just fetched, the rows just loaded, the expired entry.
+- **A change during a load** is newer than the load, which may have read the old row. While a load waits for its rows (`loadsReading`), every key counts as read (`hasReadInFlight`), so that a change of a key the cache does not hold expires it with no query, and its fence discards the loaded row. Not while the load stores its rows: its evictions beyond `maxEntries` must leave no fence. `loadRows` then leaves out of `loaded` the rows whose `currentTicket` exceeds its ticket, so that neither `staleKeys` nor `rowsOf` uses them: those keys are fetched by key.
 - **`loadTable` does not use the engine's bulk sync**: `getAll` decides freshness with `isTableLoaded`, not with the engine's timer.
 
 `fetchRows` is single-flight **per key**: keys already being fetched join those queries, the rest go into one new query (`queryRows`, [line 581](../src/cache/LilypadDbCache.ts)), which stores each row with `read.store` (this instance only, not L2, like the table loads) and caches `null` for keys without a row.
@@ -964,6 +969,7 @@ In the database: one changelog row per changed row (one per statement for `TRUNC
 | ------------------------------ | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `cursor`                       | `LilypadChangelogSync` | Where the next read starts: `{ xmax, xip }`, the transactions the last read could not see ([4.8](#the-cursor-the-transactions-a-read-could-not-see)) |
 | `lastRead`                     | `LilypadChangelogSync` | When the last **applied** read started (its `readAt`): when the next poll falls due, and whether the cursor is still within `maxGap`                 |
+| `lastApplied`                  | `LilypadChangelogSync` | When the last read was applied (`performance.now()`, at its end): whether the changes committed up to about now are applied, for `trustedSince()`    |
 | `chainStartedAt`               | `LilypadChangelogSync` | Since when the reads form an unbroken chain: what `trustedSince()` returns                                                                           |
 | `backoff`                      | `LilypadChangelogSync` | After a failure, when the next read may run                                                                                                          |
 | `ownWrites`                    | `LilypadDbCache`       | The `xid` of this instance's own writes, to recognize their echo ([Own writes](#own-writes))                                                         |
@@ -1044,16 +1050,16 @@ Two design choices in that table. **Changes are applied lazily**, by expiring ra
 
 #### Step 5: trust, and what it buys
 
-`trustedSince()` ([LilypadChangelogSync.ts](../src/cache/dbSync/LilypadChangelogSync.ts)) is `undefined` without a cursor or when the last applied read is older than `maxGap`, and `chainStartedAt` otherwise.
+`trustedSince()` ([LilypadChangelogSync.ts](../src/cache/dbSync/LilypadChangelogSync.ts)) is `undefined` without a cursor, when the last applied read is older than `maxGap`, or when no read was applied within `pollInterval` (two intervals with `poll: 'background'`), and `chainStartedAt` otherwise.
 
-Why an unbroken chain means "this instance sees every change". The chain starts with a lookback read, which expired everything held at that moment and discarded the reads in flight. Every later read starts exactly where the previous one stopped (the cursor), and the cursor reads return each change exactly once, whatever the order of the commits ([4.8](#the-cursor-the-transactions-a-read-could-not-see)). Take an entry fetched after `chainStartedAt` that no change has invalidated. A change of its row made after the fetch would have been returned by one of the reads since, and would have invalidated the entry. So the entry is up to date **as of the last applied read**.
+Why an unbroken chain means "this instance sees every change". The chain starts with a lookback read, which expired everything held at that moment and discarded the reads in flight. Every later read starts exactly where the previous one stopped (the cursor), and the cursor reads return each change exactly once, whatever the order of the commits ([4.8](#the-cursor-the-transactions-a-read-could-not-see)). Take an entry fetched after `chainStartedAt` that no change has invalidated. A change of its row made after the fetch would have been returned by one of the reads since, and would have invalidated the entry. So the entry is up to date **as of the last applied read**, which is why the trust also needs that read to be recent: `get` never reads the changelog, and a read may fail, while the chain itself holds for up to `maxGap`.
 
 Two things rely on it:
 
 - **Renewal** ([Trust and renewal](#trust-and-renewal)): an entry that reaches its TTL with no change is extended without a query, up to `maxAge`. With the changelog, the TTL costs no query while the chain holds.
 - **`getAll`**: `isTableLoaded()` ([LilypadDbCache.ts](../src/cache/LilypadDbCache.ts)) is true when the table was loaded after the chain started. `getAll` then never reloads the whole table; it fetches only the members whose entries are missing or invalidated.
 
-When the chain breaks (no applied read for `maxGap`), `trustedSince()` turns `undefined`. Entries then expire at their TTL, and `getAll` trusts its members only for `bulkSync.ttl`. The next successful read is a lookback, which expires everything and starts a new chain.
+When no read was applied for `pollInterval` (reads failing, or none triggered), `trustedSince()` is `undefined` until the next applied read, which continues the chain. When the chain breaks (no applied read for `maxGap`), `trustedSince()` turns `undefined` too. Entries then expire at their TTL, and `getAll` trusts its members only for `bulkSync.ttl`. The next successful read is a lookback, which expires everything and starts a new chain.
 
 #### A timeline
 
@@ -1224,10 +1230,10 @@ The change reached the instance within `pollInterval`, with one changelog query 
 
 Same instance. The application calls `accounts.sqlUpdate({ id: 7, plan: 'team' })`.
 
-1. `sqlUpdate`: not disposed; `key = 7`; `startTicket = nextTicket()` = 60.
+1. `sqlUpdate`: not disposed; `key = 7`; `writing` counts the write of `'7'` in flight, and `startTicket = nextTicket()` = 60.
 2. `table.update` → `prepareWrite`: the `write` hook, if any; primary key present; with `generatedPrimaryKey` the `id` is removed from the data (it only identifies the row); `columns = ['plan']` (only the declared columns that are not `undefined`).
 3. SQL: `UPDATE "accounts" SET "plan" = $1 WHERE "id" = $2 RETURNING "id", "email", "plan", pg_current_xact_id()::text AS "__lilypad_xid"`. `writeResult` strips `__lilypad_xid` and returns `{ row, xid: 9200n }`.
-4. `storeWritten(7, row, 60, 9200n)`: the entry's ticket (say 58) is not greater than 60, so nothing interfered. `engine.set(7, row)` → ticket 61, and the row is written to L2. `ownWrites.record('7', 9200n, 61)`.
+4. `storeWritten(7, row, 60, 9200n)`: `currentTicket('7')`, the entry's ticket (say 58), is not greater than 60, so nothing interfered. `engine.set(7, row)` → ticket 61, and the row is written to L2. `ownWrites.record('7', 9200n, 61)`.
 5. `emitInvalidation('write', [7])`: `platform.onInvalidate` can call `revalidateTag('lilypad:accounts:7')`.
 
 **Five seconds later**, a poll returns the trigger's change `{ xid: 9200n, rowId: '7', op: 'UPDATE' }`. `applyChange` → `ownWrites.consume(7, 9200n)`: the xid is in the set (removed now), and the entry's ticket is still 61 → `true` → return. No expiry, no query.
@@ -1322,7 +1328,7 @@ For each target, one of the two branches returns rows (the other one's first con
 | **Bulk sync**             | Replacing the whole cache with `bulkSync.fn`; "fresh" while `now < bulkSyncExpirationTime`                                             |
 | **Members**               | The keys that `LilypadDbCache` knows to exist in its table, used by `getAll`                                                           |
 | **Strategy**              | How a `LilypadDbCache` follows its table: `LilypadListenSync`, `LilypadChangelogSync` or `lilypadNoSync`                               |
-| **Trusted sync**          | `LISTEN` active with recent heartbeats, or the changelog read within `maxGap`: the cache sees every change                             |
+| **Trusted sync**          | `LISTEN` active with recent heartbeats, or the changelog read within `pollInterval` and unbroken: the cache sees every change          |
 | **Heartbeat**             | A notification the gate sends itself; while they come back, `isListenHealthy()` is true                                                |
 | **Renew**                 | Extending an expired, trusted, unchanged entry without a query, up to `maxAge`                                                         |
 | **Cursor**                | For the changelog: `{ xmax, xip }`, the transactions the last read could not see; the next read returns their changes                  |

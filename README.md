@@ -984,7 +984,7 @@ Rows are stored in the order the changes happened: a slow query can never overwr
 
 #### The TTL while the cache is in sync
 
-With `listen` or `changelog`, as long as the sync is trusted (`LISTEN` active and its [heartbeat](#listening-to-notifications-listennotify) recent, changelog read within `maxGap`), the cache sees every change of its table. A row that reaches its TTL without a change is then still up to date: the cache keeps it without a query, until it is `maxAge` old (default: 1 hour). `get`, `peek`, `getOrFetch` and `getAll` all see it as fresh. The TTL keeps bounding the shared level, which is never extended this way, and the copies read from it, which are queried again at their TTL.
+With `listen` or `changelog`, as long as the sync is trusted (`LISTEN` active and its [heartbeat](#listening-to-notifications-listennotify) recent; changelog read within `maxGap`, and a read applied within `pollInterval`, two intervals with `poll: 'background'`), the cache sees every change of its table. `get` and `peek` never read the changelog: once no read was applied for `pollInterval`, they no longer keep a row past its TTL. A row that reaches its TTL without a change is then still up to date: the cache keeps it without a query, until it is `maxAge` old (default: 1 hour). `get`, `peek`, `getOrFetch` and `getAll` all see it as fresh. The TTL keeps bounding the shared level, which is never extended this way, and the copies read from it, which are queried again at their TTL.
 
 `maxAge` bounds how long a change that the triggers do not see (triggers disabled, `session_replication_role = replica` during a restore) can go unnoticed. Set `maxAge: 0` to query the rows again at each TTL. With the `none` strategy the TTL applies as in `LilypadCache`.
 
