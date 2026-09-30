@@ -3,6 +3,7 @@ import { parseArgs, parseEnv } from 'node:util';
 import { runLilypadInitCli, type LilypadInitDependencies } from '@/cli/LilypadInitCli';
 import type { LilypadDbConfig } from '@/dbConfig/LilypadDbConfig';
 import { loadLilypadDbConfig } from '@/dbConfig/loadLilypadDbConfig';
+import { formatLilypadSchemaFixSql } from '@/dbGate/LilypadSchemaCheck';
 import {
   runLilypadDoctor,
   type LilypadDoctorOptions,
@@ -85,6 +86,12 @@ export function parseLilypadDoctorArgs(
   if (values.help) {
     return { help: true };
   }
+  if (values.sql && values.json) {
+    throw new Error('--sql and --json cannot be used together.');
+  }
+  if (values.config?.trim() === '') {
+    throw new Error('--config needs the name or the path of a config.');
+  }
   const urlEnv = values['url-env'];
   if (values.url !== undefined && urlEnv !== undefined) {
     throw new Error('--url and --url-env cannot be used together.');
@@ -118,12 +125,6 @@ export function parseLilypadDoctorArgs(
         : `The environment variable ${urlEnv} is not set${from}.`
     );
   }
-  if (values.sql && values.json) {
-    throw new Error('--sql and --json cannot be used together.');
-  }
-  if (values.config?.trim() === '') {
-    throw new Error('--config needs the name or the path of a config.');
-  }
   return {
     help: false,
     json: values.json ?? false,
@@ -146,13 +147,6 @@ export type LilypadDoctorCliDependencies = {
   /** The file system of `init`. */
   init?: LilypadInitDependencies | undefined;
 };
-
-/** The SQL that fixes the problems, once each, in the order of the problems. */
-function fixSql(report: LilypadDoctorReport): string {
-  return [
-    ...new Set(report.problems.flatMap((problem) => (problem.fix ? [problem.fix] : []))),
-  ].join('\n');
-}
 
 /**
  * Runs `lilypad-doctor` with these arguments: `init ...` creates a config file, anything else
@@ -199,7 +193,7 @@ export async function runLilypadDoctorCli(
       const { text: _text, assertOk: _assertOk, ...result } = report;
       output.log(JSON.stringify(result, null, 2));
     } else if (parsed.sql) {
-      const sql = fixSql(report);
+      const sql = formatLilypadSchemaFixSql(report.problems);
       output.log(sql === '' ? '-- lilypad-doctor: nothing to fix.' : sql);
     } else if (report.ok) {
       output.log(report.text);

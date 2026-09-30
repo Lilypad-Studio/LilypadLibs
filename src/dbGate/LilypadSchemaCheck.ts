@@ -1,4 +1,3 @@
-import type { LilypadChangelogPruning } from '@/dbConfig/LilypadDbConfig';
 import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
 import {
   LILYPAD_CHANGELOG_MIN_COMPATIBLE_VERSION,
@@ -9,6 +8,7 @@ import {
   installedLilypadChangelogPrune,
   lilypadChangelogSql,
   lilypadChangelogTriggerSql,
+  quoteIdentifier,
   type LilypadChangelogPruneOptions,
 } from '@/dbGate/LilypadChangelog';
 import {
@@ -23,196 +23,12 @@ import {
   evaluateLilypadTableShape,
   lilypadCreateTableSql,
   lilypadMissingTableForeignKeys,
-  type LilypadSchemaTableShape,
 } from '@/dbGate/LilypadSchemaShape';
-
-export type { LilypadChangelogPruning } from '@/dbConfig/LilypadDbConfig';
-export {
-  readLilypadSchemaFacts,
-  type LilypadCronJobInfo,
-  type LilypadSchemaFacts,
-  type LilypadTriggerInfo,
-} from '@/dbGate/LilypadSchemaFacts';
-export { normalizeLilypadPgType } from '@/dbConfig/LilypadPgTypes';
-export type { LilypadSchemaTableShape } from '@/dbGate/LilypadSchemaShape';
-export {
-  lilypadCommandDeletesFrom,
-  lilypadPruneCommandRetention,
-} from '@/dbGate/LilypadSchemaPruning';
-
-/** A table to check, and what it needs. */
-export type LilypadSchemaCheckTable = {
-  /** `table`, or `schema.table` (as the tables of a config are named). */
-  table: string;
-  primaryKey: string;
-  /**
-   * Whether the table needs the changelog triggers (the `changelog` strategy). Defaults to true
-   * when the options check the changelog.
-   */
-  changelog?: boolean | undefined;
-  /**
-   * The channel on which the table needs notifying triggers (the `listen` strategy), or `false`.
-   * Defaults to the `notifyChannel` of the options.
-   */
-  notifyChannel?: string | false | undefined;
-  /**
-   * The columns, keys, indexes and checks the table must have (a table definition of a config is
-   * one). Without it, only the table and its triggers are checked.
-   */
-  shape?: LilypadSchemaTableShape | undefined;
-};
-
-export type LilypadSchemaCheckOptions = {
-  tables: LilypadSchemaCheckTable[];
-  /**
-   * Checks the changelog table, its trigger function, that the tables that need it have the
-   * changelog trigger (the `changelog` strategy), and how the changelog is pruned. `false` skips
-   * these checks. Defaults to `{}`: the default changelog table.
-   */
-  changelog?:
-    | {
-        table?: string | undefined;
-        /** How the old rows are deleted (see {@link LilypadChangelogPruning}). Defaults to `detect`. */
-        pruning?: LilypadChangelogPruning | undefined;
-        /**
-         * The shortest retention the caches accept, in ms: the largest `maxGap` and `lookback` of
-         * the caches that read this changelog. A pruning found with a retention that is not longer
-         * is an error. Defaults to 1 hour (the default `maxGap`).
-         */
-        minRetention?: number | undefined;
-        /**
-         * Whether to check how the changelog is pruned (reads `cron.job` and the age of the oldest
-         * row). Defaults to true.
-         */
-        checkPruning?: boolean | undefined;
-      }
-    | false
-    | undefined;
-  /**
-   * With `changelog: false`, the changelog table whose trigger function the SQL that fixes the
-   * notifying triggers installs (it notifies too). Defaults to `lilypad_cache_changes`.
-   */
-  changelogTable?: string | undefined;
-  /**
-   * Checks that the tables have a trigger that sends notifications on this channel (the `listen`
-   * strategy), unless a table sets its own `notifyChannel`. The trigger may be the changelog trigger
-   * or one of your own: its function must call `pg_notify` with the channel name as a literal.
-   * Defaults to `false`: not checked.
-   *
-   * The SQL that fixes a missing or outdated changelog notifies on this channel, or, with `false`,
-   * on the channel the installed trigger function notifies on (none if it sends none).
-   */
-  notifyChannel?: string | false | undefined;
-};
-
-export type LilypadSchemaProblemCode =
-  /** PostgreSQL is older than 13: the changelog needs `xid8`. */
-  | 'unsupported-version'
-  /** The cached table does not exist (as seen with the `search_path` of the gate). */
-  | 'missing-table'
-  /** The changelog table or its trigger function does not exist. */
-  | 'missing-changelog'
-  /**
-   * The changelog table or its trigger function was installed by an older version of the library:
-   * an error if the caches cannot read it correctly, a warning if it only lacks an improvement.
-   */
-  | 'outdated-changelog'
-  /**
-   * The enabled changelog triggers of the table do not record each of INSERT, UPDATE and DELETE:
-   * row triggers, or statement triggers with their transition tables.
-   */
-  | 'missing-changelog-trigger'
-  /** The changelog trigger of the table records another column than the primary key. */
-  | 'wrong-trigger-primary-key'
-  /**
-   * `TRUNCATE` of the table is not recorded (or not notified, with `notifyChannel`): it fires no
-   * row trigger, so the caches would keep the removed rows.
-   */
-  | 'missing-truncate-trigger'
-  /**
-   * No enabled trigger of the table sends notifications on the channel, or not for each of INSERT,
-   * UPDATE and DELETE.
-   */
-  | 'missing-notify-trigger'
-  /**
-   * A warning: nothing is known to delete the old changelog rows. Neither the `prune` option of
-   * the trigger nor a pg_cron job was found, no row was ever deleted from the changelog, and
-   * `pruning` is not `external`. The fix is the best pruning for the database, or the one
-   * `pruning` asks for (`trigger` or `cron`).
-   */
-  | 'no-changelog-pruning'
-  /**
-   * A warning: the oldest changelog row is older than the retention (or 24 hours, if unknown)
-   * plus 7 days, so the pruning does not run, or does not keep up.
-   */
-  | 'unpruned-changelog'
-  /**
-   * The pruning found deletes rows that are not older than `minRetention`: a cache could miss
-   * changes without knowing it.
-   */
-  | 'short-changelog-retention'
-  /** A column of the description does not exist. */
-  | 'missing-column'
-  /**
-   * The type of a column is not its `pgType` (an error), or does not fit its `type` (a warning:
-   * e.g. a `numeric` column declared as `number`, which postgres.js returns as a string).
-   */
-  | 'column-type-mismatch'
-  /** A column accepts `NULL` although declared not nullable, or the reverse. */
-  | 'column-nullability-mismatch'
-  /** A column declared with a default (or the generated primary key) has none. */
-  | 'missing-column-default'
-  /**
-   * The primary key of the description is not the primary key of the table: an error if it is not
-   * unique, a warning if a unique index and `NOT NULL` make it a key anyway.
-   */
-  | 'wrong-primary-key'
-  /** No unique constraint or index covers exactly the columns of a unique key. */
-  | 'missing-unique-key'
-  /** A foreign key of the description does not exist (same columns, same referenced table). */
-  | 'missing-foreign-key'
-  /** A foreign key exists with other `ON DELETE` / `ON UPDATE` actions. */
-  | 'foreign-key-mismatch'
-  /** An index does not exist: an error for a unique index, a warning otherwise. */
-  | 'missing-index'
-  /** A check of the description does not exist (found by its name). */
-  | 'missing-check'
-  /**
-   * A warning: a `NOT NULL` column without a default is not in the description, so the inserts
-   * of the library fail.
-   */
-  | 'undeclared-required-column'
-  /** A warning of `strict`: a column of the table is not in the description. */
-  | 'undeclared-column'
-  /** A warning of `strict`: a unique key, foreign key or check is not in the description. */
-  | 'undeclared-constraint'
-  /** A warning of `strict`: an index is not in the description. */
-  | 'undeclared-index';
-
-/**
- * `error`: the database is not what the config describes (the caches may serve stale data, the
- * queries may fail), and `lilypad-doctor` exits with 1. `warning`: it works, but something needs
- * attention.
- */
-export type LilypadSchemaProblemSeverity = 'error' | 'warning';
-
-export type LilypadSchemaProblem = {
-  code: LilypadSchemaProblemCode;
-  severity: LilypadSchemaProblemSeverity;
-  /** The cached table concerned, for the per-table problems. */
-  table?: string | undefined;
-  message: string;
-  /** SQL that fixes the problem, to run in a migration. */
-  fix?: string | undefined;
-};
-
-export type LilypadSchemaCheckResult = {
-  /** Whether there is no error (there may be warnings). */
-  ok: boolean;
-  problems: LilypadSchemaProblem[];
-  /** The schema each table resolves to (`null` if the table does not exist). */
-  tables: { table: string; schema: string | null }[];
-};
+import type {
+  LilypadSchemaCheckOptions,
+  LilypadSchemaCheckResult,
+  LilypadSchemaProblem,
+} from '@/dbGate/LilypadSchemaTypes';
 
 /**
  * Thrown by `assertOk()` of a `lilypad-doctor` report when the database is not set up (the check
@@ -228,6 +44,21 @@ export class LilypadSchemaCheckError extends Error {
   }
 }
 
+/**
+ * The fixes of the problems, once each, in the order of the problems: first those of the checked
+ * database (`undefined`), then those to run in another one (`fixDatabase`), by database.
+ */
+function groupedFixes(problems: LilypadSchemaProblem[]): Map<string | undefined, string[]> {
+  const groups = new Map<string | undefined, Set<string>>([[undefined, new Set()]]);
+  for (const { fix, fixDatabase } of problems) {
+    if (fix) {
+      const group = groups.get(fixDatabase) ?? new Set();
+      groups.set(fixDatabase, group.add(fix));
+    }
+  }
+  return new Map([...groups].map(([database, fixes]) => [database, [...fixes]]));
+}
+
 /** A readable report of the problems, followed by the SQL that fixes them. */
 export function formatLilypadSchemaProblems(
   subject: string,
@@ -241,11 +72,34 @@ export function formatLilypadSchemaProblems(
   for (const problem of problems) {
     lines.push(`- ${problem.severity === 'warning' ? 'Warning: ' : ''}${problem.message}`);
   }
-  const fixes = [...new Set(problems.flatMap((problem) => (problem.fix ? [problem.fix] : [])))];
-  if (fixes.length > 0) {
-    lines.push('Run this SQL in a migration to fix it:', ...fixes);
+  for (const [database, fixes] of groupedFixes(problems)) {
+    if (fixes.length > 0) {
+      lines.push(
+        database === undefined
+          ? 'Run this SQL in a migration to fix it:'
+          : `Run this SQL in the database "${database}":`,
+        ...fixes
+      );
+    }
   }
   return lines.join('\n');
+}
+
+/**
+ * The SQL that fixes the problems in the checked database, for a migration (`lilypad-doctor
+ * --sql`): the fixes to run in another database follow as comments. Empty without any fix.
+ */
+export function formatLilypadSchemaFixSql(problems: LilypadSchemaProblem[]): string {
+  const parts: string[] = [];
+  for (const [database, fixes] of groupedFixes(problems)) {
+    if (database === undefined) {
+      parts.push(...fixes);
+    } else if (fixes.length > 0) {
+      const commented = fixes.join('\n').trimEnd().replace(/^/gm, '-- ');
+      parts.push(`-- Run in the database "${database}", not in this one:\n${commented}\n`);
+    }
+  }
+  return parts.join('\n');
 }
 
 // pg_trigger.tgtype bits
@@ -345,6 +199,7 @@ export function evaluateLilypadSchema(
   const fixChangelog = readChangelogTarget(options);
   const notifyChannel = options.notifyChannel ?? false;
   const installedPrune = installedLilypadChangelogPrune(facts.changelog.functionSource);
+  const installedChannel = installedNotifyChannel(facts.changelog.functionSource);
   const problems: LilypadSchemaProblem[] = [];
 
   if (facts.version < 130000) {
@@ -355,31 +210,39 @@ export function evaluateLilypadSchema(
     });
   }
 
-  // Reported after the other problems, which the caches need first
-  let pruningProblems: LilypadSchemaProblem[] = [];
+  // The trigger function notifies on one channel, the same in every fix that installs it: the one
+  // the check requires, else the installed one when no table needs another (a changelog installed
+  // with `notifyChannel: false` must not start notifying, nor one shared with `listen` caches
+  // stop), else the channel of the first table that needs one
+  const tableChannels = options.tables.flatMap(({ notifyChannel: channel = notifyChannel }) =>
+    channel === false ? [] : [channel]
+  );
+  const fixChannel =
+    notifyChannel !== false
+      ? notifyChannel
+      : tableChannels.length === 0 ||
+          (installedChannel !== false && tableChannels.includes(installedChannel))
+        ? installedChannel
+        : tableChannels[0]!;
+  const sqlWith = (prune: LilypadChangelogPruneOptions | false) =>
+    lilypadChangelogSql({ table: fixChangelog.custom, notifyChannel: fixChannel, prune });
+
+  // Reported after the other problems, which the caches need first. Without the pruning check,
+  // the fixes keep the installed pruning; with it, they install the suggested one
+  const pruning =
+    changelog && !(options.changelog && options.changelog.checkPruning === false)
+      ? evaluatePruning(
+          facts,
+          changelog,
+          options.changelog === false ? undefined : options.changelog,
+          sqlWith
+        )
+      : { problems: [], prune: installedPrune };
+  // The SQL that installs the changelog, in every fix that needs it
+  const changelogSql = sqlWith(pruning.prune);
+  // Whether a changelog problem carries it: the fixes of the tables then leave it out
+  let changelogFixed = false;
   if (changelog) {
-    // The fix notifies on the channel the check requires, or else on the one the installed function
-    // notifies on: a changelog installed with `notifyChannel: false` must not start notifying, nor
-    // one shared with `listen` caches stop
-    const channel =
-      notifyChannel !== false
-        ? notifyChannel
-        : installedNotifyChannel(facts.changelog.functionSource);
-    const sqlWith = (prune: LilypadChangelogPruneOptions | false) =>
-      lilypadChangelogSql({ table: changelog.custom, notifyChannel: channel, prune });
-    // The SQL that fixes the changelog keeps the installed pruning, or installs the suggested one
-    // Without the pruning check, the SQL that fixes the changelog keeps the installed pruning
-    const pruning =
-      options.changelog && options.changelog.checkPruning === false
-        ? { problems: [], prune: installedPrune }
-        : evaluatePruning(
-            facts,
-            changelog,
-            options.changelog === false ? undefined : options.changelog,
-            sqlWith
-          );
-    pruningProblems = pruning.problems;
-    const changelogSql = sqlWith(pruning.prune);
     const { hasTable, hasSchemaColumn, hasFunction, functionComment } = facts.changelog;
     if (!hasTable || !hasFunction) {
       problems.push({
@@ -390,11 +253,14 @@ export function evaluateLilypadSchema(
           : `The changelog trigger function ${changelog.functionSignature} does not exist.`,
         fix: changelogSql,
       });
+      changelogFixed = true;
     }
     const comment = functionComment ?? '';
-    const version = comment.startsWith(LILYPAD_CHANGELOG_VERSION_PREFIX)
+    const parsed = comment.startsWith(LILYPAD_CHANGELOG_VERSION_PREFIX)
       ? Number(comment.slice(LILYPAD_CHANGELOG_VERSION_PREFIX.length))
-      : 1;
+      : Number.NaN;
+    // A comment of another origin, or edited by hand: the oldest version
+    const version = Number.isInteger(parsed) ? parsed : 1;
     if ((hasTable && !hasSchemaColumn) || (hasFunction && version < LILYPAD_CHANGELOG_VERSION)) {
       const compatible =
         (!hasTable || hasSchemaColumn) && version >= LILYPAD_CHANGELOG_MIN_COMPATIBLE_VERSION;
@@ -406,6 +272,7 @@ export function evaluateLilypadSchema(
           (compatible ? `: the caches read it, but ${outdatedChangelogReason(version)}.` : '.'),
         fix: changelogSql,
       });
+      changelogFixed = true;
     }
   }
 
@@ -416,30 +283,40 @@ export function evaluateLilypadSchema(
     const { table, primaryKey, shape } = requirement;
     const needsChangelog = changelog !== undefined && requirement.changelog !== false;
     const tableChannel = requirement.notifyChannel ?? notifyChannel;
+    // The changelog function notifies on one channel: the fixes cannot give the table another one
+    const notifyFixable = tableChannel !== false && tableChannel === fixChannel;
+    const triggerSql = lilypadChangelogTriggerSql({
+      table,
+      primaryKey,
+      changelogTable: fixChangelog.custom,
+    });
     const found = facts.tables[index];
     // eslint-disable-next-line @typescript-eslint/prefer-optional-chain -- a missing table has no facts
     if (!found || found.schema === null) {
       tables.push({ table, schema: null });
-      // The table, then the triggers it needs
+      // Its schema, the table, then the triggers it needs, with the changelog SQL when they notify
+      // (the changelog check installs it otherwise)
       const createTable = shape && lilypadCreateTableSql(table, primaryKey, shape);
-      // Without the changelog check, its SQL (which notifies) is not in the fix of another problem
-      const triggerSql =
-        needsChangelog || tableChannel !== false
-          ? (needsChangelog
-              ? ''
-              : lilypadChangelogSql({
-                  table: fixChangelog.custom,
-                  notifyChannel: tableChannel,
-                  prune: installedPrune,
-                })) +
-            lilypadChangelogTriggerSql({ table, primaryKey, changelogTable: fixChangelog.custom })
+      const missingSchema = found?.missingSchema;
+      const tableTriggers =
+        needsChangelog || notifyFixable
+          ? (notifyFixable && !changelogFixed ? changelogSql : '') + triggerSql
           : '';
       problems.push({
         code: 'missing-table',
         severity: 'error',
         table,
-        message: `The table "${table}" does not exist.`,
-        ...(createTable !== undefined && { fix: `${createTable}\n${triggerSql}`.trimEnd() }),
+        message:
+          missingSchema !== undefined
+            ? `The table "${table}" does not exist, nor its schema "${missingSchema}".`
+            : `The table "${table}" does not exist.`,
+        ...(createTable !== undefined && {
+          fix: (
+            (missingSchema !== undefined
+              ? `CREATE SCHEMA IF NOT EXISTS ${quoteIdentifier(missingSchema)};\n`
+              : '') + `${createTable}\n${tableTriggers}`
+          ).trimEnd(),
+        }),
       });
       if (shape) {
         deferred.push(...lilypadMissingTableForeignKeys(table, shape));
@@ -456,15 +333,11 @@ export function evaluateLilypadSchema(
     }
 
     if (needsChangelog) {
-      const fix = lilypadChangelogTriggerSql({
-        table,
-        primaryKey,
-        changelogTable: changelog.custom,
-      });
+      const fix = triggerSql;
       // The events may be split across several triggers (one statement trigger per event)
       const working = triggers.filter((trigger) => recordedEvents(trigger) !== 0);
       const recorded = working.reduce((events, trigger) => events | recordedEvents(trigger), 0);
-      const recordedColumn = (trigger: LilypadTriggerInfo) => trigger.args.split('\\000')[0];
+      const recordedColumn = (trigger: LilypadTriggerInfo) => trigger.args[0];
       const wrongColumn = working.find((trigger) => recordedColumn(trigger) !== primaryKey);
       if (recorded !== ROW_EVENTS) {
         problems.push({
@@ -515,18 +388,17 @@ export function evaluateLilypadSchema(
               : recordedEvents(trigger)),
           0
         );
-      const fix =
-        lilypadChangelogSql({
-          table: fixChangelog.custom,
-          notifyChannel: tableChannel,
-          prune: installedPrune,
-        }) + lilypadChangelogTriggerSql({ table, primaryKey, changelogTable: fixChangelog.custom });
+      const fix = notifyFixable ? (changelogFixed ? '' : changelogSql) + triggerSql : undefined;
+      // Without a fix: the changelog function notifies on the channel of other tables
+      const ownTrigger = notifyFixable
+        ? ''
+        : ` The changelog trigger function notifies on one channel ("${String(fixChannel)}"): give "${table}" a notifying trigger of its own.`;
       if (notifiedEvents === 0) {
         problems.push({
           code: 'missing-notify-trigger',
           severity: 'error',
           table,
-          message: `No trigger of "${table}" sends notifications on the "${tableChannel}" channel: the cache is not told about changes made elsewhere.`,
+          message: `No trigger of "${table}" sends notifications on the "${tableChannel}" channel: the cache is not told about changes made elsewhere.${ownTrigger}`,
           fix,
         });
       } else if (notifiedEvents !== ROW_EVENTS) {
@@ -534,7 +406,7 @@ export function evaluateLilypadSchema(
           code: 'missing-notify-trigger',
           severity: 'error',
           table,
-          message: `The triggers of "${table}" send notifications on the "${tableChannel}" channel only on ${eventNames(notifiedEvents)}: the cache is not told about ${eventNames(ROW_EVENTS & ~notifiedEvents)} made elsewhere.`,
+          message: `The triggers of "${table}" send notifications on the "${tableChannel}" channel only on ${eventNames(notifiedEvents)}: the cache is not told about ${eventNames(ROW_EVENTS & ~notifiedEvents)} made elsewhere.${ownTrigger}`,
           fix,
         });
       } else if (
@@ -544,14 +416,14 @@ export function evaluateLilypadSchema(
           code: 'missing-truncate-trigger',
           severity: 'error',
           table,
-          message: `No trigger of "${table}" sends a notification on the "${tableChannel}" channel for TRUNCATE: the caches would keep the removed rows.`,
+          message: `No trigger of "${table}" sends a notification on the "${tableChannel}" channel for TRUNCATE: the caches would keep the removed rows.${ownTrigger}`,
           fix,
         });
       }
     }
   });
 
-  problems.push(...deferred, ...pruningProblems);
+  problems.push(...deferred, ...pruning.problems);
   return { ok: !problems.some((problem) => problem.severity === 'error'), problems, tables };
 }
 

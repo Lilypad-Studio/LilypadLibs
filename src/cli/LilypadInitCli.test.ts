@@ -114,26 +114,37 @@ describe('runLilypadInitCli', () => {
 
   it('should not overwrite an existing config without --force', () => {
     const out = output();
-    const fs = files('lilypad.config.mjs');
+    const fs = files('lilypad.config.ts');
 
     expect(runLilypadInitCli([], out, fs.deps)).toBe(2);
     expect(out.error).toHaveBeenCalledWith(
-      'lilypad-doctor init: lilypad.config.mjs already exists: pass --force to overwrite lilypad.config.ts.'
+      'lilypad-doctor init: lilypad.config.ts already exists: pass --force to overwrite it.'
     );
-    expect(fs.written.has(resolve(cwd, 'lilypad.config.ts'))).toBe(false);
+    expect(fs.written.get(resolve(cwd, 'lilypad.config.ts'))).toBe('');
   });
 
-  it('should overwrite with --force, and warn about another file of the same config', () => {
+  it('should overwrite with --force', () => {
     const out = output();
-    const fs = files('lilypad.config.ts', 'lilypad.config.mjs');
+    const fs = files('lilypad.config.ts');
 
     expect(runLilypadInitCli(['--force'], out, fs.deps)).toBe(0);
 
     expect(fs.written.get(resolve(cwd, 'lilypad.config.ts'))).toContain('defineLilypadDb');
-    expect(out.log).toHaveBeenCalledWith(
-      expect.stringContaining('Warning: lilypad.config.mjs defines the same config: remove it.')
-    );
   });
+
+  it.each([[[]], [['--force']]])(
+    'should refuse %o next to another file of the same config, which the loader would refuse with it',
+    (argv) => {
+      const out = output();
+      const fs = files('lilypad.config.ts', 'lilypad.config.mjs');
+
+      expect(runLilypadInitCli(argv, out, fs.deps)).toBe(2);
+      expect(out.error).toHaveBeenCalledWith(
+        'lilypad-doctor init: lilypad.config.mjs already defines the config "default": remove it first (--force only overwrites lilypad.config.ts).'
+      );
+      expect(fs.written.get(resolve(cwd, 'lilypad.config.ts'))).toBe('');
+    }
+  );
 
   it.each([
     [['--config', './config.json'], 'must end with'],

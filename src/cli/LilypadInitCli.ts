@@ -13,10 +13,10 @@ Options:
   --config <name|path>  A name creates lilypad.<name>.config.ts in the working directory; a path
                         creates that file (.ts, .mts, .mjs or .js). Without it: lilypad.config.ts
   --empty               No example table (it is left as a comment)
-  --force               Overwrite the file if it exists
+  --force               Overwrite the file if it exists (not another file of the same config)
   -h, --help            Print this help
 
-Exit code: 0 when the file is created, 2 otherwise (invalid arguments, the file exists).`;
+Exit code: 0 when the file is created, 2 otherwise (invalid arguments, a file of the config exists).`;
 
 const CONFIG_NAME = /^[A-Za-z0-9_-]+$/;
 const EXTENSIONS = new Set(['.ts', '.mts', '.mjs', '.js']);
@@ -120,10 +120,17 @@ export function runLilypadInitCli(
   }
 
   const shown = (path: string) => relative(cwd, path) || path;
+  // Another file of the same config: the loader would refuse both
   const others = target.existing.filter((path) => path !== target.path);
+  if (others.length > 0) {
+    output.error(
+      `lilypad-doctor init: ${others.map(shown).join(', ')} already defines the config "${target.name}": remove it first (--force only overwrites ${shown(target.path)}).`
+    );
+    return 2;
+  }
   if (target.existing.length > 0 && !values.force) {
     output.error(
-      `lilypad-doctor init: ${target.existing.map(shown).join(', ')} already exists: pass --force to overwrite ${shown(target.path)}.`
+      `lilypad-doctor init: ${shown(target.path)} already exists: pass --force to overwrite it.`
     );
     return 2;
   }
@@ -147,9 +154,6 @@ export function runLilypadInitCli(
   output.log(
     [
       `Created ${shown(target.path)}.`,
-      ...(others.length > 0
-        ? [`Warning: ${others.map(shown).join(', ')} defines the same config: remove it.`]
-        : []),
       ...(extname(target.path) === '.js'
         ? ['A .js config is an ES module: the package.json needs "type": "module" (or use .mjs).']
         : []),

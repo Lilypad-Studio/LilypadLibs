@@ -6,12 +6,9 @@ import {
   quoteIdentifier,
   type LilypadChangelogPruneOptions,
 } from '@/dbGate/LilypadChangelog';
-import type { changelogTarget, LilypadSchemaFacts } from '@/dbGate/LilypadSchemaFacts';
-import type {
-  LilypadChangelogPruning,
-  LilypadSchemaCheckOptions,
-  LilypadSchemaProblem,
-} from '@/dbGate/LilypadSchemaCheck';
+import type { LilypadChangelogPruning } from '@/dbConfig/LilypadDbConfig';
+import type { LilypadChangelogTarget, LilypadSchemaFacts } from '@/dbGate/LilypadSchemaFacts';
+import type { LilypadSchemaCheckOptions, LilypadSchemaProblem } from '@/dbGate/LilypadSchemaTypes';
 import { assertNumberOption } from '@/internal/LilypadValidation';
 
 /**
@@ -50,30 +47,67 @@ function formatDuration(ms: number): string {
 
 // The units of an interval literal, most specific first where their names overlap
 const INTERVAL_UNITS: [RegExp, number][] = [
+  [/^(y|yrs?|years?)$/, 365 * DAY],
   [/^(w|weeks?)$/, 7 * DAY],
   [/^(d|days?)$/, DAY],
   [/^(h|hrs?|hours?)$/, HOUR],
   [/^(mons?|months?)$/, 30 * DAY],
   [/^(m|mins?|minutes?)$/, MINUTE],
   [/^(s|secs?|seconds?)$/, 1000],
+  [/^(ms|msecs?|milliseconds?)$/, 1],
 ];
 
-/** The duration of an interval literal (`24 hours`, `1 day 12:00:00`), or `undefined`. */
+/**
+ * The duration of an interval literal (`24 hours`, `1 day 12:00:00`), or `undefined` when any part
+ * of it is not understood (an ISO 8601 `P1M`, a sign, `ago`, an unknown unit): an unknown retention
+ * is accepted, where a misread one could be reported as too short.
+ */
 function parseInterval(text: string): number | undefined {
+  const parts = text.trim().toLowerCase().split(/\s+/);
   let total = 0;
-  let matched = false;
-  for (const [, hours, minutes, seconds] of text.matchAll(/(\d+):(\d{2})(?::(\d{2}))?/g)) {
-    total += Number(hours) * HOUR + Number(minutes) * MINUTE + Number(seconds ?? 0) * 1000;
-    matched = true;
-  }
-  for (const [, amount, unit] of text.matchAll(/(\d+(?:\.\d+)?)\s*([a-z]+)/gi)) {
-    const size = INTERVAL_UNITS.find(([pattern]) => pattern.test(unit!.toLowerCase()))?.[1];
-    if (size !== undefined) {
-      total += Number(amount) * size;
-      matched = true;
+  for (let index = 0; index < parts.length; index++) {
+    const part = parts[index]!;
+    const clock = /^(\d+):(\d{2})(?::(\d{2}(?:\.\d+)?))?$/.exec(part);
+    if (clock) {
+      total += Number(clock[1]) * HOUR + Number(clock[2]) * MINUTE + Number(clock[3] ?? 0) * 1000;
+      continue;
     }
+    // `24 hours` or `24hours`
+    const joined = /^(\d+(?:\.\d+)?)([a-z]+)?$/.exec(part);
+    const amount = joined?.[1];
+    const unit = joined?.[2] ?? parts[++index];
+    const size =
+      unit === undefined ? undefined : INTERVAL_UNITS.find(([pattern]) => pattern.test(unit))?.[1];
+    if (amount === undefined || size === undefined) {
+      return undefined;
+    }
+    total += Number(amount) * size;
   }
-  return matched ? total : undefined;
+  return parts[0] === '' ? undefined : total;
+}
+
+/**
+ * A SQL command without its comments (`-- ...`, `/* ... *\/`), which are replaced with a space. The
+ * string literals and quoted identifiers are kept as they are.
+ */
+function withoutComments(command: string): string {
+  return command.replace(/'(?:[^']|'')*'|"(?:[^"]|"")*"|--[^\n]*|\/\*[\s\S]*?\*\//g, (token) =>
+    token.startsWith('--') || token.startsWith('/*') ? ' ' : token
+  );
+}
+
+// An identifier: quoted (its case kept) or not (folded to lower case, as PostgreSQL does)
+const IDENTIFIER = String.raw`(?:"(?:[^"]|"")+"|[\w$]+)`;
+const DELETE_FROM = new RegExp(
+  String.raw`\bdelete\s+from\s+(?:only\s+)?(${IDENTIFIER}(?:\s*\.\s*${IDENTIFIER})?)`,
+  'gi'
+);
+
+/** The parts of a name of a command, as PostgreSQL reads them. */
+function nameParts(name: string): string[] {
+  return [...name.matchAll(new RegExp(IDENTIFIER, 'g'))].map(([part]) =>
+    part.startsWith('"') ? part.slice(1, -1).replace(/""/g, '"') : part.toLowerCase()
+  );
 }
 
 /**
@@ -81,6 +115,7 @@ function parseInterval(text: string): number | undefined {
  * or an interval literal (`interval '7 days'`, `'1 day'::interval`); `undefined` if not found.
  */
 export function lilypadPruneCommandRetention(command: string): number | undefined {
+  command = withoutComments(command);
   const seconds = /make_interval\s*\(\s*secs\s*=>\s*'?(\d+(?:\.\d+)?)'?\s*\)/i.exec(command);
   if (seconds) {
     return Number(seconds[1]) * 1000;
@@ -92,12 +127,14 @@ export function lilypadPruneCommandRetention(command: string): number | undefine
 
 /**
  * Whether a command deletes rows from the changelog table: a `DELETE FROM` of the same table name,
- * in the same schema when both name one. Case and quotes are ignored.
+ * in the same schema when both name one. The comments are ignored, and the names compared as
+ * PostgreSQL does: an unquoted name of the command in lower case, the name of the changelog table
+ * as it is (the library quotes it).
  */
 export function lilypadCommandDeletesFrom(command: string, changelogTable: string): boolean {
-  const target = changelogTable.replace(/"/g, '').toLowerCase().split('.');
-  for (const [, name] of command.matchAll(/\bdelete\s+from\s+(?:only\s+)?([\w$."]+)/gi)) {
-    const parts = name!.replace(/"/g, '').toLowerCase().split('.');
+  const target = changelogTable.split('.');
+  for (const [, name] of withoutComments(command).matchAll(DELETE_FROM)) {
+    const parts = nameParts(name!);
     if (
       parts.at(-1) === target.at(-1) &&
       (parts.length === 1 || target.length === 1 || parts.at(-2) === target.at(-2))
@@ -123,7 +160,7 @@ type DetectedPruning = {
  */
 export function evaluatePruning(
   facts: LilypadSchemaFacts,
-  changelog: NonNullable<ReturnType<typeof changelogTarget>>,
+  changelog: LilypadChangelogTarget,
   options: Exclude<LilypadSchemaCheckOptions['changelog'], false>,
   changelogSql: (prune: LilypadChangelogPruneOptions | false) => string
 ): { problems: LilypadSchemaProblem[]; prune: LilypadChangelogPruneOptions | false } {
@@ -211,6 +248,7 @@ export function evaluatePruning(
           ? ''
           : ` To choose the suggested pruning, set pruning: 'trigger' or 'cron'.`),
       fix: suggestion.fix,
+      ...(suggestion.fixDatabase !== undefined && { fixDatabase: suggestion.fixDatabase }),
     });
     prune = suggestion.prune ?? installed;
   } else if (age !== null) {
@@ -251,11 +289,17 @@ function capitalize(text: string): string {
  */
 function suggestPruning(
   facts: LilypadSchemaFacts,
-  changelog: NonNullable<ReturnType<typeof changelogTarget>>,
+  changelog: LilypadChangelogTarget,
   olderThan: number,
   changelogSql: (prune: LilypadChangelogPruneOptions | false) => string,
   pruning: LilypadChangelogPruning
-): { message: string; fix: string; prune?: LilypadChangelogPruneOptions | undefined } {
+): {
+  message: string;
+  fix: string;
+  /** The database the fix runs in, when it is not this one. */
+  fixDatabase?: string | undefined;
+  prune?: LilypadChangelogPruneOptions | undefined;
+} {
   const { cron } = facts;
   const retention = formatDuration(olderThan);
   const trigger = `The fix makes the changelog trigger delete the rows older than ${retention} as it records changes (the prune option of lilypadChangelogSql).`;
@@ -288,8 +332,8 @@ function suggestPruning(
         (pruning === 'cron'
           ? ''
           : ` If you cannot run SQL there (e.g. on a managed host), make the changelog trigger delete them as it records changes, from this database: lilypadChangelogSql({ prune: { olderThan: ${olderThan} } }).`),
+      fixDatabase: cron.database,
       fix:
-        `-- Run in the database "${cron.database}", where pg_cron runs:\n` +
         'CREATE EXTENSION IF NOT EXISTS pg_cron;\n' +
         lilypadChangelogPruneScheduleSql({
           olderThan,

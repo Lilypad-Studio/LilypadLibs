@@ -119,6 +119,9 @@ describe('parseLilypadDoctorArgs', () => {
     [[], 'Pass --url'],
     [['--url', url, '--sql', '--json'], 'cannot be used together'],
     [['--url', url, '--config', ' '], '--config needs'],
+    // The invalid flags first, before the database URL
+    [['--sql', '--json'], '--sql and --json cannot be used together.'],
+    [['--config', ''], '--config needs'],
     [['--url', url, '--table', 'users'], "Unknown option '--table'"],
   ])('should reject %o', (argv, message) => {
     expect(() => parseLilypadDoctorArgs(argv, {})).toThrow(message);

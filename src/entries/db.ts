@@ -44,11 +44,8 @@ export type {
   LilypadChangesRequest,
 } from '../dbGate/LilypadChangelog';
 
-export {
-  checkLilypadSchema,
-  LilypadSchemaCheckError,
-  normalizeLilypadPgType,
-} from '../dbGate/LilypadSchemaCheck';
+export { checkLilypadSchema, LilypadSchemaCheckError } from '../dbGate/LilypadSchemaCheck';
+export { normalizeLilypadPgType } from '../dbConfig/LilypadPgTypes';
 export { lilypadSchemaCheckOptions, runLilypadDoctor } from '../dbGate/LilypadDoctor';
 export type { LilypadDoctorOptions, LilypadDoctorReport } from '../dbGate/LilypadDoctor';
 export type {
@@ -59,4 +56,4 @@ export type {
   LilypadSchemaProblemCode,
   LilypadSchemaProblemSeverity,
   LilypadSchemaTableShape,
-} from '../dbGate/LilypadSchemaCheck';
+} from '../dbGate/LilypadSchemaTypes';

@@ -5,9 +5,11 @@ import {
   checkLilypadSchema,
   formatLilypadSchemaProblems,
   LilypadSchemaCheckError,
-  type LilypadSchemaCheckOptions,
-  type LilypadSchemaCheckResult,
 } from '@/dbGate/LilypadSchemaCheck';
+import type {
+  LilypadSchemaCheckOptions,
+  LilypadSchemaCheckResult,
+} from '@/dbGate/LilypadSchemaTypes';
 
 export type LilypadDoctorOptions = {
   /** The connection string of the database to check. */

@@ -540,7 +540,7 @@ npx lilypad-doctor init --config analytics    # lilypad.analytics.config.ts (nam
 npx lilypad-doctor init --config ./db/lilypad.config.mjs --empty  # JavaScript, no example table
 ```
 
-It never overwrites a config (a file of the same config with any extension) unless you pass `--force`, and it needs no database. The file it writes lists the options of the config with their defaults, as comments. A complete config looks like this:
+It never overwrites a config unless you pass `--force`, which overwrites only the file it creates: when another file of the same config exists (another extension), it stops, since the loader would refuse both. It needs no database. The file it writes lists the options of the config with their defaults, as comments. A complete config looks like this:
 
 ```ts
 // lilypad.config.ts, at the root of the project
@@ -1053,7 +1053,7 @@ npx lilypad-doctor --json                                   # a machine-readable
 
 The URL is `--url`, else the environment variable named by `--url-env` (default `DATABASE_URL`). `--env-file <path>` reads variables from a file such as `.env` (repeatable: the later files win, and a variable already set in the environment wins over the files), so a `package.json` script needs no shell expansion, which `cmd` on Windows lacks: `"db:check": "lilypad-doctor --env-file .env --url-env POSTGRES_URL"`.
 
-It prints the problems and the SQL that fixes them, and exits with 0 when the database matches the config (warnings may be printed), 1 when it does not, and 2 when the check could not run (invalid arguments, config not found, unreachable database). The SQL comes in an order that runs as it is: the changelog first, then each table (a missing table is created with its keys, checks, indexes and triggers), then the foreign keys. Read it before you run it: a type change or a `SET NOT NULL` can fail on the existing rows.
+It prints the problems and the SQL that fixes them, and exits with 0 when the database matches the config (warnings may be printed), 1 when it does not, and 2 when the check could not run (invalid arguments, config not found, unreachable database). The SQL comes in an order that runs as it is: the changelog first, then each table (a missing table is created with its schema, keys, checks, indexes and triggers), then the foreign keys. Read it before you run it: a type change or a `SET NOT NULL` can fail on the existing rows. A fix that must run in another database (a pg_cron job scheduled from the database pg_cron runs in) has its `fixDatabase`: the report shows it apart, and `--sql` prints it as a comment, out of the migration.
 
 For each table of the config, it checks:
 

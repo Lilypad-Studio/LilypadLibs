@@ -5,17 +5,20 @@ import {
   LILYPAD_CHANGELOG_VERSION,
   lilypadChangelogPruneScheduleSql,
   lilypadChangelogSql,
+  lilypadChangelogTriggerSql,
 } from './LilypadChangelog';
 import {
   evaluateLilypadSchema,
+  formatLilypadSchemaFixSql,
   formatLilypadSchemaProblems,
-  lilypadCommandDeletesFrom,
-  lilypadPruneCommandRetention,
-  type LilypadCronJobInfo,
-  type LilypadSchemaCheckOptions,
-  type LilypadSchemaFacts,
-  type LilypadTriggerInfo,
 } from './LilypadSchemaCheck';
+import type {
+  LilypadCronJobInfo,
+  LilypadSchemaFacts,
+  LilypadTriggerInfo,
+} from './LilypadSchemaFacts';
+import { lilypadCommandDeletesFrom, lilypadPruneCommandRetention } from './LilypadSchemaPruning';
+import type { LilypadSchemaCheckOptions } from './LilypadSchemaTypes';
 
 // pg_trigger.tgtype: ROW = 1, INSERT = 4, DELETE = 8, UPDATE = 16, TRUNCATE = 32
 const ROW_TRIGGER = 1 | 4 | 8 | 16;
@@ -23,7 +26,7 @@ const TRUNCATE_TRIGGER = 32;
 
 const changelogRow: LilypadTriggerInfo = {
   changelog: true,
-  args: 'id\\000',
+  args: ['id'],
   type: ROW_TRIGGER,
   enabled: true,
   source: '',
@@ -146,6 +149,20 @@ describe('evaluateLilypadSchema', () => {
     expect(result.problems[0]!.message).toContain('BULK');
     expect(result.ok).toBe(true);
   });
+
+  it.each(['lilypad-changelog:abc', 'lilypad-changelog:6.5', 'my own function'])(
+    'should take a changelog whose comment is %j for the oldest version',
+    (functionComment) => {
+      const result = evaluateLilypadSchema(
+        facts({ changelog: { ...facts().changelog, functionComment } }),
+        changelogOptions
+      );
+
+      expect(codes(result)).toEqual(['outdated-changelog']);
+      expect(result.problems[0]!.message).toContain('(version 1, expected');
+      expect(result.ok).toBe(false);
+    }
+  );
 
   it('should warn about the prune function of a changelog of version 5', () => {
     const result = evaluateLilypadSchema(
@@ -302,7 +319,7 @@ describe('evaluateLilypadSchema', () => {
           {
             schema: 'public',
             triggers: [
-              ...changelogStatements.map((trigger) => ({ ...trigger, args: 'uuid\\000' })),
+              ...changelogStatements.map((trigger) => ({ ...trigger, args: ['uuid'] })),
               changelogTruncate,
             ],
           },
@@ -318,7 +335,7 @@ describe('evaluateLilypadSchema', () => {
   it('should report a statement trigger that records another column', () => {
     const triggers = [
       ...changelogStatements.slice(0, 2),
-      { ...changelogStatements[2]!, args: 'uuid\\000' },
+      { ...changelogStatements[2]!, args: ['uuid'] },
       changelogTruncate,
     ];
     const result = evaluateLilypadSchema(
@@ -351,7 +368,7 @@ describe('evaluateLilypadSchema', () => {
   describe('notifications', () => {
     const notifier = (channel: string, type: number): LilypadTriggerInfo => ({
       changelog: false,
-      args: '',
+      args: [],
       type,
       enabled: true,
       source: notifySource(channel),
@@ -575,15 +592,36 @@ describe('the pruning of the changelog', () => {
       expect(result.problems[0]!.message).toContain(
         `lilypadChangelogSql({ prune: { olderThan: ${DAY} } })`
       );
+      expect(result.problems[0]!.fixDatabase).toBe('postgres');
       expect(result.problems[0]!.fix).toBe(
-        '-- Run in the database "postgres", where pg_cron runs:\n' +
-          'CREATE EXTENSION IF NOT EXISTS pg_cron;\n' +
+        'CREATE EXTENSION IF NOT EXISTS pg_cron;\n' +
           lilypadChangelogPruneScheduleSql({
             olderThan: DAY,
             changelogTable: 'public.lilypad_cache_changes',
             database: 'app',
           })
       );
+    });
+
+    it('should keep the fix of the pg_cron database out of the migration of this one', () => {
+      const facts = unpruned({ available: true, database: 'postgres' });
+      facts.tables = [{ schema: 'public', triggers: [] }];
+      const { problems } = evaluateLilypadSchema(facts, changelogOptions);
+      expect(problems.map((problem) => problem.code)).toEqual([
+        'missing-changelog-trigger',
+        'no-changelog-pruning',
+      ]);
+      const cronFix = problems.find((problem) => problem.fixDatabase === 'postgres')!.fix!;
+
+      const sql = formatLilypadSchemaFixSql(problems);
+      expect(sql.startsWith(problems[0]!.fix!)).toBe(true);
+      expect(sql).toContain('-- Run in the database "postgres", not in this one:\n');
+      expect(sql).toContain('-- CREATE EXTENSION IF NOT EXISTS pg_cron;\n');
+      expect(sql).not.toContain(`\n${cronFix}`);
+
+      const text = formatLilypadSchemaProblems('lilypad-doctor', problems);
+      expect(text).toContain('Run this SQL in a migration to fix it:');
+      expect(text).toContain(`Run this SQL in the database "postgres":\n${cronFix}`);
     });
 
     it('should tell how to choose the suggestion', () => {
@@ -661,7 +699,7 @@ describe('the pruning of the changelog', () => {
         );
 
         expect(result.problems[0]!.message).not.toContain('lilypadChangelogSql');
-        expect(result.problems[0]!.fix).toContain('-- Run in the database "postgres"');
+        expect(result.problems[0]!.fixDatabase).toBe('postgres');
       });
 
       it('should schedule from there even if the schema of the changelog is unknown', () => {
@@ -948,7 +986,19 @@ describe('lilypadPruneCommandRetention', () => {
     ["now() - interval '90 min'", 90 * 60_000],
     ["now() - interval '1 mon'", 30 * 86_400_000],
     ["now() - interval '2w'", 14 * 86_400_000],
+    ["now() - interval '1 year'", 365 * 86_400_000],
+    ["now() - interval '90 minutes 500 ms'", 90 * 60_000 + 500],
     ['current_date - 7', undefined],
+    // Not understood, so unknown: never misread as a shorter retention
+    ["now() - interval 'P1M'", undefined],
+    ["now() - interval 'P1DT2H'", undefined],
+    ["now() - interval '1 decade 30 minutes'", undefined],
+    ["now() - interval '-1 day'", undefined],
+    ["now() - interval '1 day ago'", undefined],
+    ["now() - interval ''", undefined],
+    // A comment is not the condition
+    ["now() - interval '7 days' -- interval '1 minute'", 7 * 86_400_000],
+    ["/* interval '1 minute' */ now() - interval '7 days'", 7 * 86_400_000],
   ])('should read %s', (condition, expected) => {
     expect(
       lilypadPruneCommandRetention(
@@ -966,6 +1016,17 @@ describe('lilypadCommandDeletesFrom', () => {
     ['DELETE FROM app.changes WHERE true', 'other.changes', false],
     ['DELETE FROM lilypad_cache_changes_old WHERE true', 'lilypad_cache_changes', false],
     ['SELECT * FROM lilypad_cache_changes', 'lilypad_cache_changes', false],
+    // Comments delete nothing
+    ['SELECT 1 -- DELETE FROM lilypad_cache_changes', 'lilypad_cache_changes', false],
+    ['SELECT 1 /* DELETE FROM lilypad_cache_changes */', 'lilypad_cache_changes', false],
+    ["SELECT '-- not a comment'; DELETE FROM lilypad_cache_changes", 'lilypad_cache_changes', true],
+    // Names as PostgreSQL reads them: quoted ones keep their case and may hold spaces and quotes
+    ['DELETE FROM public."My Changes" WHERE true', 'public.My Changes', true],
+    ['DELETE FROM "a""b" WHERE true', 'a"b', true],
+    ['DELETE FROM Lilypad_Cache_Changes WHERE true', 'lilypad_cache_changes', true],
+    ['DELETE FROM mychanges WHERE true', 'MyChanges', false],
+    ['DELETE FROM "MYCHANGES" WHERE true', 'MyChanges', false],
+    ['WITH gone AS (DELETE FROM changes RETURNING id) SELECT 1', 'changes', true],
   ])('%s (%s): %s', (command, table, expected) => {
     expect(lilypadCommandDeletesFrom(command, table)).toBe(expected);
   });
@@ -1150,6 +1211,99 @@ describe('evaluateLilypadSchema with the tables of a config', () => {
     expect(logs!.fix).toBeUndefined();
     expect(foreignKey!.fix).toBe(
       'ALTER TABLE "public"."users" ADD FOREIGN KEY ("orgId") REFERENCES "public"."orgs" ("id") ON DELETE NO ACTION ON UPDATE NO ACTION;'
+    );
+  });
+
+  it('should create the schema of a missing table when it does not exist either', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        tables: [
+          { schema: null, triggers: [], missingSchema: 'public' },
+          { schema: null, triggers: [] },
+          { schema: null, triggers: [] },
+        ],
+      }),
+      options
+    );
+
+    expect(result.problems[0]!.message).toBe(
+      'The table "public.orgs" does not exist, nor its schema "public".'
+    );
+    expect(result.problems[0]!.fix).toMatch(
+      /^CREATE SCHEMA IF NOT EXISTS "public";\nCREATE TABLE "public"\."orgs"/
+    );
+    expect(result.problems[1]!.fix).toMatch(/^CREATE TABLE "public"\."users"/);
+  });
+
+  it('should install one changelog, with the pruning and the channel the tables need, in every fix', () => {
+    // A listen table and a changelog table, on a database without the changelog nor pg_cron
+    const mixed = defineLilypadDb({
+      tables: {
+        orgs,
+        items: {
+          tableName: 'items',
+          primaryKey: 'id',
+          cols: { id: { pgType: 'int4' } },
+          sync: { strategy: 'changelog', pollInterval: 1000 },
+        },
+      },
+    });
+    const result = evaluateLilypadSchema(
+      facts({
+        changelog: noChangelog,
+        cron: { available: false, installed: false, database: null, jobs: null },
+        tables: [
+          { schema: 'public', triggers: [] },
+          { schema: 'public', triggers: [] },
+        ],
+      }),
+      lilypadSchemaCheckOptions(mixed)
+    );
+
+    expect(result.problems.map((problem) => problem.code)).toEqual([
+      'missing-changelog',
+      'missing-notify-trigger',
+      'missing-changelog-trigger',
+      'no-changelog-pruning',
+    ]);
+    const changelogSql = lilypadChangelogSql({
+      notifyChannel: 'cache_events',
+      prune: { olderThan: 24 * 3_600_000 },
+    });
+    expect(result.problems[0]!.fix).toBe(changelogSql);
+    expect(result.problems[3]!.fix).toBe(changelogSql);
+    // Installed once, before: the fixes of the tables do not install it again without its pruning
+    expect(result.problems[1]!.fix).toBe(
+      lilypadChangelogTriggerSql({ table: 'public.orgs', primaryKey: 'id' })
+    );
+  });
+
+  it('should not fix the notifications of a table on another channel than the changelog one', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        changelog: noChangelog,
+        tables: [
+          { schema: 'public', triggers: [] },
+          { schema: 'public', triggers: [] },
+        ],
+      }),
+      {
+        tables: [
+          { table: 'a', primaryKey: 'id', notifyChannel: 'one' },
+          { table: 'b', primaryKey: 'id', notifyChannel: 'two' },
+        ],
+        changelog: false,
+      }
+    );
+
+    expect(result.problems.map((problem) => problem.code)).toEqual([
+      'missing-notify-trigger',
+      'missing-notify-trigger',
+    ]);
+    expect(result.problems[0]!.fix).toContain("pg_notify('one'");
+    expect(result.problems[1]!.fix).toBeUndefined();
+    expect(result.problems[1]!.message).toContain(
+      'The changelog trigger function notifies on one channel ("one"): give "b" a notifying trigger of its own.'
     );
   });
 });

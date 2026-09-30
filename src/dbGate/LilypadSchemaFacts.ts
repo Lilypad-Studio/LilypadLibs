@@ -6,7 +6,7 @@ import {
   textArrayLiteral,
   triggerFunctionName,
 } from '@/dbGate/LilypadChangelog';
-import type { LilypadSchemaCheckOptions } from '@/dbGate/LilypadSchemaCheck';
+import type { LilypadSchemaCheckOptions } from '@/dbGate/LilypadSchemaTypes';
 
 /**
  * What the schema check reads from the catalogs (`readLilypadSchemaFacts`), before it evaluates it
@@ -16,8 +16,8 @@ import type { LilypadSchemaCheckOptions } from '@/dbGate/LilypadSchemaCheck';
 export type LilypadTriggerInfo = {
   /** Whether it calls the changelog trigger function. */
   changelog: boolean | null;
-  /** Its arguments, as `encode(tgargs, 'escape')`: each one ends with `\000`. */
-  args: string;
+  /** Its arguments (`tgargs`). */
+  args: string[];
   type: number;
   /** Whether it fires in normal operation (not disabled, nor `ENABLE REPLICA` only). */
   enabled: boolean;
@@ -142,6 +142,8 @@ export type LilypadSchemaFacts = {
  */
 export type LilypadTableFacts = {
   schema: string | null;
+  /** The schema of a missing `schema.table`, when it does not exist either. */
+  missingSchema?: string | undefined;
   triggers: LilypadTriggerInfo[];
   columns?: LilypadColumnInfo[] | undefined;
   constraints?: LilypadConstraintInfo[] | undefined;
@@ -151,6 +153,27 @@ export type LilypadTableFacts = {
 /** A `json` column: postgres.js parses it, unless the type is not registered yet. */
 function parseJsonColumn(value: unknown): unknown {
   return typeof value === 'string' ? JSON.parse(value) : value;
+}
+
+/**
+ * The arguments of a trigger, from `encode(tgargs, 'escape')`: each one ends with a zero byte, and
+ * the zero bytes, the bytes with the high bit set (UTF-8 beyond ASCII) and the backslashes are
+ * escaped (`\000`, `\303\251`, `\\`).
+ */
+export function decodeLilypadTriggerArgs(escaped: string): string[] {
+  const bytes: number[] = [];
+  for (let index = 0; index < escaped.length; index++) {
+    if (escaped[index] !== '\\') {
+      bytes.push(escaped.charCodeAt(index));
+    } else if (escaped[index + 1] === '\\') {
+      bytes.push(0x5c);
+      index++;
+    } else {
+      bytes.push(Number.parseInt(escaped.slice(index + 1, index + 4), 8));
+      index += 3;
+    }
+  }
+  return new TextDecoder().decode(Uint8Array.from(bytes)).split('\0').slice(0, -1);
 }
 
 /** A changelog table and its trigger function. */
@@ -216,7 +239,11 @@ async function readDatabaseFacts(
       EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_cron') AS cron_available,
       EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') AS cron_installed,
       (SELECT setting FROM pg_settings WHERE name = 'cron.database_name') AS cron_database,
-      to_regclass('cron.job') IS NOT NULL AS has_cron_jobs,
+      -- Not to_regclass('cron.job'): it throws without USAGE on the schema (readCronJobs catches it)
+      EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'cron' AND c.relname = 'job'
+      ) AS has_cron_jobs,
       EXISTS (
         SELECT 1 FROM pg_attribute
         WHERE attrelid = to_regclass(${quotedChangelog}::text)
@@ -389,14 +416,48 @@ async function readTableFacts(
     JOIN pg_namespace n ON n.oid = t.relnamespace
   `;
   const byPosition = new Map(found.map((row) => [Number(row.position), row]));
+  // The schemas of the missing `schema.table`, and which of them exist
+  const schemaOf = (table: string) => {
+    const parts = table.split('.');
+    return parts.length === 2 ? parts[0] : undefined;
+  };
+  const missingSchemas = [
+    ...new Set(
+      options.tables.flatMap(({ table }, index) => {
+        const schema = byPosition.has(index + 1) ? undefined : schemaOf(table);
+        return schema === undefined ? [] : [schema];
+      })
+    ),
+  ];
+  const existingSchemas = new Set(
+    missingSchemas.length === 0
+      ? []
+      : (
+          await sql`
+            SELECT nspname FROM pg_namespace
+            WHERE nspname = ANY(${textArrayLiteral(missingSchemas)}::text[])
+          `
+        ).map((row) => row.nspname as string)
+  );
   const tables: LilypadSchemaFacts['tables'] = options.tables.map((table, index) => {
     const row = byPosition.get(index + 1);
     if (!row) {
-      return { schema: null, triggers: [] };
+      const schema = schemaOf(table.table);
+      return {
+        schema: null,
+        triggers: [],
+        ...(schema !== undefined && !existingSchemas.has(schema) && { missingSchema: schema }),
+      };
     }
+    const triggers = parseJsonColumn(row.triggers) as (Omit<LilypadTriggerInfo, 'args'> & {
+      args: string;
+    })[];
     const facts: LilypadTableFacts = {
       schema: row.schema_name as string,
-      triggers: parseJsonColumn(row.triggers) as LilypadTriggerInfo[],
+      triggers: triggers.map((trigger) => ({
+        ...trigger,
+        args: decodeLilypadTriggerArgs(trigger.args),
+      })),
     };
     if (table.shape !== undefined) {
       facts.columns = parseJsonColumn(row.columns) as LilypadColumnInfo[];

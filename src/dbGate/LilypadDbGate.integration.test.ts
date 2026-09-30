@@ -17,10 +17,11 @@ import {
 } from './LilypadChangelog';
 import {
   checkLilypadSchema,
+  formatLilypadSchemaFixSql,
   LilypadSchemaCheckError,
-  readLilypadSchemaFacts,
-  type LilypadSchemaCheckOptions,
 } from './LilypadSchemaCheck';
+import { readLilypadSchemaFacts } from './LilypadSchemaFacts';
+import type { LilypadSchemaCheckOptions } from './LilypadSchemaTypes';
 import { lilypadSchemaCheckOptions, runLilypadDoctor } from './LilypadDoctor';
 import type { LilypadLoggerType } from '@/logger/LilypadLogger';
 
@@ -1712,6 +1713,102 @@ describe('LilypadDbGate (integration)', () => {
         'lilypad-doctor (config "default"): the database is not set up.'
       );
       expect(() => report.assertOk()).toThrow(LilypadSchemaCheckError);
+    });
+
+    /** A new database of the container, its URL and a client of it, dropped after `run`. */
+    const withDatabase = async (
+      name: string,
+      run: (url: string, sql: postgres.Sql) => Promise<void>
+    ) => {
+      await admin.unsafe(`CREATE DATABASE ${name}`);
+      const url = container.getConnectionUri().replace(/\/[^/]+$/, `/${name}`);
+      const sql = postgres(url, { onnotice: () => {} });
+      try {
+        await run(url, sql);
+      } finally {
+        await sql.end();
+        await admin.unsafe(`DROP DATABASE ${name} WITH (FORCE)`);
+      }
+    };
+
+    it('should fix an empty database in one run of its SQL', async () => {
+      const config = defineLilypadDb({
+        tables: {
+          orgs: {
+            tableName: 'app.orgs',
+            primaryKey: 'id',
+            generatedPrimaryKey: true,
+            cols: { id: { pgType: 'uuid' }, name: { pgType: 'text', nullable: false } },
+            sync: { strategy: 'changelog', pollInterval: 1000 },
+          },
+          members: {
+            tableName: 'members',
+            primaryKey: 'id',
+            generatedPrimaryKey: true,
+            cols: {
+              id: { pgType: 'int8' },
+              orgId: { pgType: 'uuid', references: { table: 'app.orgs', onDelete: 'cascade' } },
+            },
+            sync: { strategy: 'listen' },
+          },
+        },
+      });
+
+      await withDatabase('doctor_fix', async (url, sql) => {
+        const check = () => runLilypadDoctor({ connectionString: url, config });
+        const first = await check();
+        expect(first.ok).toBe(false);
+
+        await sql.unsafe(formatLilypadSchemaFixSql(first.problems));
+
+        // The changelog prunes itself, and notifies the listen table
+        expect((await check()).problems).toEqual([]);
+      });
+    });
+
+    it('should check the tables whose primary key has a name beyond ASCII', async () => {
+      await admin.unsafe(`CREATE TABLE accents ("clé" int PRIMARY KEY)`);
+      await admin.unsafe(lilypadChangelogTriggerSql({ table: 'accents', primaryKey: 'clé' }));
+      try {
+        const result = await checkLilypadSchema(gate, {
+          tables: [{ table: 'accents', primaryKey: 'clé' }],
+          changelog: { checkPruning: false },
+        });
+
+        expect(result.problems).toEqual([]);
+      } finally {
+        await admin`DROP TABLE accents`;
+      }
+    });
+
+    it('should check the database for a role that cannot use the schema of pg_cron', async () => {
+      await withDatabase('doctor_cron', async (url, sql) => {
+        // The schema of pg_cron, which grants no USAGE to the other roles
+        await sql.unsafe(`
+          CREATE SCHEMA cron;
+          CREATE TABLE cron.job (jobid bigint, command text);
+          REVOKE ALL ON SCHEMA cron FROM PUBLIC;
+          CREATE ROLE doctor_app LOGIN PASSWORD 'doctor_app';
+        `);
+        try {
+          const report = await runLilypadDoctor({
+            connectionString: url.replace(/\/\/[^@]+@/, '//doctor_app:doctor_app@'),
+            config: defineLilypadDb({
+              tables: {
+                users: { ...usersInput, sync: { strategy: 'changelog', pollInterval: 1000 } },
+              },
+            }),
+          });
+
+          expect(report.problems.map((problem) => problem.code)).toEqual([
+            'missing-changelog',
+            'missing-table',
+            'no-changelog-pruning',
+          ]);
+        } finally {
+          await sql.unsafe('DROP OWNED BY doctor_app; DROP ROLE doctor_app;');
+        }
+      });
     });
   });
 
