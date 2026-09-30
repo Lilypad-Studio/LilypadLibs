@@ -66,3 +66,4 @@ The only alias is `@/*` → `src/*`, defined in `tsconfig.json` `paths` (vitest 
 | `check-runner`     | subagent | To run `npm run check` or the integration tests and get only the failures back                                                  |
 | `/write-changeset` | skill    | A user-facing change needs its changeset (bump + CHANGELOG entry in the house sections)                                         |
 | `db-modules`       | skill    | Auto-loaded in `src/cache/`, `src/dbGate/`, `src/dbConfig/`, `src/cli/`: checklists for sync strategies, PG types, format bumps |
+| `backlog/`         | backlog  | Open tasks; run with `/backlog`, format in `backlog/README.md`                                                                  |
