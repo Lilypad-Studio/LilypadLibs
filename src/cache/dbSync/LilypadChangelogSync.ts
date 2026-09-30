@@ -92,7 +92,7 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
 
   beforeRead(): Promise<void> | undefined {
     const now = Date.now();
-    if (now - this.lastRead < this.options.pollInterval || !this.backoff.ready(now)) {
+    if (now - this.lastRead < this.options.pollInterval || !this.backoff.ready()) {
       return undefined;
     }
     const reading = this.read();

@@ -736,3 +736,134 @@ describe('LilypadFlowControl retries and limits', () => {
     expect(prune).toHaveBeenCalledOnce();
   });
 });
+
+describe('LilypadFlowControl edge cases', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it.each([Number.NaN, -1, 1.5, Number.POSITIVE_INFINITY])(
+    'should reject per-call retries of %s before the first attempt',
+    async (retries) => {
+      const flowControl = new LilypadFlowControl();
+      const fn = vi.fn(async () => 'ok');
+
+      await expect(flowControl.executeWithRetries({ executionFn: fn, retries })).rejects.toThrow(
+        'retries must be a non-negative integer'
+      );
+      await expect(
+        flowControl.executeFn({ functionIdentifier: 'fn', fn, retries })
+      ).rejects.toThrow('retries must be a non-negative integer');
+      expect(fn).not.toHaveBeenCalled();
+    }
+  );
+
+  it('should keep the error of the attempt as the cause of an invalid backoff time', async () => {
+    const flowControl = new LilypadFlowControl({ retries: 1 });
+    const failure = new Error('down');
+
+    const result = flowControl.executeWithRetries({
+      executionFn: async () => {
+        throw failure;
+      },
+      backOffTime: () => Number.NaN,
+    });
+
+    await expect(result).rejects.toThrow('backOffTime must be');
+    await expect(result).rejects.toMatchObject({ cause: failure });
+  });
+
+  it('should cap the default backoff at 30 seconds', async () => {
+    vi.useFakeTimers();
+    const flowControl = new LilypadFlowControl({ retries: 30 });
+    const fn = vi.fn(async () => {
+      throw new Error('down');
+    });
+
+    const result = flowControl.executeWithRetries({ executionFn: fn });
+    result.catch(() => {});
+    await vi.runAllTimersAsync();
+
+    await expect(result).rejects.toThrow('down');
+    expect(fn).toHaveBeenCalledTimes(31);
+  });
+
+  it('should observe the rejection of a timed out attempt that settles later', async () => {
+    vi.useFakeTimers();
+    const flowControl = new LilypadFlowControl({ timeout: 100 });
+
+    const result = flowControl.executeWithTimeout(
+      () => new Promise((_, reject) => setTimeout(() => reject(new Error('late')), 110))
+    );
+    // eslint-disable-next-line vitest/valid-expect -- awaited once the fake timers have advanced
+    const assertion = expect(result).rejects.toBeInstanceOf(LilypadTimeoutError);
+    // An unobserved rejection of the attempt would fail the run
+    await vi.advanceTimersByTimeAsync(200);
+
+    await assertion;
+  });
+
+  it('should retry an attempt that never settles once its timeout aborts it', async () => {
+    vi.useFakeTimers();
+    const flowControl = new LilypadFlowControl({ timeout: 100 });
+    const signals: AbortSignal[] = [];
+
+    const result = flowControl.executeFn({
+      functionIdentifier: 'fn',
+      retries: 1,
+      backOffTime: () => 50,
+      fn: (signal) => {
+        signals.push(signal);
+        return signals.length === 1 ? new Promise<string>(() => {}) : Promise.resolve('second');
+      },
+    });
+    // eslint-disable-next-line vitest/valid-expect -- awaited once the fake timers have advanced
+    const assertion = expect(result).resolves.toBe('second');
+    await vi.advanceTimersByTimeAsync(150);
+
+    await assertion;
+    expect(signals).toHaveLength(2);
+    expect(signals[0]?.aborted).toBe(true);
+    expect(signals[1]?.aborted).toBe(false);
+  });
+
+  it('should allow a first call made less than rate after the clock origin', () => {
+    vi.useFakeTimers({ now: 0 });
+    const flowControl = new LilypadFlowControl({ rate: 1000 });
+
+    expect(() => flowControl.rateLimit('first')).not.toThrow();
+  });
+
+  it('should not lock the keys out when the wall clock steps back', () => {
+    vi.useFakeTimers();
+    const flowControl = new LilypadFlowControl({ rate: 1000 });
+    flowControl.rateLimit('key');
+
+    vi.setSystemTime(Date.now() - 3_600_000);
+    vi.advanceTimersByTime(1000);
+
+    expect(() => flowControl.rateLimit('key')).not.toThrow();
+  });
+
+  it('should record nothing with a rate of 0', () => {
+    const flowControl = new LilypadFlowControl({ rate: 0 });
+
+    flowControl.rateLimit('key');
+    flowControl.rateLimit('key');
+
+    expect(flowControl['rateMap'].size).toBe(0);
+  });
+
+  it('should expose the limited key on a LilypadRateLimitError', () => {
+    const flowControl = new LilypadFlowControl({ rate: 1000 });
+    flowControl.rateLimit('user#fn');
+
+    expect(() => flowControl.rateLimit('user#fn')).toThrow(
+      expect.objectContaining({ rateKey: 'user#fn' })
+    );
+  });
+
+  it('should reject invalid options with a RangeError', () => {
+    expect(() => new LilypadFlowControl({ rate: -1 })).toThrow(RangeError);
+  });
+});

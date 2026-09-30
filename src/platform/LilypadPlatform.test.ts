@@ -1,5 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
-import { runAfterResponse, runInBackground, sharedStoreOperation } from './LilypadPlatform';
+import {
+  runAfterResponse,
+  runInBackground,
+  sharedStoreOperation,
+  toTtlSeconds,
+} from './LilypadPlatform';
 
 describe('runInBackground', () => {
   it('should still run the task when the platform function throws', async () => {
@@ -54,6 +59,18 @@ describe('runInBackground', () => {
 
     expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: 'task failed' }));
   });
+
+  it('should not let a throwing onError turn the task into an unhandled rejection', async () => {
+    const onError = vi.fn(() => {
+      throw new Error('handler failed');
+    });
+
+    // An unhandled rejection would fail the run
+    runInBackground(undefined, Promise.reject(new Error('task failed')), onError);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(onError).toHaveBeenCalledOnce();
+  });
 });
 
 describe('runAfterResponse', () => {
@@ -65,6 +82,33 @@ describe('runAfterResponse', () => {
 
     expect(afterResponse).toHaveBeenCalledOnce();
     expect(work).not.toHaveBeenCalled();
+  });
+
+  it('should pass the errors of the work handed to afterResponse to onError', async () => {
+    let handed!: () => Promise<unknown>;
+    const onError = vi.fn();
+
+    runAfterResponse(
+      { afterResponse: (work) => (handed = work) },
+      async () => {
+        throw new Error('work failed');
+      },
+      onError
+    );
+    await handed();
+
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: 'work failed' }));
+  });
+
+  it('should start the work at once and hand it to background without afterResponse', async () => {
+    const background = vi.fn();
+    const work = vi.fn(async () => 'done');
+
+    runAfterResponse({ background }, work, () => {});
+
+    expect(work).toHaveBeenCalledOnce();
+    expect(background).toHaveBeenCalledOnce();
+    await expect(background.mock.calls[0]?.[0]).resolves.toBe('done');
   });
 
   it('should start the work at once when afterResponse throws', () => {
@@ -110,5 +154,51 @@ describe('sharedStoreOperation', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('sharedStoreOperation failures', () => {
+  it('should resolve to the fallback when the operation rejects', async () => {
+    const onError = vi.fn();
+
+    await expect(
+      sharedStoreOperation(() => Promise.reject(new Error('store down')), 'fallback', 300, onError)
+    ).resolves.toBe('fallback');
+    expect(onError).toHaveBeenCalledOnce();
+  });
+
+  it('should observe the rejection of an operation that fails after the timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      const onError = vi.fn();
+      const result = sharedStoreOperation(
+        () => new Promise<string>((_, reject) => setTimeout(() => reject(new Error('late')), 400)),
+        'fallback',
+        300,
+        onError
+      );
+
+      // An unobserved rejection of the operation would fail the run
+      await vi.advanceTimersByTimeAsync(500);
+
+      await expect(result).resolves.toBe('fallback');
+      expect(onError).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('toTtlSeconds', () => {
+  it.each([
+    [0, 1],
+    [1, 1],
+    [1000, 1],
+    [1001, 2],
+    [-5, 1],
+    [Number.NaN, 1],
+    [Number.POSITIVE_INFINITY, 1],
+  ])('should convert %s ms to %s s', (ms, seconds) => {
+    expect(toTtlSeconds(ms)).toBe(seconds);
   });
 });

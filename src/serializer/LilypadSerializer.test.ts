@@ -358,3 +358,35 @@ describe('LilypadSerializer null values', () => {
     expect(roundTrip).toEqual([{ note: null }]);
   });
 });
+
+describe('LilypadSerializer runtime keys', () => {
+  type Source = { a: number; b: string };
+  type Target = { x: number; y: string };
+
+  const createSerializer = () =>
+    new LilypadSerializer<Source, Target, { a: 'x'; b: 'y' }>({
+      serialization: {
+        a: { target: 'x', serialize: (item) => item.a, deserialize: (item) => item.x, default: 0 },
+        b: { target: 'y', serialize: (item) => item.b, deserialize: (item) => item.y, default: '' },
+      },
+    });
+
+  it('should refuse __proto__ as a target or a source key', () => {
+    // Parsed: the types reject these mappings, and a literal `__proto__` key sets the prototype
+    for (const json of ['{"a": {"target": "__proto__"}}', '{"__proto__": {"target": "x"}}']) {
+      expect(() => new LilypadSerializer({ serialization: JSON.parse(json) as never })).toThrow(
+        '"__proto__" cannot be a key'
+      );
+    }
+  });
+
+  it('should drop the input keys that the mapping does not know', () => {
+    const extra = { a: 1, b: 'b', c: true } as Source;
+
+    expect(createSerializer().serialize([extra])).toEqual([{ x: 1, y: 'b' }]);
+  });
+
+  it('should give a missing target key its default', () => {
+    expect(createSerializer().deserialize([{ x: 5 } as Target])).toEqual([{ a: 5, b: '' }]);
+  });
+});

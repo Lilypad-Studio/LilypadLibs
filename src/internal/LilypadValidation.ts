@@ -46,7 +46,7 @@ function satisfies(value: number, rule: NumberRule): boolean {
 }
 
 /**
- * Throws if `value` is set and does not follow `rule`.
+ * Throws a `RangeError` if `value` is set and does not follow `rule`.
  *
  * @param owner - The class whose option it is, for the message.
  */
@@ -57,6 +57,6 @@ export function assertNumberOption(
   rule: NumberRule
 ): void {
   if (value !== undefined && (typeof value !== 'number' || !satisfies(value, rule))) {
-    throw new Error(`${owner}: ${name} must be ${DESCRIPTIONS[rule]} (got ${String(value)}).`);
+    throw new RangeError(`${owner}: ${name} must be ${DESCRIPTIONS[rule]} (got ${String(value)}).`);
   }
 }

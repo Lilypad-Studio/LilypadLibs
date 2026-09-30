@@ -78,8 +78,22 @@ export type LilypadPlatform = {
 };
 
 /**
+ * Wraps an error handler so that it never throws: a throwing `onError` would otherwise turn the
+ * handled task back into an unhandled rejection, which terminates the Node.js process.
+ */
+function safeHandler(onError: (error: unknown) => void): (error: unknown) => void {
+  return (error) => {
+    try {
+      onError(error);
+    } catch {
+      // Ignored: nothing is left to report the error of an error handler to
+    }
+  };
+}
+
+/**
  * Runs `task` without awaiting it: its errors go to `onError` (they never become unhandled
- * rejections), and the platform keeps the instance alive until it settles.
+ * rejections, even if `onError` throws), and the platform keeps the instance alive until it settles.
  *
  * @param onPlatformError - Receives the error of `platform.background` itself (e.g. `after` called
  * outside a request scope), which is not an error of the task: the task still runs, without the
@@ -91,7 +105,7 @@ export function runInBackground(
   onError: (error: unknown) => void,
   onPlatformError: (error: unknown) => void = () => {}
 ): void {
-  const handled = task.catch(onError);
+  const handled = task.catch(safeHandler(onError));
   try {
     platform?.background?.(handled);
   } catch (error) {
@@ -114,7 +128,8 @@ export function runAfterResponse(
 ): void {
   if (platform?.afterResponse) {
     try {
-      platform.afterResponse(() => work().catch(onError));
+      const handler = safeHandler(onError);
+      platform.afterResponse(() => work().catch(handler));
       return;
     } catch (error) {
       // e.g. `after` called outside a request scope: fall back to starting the work now
@@ -146,7 +161,11 @@ export async function sharedStoreOperation<T>(
   }
 }
 
-/** Converts milliseconds to the whole seconds used by the shared store TTLs (at least 1). */
+/**
+ * Converts milliseconds to the whole seconds used by the shared store TTLs (at least 1). A value
+ * that is not finite (`NaN`, `Infinity`) gives 1: a shared entry that expires too early is only a
+ * miss, and the store never receives a TTL it cannot use.
+ */
 export function toTtlSeconds(ms: number): number {
-  return Math.max(1, Math.ceil(ms / 1000));
+  return Number.isFinite(ms) ? Math.max(1, Math.ceil(ms / 1000)) : 1;
 }

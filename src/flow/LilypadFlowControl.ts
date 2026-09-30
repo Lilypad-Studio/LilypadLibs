@@ -2,14 +2,17 @@ import { withLilypadTimeout } from '@/internal/LilypadTimeout';
 import { assertNumberOption } from '@/internal/LilypadValidation';
 
 export type LilypadFlowControlOptions = {
-  /** Minimum time between two executions of each consumer/function pair, in milliseconds. */
+  /**
+   * Minimum time between two executions of each consumer/function pair, in milliseconds. `0`, like
+   * no value, disables the rate limit.
+   */
   rate?: number | undefined;
   /**
    * Maximum duration of each attempt, in milliseconds. With retries, the total duration can be up to
    * `(retries + 1) * timeout` plus the backoff times.
    */
   timeout?: number | undefined;
-  /** How many times a failed attempt is retried. Defaults to 0. */
+  /** How many times a failed attempt is retried: a non-negative integer. Defaults to 0. */
   retries?: number | undefined;
 };
 
@@ -53,9 +56,13 @@ export class LilypadTimeoutError extends Error {
 
 /** Thrown when an execution is refused by the rate limit. */
 export class LilypadRateLimitError extends Error {
+  /** What is limited: `<consumer>#<function>`, or the function alone. */
+  readonly rateKey: string;
+
   constructor(rateKey: string) {
     super(`Rate limit exceeded for ${rateKey}`);
     this.name = 'LilypadRateLimitError';
+    this.rateKey = rateKey;
   }
 }
 
@@ -63,6 +70,9 @@ export class LilypadRateLimitError extends Error {
  * Above this number of tracked rate limit keys, expired entries are pruned (at most once per `rate`).
  */
 const RATE_MAP_PRUNE_THRESHOLD = 1000;
+
+/** The longest default wait before a retry (without `backOffTime`). */
+const MAX_DEFAULT_BACKOFF = 30_000;
 
 /**
  * Flow control for asynchronous operations: timeouts, retries, rate limiting and single-flight
@@ -99,9 +109,10 @@ export class LilypadFlowControl {
   private readonly retries?: number | undefined;
 
   private singleFlightMap = new Map<string, Promise<unknown>>();
+  /** When each key last ran, on the monotonic clock (`performance.now()`). */
   private rateMap = new Map<string, number>();
   /** When the rate limit entries were last pruned. */
-  private lastRatePrune = 0;
+  private lastRatePrune = -Infinity;
 
   /** @throws If a numeric option is not valid (e.g. `NaN`, or a negative duration). */
   constructor(options?: LilypadFlowControlOptions) {
@@ -145,11 +156,13 @@ export class LilypadFlowControl {
    *
    * @template T The return type of the execution function.
    * @param options.executionFn - The asynchronous function to execute.
-   * @param options.retries - The maximum number of retry attempts. If not provided, the instance's configured retries will be used.
-   * @param options.backOffTime - Optional function to calculate the backoff time (in milliseconds) before each retry attempt. Receives the current attempt number as an argument. Defaults to exponential backoff if not provided.
+   * @param options.retries - The maximum number of retry attempts, a non-negative integer. If not provided, the instance's configured retries will be used.
+   * @param options.backOffTime - Optional function to calculate the backoff time (in milliseconds) before each retry attempt. Receives the current attempt number as an argument. Defaults to an exponential backoff (200 ms, 400 ms, ...) of at most 30 s.
    * @param options.shouldRetry - Returns `false` for an error that must not be retried: it is thrown at once.
    * @returns A promise that resolves with the result of `executionFn`.
    * @throws The error of the last attempt, once all retries are exhausted.
+   * @throws If `retries` is not a non-negative integer (before the first attempt), or if
+   * `backOffTime` returns a delay a timer cannot hold (with the error of the attempt as `cause`).
    */
   async executeWithRetries<T>(options: {
     executionFn: () => Promise<T>;
@@ -157,29 +170,33 @@ export class LilypadFlowControl {
     backOffTime?: ((attempt: number) => number) | undefined;
     shouldRetry?: ((error: unknown, attempt: number) => boolean) | undefined;
   }): Promise<T> {
+    // Checked per call too: `attempts >= NaN` is always false, so NaN would retry without end
+    const retries = options.retries ?? this.retries ?? 0;
+    assertNumberOption('LilypadFlowControl', 'retries', retries, 'non-negative-integer');
     let attempts = 0;
     while (true) {
       try {
-        const result = await options.executionFn();
-        return result;
+        return await options.executionFn();
       } catch (error) {
-        if (
-          attempts >= (options.retries ?? this.retries ?? 0) ||
-          options.shouldRetry?.(error, attempts + 1) === false
-        ) {
+        if (attempts >= retries || options.shouldRetry?.(error, attempts + 1) === false) {
           throw error;
         }
         attempts++;
         const backoffTimeValue = options.backOffTime
           ? options.backOffTime(attempts)
-          : Math.pow(2, attempts) * 100; // Exponential backoff
-        // A delay that a timer cannot hold (NaN, beyond 2^31 - 1 ms) would retry at once
-        assertNumberOption(
-          'LilypadFlowControl',
-          'backOffTime',
-          backoffTimeValue,
-          'non-negative-delay'
-        );
+          : Math.min(2 ** attempts * 100, MAX_DEFAULT_BACKOFF);
+        try {
+          // A delay that a timer cannot hold (NaN, beyond 2^31 - 1 ms) would retry at once
+          assertNumberOption(
+            'LilypadFlowControl',
+            'backOffTime',
+            backoffTimeValue,
+            'non-negative-delay'
+          );
+        } catch (invalid) {
+          // Keeps the failure of the attempt, which the invalid delay would otherwise hide
+          throw new RangeError((invalid as Error).message, { cause: error });
+        }
         await new Promise((resolve) => setTimeout(resolve, backoffTimeValue));
       }
     }
@@ -187,7 +204,9 @@ export class LilypadFlowControl {
 
   /**
    * Enforces the rate limit (the `rate` option) for a key: records the call, or throws if the
-   * previous call of the key is more recent than `rate`. Without `rate`, it does nothing.
+   * previous call of the key is more recent than `rate`. Without `rate` (or with `0`), it does
+   * nothing. Intervals are measured on the monotonic clock, so a step back of the wall clock does
+   * not lock the keys out.
    *
    * It must stay synchronous: `executeFn` relies on no await happening between the single-flight
    * lookup and the registration of the new execution.
@@ -196,28 +215,31 @@ export class LilypadFlowControl {
    * @throws {LilypadRateLimitError} If the rate limit is exceeded for the key.
    */
   rateLimit(rateKey: string): void {
-    if (this.rate !== undefined) {
-      const now = Date.now();
-      const lastExecution = this.rateMap.get(rateKey) ?? 0;
-      if (now - lastExecution < this.rate) {
-        throw new LilypadRateLimitError(rateKey);
-      }
-      this.rateMap.set(rateKey, now);
-      // At most once per `rate`: when every key is still limited, pruning at each call would scan
-      // the whole map for nothing
-      if (this.rateMap.size > RATE_MAP_PRUNE_THRESHOLD && now - this.lastRatePrune >= this.rate) {
-        this.lastRatePrune = now;
-        this.pruneRateMap(now);
-      }
+    const rate = this.rate;
+    if (!rate) {
+      return;
+    }
+    // `performance.now()` starts near 0: a missing entry must not count as a call at time 0
+    const now = performance.now();
+    const lastExecution = this.rateMap.get(rateKey);
+    if (lastExecution !== undefined && now - lastExecution < rate) {
+      throw new LilypadRateLimitError(rateKey);
+    }
+    this.rateMap.set(rateKey, now);
+    // At most once per `rate`: when every key is still limited, pruning at each call would scan
+    // the whole map for nothing
+    if (this.rateMap.size > RATE_MAP_PRUNE_THRESHOLD && now - this.lastRatePrune >= rate) {
+      this.lastRatePrune = now;
+      this.pruneRateMap(now, rate);
     }
   }
 
   /**
    * Removes the rate limit entries whose interval has already elapsed, as they no longer limit anything.
    */
-  private pruneRateMap(now: number) {
+  private pruneRateMap(now: number, rate: number) {
     for (const [rateKey, lastExecution] of this.rateMap) {
-      if (now - lastExecution >= this.rate!) {
+      if (now - lastExecution >= rate) {
         this.rateMap.delete(rateKey);
       }
     }

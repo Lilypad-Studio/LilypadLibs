@@ -4,6 +4,7 @@ import {
   createLilypadSingletonAbleAsync,
   getLilypadSingletonInstance,
   getLilypadSingletonInstanceAsync,
+  lilypadSingletonRegistryKey,
   removeLilypadSingletonInstance,
 } from './LilypadSingleton';
 
@@ -102,7 +103,7 @@ describe('LilypadSingleton', () => {
       releaseFirst = release;
       return { value: 1 };
     });
-    removeLilypadSingletonInstance(`A:${options.singleton}`);
+    removeLilypadSingletonInstance(lilypadSingletonRegistryKey('A', options.singleton));
     const second = await createLilypadSingletonAbleAsync('A', options, async () => ({ value: 2 }));
 
     // The first instance is disposed only now: its release must leave the second one registered
@@ -120,7 +121,7 @@ describe('LilypadSingleton', () => {
       releaseFirst = release;
       return { value: 1 };
     });
-    removeLilypadSingletonInstance(`S:${options.singleton}`);
+    removeLilypadSingletonInstance(lilypadSingletonRegistryKey('S', options.singleton));
     const second = createLilypadSingletonAble('S', options, () => ({ value: 2 }));
 
     releaseFirst();
@@ -130,15 +131,15 @@ describe('LilypadSingleton', () => {
   });
 
   it('should give a no-op release function to instances that are not singletons', async () => {
-    const identifier = uniqueId();
-    const registered = getLilypadSingletonInstance(`A:${identifier}`, () => ({ value: 1 }));
+    const key = lilypadSingletonRegistryKey('A', uniqueId());
+    const registered = getLilypadSingletonInstance(key, () => ({ value: 1 }));
     const instance = await createLilypadSingletonAbleAsync('A', {}, async (release) => {
       release();
       return { value: 2 };
     });
 
     expect(instance).toEqual({ value: 2 });
-    expect(getLilypadSingletonInstance(`A:${identifier}`, () => ({ value: 3 }))).toBe(registered);
+    expect(getLilypadSingletonInstance(key, () => ({ value: 3 }))).toBe(registered);
   });
 
   it('should create synchronous singletons with the same namespacing', () => {
@@ -166,6 +167,55 @@ describe('LilypadSingleton', () => {
     const second = getLilypadSingletonInstance(id, () => ({}), { value: 'b', onMismatch });
     expect(onMismatch).toHaveBeenCalledOnce();
     expect(second).toBe(first);
+  });
+
+  it('should forget the signature on release, so that a new instance may use other options', () => {
+    const options = { singleton: uniqueId() };
+    const onMismatch = vi.fn();
+    let release!: () => void;
+    createLilypadSingletonAble(
+      'A',
+      options,
+      (r) => {
+        release = r;
+        return {};
+      },
+      { value: 'a', onMismatch }
+    );
+
+    release();
+    createLilypadSingletonAble('A', options, () => ({}), { value: 'b', onMismatch });
+    createLilypadSingletonAble('A', options, () => ({}), { value: 'b', onMismatch });
+
+    expect(onMismatch).not.toHaveBeenCalled();
+  });
+
+  it('should keep the keys of the create methods apart from other versions of the registry', () => {
+    const singleton = uniqueId();
+    // What a copy of the library with an older key format registered under the same identifier
+    const older = getLilypadSingletonInstance(`A:${singleton}`, () => ({ version: 0 }));
+
+    const current = createLilypadSingletonAble('A', { singleton }, () => ({ version: 1 }));
+
+    expect(current).not.toBe(older);
+    expect(lilypadSingletonRegistryKey('A', singleton)).toBe(`A@1:${singleton}`);
+  });
+
+  it('should leave the registry empty when a failing creation calls its release', async () => {
+    const options = { singleton: uniqueId() };
+
+    await expect(
+      createLilypadSingletonAbleAsync('A', options, async (release) => {
+        await Promise.resolve();
+        // e.g. a partially built instance disposed by its factory
+        release();
+        throw new Error('creation failed');
+      })
+    ).rejects.toThrow('creation failed');
+
+    expect(
+      removeLilypadSingletonInstance(lilypadSingletonRegistryKey('A', options.singleton))
+    ).toBe(false);
   });
 
   it('should refuse a synchronous lookup of a singleton being created asynchronously', async () => {

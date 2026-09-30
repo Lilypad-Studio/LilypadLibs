@@ -88,7 +88,7 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
   }
 
   beforeRead(): Promise<void> | undefined {
-    if (this.listening || this.options.connect !== 'lazy' || !this.backoff.ready(Date.now())) {
+    if (this.listening || this.options.connect !== 'lazy' || !this.backoff.ready()) {
       return undefined;
     }
     return this.startListening().catch((error: unknown) => {

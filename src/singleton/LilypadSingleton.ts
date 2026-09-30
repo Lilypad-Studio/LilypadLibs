@@ -7,6 +7,18 @@ const singletonMap = (globalThis.__lilypadSingletonMap ??= new Map<string, unkno
 const signatureMap = (globalThis.__lilypadSingletonSignatureMap ??= new Map<string, string>());
 
 /**
+ * Part of the keys of the `create` methods (`<namespace>@<version>:<singleton>`). The registry is
+ * shared by every copy of the library in the process: bump it when an instance changes in a way
+ * another copy could not use, so that incompatible copies never hand each other their instances.
+ */
+const SINGLETON_REGISTRY_VERSION = 1;
+
+/** The registry key of a singleton created by a `create` method: `<namespace>@<version>:<singleton>`. */
+export function lilypadSingletonRegistryKey(namespace: string, singleton: string): string {
+  return `${namespace}@${SINGLETON_REGISTRY_VERSION}:${singleton}`;
+}
+
+/**
  * The singleton option of the `create` methods: with an identifier, a later `create` with the same
  * identifier returns the same instance; without one, each call creates a new instance.
  */
@@ -112,7 +124,9 @@ export type LilypadSingletonRelease = () => void;
 
 function registryKeyOf(namespace: string, options: LilypadSingletonAble): string | undefined {
   // The namespace keeps singletons of different classes apart even when they share an identifier
-  return options.singleton !== undefined ? `${namespace}:${options.singleton}` : undefined;
+  return options.singleton !== undefined
+    ? lilypadSingletonRegistryKey(namespace, options.singleton)
+    : undefined;
 }
 
 /** What a factory registered under a key: the instance, or the promise of it while it is created. */
@@ -141,7 +155,7 @@ function releaseFor(
 
 /**
  * Shared implementation of the synchronous `create` methods: builds a new instance, or returns the
- * singleton registered under `namespace:singleton`.
+ * singleton registered under `lilypadSingletonRegistryKey(namespace, singleton)`.
  *
  * @param createInstanceFn - Receives the function that removes the instance from the registry.
  */
@@ -169,7 +183,7 @@ export function createLilypadSingletonAble<T>(
 
 /**
  * Shared implementation of the async `create` methods: builds a new instance, or returns the
- * singleton registered under `namespace:singleton`.
+ * singleton registered under `lilypadSingletonRegistryKey(namespace, singleton)`.
  *
  * @param createInstanceFn - Receives the function that removes the instance from the registry.
  */

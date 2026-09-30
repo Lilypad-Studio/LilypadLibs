@@ -1143,18 +1143,18 @@ const result = await payments.executeFn({
   functionIdentifier: 'charge:user-42', // concurrent calls with the same id share one execution
   consumerIdentifier: 'user-42', // optional: the rate limit applies per consumer and function
   fn: (signal) => callPaymentApi('user-42', signal), // pass the signal on so a timeout cancels the work
-  backOffTime: (attempt) => attempt * 500, // wait before retries (default: 200, 400, 800 ms...)
+  backOffTime: (attempt) => attempt * 500, // wait before retries (default: 200, 400, 800 ms... up to 30 s)
 });
 ```
 
 - **Typing:** the class is not generic: each execution is typed by its `fn` (here `{ ok: boolean }`).
 - **Single flight:** while an execution with a given `functionIdentifier` is running, other calls with the same identifier receive its promise. They do not start a new execution and are not rate limited, and their own options (`fn`, `timeout`, ...) are ignored: they share the outcome of the first call. Each caller handles an error on its own (`.catch`).
-- **Per-call options:** `retries` and `timeout` in the options of `executeFn` override those of the instance for that execution. `shouldRetry(error, attempt)` returns `false` for an error that another attempt cannot fix: it is thrown at once.
+- **Per-call options:** `retries` and `timeout` in the options of `executeFn` override those of the instance for that execution, and are checked the same way (`retries` must be a non-negative integer: the call rejects before the first attempt otherwise). `shouldRetry(error, attempt)` returns `false` for an error that another attempt cannot fix: it is thrown at once. If `backOffTime` returns a delay a timer cannot hold, the call rejects with a `RangeError` whose `cause` is the error of the attempt.
 - **Durations:** every timeout and delay given to a timer must be at most 2^31 - 1 ms (about 24.8 days): beyond it, a JavaScript timer fires at once, so the constructors and the calls throw instead.
 - **Timeout:** a timed out attempt fails with a `LilypadTimeoutError` (`Operation timed out after <timeout>ms`, with the `timeout` as a property). Each attempt gets its own timeout, so with retries the whole execution can last `(retries + 1) × timeout` plus the backoff times. Each attempt gets an `AbortSignal` that is aborted when the timeout expires. JavaScript cannot stop a running promise, so pass the signal to `fetch`, to the database driver, and so on, or check `signal.aborted` yourself.
-- **Rate limit:** a new execution started less than `rate` ms after the previous one for the same consumer/function pair fails with a `LilypadRateLimitError` (`Rate limit exceeded for ...`). The call is rejected, not delayed.
+- **Rate limit:** a new execution started less than `rate` ms after the previous one for the same consumer/function pair fails with a `LilypadRateLimitError` (`Rate limit exceeded for ...`, with the limited key as `rateKey`). The call is rejected, not delayed. `rate: 0` disables it. Intervals are measured on the monotonic clock (`performance.now()`), so a step back of the system clock does not lock callers out.
 - An execution refused by the rate limit rejects with a `LilypadRateLimitError`; one that failed rejects with the error of its last attempt.
-- The constructor throws for an invalid option (`NaN`, a negative duration, a fractional `retries`).
+- The constructor throws a `RangeError` for an invalid option (`NaN`, a negative duration, a fractional `retries`).
 
 The individual steps are also available: `executeWithTimeout(fn, timeout?)`, `executeWithRetries({ executionFn, retries, backOffTime, shouldRetry })`, `rateLimit(key)` (synchronous: it throws when the limit is exceeded), `singleFlight(key, fn)` and `isInFlight(key)`.
 
@@ -1241,7 +1241,7 @@ const cache = getLilypadSingletonInstance('prices', () => new LilypadCache({ ttl
 
 `getLilypadSingletonInstanceAsync` shares one creation between concurrent callers. If the creation fails, it is forgotten, so the next call tries again.
 
-The registry is stored on `globalThis`, so it is shared by the whole process, including copies of the library loaded from different bundles. Use identifiers that are unique across your application. The `create()` methods prefix their identifiers with the class name (`LilypadDbGate:main-db`), so they never collide with yours. `getLilypadSingletonInstance` throws if the identifier is still being created by `getLilypadSingletonInstanceAsync`.
+The registry is stored on `globalThis`, so it is shared by the whole process, including copies of the library loaded from different bundles. Use identifiers that are unique across your application. The `create()` methods prefix their identifiers with the class name and a registry version (`LilypadDbGate@1:main-db`), so they never collide with yours, and two copies of the library whose instances are not compatible never share them. To drop one of those singletons, call its `close()`/`dispose()` rather than `removeLilypadSingletonInstance`. `getLilypadSingletonInstance` throws if the identifier is still being created by `getLilypadSingletonInstanceAsync`.
 
 ## Troubleshooting
 

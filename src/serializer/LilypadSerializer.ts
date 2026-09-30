@@ -58,7 +58,10 @@ export type LilypadSerializerConstructorOptions<
  * - Default values and equality checks can be specified to skip serialization of default values.
  * - When a function in the serialization map returns `undefined`, that key is omitted from the serialized output.
  * - When deserialization returns `undefined`, the key gets a copy of its default value (object
- *   defaults are cloned, so deserialized items never share them). `null` is kept as a value.
+ *   defaults are cloned with `structuredClone`, so deserialized items never share them: a default
+ *   must be structured-cloneable, and a class instance comes back as a plain object). `null` is
+ *   kept as a value.
+ * - `__proto__` cannot be a key, on either side: the constructor throws.
  *
  * @example
  * ```typescript
@@ -79,29 +82,36 @@ export class LilypadSerializer<
   TO extends object,
   KeyMap extends Record<keyof FROM, keyof TO>,
 > {
-  private readonly fromKeys: (keyof FROM)[];
+  private readonly fields: [
+    keyof FROM,
+    LilypadSerializerConstructorOptions<FROM, TO, KeyMap>['serialization'][keyof FROM],
+  ][];
 
-  constructor(private options: LilypadSerializerConstructorOptions<FROM, TO, KeyMap>) {
-    this.fromKeys = Object.keys(options.serialization) as (keyof FROM)[];
+  /** @throws If a key or a `target` is `__proto__`: assigning it would set the prototype instead. */
+  constructor(options: LilypadSerializerConstructorOptions<FROM, TO, KeyMap>) {
+    this.fields = Object.entries(options.serialization) as typeof this.fields;
+    for (const [fromKey, field] of this.fields) {
+      if (fromKey === '__proto__' || field.target === '__proto__') {
+        throw new Error('LilypadSerializer: "__proto__" cannot be a key.');
+      }
+    }
   }
 
   serialize(input: FROM[]): TO[] {
     return input.map((item) => {
       const packedItem = {} as TO;
-      this.fromKeys.forEach((fromKey) => {
-        const isEqual = this.options.serialization[fromKey].equality ?? ((v, d) => v === d); // Fallback to strict equality
-        if (isEqual(item[fromKey], this.options.serialization[fromKey].default)) {
-          return; // Skip default values
+      for (const [fromKey, field] of this.fields) {
+        const isEqual = field.equality ?? ((value, defaultValue) => value === defaultValue);
+        if (isEqual(item[fromKey], field.default)) {
+          continue; // Skip default values
         }
-
-        const value = this.options.serialization[fromKey].serialize(item);
+        const value = field.serialize(item);
         if (value === undefined) {
-          return; // Skip undefined serialization results
+          continue; // Skip undefined serialization results
         }
-
-        const toKey = this.options.serialization[fromKey].target;
+        const toKey = field.target;
         packedItem[toKey] = value as TO[typeof toKey];
-      });
+      }
       return packedItem;
     });
   }
@@ -109,13 +119,13 @@ export class LilypadSerializer<
   deserialize(input: TO[]): FROM[] {
     return input.map((item) => {
       const unpackedItem = {} as FROM;
-      this.fromKeys.forEach((fromKey) => {
-        const value = this.options.serialization[fromKey].deserialize(item);
+      for (const [fromKey, field] of this.fields) {
+        const value = field.deserialize(item);
         // Only undefined: null is a value, which the serialization may have written on purpose
         unpackedItem[fromKey] =
           // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- null is kept
-          value === undefined ? cloneDefault(this.options.serialization[fromKey].default) : value;
-      });
+          value === undefined ? cloneDefault(field.default) : value;
+      }
       return unpackedItem;
     });
   }
