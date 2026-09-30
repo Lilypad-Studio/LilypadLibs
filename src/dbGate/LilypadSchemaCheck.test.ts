@@ -981,15 +981,16 @@ describe('formatLilypadSchemaProblems', () => {
 });
 
 describe('evaluateLilypadSchema with the tables of a config', () => {
+  const orgs = {
+    tableName: 'orgs',
+    primaryKey: 'id',
+    cols: { id: { pgType: 'int4' } },
+    sync: { strategy: 'listen' },
+  } as const;
   const db = defineLilypadDb({
     changelog: { pruning: 'external', minRetention: 2 * 3_600_000 },
     tables: {
-      orgs: {
-        tableName: 'orgs',
-        primaryKey: 'id',
-        cols: { id: { pgType: 'int4' } },
-        sync: { strategy: 'listen' },
-      },
+      orgs,
       users: {
         tableName: 'users',
         primaryKey: 'id',
@@ -1044,16 +1045,15 @@ describe('evaluateLilypadSchema with the tables of a config', () => {
       changelogTable: 'lilypad_cache_changes',
       notifyChannel: false,
     });
-    expect(
-      lilypadSchemaCheckOptions(defineLilypadDb({ tables: { orgs: db.tables.orgs as never } }))
-        .changelog
-    ).toBe(false);
+    expect(lilypadSchemaCheckOptions(defineLilypadDb({ tables: { orgs: orgs } })).changelog).toBe(
+      false
+    );
   });
 
   it('should install the changelog of the config in the fixes of listen tables alone', () => {
     const listenOnly = defineLilypadDb({
       changelog: { table: 'app_changes' },
-      tables: { orgs: db.tables.orgs as never },
+      tables: { orgs: orgs },
     });
     const listenOptions = lilypadSchemaCheckOptions(listenOnly);
     const result = evaluateLilypadSchema(

@@ -260,7 +260,43 @@ describe('defineLilypadDb', () => {
       cols: { ...table.cols, iso: { pgType: 'timestamptz' } },
     });
 
+    defineLilypadTable<{ id: number; note?: string }, 'id'>({
+      tableName: 'notes',
+      primaryKey: 'id',
+      // @ts-expect-error: an optional property of the row type needs its column too
+      cols: { id: { pgType: 'int4' } },
+    });
+
     expect(defineLilypadDb({ tables: { table } }).tables.table.cols.id.type).toBe('number');
+  });
+
+  it('should freeze the definitions, with copies of what they take from the input', () => {
+    const email: { type: 'string'; unique: boolean } = { type: 'string', unique: true };
+    const input = defineLilypadTable<User, 'id'>({ ...users, cols: { ...users.cols, email } });
+    const { users: definition } = defineLilypadDb({ tables: { orgs, users: input } }).tables;
+
+    expect(Object.isFrozen(definition.cols)).toBe(true);
+    expect(Object.isFrozen(definition.cols.email)).toBe(true);
+    expect(Object.isFrozen(definition.cols.orgId.references)).toBe(true);
+    expect(Object.isFrozen(definition.cols.id.default)).toBe(true);
+    const lists = [
+      definition.unique,
+      definition.foreignKeys,
+      definition.indexes,
+      definition.checks,
+    ];
+    for (const list of lists) {
+      expect(Object.isFrozen(list)).toBe(true);
+      expect(list.every((item) => Object.isFrozen(item))).toBe(true);
+    }
+    expect(Object.isFrozen(definition.foreignKeys[0]!.columns)).toBe(true);
+    expect(Object.isFrozen(definition.foreignKeys[0]!.references)).toBe(true);
+    expect(Object.isFrozen(definition.foreignKeys[0]!.references.columns)).toBe(true);
+    expect(Object.isFrozen(definition.indexes[0]!.columns)).toBe(true);
+
+    email.unique = false;
+
+    expect(definition.cols.email.unique).toBe(true);
   });
 
   it.each<[string, Record<string, unknown>, string]>([
@@ -272,6 +308,21 @@ describe('defineLilypadDb', () => {
     ],
     ['a negative retention', { changelog: { minRetention: -1 } }, 'changelog.minRetention must be'],
     ['an empty notify channel', { notifyChannel: '' }, 'notifyChannel must be a non-empty string'],
+    ['a misspelled option', { notifyChanel: 'events' }, 'notifyChanel is not an option'],
+    ['a changelog that is not an object', { changelog: null }, 'changelog must be an object'],
+    [
+      'a misspelled changelog option',
+      { changelog: { tabel: 'x' } },
+      'changelog.tabel is not an option',
+    ],
+    ['a strict flag that is not a boolean', { strict: 'yes' }, 'strict must be a boolean'],
+    ['a schema with a dot', { defaultSchema: 'a.b' }, 'defaultSchema must not contain a dot'],
+    ['a channel longer than 63 bytes', { notifyChannel: 'c'.repeat(64) }, 'longer than 63 bytes'],
+    [
+      'a channel that postgres.js cannot listen to',
+      { notifyChannel: 'constructor' },
+      'notifyChannel cannot be "constructor"',
+    ],
   ])('should reject %s', (_case, config, message) => {
     expect(() => defineLilypadDb({ ...config, tables: { orgs } })).toThrow(message);
   });
@@ -348,6 +399,87 @@ describe('defineLilypadDb', () => {
       { sync: { strategy: 'poll' } as never },
       'sync.strategy must be one of',
     ],
+    [
+      'a misspelled option',
+      { generatedPrimarykey: true } as never,
+      'tables.orgs.generatedPrimarykey is not an option',
+    ],
+    [
+      'a misspelled column option',
+      { cols: { id: { nullabel: true } as never } },
+      'tables.orgs.cols.id.nullabel is not an option',
+    ],
+    [
+      'an option of another strategy',
+      { sync: { strategy: 'listen', pollInterval: 5 } as never },
+      'tables.orgs.sync.pollInterval is not an option',
+    ],
+    [
+      'a sync without strategy',
+      { sync: { pollInterval: 5 } as never },
+      'sync.strategy is required',
+    ],
+    ['a sync that is not an object', { sync: null as never }, 'sync must be an object'],
+    ['a check that is not an object', { checks: [null as never] }, 'checks[0] must be an object'],
+    ['unique keys that are not a list', { unique: 'id' as never }, 'unique must be an array'],
+    [
+      'a unique flag that is not a boolean',
+      { cols: { id: { unique: 'no' as never } } },
+      'cols.id.unique must be a boolean',
+    ],
+    [
+      'a generatedPrimaryKey that is not a boolean',
+      { generatedPrimaryKey: 1 as never },
+      'generatedPrimaryKey must be a boolean',
+    ],
+    [
+      'a default with another option',
+      { cols: { id: { default: { sql: 'now()', when: 'insert' } as never } } },
+      'default must be true or',
+    ],
+    ['a column listed twice', { unique: [{ columns: ['id', 'id'] }] }, 'names "id" twice'],
+    ['a column name with a dot', { cols: { 'a.b': {} } }, 'cols.a.b must not contain a dot'],
+    ['a table name longer than 63 bytes', { tableName: 't'.repeat(64) }, 'longer than 63 bytes'],
+    [
+      'a referenced column listed twice',
+      {
+        foreignKeys: [
+          { columns: ['id', 'name'], references: { table: 'x', columns: ['id', 'id'] } },
+        ],
+      },
+      'references.columns names "id" twice',
+    ],
+    [
+      'an applyChanges that is not a boolean',
+      { sync: { strategy: 'listen', applyChanges: 'no' as never } },
+      'sync.applyChanges must be a boolean',
+    ],
+    [
+      'an index flag that is not a boolean',
+      { indexes: [{ columns: ['id'], unique: 1 as never }] },
+      'indexes[0].unique must be a boolean',
+    ],
+    [
+      'a constraint name with a dot',
+      { unique: [{ name: 'a.b', columns: ['id'] }] },
+      'unique[0].name must not contain a dot',
+    ],
+    [
+      'an index name longer than 63 bytes',
+      { indexes: [{ name: 'i'.repeat(64), columns: ['id'] }] },
+      'indexes[0].name "' + 'i'.repeat(64) + '" is longer than 63 bytes',
+    ],
+    [
+      'a referenced table name longer than 63 bytes',
+      { cols: { id: { references: { table: `app.${'r'.repeat(64)}`, column: 'id' } } } },
+      'cols.id.references.table "' + 'r'.repeat(64) + '" is longer than 63 bytes',
+    ],
+    [
+      'a referenced column with a dot',
+      { cols: { id: { references: { table: 'x', column: 'a.b' } } } },
+      'references.column must not contain a dot',
+    ],
+    ['an empty column name', { cols: { '': {} } }, 'tables.orgs.cols. must be a non-empty string'],
   ])('should reject a table with %s', (_case, changes, message) => {
     expect(() =>
       defineLilypadDb({ tables: { orgs: { ...(orgs as LilypadDbTableInputBase), ...changes } } })
@@ -375,6 +507,28 @@ describe('defineLilypadDb', () => {
       })
     ).toThrow('has 2 columns, but references 1');
   });
+
+  it.each<[string, Partial<LilypadDbTableInputBase>]>([
+    [
+      'a column',
+      {
+        cols: { ...users.cols, orgId: { references: { table: 'orgs', column: 'uid' } } },
+      },
+    ],
+    [
+      'a foreign key',
+      { foreignKeys: [{ columns: ['orgId'], references: { table: 'orgs', columns: ['uid'] } }] },
+    ],
+  ])(
+    'should reject %s that references an unknown column of a table of the config',
+    (_case, changes) => {
+      expect(() =>
+        defineLilypadDb({
+          tables: { orgs, users: { ...(users as LilypadDbTableInputBase), ...changes } },
+        })
+      ).toThrow('references the column "uid" of "orgs", which is not a column of that table');
+    }
+  );
 
   it('should require the referenced columns of a table outside the config', () => {
     expect(() =>

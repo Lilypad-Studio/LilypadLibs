@@ -5,7 +5,7 @@ import type {
   LilypadDbReference,
   LilypadDbReferentialAction,
   LilypadDbSchema,
-} from '@/dbGate/LilypadDbSchema';
+} from '@/dbConfig/LilypadDbSchema';
 import {
   LILYPAD_DEFAULT_CHANGELOG_TABLE,
   LILYPAD_DEFAULT_DB_CONFIG_NAME,
@@ -201,7 +201,7 @@ export type LilypadDbTableDefinition<T, PK extends keyof T = keyof T> = Omit<
   readonly [lilypadRowType]?: T | undefined;
   readonly primaryKey: PK;
   readonly hooks?: LilypadDbTableHooks<T> | undefined;
-  readonly cols: { readonly [K in keyof T]: LilypadDbColumn };
+  readonly cols: { readonly [K in keyof T]-?: LilypadDbColumn };
 };
 
 /** The input of a table, whatever its row type. */
@@ -428,18 +428,38 @@ function withConfigHooks(
   return Object.freeze({ ...definition, hooks: bound.hooks });
 }
 
-/** The columns, each with the `type` that follows from its `pgType` when it has none. */
+/**
+ * The columns, each with the `type` that follows from its `pgType` when it has none: frozen copies,
+ * so that a change of the input (or of a column shared by two tables) does not reach them.
+ */
 function resolveColumns(
   cols: Readonly<Record<string, LilypadDbColumn>>
-): Record<string, LilypadDbColumn> {
-  return Object.fromEntries(
-    Object.entries(cols).map(([name, column]) => {
-      const type =
-        column.type ??
-        (column.pgType === undefined ? undefined : lilypadColumnTypesOfPgType(column.pgType)?.[0]);
-      return [name, type === column.type ? column : { ...column, type }];
-    })
+): Readonly<Record<string, LilypadDbColumn>> {
+  return Object.freeze(
+    Object.fromEntries(
+      Object.entries(cols).map(([name, column]) => {
+        const type =
+          column.type ??
+          (column.pgType === undefined
+            ? undefined
+            : lilypadColumnTypesOfPgType(column.pgType)?.[0]);
+        const resolved: LilypadDbColumn = {
+          ...column,
+          ...(type === undefined ? {} : { type }),
+          ...(column.references ? { references: Object.freeze({ ...column.references }) } : {}),
+          ...(typeof column.default === 'object'
+            ? { default: Object.freeze({ ...column.default }) }
+            : {}),
+        };
+        return [name, Object.freeze(resolved)];
+      })
+    )
   );
+}
+
+/** A frozen copy of each item of a list, in a frozen list. */
+function frozenList<T extends object>(items: readonly T[]): readonly T[] {
+  return Object.freeze(items.map((item) => Object.freeze({ ...item })));
 }
 
 /** Splits `schema.table`, or applies the default schema. */
@@ -506,30 +526,27 @@ export function defineLilypadDb<Tables extends Record<string, LilypadDbTableInpu
         `defineLilypadDb: ${owner} references "${name}", which is not a table of the config: give the referenced columns.`
       );
     }
-    return { table, columns: resolvedColumns };
+    const unknown =
+      target && resolvedColumns.find((column) => !Object.hasOwn(target.table.cols, column));
+    if (unknown !== undefined) {
+      throw new Error(
+        `defineLilypadDb: ${owner} references the column "${unknown}" of "${name}", which is not a column of that table.`
+      );
+    }
+    return Object.freeze({ table, columns: Object.freeze([...resolvedColumns]) });
   };
 
   const tables: Record<string, LilypadDbTableDefinitionBase> = {};
   for (const { key, table, schema, tableName, qualifiedName } of located) {
-    const {
-      sync,
-      strict,
-      unique,
-      foreignKeys,
-      indexes,
-      checks,
-      schemaName: _schemaName,
-      tableName: _tableName,
-      ...rest
-    } = table;
+    const { sync, strict, unique, foreignKeys, indexes, checks } = table;
     const owner = `the table "${key}"`;
     const resolvedUnique: LilypadDbResolvedUniqueKey[] = [
       ...Object.entries(table.cols)
         .filter(([, column]) => column.unique)
-        .map(([name]) => ({ columns: [name] })),
+        .map(([name]) => ({ columns: Object.freeze([name]) })),
       ...(unique ?? []).map((uniqueKey) => ({
         name: uniqueKey.name,
-        columns: [...uniqueKey.columns],
+        columns: Object.freeze([...uniqueKey.columns]),
       })),
     ];
     const resolvedForeignKeys: LilypadDbResolvedForeignKey[] = [
@@ -540,7 +557,7 @@ export function defineLilypadDb<Tables extends Record<string, LilypadDbTableInpu
         }
         return [
           {
-            columns: [name],
+            columns: Object.freeze([name]),
             references: referenced(
               reference.table,
               `${owner} (column "${name}")`,
@@ -553,7 +570,7 @@ export function defineLilypadDb<Tables extends Record<string, LilypadDbTableInpu
       }),
       ...(foreignKeys ?? []).map((foreignKey) => ({
         name: foreignKey.name,
-        columns: [...foreignKey.columns],
+        columns: Object.freeze([...foreignKey.columns]),
         references: referenced(
           foreignKey.references.table,
           owner,
@@ -571,24 +588,27 @@ export function defineLilypadDb<Tables extends Record<string, LilypadDbTableInpu
       }
     }
     tables[key] = Object.freeze({
-      ...rest,
       [LILYPAD_DB_TABLE]: true as const,
       key,
       tableName,
       schemaName: schema,
       qualifiedName,
+      primaryKey: table.primaryKey,
+      generatedPrimaryKey: table.generatedPrimaryKey ?? false,
       cols: resolveColumns(table.cols),
       sync: Object.freeze({ ...(sync ?? { strategy: 'listen' }) }),
       strict: strict ?? input.strict ?? false,
-      unique: resolvedUnique,
-      foreignKeys: resolvedForeignKeys,
-      indexes: (indexes ?? []).map((index) => ({
-        name: index.name,
-        columns: [...index.columns],
-        unique: index.unique ?? false,
-        using: index.using ?? 'btree',
-      })),
-      checks: [...(checks ?? [])],
+      unique: frozenList(resolvedUnique),
+      foreignKeys: frozenList(resolvedForeignKeys),
+      indexes: frozenList(
+        (indexes ?? []).map((index) => ({
+          name: index.name,
+          columns: Object.freeze([...index.columns]),
+          unique: index.unique ?? false,
+          using: index.using ?? 'btree',
+        }))
+      ),
+      checks: frozenList(checks ?? []),
       db: settings,
     });
   }

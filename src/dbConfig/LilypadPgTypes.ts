@@ -106,8 +106,9 @@ const ALIASES = new Map<string, string>(
 const SERIAL_TYPES = new Set(entries.flatMap(([, type]) => type.serials ?? []));
 
 /**
- * The column types that fit a column of unknown type, by `pg_type.typcategory`: a domain has the
- * category of its base type, and PostgreSQL sends its values as those of its base type.
+ * The column types that fit a column of unknown type, by `pg_type.typcategory`, the last resort:
+ * a domain is judged by its base type (PostgreSQL sends its values as those of its base type), and
+ * only a type whose base type is not known either (a domain of an enum...) by its category.
  */
 const CATEGORY_TYPES: Readonly<Record<string, ColumnTypes>> = {
   A: ['array'],
@@ -142,6 +143,10 @@ export function normalizeLilypadPgType(type: string): string {
   if (name === 'timestamp' || name === 'time') {
     return `${name}${args} ${rest || 'without time zone'}${arrays}`;
   }
+  // `float(p)` is a `real` up to 24 bits of precision, a `double precision` above
+  if (name === 'float' && args) {
+    return `${Number(args.slice(1, -1)) <= 24 ? 'real' : 'double precision'}${arrays}`;
+  }
   const resolved = ALIASES.get(name) ?? name;
   if (resolved === 'character' && !args) {
     return `character(1)${arrays}`;
@@ -172,16 +177,19 @@ export function lilypadColumnTypesOfPgType(pgType: string): ColumnTypes | undefi
 
 /**
  * When postgres.js does not return a column of `pgType` as `type`, the column types that fit it
- * (the one it returns first); otherwise, or when the type is not known, `undefined`. A type that
- * is not known is judged by its `pg_type.typcategory`, when given.
+ * (the one it returns first); otherwise, or when the type is not known, `undefined`. A domain is
+ * judged by its `baseType` (the type it is based on, through nested domains), a type that is not
+ * known by its `pg_type.typcategory`, when given.
  */
 export function lilypadColumnTypeMismatch(
   type: LilypadDbColumnType,
   pgType: string,
-  category?: string
+  category?: string,
+  baseType?: string | null
 ): ColumnTypes | undefined {
   const fitting =
     lilypadColumnTypesOfPgType(pgType) ??
+    (baseType ? lilypadColumnTypesOfPgType(baseType) : undefined) ??
     (category !== undefined && Object.hasOwn(CATEGORY_TYPES, category)
       ? CATEGORY_TYPES[category]
       : undefined);

@@ -14,7 +14,7 @@ import type {
   LilypadDbCheck,
   LilypadDbColumn,
   LilypadDbReferentialAction,
-} from '@/dbGate/LilypadDbSchema';
+} from '@/dbConfig/LilypadDbSchema';
 import type {
   LilypadConstraintInfo,
   LilypadIndexInfo,
@@ -250,7 +250,12 @@ export function evaluateLilypadTableShape(
         );
       }
     } else if (column.type !== undefined) {
-      const fitting = lilypadColumnTypeMismatch(column.type, installed.type, installed.category);
+      const fitting = lilypadColumnTypeMismatch(
+        column.type,
+        installed.type,
+        installed.category,
+        installed.baseType
+      );
       if (fitting) {
         push(
           'column-type-mismatch',

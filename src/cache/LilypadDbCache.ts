@@ -37,7 +37,7 @@ import {
   LilypadDbMissingPrimaryKeyError,
   type LilypadDbInsertData,
   type LilypadDbUpdateData,
-} from '@/dbGate/LilypadDbSchema';
+} from '@/dbConfig/LilypadDbSchema';
 import type { LilypadDbTable } from '@/dbGate/LilypadDbTable';
 import { LilypadFlowControl } from '@/flow/LilypadFlowControl';
 import { assertNumberOption } from '@/internal/LilypadValidation';

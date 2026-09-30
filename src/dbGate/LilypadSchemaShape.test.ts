@@ -192,6 +192,39 @@ describe('evaluateLilypadTableShape', () => {
     ]);
   });
 
+  it('should judge the type of a domain by its base type', () => {
+    const table = defineLilypadDb({
+      tables: {
+        t: {
+          tableName: 't',
+          primaryKey: 'id',
+          cols: { id: { type: 'string' }, amount: { type: 'number' } },
+        },
+      },
+    }).tables.t;
+    const domainFacts = (idBase: string, amountBase: string): LilypadTableFacts => ({
+      schema: 'public',
+      triggers: [],
+      columns: [
+        column('id', 'app.big_id', { notNull: true, category: 'N', baseType: idBase }),
+        column('amount', 'app.money_amount', { category: 'N', baseType: amountBase }),
+      ],
+      constraints: [constraint('t_pkey', 'p', ['id'])],
+      indexes: [],
+    });
+    const messages = (facts: LilypadTableFacts) =>
+      evaluateLilypadTableShape('public.t', 'id', table, facts).problems.map(
+        (problem) => problem.message
+      );
+
+    // postgres.js reads a domain of bigint as a string, of integer as a number
+    expect(messages(domainFacts('bigint', 'integer'))).toEqual([]);
+    expect(messages(domainFacts('integer', 'numeric'))).toEqual([
+      'The column "id" of "public.t" is app.big_id, declared as string: postgres.js reads it as number (declare number).',
+      'The column "amount" of "public.t" is app.money_amount, declared as number: postgres.js reads it as string (declare string or bigint).',
+    ]);
+  });
+
   it('should report the nullability and the defaults that differ', () => {
     const facts = usersFacts();
     facts.columns = [

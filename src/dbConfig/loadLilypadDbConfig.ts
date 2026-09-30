@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { isLilypadDbConfig, type LilypadDbConfig } from '@/dbConfig/LilypadDbConfig';
 import { LILYPAD_DEFAULT_DB_CONFIG_NAME } from '@/dbConfig/LilypadDbConfigDefaults';
 
-/** The extensions of the config files, in the order they are looked for. */
+/** The extensions of the config files. */
 const EXTENSIONS = ['ts', 'mts', 'mjs', 'js'];
 const CONFIG_NAME = /^[A-Za-z0-9_-]+$/;
 
@@ -22,7 +22,8 @@ export function lilypadDbConfigFileNames(name: string): string[] {
  * The file of a config: `config` is the name of a config (`default` when absent), looked for in
  * `cwd`, or the path of a file.
  *
- * @throws If there is no such file.
+ * @throws If there is no such file, or if several files have that name (e.g. `lilypad.config.ts`
+ * and `lilypad.config.mjs`).
  */
 export function findLilypadDbConfig(config: string | undefined, cwd: string): string {
   const reference = config ?? LILYPAD_DEFAULT_DB_CONFIG_NAME;
@@ -34,13 +35,19 @@ export function findLilypadDbConfig(config: string | undefined, cwd: string): st
     return path;
   }
   const candidates = lilypadDbConfigFileNames(reference);
-  const found = candidates.map((file) => resolve(cwd, file)).find((path) => existsSync(path));
-  if (!found) {
+  const found = candidates.filter((file) => existsSync(resolve(cwd, file)));
+  const [file, ...others] = found;
+  if (file === undefined) {
     throw new Error(
       `No config "${reference}" in ${cwd}: expected one of ${candidates.join(', ')}.`
     );
   }
-  return found;
+  if (others.length > 0) {
+    throw new Error(
+      `Several files of the config "${reference}" in ${cwd}: ${found.join(', ')}. Keep only one.`
+    );
+  }
+  return resolve(cwd, file);
 }
 
 /** The errors of a module that Node.js cannot resolve without a bundler. */
@@ -84,7 +91,7 @@ export async function loadLilypadDbConfig(
   try {
     module = (await import(pathToFileURL(path).href)) as Record<string, unknown>;
   } catch (error) {
-    if ((error as { code?: unknown }).code === 'ERR_UNKNOWN_FILE_EXTENSION') {
+    if ((error as { code?: unknown } | null)?.code === 'ERR_UNKNOWN_FILE_EXTENSION') {
       throw new Error(
         `Node.js ${process.version} cannot load the TypeScript config ${path}: use Node.js 22.18 or later, run it with NODE_OPTIONS=--experimental-strip-types, or write the config as .mjs.`,
         { cause: error }

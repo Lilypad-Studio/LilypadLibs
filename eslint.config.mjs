@@ -13,7 +13,6 @@ const edgeModules = [
   'src/entries/!(db).ts',
   'src/cache/*.ts',
   'src/dbConfig/*.ts',
-  'src/dbGate/LilypadDbSchema.ts',
   'src/flow/**/*.ts',
   'src/internal/**/*.ts',
   'src/logger/**/*.ts',
@@ -105,7 +104,7 @@ export default defineConfig([
               message: 'The edge-compatible modules must not use Node.js APIs.',
             },
             {
-              group: ['postgres', '@/dbGate/*', '!@/dbGate/LilypadDbSchema', '@/cli/*'],
+              group: ['postgres', '@/dbGate/*', '@/cli/*'],
               allowTypeImports: true,
               message: 'Only the `db` entry may reach postgres.js and the gate.',
             },

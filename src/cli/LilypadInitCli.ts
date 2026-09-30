@@ -1,5 +1,5 @@
 import { existsSync, writeFileSync } from 'node:fs';
-import { basename, extname, isAbsolute, relative, resolve } from 'node:path';
+import { basename, dirname, extname, isAbsolute, relative, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { lilypadDbConfigTemplate } from '@/cli/lilypadDbConfigTemplate';
 import { LILYPAD_DEFAULT_DB_CONFIG_NAME } from '@/dbConfig/LilypadDbConfigDefaults';
@@ -63,11 +63,12 @@ export function lilypadInitTarget(
     throw new Error(`The config file must end with .ts, .mts, .mjs or .js (got ${reference}).`);
   }
   const match = CONFIG_FILE.exec(basename(path));
-  return {
-    path,
-    name: match?.[1] ?? LILYPAD_DEFAULT_DB_CONFIG_NAME,
-    existing: exists(path) ? [path] : [],
-  };
+  const name = match?.[1] ?? LILYPAD_DEFAULT_DB_CONFIG_NAME;
+  // A file named as a config: the loader refuses two files of it in one folder
+  const siblings = match
+    ? lilypadDbConfigFileNames(name).map((file) => resolve(dirname(path), file))
+    : [path];
+  return { path, name, existing: siblings.filter((sibling) => exists(sibling)) };
 }
 
 /**

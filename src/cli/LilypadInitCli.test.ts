@@ -53,6 +53,14 @@ describe('lilypadInitTarget', () => {
     ]);
   });
 
+  it('should find the files of the same config next to a path named as a config', () => {
+    const existing = resolve(cwd, 'db/lilypad.config.ts');
+    const exists = (path: string) => path === existing;
+
+    expect(lilypadInitTarget('./db/lilypad.config.mjs', cwd, exists).existing).toEqual([existing]);
+    expect(lilypadInitTarget('./db/database.mjs', cwd, exists).existing).toEqual([]);
+  });
+
   it('should reject a path that Node.js cannot load as a module', () => {
     expect(() => lilypadInitTarget('./db/config.json', cwd, none)).toThrow(
       'must end with .ts, .mts, .mjs or .js'

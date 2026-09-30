@@ -9,7 +9,7 @@ import {
   type LilypadDbPartialRow,
   type LilypadDbUpdateData,
   type LilypadDbWriteResult,
-} from '@/dbGate/LilypadDbSchema';
+} from '@/dbConfig/LilypadDbSchema';
 import type postgres from 'postgres';
 
 /** Rows read at a time by `selectAll`. */

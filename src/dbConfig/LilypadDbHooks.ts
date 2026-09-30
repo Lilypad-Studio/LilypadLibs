@@ -5,7 +5,7 @@ import {
   type LilypadDbTableDefinitionBase,
   type LilypadDbTableName,
 } from '@/dbConfig/LilypadDbConfig';
-import type { LilypadDbPartialRow } from '@/dbGate/LilypadDbSchema';
+import type { LilypadDbPartialRow } from '@/dbConfig/LilypadDbSchema';
 
 /**
  * The functions applied to the rows of a table. They are not part of the config file, which
@@ -53,7 +53,8 @@ const HOOK_NAMES = new Set(['write', 'select']);
  * everywhere: a gate created with the bound config also applies them to the definitions of the
  * original one (`db.tables.users`).
  *
- * Binding a config that already has hooks replaces the hooks given, and keeps the others.
+ * Binding a config that already has hooks replaces the hooks given, and keeps the others (an
+ * `undefined` hook is not given).
  *
  * @example
  * ```typescript
@@ -94,6 +95,7 @@ export function bindLilypadDbHooks<C extends LilypadDbConfig>(
     if (typeof tableHooks !== 'object' || tableHooks === null) {
       throw new Error(`${OWNER}: the hooks of "${key}" must be an object: { write?, select? }.`);
     }
+    const given: Record<string, unknown> = {};
     for (const [name, hook] of Object.entries(tableHooks)) {
       if (!HOOK_NAMES.has(name)) {
         throw new Error(
@@ -103,10 +105,18 @@ export function bindLilypadDbHooks<C extends LilypadDbConfig>(
       if (hook !== undefined && typeof hook !== 'function') {
         throw new Error(`${OWNER}: "${key}.${name}" must be a function.`);
       }
+      // An undefined hook is a missing one: it keeps the hook bound before
+      if (hook !== undefined) {
+        given[name] = hook;
+      }
+    }
+    // No hook: the table stays as it is (an empty `hooks` would hide those of the gate's config)
+    if (Object.keys(given).length === 0) {
+      continue;
     }
     tables[key] = Object.freeze({
       ...definition,
-      hooks: Object.freeze({ ...definition.hooks, ...(tableHooks as LilypadDbTableHooksBase) }),
+      hooks: Object.freeze({ ...definition.hooks, ...(given as LilypadDbTableHooksBase) }),
     });
   }
   return Object.freeze({ ...config, tables: Object.freeze(tables) });

@@ -26,6 +26,7 @@ describe('lilypadColumnTypesOfPgType', () => {
     ['date', ['date']],
     ['bool', ['boolean']],
     ['jsonb', ['json']],
+    ['float(10)', ['number']],
     ['text[]', ['array']],
     ['user_role[]', ['array']],
   ])('should read %s as %j', (pgType, types) => {
@@ -63,6 +64,10 @@ describe('normalizeLilypadPgType', () => {
     ['text[][]', 'text[][]'],
     ['uuid', 'uuid'],
     ['Public.CITEXT', 'public.citext'],
+    ['float', 'double precision'],
+    ['float(24)', 'real'],
+    ['float(25)', 'double precision'],
+    ['FLOAT(10)[]', 'real[]'],
   ])('should read %s as %s', (declared, expected) => {
     expect(normalizeLilypadPgType(declared)).toBe(expected);
   });
@@ -77,6 +82,24 @@ describe('lilypadColumnTypeMismatch', () => {
     expect(lilypadColumnTypeMismatch('number', 'app.positive_int', 'N')).toBeUndefined();
     expect(lilypadColumnTypeMismatch('number', 'vector(3)', 'U')).toBeUndefined();
     expect(lilypadColumnTypeMismatch('number', 'mood')).toBeUndefined();
+  });
+
+  it('should judge a domain by its base type, which its category does not tell', () => {
+    // A domain of int8 is in N, of time in D: postgres.js reads both as strings
+    expect(lilypadColumnTypeMismatch('bigint', 'app.big_id', 'N', 'bigint')).toBeUndefined();
+    expect(lilypadColumnTypeMismatch('number', 'app.big_id', 'N', 'bigint')).toEqual([
+      'bigint',
+      'string',
+    ]);
+    expect(lilypadColumnTypeMismatch('string', 'app.clock', 'D', 'time without time zone')).toBe(
+      undefined
+    );
+    expect(lilypadColumnTypeMismatch('string', 'app.positive', 'N', 'integer')).toEqual(['number']);
+    // A base type that is not known either: its category
+    expect(lilypadColumnTypeMismatch('number', 'app.mood_domain', 'E', 'app.mood')).toEqual([
+      'string',
+    ]);
+    expect(lilypadColumnTypeMismatch('number', 'app.big_id', 'N', null)).toBeUndefined();
   });
 });
 

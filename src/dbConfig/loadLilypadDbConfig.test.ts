@@ -26,6 +26,9 @@ describe('loadLilypadDbConfig', () => {
     writeFileSync(join(dir, 'not-a-config.mjs'), 'export default { name: "plain" };\n');
     writeFileSync(join(dir, 'broken.mjs'), 'export default (;\n');
     writeFileSync(join(dir, 'app-code.mjs'), "throw new Error('server-only');\n");
+    writeFileSync(join(dir, 'throws-null.mjs'), 'throw null;\n');
+    writeFileSync(join(dir, 'lilypad.twice.config.mjs'), configModule('twice'));
+    writeFileSync(join(dir, 'lilypad.twice.config.js'), configModule('twice'));
     // Written as ESM: `.js` files are loaded as modules by the "type" of this package.json
     writeFileSync(join(dir, 'package.json'), '{ "type": "module" }\n');
   });
@@ -78,6 +81,8 @@ describe('loadLilypadDbConfig', () => {
       'must export a config made with defineLilypadDb',
     ],
     ['a module that does not load', { config: './broken.mjs' }, 'Could not load the config'],
+    ['a module that throws null', { config: './throws-null.mjs' }, 'Could not load the config'],
+    ['a config of two files', { config: 'twice' }, 'Several files of the config "twice"'],
   ])('should reject %s', async (_case, options, message) => {
     await expect(loadLilypadDbConfig({ ...options, cwd: dir })).rejects.toThrow(message);
   });
@@ -122,6 +127,9 @@ describe('loadLilypadDbConfig', () => {
     expect(findLilypadDbConfig(undefined, dir)).toBe(join(dir, 'lilypad.config.mjs'));
     expect(() => findLilypadDbConfig('none', dir)).toThrow(
       'expected one of lilypad.none.config.ts, lilypad.none.config.mts'
+    );
+    expect(() => findLilypadDbConfig('twice', dir)).toThrow(
+      'lilypad.twice.config.mjs, lilypad.twice.config.js. Keep only one.'
     );
   });
 });

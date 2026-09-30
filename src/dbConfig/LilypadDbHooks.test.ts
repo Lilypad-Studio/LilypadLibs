@@ -8,7 +8,7 @@ import {
   type LilypadDbTableInputBase,
 } from './LilypadDbConfig';
 import { bindLilypadDbHooks } from './LilypadDbHooks';
-import type { LilypadDbPartialRow } from '@/dbGate/LilypadDbSchema';
+import type { LilypadDbPartialRow } from '@/dbConfig/LilypadDbSchema';
 
 type Org = { id: number; name: string };
 type Event = { id: string; title: string };
@@ -75,6 +75,26 @@ describe('bindLilypadDbHooks', () => {
 
     expect(second.tables.events.hooks).toEqual({ write: trimTitle, select: upper });
     expect(first.tables.events.hooks?.select).toBe(toEvent);
+  });
+
+  it('should keep a hook bound before when it is given as undefined', () => {
+    const first = bindLilypadDbHooks(db, { events: { write: trimTitle, select: toEvent } });
+
+    const second = bindLilypadDbHooks(first, { events: { write: undefined, select: toEvent } });
+
+    expect(second.tables.events.hooks).toEqual({ write: trimTitle, select: toEvent });
+    expect(second.tables.events.hooks?.write).toBe(trimTitle);
+  });
+
+  it('should leave a table given no hook as it is', () => {
+    const appDb = bindLilypadDbHooks(db, { events: { select: toEvent } });
+
+    const none = bindLilypadDbHooks(db, { events: {}, orgs: { write: undefined } });
+
+    expect(none.tables.events).toBe(db.tables.events);
+    expect(none.tables.orgs).toBe(db.tables.orgs);
+    // An empty `hooks` would hide those of the gate's config
+    expect(resolveLilypadDbTable('Test', none.tables.events, appDb).hooks?.select).toBe(toEvent);
   });
 
   it('should type the hooks with the rows of each table', () => {

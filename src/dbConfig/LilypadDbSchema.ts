@@ -105,7 +105,7 @@ export type LilypadDbSchema<T, PK extends keyof T = keyof T> = {
    */
   generatedPrimaryKey?: boolean | undefined;
   /**
-   * The columns of the table, one for each property of `T`.
+   * The columns of the table, one for each property of `T` (optional ones included).
    * - Without a `select` hook (see `bindLilypadDbHooks`), only these columns are selected.
    * - Only these columns are written by inserts and updates: any other property of the data is ignored.
    *
@@ -116,7 +116,7 @@ export type LilypadDbSchema<T, PK extends keyof T = keyof T> = {
    * The `type` or `pgType` of each column must fit the property of `T` (see
    * {@link LilypadDbColumnFor}).
    */
-  cols: { [K in keyof T]: LilypadDbColumnFor<T[K]> };
+  cols: { [K in keyof T]-?: LilypadDbColumnFor<T[K]> };
   /** The sets of columns that are unique together (see also the `unique` of a column). */
   unique?: readonly LilypadDbUniqueKey<T>[] | undefined;
   /** The foreign keys of the table (see also the `references` of a column). */

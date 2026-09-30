@@ -34,6 +34,11 @@ export type LilypadColumnInfo = {
   type: string;
   /** `pg_type.typcategory`, e.g. `N` (numeric), `S` (string), `A` (array). */
   category: string;
+  /**
+   * For a domain, the type it is based on, through nested domains (`format_type`, without
+   * modifiers): PostgreSQL sends the values of a domain as those of its base type. `null` otherwise.
+   */
+  baseType?: string | null | undefined;
   notNull: boolean;
   /** Whether it has a default expression (`atthasdef`; a generated column has one too). */
   hasDefault: boolean;
@@ -288,6 +293,16 @@ async function readTableFacts(
           'name', a.attname,
           'type', format_type(a.atttypid, a.atttypmod),
           'category', ty.typcategory,
+          'baseType', CASE WHEN ty.typtype = 'd' THEN (
+            WITH RECURSIVE base AS (
+              SELECT ty.typtype, ty.typbasetype, ty.oid
+              UNION ALL
+              SELECT b.typtype, b.typbasetype, b.oid
+              FROM base JOIN pg_type b ON b.oid = base.typbasetype
+              WHERE base.typtype = 'd'
+            )
+            SELECT format_type(base.oid, NULL) FROM base WHERE base.typtype <> 'd'
+          ) END,
           'notNull', a.attnotnull,
           'hasDefault', a.atthasdef,
           'identity', a.attidentity <> '',

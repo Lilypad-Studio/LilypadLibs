@@ -49,7 +49,7 @@ export {
   LilypadDbEmptyWriteError,
   LilypadDbMissingPrimaryKeyError,
   LilypadDbNotFoundError,
-} from '../dbGate/LilypadDbSchema';
+} from '../dbConfig/LilypadDbSchema';
 export type {
   LilypadDbCheck,
   LilypadDbColumn,
@@ -69,4 +69,4 @@ export type {
   LilypadDbUniqueKey,
   LilypadDbUpdateData,
   LilypadDbWriteResult,
-} from '../dbGate/LilypadDbSchema';
+} from '../dbConfig/LilypadDbSchema';

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } 
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import postgres from 'postgres';
 import { LilypadDbGate } from './LilypadDbGate';
-import { LilypadDbEmptyWriteError, LilypadDbNotFoundError } from './LilypadDbSchema';
+import { LilypadDbEmptyWriteError, LilypadDbNotFoundError } from '@/dbConfig/LilypadDbSchema';
 import { defineLilypadDb, defineLilypadTable } from '@/dbConfig/LilypadDbConfig';
 import { bindLilypadDbHooks, type LilypadDbTableHooks } from '@/dbConfig/LilypadDbHooks';
 import { LilypadDbCache } from '@/cache/LilypadDbCache';
@@ -1753,6 +1753,46 @@ describe('LilypadDbGate (integration)', () => {
       expect(codes(await check())).toEqual([]);
       // With strict, the index of the database that the description lacks
       expect(codes(await check(true))).toEqual(['public.shape_members:undeclared-index']);
+    });
+
+    it('should judge the columns of a domain by its base type, through nested domains', async () => {
+      await admin.unsafe(`
+        CREATE DOMAIN shape_big_id AS int8 CHECK (VALUE > 0);
+        CREATE DOMAIN shape_small_id AS shape_big_id;
+        CREATE DOMAIN shape_count AS int4;
+        CREATE TABLE shape_domains (id shape_small_id PRIMARY KEY, n shape_count, at timetz);
+      `);
+      type Row = { id: string; n: string; at: string };
+      const domainsDb = defineLilypadDb({
+        tables: {
+          domains: defineLilypadTable<Row, 'id'>({
+            tableName: 'shape_domains',
+            primaryKey: 'id',
+            cols: { id: { type: 'string' }, n: { type: 'string' }, at: { type: 'string' } },
+            sync: { strategy: 'none' },
+          }),
+        },
+      });
+
+      try {
+        const result = await checkLilypadSchema(gate, lilypadSchemaCheckOptions(domainsDb));
+
+        expect(result.problems.map((problem) => problem.message)).toEqual([
+          'The column "n" of "public.shape_domains" is shape_count, declared as string: postgres.js reads it as number (declare number).',
+        ]);
+        // What postgres.js returns indeed
+        await admin`INSERT INTO shape_domains VALUES (1, 2, '12:00+00')`;
+        const [row] = await admin`SELECT * FROM shape_domains`;
+        expect([typeof row!.id, typeof row!.n, typeof row!.at]).toEqual([
+          'string',
+          'number',
+          'string',
+        ]);
+      } finally {
+        await admin.unsafe(
+          'DROP TABLE shape_domains; DROP DOMAIN shape_small_id; DROP DOMAIN shape_big_id; DROP DOMAIN shape_count;'
+        );
+      }
     });
   });
 });

@@ -4,8 +4,16 @@ import type {
   LilypadDbTableSync,
 } from '@/dbConfig/LilypadDbConfig';
 import { LILYPAD_DEFAULT_DB_SCHEMA } from '@/dbConfig/LilypadDbConfigDefaults';
+import type {
+  LilypadDbCheck,
+  LilypadDbColumn,
+  LilypadDbColumnReference,
+  LilypadDbForeignKey,
+  LilypadDbIndex,
+  LilypadDbReference,
+  LilypadDbUniqueKey,
+} from '@/dbConfig/LilypadDbSchema';
 import { LILYPAD_DB_COLUMN_TYPES, lilypadColumnTypeMismatch } from '@/dbConfig/LilypadPgTypes';
-import type { LilypadDbColumn, LilypadDbReference } from '@/dbGate/LilypadDbSchema';
 import { assertNumberOption } from '@/internal/LilypadValidation';
 
 const OWNER = 'defineLilypadDb';
@@ -14,6 +22,96 @@ const COLUMN_TYPES = new Set<string>(LILYPAD_DB_COLUMN_TYPES);
 const ACTIONS = new Set(['no action', 'restrict', 'cascade', 'set null', 'set default']);
 const INDEX_METHODS = new Set(['btree', 'hash', 'gin', 'gist', 'brin', 'spgist']);
 const PRUNING_MODES = new Set(['detect', 'trigger', 'cron', 'external']);
+const STRATEGIES = new Set(['listen', 'changelog', 'none']);
+/** PostgreSQL truncates longer identifiers (`NAMEDATALEN - 1`), and `pg_notify` rejects them. */
+const MAX_IDENTIFIER_BYTES = 63;
+const encoder = new TextEncoder();
+
+/** The options of an object of the config: the compiler checks that it lists every one of its type. */
+function optionsOf<T>(options: Record<keyof T & string, true>): ReadonlySet<string> {
+  return new Set(Object.keys(options));
+}
+
+type ConfigInput = LilypadDbConfigInput<Record<string, LilypadDbTableInputBase>>;
+type SyncOf<S> = Extract<LilypadDbTableSync, { strategy: S }>;
+
+const CONFIG_OPTIONS = optionsOf<ConfigInput>({
+  name: true,
+  defaultSchema: true,
+  notifyChannel: true,
+  changelog: true,
+  strict: true,
+  tables: true,
+});
+const CHANGELOG_OPTIONS = optionsOf<NonNullable<ConfigInput['changelog']>>({
+  table: true,
+  pruning: true,
+  minRetention: true,
+});
+const TABLE_OPTIONS = optionsOf<LilypadDbTableInputBase>({
+  tableName: true,
+  schemaName: true,
+  primaryKey: true,
+  generatedPrimaryKey: true,
+  cols: true,
+  unique: true,
+  foreignKeys: true,
+  indexes: true,
+  checks: true,
+  sync: true,
+  strict: true,
+});
+const COLUMN_OPTIONS = optionsOf<LilypadDbColumn>({
+  type: true,
+  pgType: true,
+  converted: true,
+  nullable: true,
+  default: true,
+  unique: true,
+  references: true,
+});
+const COLUMN_REFERENCE_OPTIONS = optionsOf<LilypadDbColumnReference>({
+  table: true,
+  column: true,
+  onDelete: true,
+  onUpdate: true,
+});
+const REFERENCE_OPTIONS = optionsOf<LilypadDbReference>({
+  table: true,
+  columns: true,
+  onDelete: true,
+  onUpdate: true,
+});
+const UNIQUE_OPTIONS = optionsOf<LilypadDbUniqueKey<unknown>>({ name: true, columns: true });
+const INDEX_OPTIONS = optionsOf<LilypadDbIndex<unknown>>({
+  name: true,
+  columns: true,
+  unique: true,
+  using: true,
+});
+const FOREIGN_KEY_OPTIONS = optionsOf<LilypadDbForeignKey<unknown>>({
+  name: true,
+  columns: true,
+  references: true,
+});
+const CHECK_OPTIONS = optionsOf<LilypadDbCheck>({ name: true, expression: true });
+const SYNC_OPTIONS: Readonly<Record<LilypadDbTableSync['strategy'], ReadonlySet<string>>> = {
+  listen: optionsOf<SyncOf<'listen'>>({
+    strategy: true,
+    maxAge: true,
+    connect: true,
+    applyChanges: true,
+  }),
+  changelog: optionsOf<SyncOf<'changelog'>>({
+    strategy: true,
+    maxAge: true,
+    pollInterval: true,
+    poll: true,
+    maxGap: true,
+    lookback: true,
+  }),
+  none: optionsOf<SyncOf<'none'>>({ strategy: true }),
+};
 
 function fail(message: string): never {
   throw new Error(`${OWNER}: ${message}`);
@@ -23,9 +121,78 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-function assertName(value: unknown, what: string): void {
+function assertName(value: unknown, what: string): asserts value is string {
   if (!isNonEmptyString(value)) {
     fail(`${what} must be a non-empty string (got ${JSON.stringify(value)}).`);
+  }
+}
+
+/** A name that PostgreSQL keeps as it is: 63 bytes at most. */
+function assertLength(value: string, what: string): void {
+  if (encoder.encode(value).length > MAX_IDENTIFIER_BYTES) {
+    fail(
+      `${what} "${value}" is longer than ${MAX_IDENTIFIER_BYTES} bytes, which PostgreSQL truncates.`
+    );
+  }
+}
+
+/** An unqualified identifier: the library splits the names it quotes on their dots. */
+function assertIdentifier(value: unknown, what: string): asserts value is string {
+  assertName(value, what);
+  if (value.includes('.')) {
+    fail(`${what} must not contain a dot (got "${value}").`);
+  }
+  assertLength(value, what);
+}
+
+function assertOptionalIdentifier(value: unknown, what: string): void {
+  if (value !== undefined) {
+    assertIdentifier(value, what);
+  }
+}
+
+function assertObject(value: unknown, what: string): asserts value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    fail(`${what} must be an object.`);
+  }
+}
+
+/**
+ * A config in JavaScript is not type-checked: a misspelled option would be ignored. `what` is the
+ * path of the object (empty for the config itself).
+ */
+function assertOptions(value: object, options: ReadonlySet<string>, what: string): void {
+  for (const key of Object.keys(value)) {
+    if (!options.has(key)) {
+      fail(
+        `${what ? `${what}.` : ''}${key} is not an option (expected ${[...options].join(', ')}).`
+      );
+    }
+  }
+}
+
+/** An optional list of objects that have only these options. */
+function assertEntries(
+  value: unknown,
+  options: ReadonlySet<string>,
+  what: string
+): Record<string, unknown>[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    fail(`${what} must be an array.`);
+  }
+  return (value as unknown[]).map((entry, index) => {
+    assertObject(entry, `${what}[${index}]`);
+    assertOptions(entry, options, `${what}[${index}]`);
+    return entry;
+  });
+}
+
+function assertBoolean(value: unknown, what: string): void {
+  if (value !== undefined && typeof value !== 'boolean') {
+    fail(`${what} must be a boolean (got ${JSON.stringify(value)}).`);
   }
 }
 
@@ -36,96 +203,130 @@ function assertOneOf(value: unknown, allowed: Set<string>, what: string): void {
 }
 
 /** `schema.table` has at most one dot, and no empty part. */
-function assertTableName(value: unknown, what: string): void {
+function assertTableName(value: unknown, what: string): asserts value is string {
   assertName(value, what);
-  const parts = (value as string).split('.');
+  const parts = value.split('.');
   if (parts.length > 2 || parts.some((part) => part.length === 0)) {
-    fail(`${what} must be "table" or "schema.table" (got "${value as string}").`);
+    fail(`${what} must be "table" or "schema.table" (got "${value}").`);
+  }
+  for (const part of parts) {
+    assertLength(part, what);
   }
 }
 
-function assertColumns(
-  columns: unknown,
-  known: Record<string, unknown>,
-  what: string
-): asserts columns is readonly string[] {
+/** Columns of `cols`, at least one, each once. */
+function assertColumns(columns: unknown, known: Record<string, unknown>, what: string): void {
   if (!Array.isArray(columns) || columns.length === 0) {
     fail(`${what} must list at least one column.`);
   }
+  const seen = new Set<string>();
   for (const column of columns as unknown[]) {
     if (typeof column !== 'string' || !Object.hasOwn(known, column)) {
       fail(`${what} names "${String(column)}", which is not a column of \`cols\`.`);
     }
+    if (seen.has(column)) {
+      fail(`${what} names "${column}" twice.`);
+    }
+    seen.add(column);
   }
 }
 
-function assertReference(reference: Partial<LilypadDbReference>, what: string): void {
-  if (typeof reference !== 'object' || reference === null) {
-    fail(`${what} must be an object.`);
+/** The columns of the referenced table, each once (`defineLilypadDb` checks that they exist). */
+function assertReferencedColumns(columns: unknown, what: string): void {
+  if (columns === undefined) {
+    return;
   }
+  if (!Array.isArray(columns) || columns.length === 0) {
+    fail(`${what} must list column names.`);
+  }
+  const seen = new Set<string>();
+  (columns as unknown[]).forEach((column, index) => {
+    assertIdentifier(column, `${what}[${index}]`);
+    if (seen.has(column)) {
+      fail(`${what} names "${column}" twice.`);
+    }
+    seen.add(column);
+  });
+}
+
+function assertReference(
+  reference: unknown,
+  options: ReadonlySet<string>,
+  what: string
+): asserts reference is Record<string, unknown> {
+  assertObject(reference, what);
+  assertOptions(reference, options, what);
   assertTableName(reference.table, `${what}.table`);
   assertOneOf(reference.onDelete, ACTIONS, `${what}.onDelete`);
   assertOneOf(reference.onUpdate, ACTIONS, `${what}.onUpdate`);
 }
 
-function assertColumn(column: LilypadDbColumn, what: string): void {
+function assertColumn(name: string, column: unknown, what: string): void {
+  assertIdentifier(name, what);
   if (typeof column !== 'object' || column === null) {
     fail(`${what} must be an object (e.g. { type: 'string' }).`);
   }
-  assertOneOf(column.type, COLUMN_TYPES, `${what}.type`);
-  if (column.pgType !== undefined) {
-    assertName(column.pgType, `${what}.pgType`);
-    const fitting =
-      column.type === undefined ? undefined : lilypadColumnTypeMismatch(column.type, column.pgType);
+  assertOptions(column, COLUMN_OPTIONS, what);
+  const { type, pgType, converted, nullable, unique, references } = column as LilypadDbColumn;
+  assertOneOf(type, COLUMN_TYPES, `${what}.type`);
+  if (pgType !== undefined) {
+    assertName(pgType, `${what}.pgType`);
+    const fitting = type === undefined ? undefined : lilypadColumnTypeMismatch(type, pgType);
     if (fitting) {
       fail(
-        `${what}.type "${String(column.type)}" does not fit its pgType "${column.pgType}", which postgres.js returns as ${fitting[0]}: declare ${fitting.map((type) => `"${type}"`).join(' or ')}, or leave type out.`
+        `${what}.type "${String(type)}" does not fit its pgType "${pgType}", which postgres.js returns as ${fitting[0]}: declare ${fitting.map((fit) => `"${fit}"`).join(' or ')}, or leave type out.`
       );
     }
   }
-  if (column.converted !== undefined && typeof column.converted !== 'boolean') {
-    fail(`${what}.converted must be a boolean.`);
-  }
-  const columnDefault: unknown = column.default;
+  assertBoolean(converted, `${what}.converted`);
+  assertBoolean(nullable, `${what}.nullable`);
+  assertBoolean(unique, `${what}.unique`);
+  const columnDefault: unknown = (column as LilypadDbColumn).default;
   if (
     columnDefault !== undefined &&
     columnDefault !== true &&
     !(
       typeof columnDefault === 'object' &&
       columnDefault !== null &&
+      Object.keys(columnDefault).length === 1 &&
       isNonEmptyString((columnDefault as { sql?: unknown }).sql)
     )
   ) {
     fail(`${what}.default must be true or { sql: '<expression>' }.`);
   }
-  if (column.references !== undefined) {
-    assertReference(column.references, `${what}.references`);
-    if (column.references.column !== undefined) {
-      assertName(column.references.column, `${what}.references.column`);
-    }
+  if (references !== undefined) {
+    assertReference(references, COLUMN_REFERENCE_OPTIONS, `${what}.references`);
+    assertOptionalIdentifier(references.column, `${what}.references.column`);
   }
 }
 
-function assertSync(sync: LilypadDbTableSync | undefined, what: string): void {
+function assertSync(sync: unknown, what: string): void {
   if (sync === undefined) {
     return;
   }
-  assertOneOf(sync.strategy, new Set(['listen', 'changelog', 'none']), `${what}.strategy`);
-  if (sync.strategy === 'none') {
+  assertObject(sync, what);
+  if (sync.strategy === undefined) {
+    fail(`${what}.strategy is required (one of ${[...STRATEGIES].join(', ')}).`);
+  }
+  assertOneOf(sync.strategy, STRATEGIES, `${what}.strategy`);
+  const typed = sync as LilypadDbTableSync;
+  assertOptions(sync, SYNC_OPTIONS[typed.strategy], what);
+  if (typed.strategy === 'none') {
     return;
   }
-  assertNumberOption(OWNER, `${what}.maxAge`, sync.maxAge, 'non-negative');
-  if (sync.strategy === 'listen') {
-    assertOneOf(sync.connect, new Set(['eager', 'lazy']), `${what}.connect`);
+  assertNumberOption(OWNER, `${what}.maxAge`, typed.maxAge, 'non-negative');
+  if (typed.strategy === 'listen') {
+    assertOneOf(typed.connect, new Set(['eager', 'lazy']), `${what}.connect`);
+    assertBoolean(typed.applyChanges, `${what}.applyChanges`);
     return;
   }
-  if (typeof sync.pollInterval !== 'number') {
+  if (typeof typed.pollInterval !== 'number') {
     fail(`${what}.pollInterval is required with the changelog strategy.`);
   }
-  assertNumberOption(OWNER, `${what}.pollInterval`, sync.pollInterval, 'non-negative');
-  assertNumberOption(OWNER, `${what}.maxGap`, sync.maxGap, 'positive');
-  assertNumberOption(OWNER, `${what}.lookback`, sync.lookback, 'non-negative');
-  assertOneOf(sync.poll, new Set(['await', 'background']), `${what}.poll`);
+  assertNumberOption(OWNER, `${what}.pollInterval`, typed.pollInterval, 'non-negative');
+  assertNumberOption(OWNER, `${what}.maxGap`, typed.maxGap, 'positive');
+  assertNumberOption(OWNER, `${what}.lookback`, typed.lookback, 'non-negative');
+  assertOneOf(typed.poll, new Set(['await', 'background']), `${what}.poll`);
 }
 
 /** The functions a table description may no longer hold, and the hook that replaces each. */
@@ -149,53 +350,56 @@ function assertNoHooks(key: string, table: Record<string, unknown>): void {
   }
 }
 
-function assertTable(key: string, table: LilypadDbTableInputBase, defaultSchema: string): string {
+function assertTable(key: string, table: unknown, defaultSchema: string): string {
   const what = `tables.${key}`;
   if (typeof table !== 'object' || table === null) {
     fail(`${what} must be a table (see defineLilypadTable).`);
   }
-  assertTableName(table.tableName, `${what}.tableName`);
-  const qualified = table.tableName.includes('.');
-  if (table.schemaName !== undefined) {
-    assertName(table.schemaName, `${what}.schemaName`);
+  assertNoHooks(key, table as Record<string, unknown>);
+  assertOptions(table, TABLE_OPTIONS, what);
+  const input = table as LilypadDbTableInputBase;
+  assertTableName(input.tableName, `${what}.tableName`);
+  const qualified = input.tableName.includes('.');
+  if (input.schemaName !== undefined) {
+    assertIdentifier(input.schemaName, `${what}.schemaName`);
     if (qualified) {
       fail(`${what}: give the schema in tableName or in schemaName, not both.`);
     }
   }
-  const cols = table.cols as Record<string, LilypadDbColumn> | undefined;
+  const cols = input.cols as Record<string, unknown> | undefined;
   if (typeof cols !== 'object' || cols === null || Object.keys(cols).length === 0) {
     fail(`${what}.cols must describe at least one column.`);
   }
   for (const [name, column] of Object.entries(cols)) {
-    assertColumn(column, `${what}.cols.${name}`);
+    assertColumn(name, column, `${what}.cols.${name}`);
   }
-  if (typeof table.primaryKey !== 'string' || !Object.hasOwn(cols, table.primaryKey)) {
-    fail(`${what}.primaryKey "${String(table.primaryKey)}" is not a column of \`cols\`.`);
+  if (typeof input.primaryKey !== 'string' || !Object.hasOwn(cols, input.primaryKey)) {
+    fail(`${what}.primaryKey "${String(input.primaryKey)}" is not a column of \`cols\`.`);
   }
-  (table.unique ?? []).forEach((uniqueKey, index) => {
+  assertBoolean(input.generatedPrimaryKey, `${what}.generatedPrimaryKey`);
+  assertBoolean(input.strict, `${what}.strict`);
+  assertEntries(input.unique, UNIQUE_OPTIONS, `${what}.unique`).forEach((uniqueKey, index) => {
+    assertOptionalIdentifier(uniqueKey.name, `${what}.unique[${index}].name`);
     assertColumns(uniqueKey.columns, cols, `${what}.unique[${index}].columns`);
   });
-  (table.indexes ?? []).forEach((tableIndex, index) => {
+  assertEntries(input.indexes, INDEX_OPTIONS, `${what}.indexes`).forEach((tableIndex, index) => {
+    assertOptionalIdentifier(tableIndex.name, `${what}.indexes[${index}].name`);
     assertColumns(tableIndex.columns, cols, `${what}.indexes[${index}].columns`);
+    assertBoolean(tableIndex.unique, `${what}.indexes[${index}].unique`);
     assertOneOf(tableIndex.using, INDEX_METHODS, `${what}.indexes[${index}].using`);
   });
-  (table.foreignKeys ?? []).forEach((foreignKey, index) => {
-    assertColumns(foreignKey.columns, cols, `${what}.foreignKeys[${index}].columns`);
-    assertReference(foreignKey.references, `${what}.foreignKeys[${index}].references`);
-    if (foreignKey.references.columns !== undefined) {
-      const referencedColumns: unknown = foreignKey.references.columns;
-      if (
-        !Array.isArray(referencedColumns) ||
-        referencedColumns.length === 0 ||
-        !referencedColumns.every(isNonEmptyString)
-      ) {
-        fail(`${what}.foreignKeys[${index}].references.columns must list column names.`);
-      }
+  assertEntries(input.foreignKeys, FOREIGN_KEY_OPTIONS, `${what}.foreignKeys`).forEach(
+    (foreignKey, index) => {
+      const at = `${what}.foreignKeys[${index}]`;
+      assertOptionalIdentifier(foreignKey.name, `${at}.name`);
+      assertColumns(foreignKey.columns, cols, `${at}.columns`);
+      assertReference(foreignKey.references, REFERENCE_OPTIONS, `${at}.references`);
+      assertReferencedColumns(foreignKey.references.columns, `${at}.references.columns`);
     }
-  });
+  );
   const checkNames = new Set<string>();
-  (table.checks ?? []).forEach((check, index) => {
-    assertName(check.name, `${what}.checks[${index}].name`);
+  assertEntries(input.checks, CHECK_OPTIONS, `${what}.checks`).forEach((check, index) => {
+    assertIdentifier(check.name, `${what}.checks[${index}].name`);
     if (checkNames.has(check.name)) {
       fail(`${what}.checks has two checks named "${check.name}".`);
     }
@@ -204,23 +408,19 @@ function assertTable(key: string, table: LilypadDbTableInputBase, defaultSchema:
       assertName(check.expression, `${what}.checks[${index}].expression`);
     }
   });
-  assertSync(table.sync, `${what}.sync`);
-  assertNoHooks(key, table);
-  return qualified ? table.tableName : `${table.schemaName ?? defaultSchema}.${table.tableName}`;
+  assertSync(input.sync, `${what}.sync`);
+  return qualified ? input.tableName : `${input.schemaName ?? defaultSchema}.${input.tableName}`;
 }
 
 /**
  * Checks a config before `defineLilypadDb` resolves it: only the config itself, never the
- * database.
+ * database. Every object of the config may hold only its options.
  *
  * @throws With a message naming the option that is not valid.
  */
-export function validateLilypadDbConfigInput(
-  input: LilypadDbConfigInput<Record<string, LilypadDbTableInputBase>>
-): void {
-  if (typeof input !== 'object' || input === null) {
-    fail('the config must be an object.');
-  }
+export function validateLilypadDbConfigInput(input: ConfigInput): void {
+  assertObject(input, 'the config');
+  assertOptions(input, CONFIG_OPTIONS, '');
   if (
     input.name !== undefined &&
     (typeof input.name !== 'string' || !CONFIG_NAME.test(input.name))
@@ -229,19 +429,24 @@ export function validateLilypadDbConfigInput(
       `name must contain only letters, digits, "_" and "-" (got ${JSON.stringify(input.name)}).`
     );
   }
-  if (input.defaultSchema !== undefined) {
-    assertName(input.defaultSchema, 'defaultSchema');
-  }
+  assertOptionalIdentifier(input.defaultSchema, 'defaultSchema');
   if (input.notifyChannel !== undefined) {
-    assertName(input.notifyChannel, 'notifyChannel');
+    assertIdentifier(input.notifyChannel, 'notifyChannel');
+    // postgres.js keeps its channels in a plain object
+    if (Object.hasOwn(Object.prototype, input.notifyChannel)) {
+      fail(`notifyChannel cannot be "${input.notifyChannel}".`);
+    }
   }
   if (input.changelog !== undefined) {
+    assertObject(input.changelog, 'changelog');
+    assertOptions(input.changelog, CHANGELOG_OPTIONS, 'changelog');
     if (input.changelog.table !== undefined) {
       assertTableName(input.changelog.table, 'changelog.table');
     }
     assertOneOf(input.changelog.pruning, PRUNING_MODES, 'changelog.pruning');
     assertNumberOption(OWNER, 'changelog.minRetention', input.changelog.minRetention, 'positive');
   }
+  assertBoolean(input.strict, 'strict');
   if (typeof input.tables !== 'object' || input.tables === null) {
     fail('tables must be an object: { <key>: <table> }.');
   }
