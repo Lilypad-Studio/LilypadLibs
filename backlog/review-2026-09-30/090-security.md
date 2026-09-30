@@ -2,12 +2,12 @@
 
 ## Goal
 
-Review the library's trust boundaries end-to-end as a senior security reviewer and write the report into `backlog/review-2026-09-30/900-synthesis.md`, replacing the placeholder under `### 090-security`. This is a review only: change nothing else, not even the other sections of that file.
+Review the library's trust boundaries end-to-end as a senior security reviewer, report the findings in chat, then ask the user whether to apply the fixes now or queue them as focused fix tasks.
 
 ## Context
 
 - Project: `@lilypad-studio/libs` 0.7.0, an internal TypeScript library used by Lilypad Studio's own apps (its audience is the studio's developers). ESM only, Node.js >= 22.12; every entry except `db` must also run in edge runtimes. Modules: in-memory cache with an optional shared level (L2), PostgreSQL gateway on postgres.js 3.4 (optional peer) with a database-backed cache synced by LISTEN/NOTIFY or a trigger-written changelog, logger, flow control, serializer, singletons, and the `lilypad-doctor` CLI. Repo rules: `CLAUDE.md`; per-module invariants: `docs/architecture.md`. The repository `Lilypad-Studio/LilypadLibs` has been public; the package is published to GitHub Packages.
-- Baseline: commit `a3cfaf4`. If `src/` changed since (`git diff a3cfaf4 --stat -- src .github package.json`), say so at the top of the report and review the current code.
+- Baseline: commit `a3cfaf4`. If `src/` changed since (`git diff a3cfaf4 --stat -- src .github package.json`), say so at the top of the report and review the current code: earlier units may have applied fixes.
 - Compatibility constraints: breaking changes to the public API, the config format (`lilypad.config.*`) and the CLI are acceptable when they clearly improve the design, provided each is recorded in a changeset `#### Upgrading` row (`/write-changeset`). Changelog SQL installed in databases: any change bumps `LILYPAD_CHANGELOG_VERSION` (5); raising `LILYPAD_CHANGELOG_MIN_COMPATIBLE_VERSION` (4) is allowed. L2 shared entries: any change bumps `SHARED_FORMAT_VERSION`. Every entry except `db` must stay edge-compatible.
 - Scope: the whole repository, following data across these trust boundaries (the per-unit tasks already check local issues; this one follows the flows between modules):
   - **Database notifications** (any role with access to the database can `NOTIFY` on `cache_events`): `src/dbGate/LilypadDbGate.ts` listeners → `src/cache/dbSync/LilypadNotificationRouter.ts` (`parseLilypadNotification`, `resolveNotifiedKey`) → `src/cache/LilypadDbCache.ts` (eager re-reads, the `takeEagerRefresh` budget, `BULK`/`TRUNCATE` handling).
@@ -27,6 +27,7 @@ Review the library's trust boundaries end-to-end as a senior security reviewer a
   - `SET search_path FROM CURRENT` on a `SECURITY DEFINER` function: with a default `search_path` that includes a schema writable by other roles (`public` on PostgreSQL < 15), can the function resolve an object planted there?
   - Do connection errors from postgres.js, the CLI's messages or `--json` include the password of the URL?
   - Does `lilypad-doctor`'s `--config <path>` or the config discovery load a file from an unexpected place (parent directories, symlinks)?
+- Fix tasks folder: `backlog/review-2026-09-30-fixes/090-security/`. Task format: `backlog/README.md`.
 
 ## Instructions
 
@@ -37,7 +38,7 @@ Objectives, in priority order:
 
 Categories: injection (SQL, format strings), privilege escalation, data integrity of the caches, secret exposure, resource exhaustion, supply chain.
 
-Read the code paths listed above in full, following each boundary from input to effect. Run what helps: `npm audit --audit-level=high`, `npx vitest run --project unit src/cache/dbSync src/dbGate`, and `npm run test:integration` if Docker is running to try a payload (say so if it isn't).
+Read the code paths listed above in full, following each boundary from input to effect. Run what helps: `npm audit --audit-level=high`, `npx vitest run --project unit src/cache/dbSync src/dbGate`, and `npm run test:integration` if Docker is running to try a payload (say so if it isn't). Change nothing until the user has chosen below.
 
 Rules:
 
@@ -49,21 +50,49 @@ Rules:
   - `recommended`: defense in depth with a concrete risk, unbounded resource use reachable from untrusted input
   - `minor`: hardening with little practical risk
 - A concrete fix for every finding: a minimal patch or snippet. A fix of the changelog SQL states the `LILYPAD_CHANGELOG_VERSION` bump.
+- Mark a finding `breaking` if its fix changes an API, a format or a behavior that callers or users rely on, and `cross-unit` if its fix touches files outside this unit.
 - Don't report theoretical issues the documented trust model already accepts, unless the model itself is the problem (then say why).
 - Group `minor` findings of the same kind into one entry.
 - If the boundaries hold, say so. Don't pad the report.
 
-Report format: Markdown, with `####` sub-headings under the unit's `###` heading. Finding IDs: `SEC-<n>`:
+Report, in chat. Finding IDs: `SEC-<n>`:
 
 1. Summary (5-10 lines) and the 3 most important actions.
-2. Findings, by severity. Each: ID, severity, confidence, attacker model, location, problem, fix.
-3. Proposed breaking changes: what changes, why, impact, migration.
-4. Tests to add (e.g. hostile identifiers and payloads, with the expected behavior).
-5. Impact on other units: which unit's code each fix touches, with the affected paths.
-6. Checks run: commands and results, or why none ran.
+2. Findings, by severity. Each: ID, severity, confidence, attacker model, `breaking`/`cross-unit` if they apply, location, problem, fix.
+3. Tests to add.
+4. Checks run: commands and results, or why none ran.
+
+### Apply or queue
+
+If there are no findings, skip to the closing summary. Otherwise ask the user, listing the finding IDs, with these options:
+
+- **Apply now**: fix every listed finding in this task, in the same commit that deletes it.
+- **Queue**: create fix tasks instead; change no source code.
+- **Mix**: the user names the IDs to apply now; the rest are queued or, for `minor` ones, dropped.
+
+Whatever the choice:
+
+- `breaking` and `cross-unit` findings are applied only if the user names their IDs explicitly; otherwise they're queued.
+- If you can't ask the user (you run as a subagent), stop here and report `needs decision` with the question, the options and the finding list; you'll be resumed with the answer.
+
+Applying a finding: make the fix, and for a bug, add a test that reproduces it. A fix that changes user-facing behavior gets its changeset (`/write-changeset`), with a `#### Upgrading` row if it is `breaking`. Run the build and the tests covering the unit.
+
+Queuing findings: one task per finding, or per group of findings that must change together, in the fix tasks folder, numbered `010`, `020`... after the highest number ever used there (`git log --all --name-only --format= -- backlog/review-2026-09-30-fixes/090-security`), following `backlog/README.md`:
+
+- Context is self-contained: quote the finding ID, the location, the snippet and the proposed fix. This review leaves no other record.
+- "Done when" is verifiable: for a bug, a test that reproduces it and now passes; otherwise a command or an observable behavior. Include `npm run check` (and `npm run test:integration` for database code), and the changeset when the fix changes user-facing behavior.
+- `depends-on: [review-2026-09-30/900-integration]` on every task, so none runs before integration has reviewed the queue. Add other `depends-on` only for real dependencies between fix tasks, not mere ordering.
+- A `breaking` finding gets `blocked: "needs approval: <the change, one line>"` (quoted: the value contains `: `), so nobody applies it unreviewed.
+- `minor` findings: group them by kind into one or two tasks, or drop them with a reason in chat.
+
+End with a short chat summary: applied (IDs, files changed, checks run), queued (IDs → task paths), dropped (IDs, reason).
 
 ## Done when
 
-- The `### 090-security` section of `backlog/review-2026-09-30/900-synthesis.md` holds the report instead of the placeholder, with the six sections above; empty ones say "None".
+- The report is in chat, with the four sections above; empty ones say "None".
 - Every finding has an ID, severity, confidence, an attacker model, a code location and a fix.
-- `git status --porcelain` shows no change outside `backlog/`; build or test artifacts left by the checks are removed.
+- Every `blocker` and `recommended` finding is applied (with its test, for a bug), queued in the fix tasks folder, or dropped with a reason in chat.
+- Every queued task follows `backlog/README.md`, has a checkable "Done when", and every `depends-on` target exists.
+- If this task applied anything: the build and the tests covering the unit pass, and the files it changed are within the unit, its tests, its changeset, or findings the user explicitly named.
+- If this task applied nothing: it changed no file outside `backlog/`.
+- Build or test artifacts left by the checks are removed.
