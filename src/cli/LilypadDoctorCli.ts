@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { parseArgs, parseEnv } from 'node:util';
 import { runLilypadInitCli, type LilypadInitDependencies } from '@/cli/LilypadInitCli';
 import type { LilypadDbConfig } from '@/dbConfig/LilypadDbConfig';
-import { loadLilypadDbConfig } from '@/dbConfig/loadLilypadDbConfig';
+import { loadLilypadDbConfig } from '@/dbGate/loadLilypadDbConfig';
 import { formatLilypadSchemaFixSql } from '@/dbGate/LilypadSchemaCheck';
 import {
   runLilypadDoctor,

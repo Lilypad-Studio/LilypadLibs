@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { LilypadCache, LilypadDisposedError, type LilypadCacheKey } from './LilypadCache';
+import { LilypadDisposedError } from '@/internal/LilypadDisposedError';
+import { LilypadCache, type LilypadCacheKey } from './LilypadCache';
 import type { LilypadLoggerType } from '@/logger/LilypadLogger';
 
 describe('LilypadCache', () => {

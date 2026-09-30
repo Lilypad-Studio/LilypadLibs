@@ -1,10 +1,15 @@
-declare global {
-  var __lilypadSingletonMap: Map<string, unknown> | undefined;
-  var __lilypadSingletonSignatureMap: Map<string, string> | undefined;
-}
-const singletonMap = (globalThis.__lilypadSingletonMap ??= new Map<string, unknown>());
+/**
+ * The registry lives on `globalThis`, so that every copy of the library in the process shares it.
+ * Typed here rather than with `declare global`, which the declarations of the package would publish
+ * into the global types of the applications.
+ */
+const registry = globalThis as typeof globalThis & {
+  __lilypadSingletonMap?: Map<string, unknown> | undefined;
+  __lilypadSingletonSignatureMap?: Map<string, string> | undefined;
+};
+const singletonMap = (registry.__lilypadSingletonMap ??= new Map<string, unknown>());
 // Kept apart from singletonMap, so that bundles of older versions sharing the registry still read it
-const signatureMap = (globalThis.__lilypadSingletonSignatureMap ??= new Map<string, string>());
+const signatureMap = (registry.__lilypadSingletonSignatureMap ??= new Map<string, string>());
 
 /**
  * Part of the keys of the `create` methods (`<namespace>@<version>:<singleton>`). The registry is
@@ -50,6 +55,15 @@ function checkSignature(identifier: string, signature?: LilypadSingletonSignatur
   }
 }
 
+/**
+ * Returns the instance registered under `identifier`, or creates it with `createInstanceFn` and
+ * registers it. The registry is shared by the whole process (it lives on `globalThis`), including
+ * the copies of the library loaded by other bundles: use identifiers unique in the application.
+ *
+ * @param signature - Describes the options of this call: `onMismatch` is called when they differ
+ * from those of the call that created the instance, which is returned anyway.
+ * @throws If the instance is still being created by {@link getLilypadSingletonInstanceAsync}.
+ */
 export function getLilypadSingletonInstance<T>(
   identifier: string,
   createInstanceFn: () => T,
@@ -84,6 +98,10 @@ export function removeLilypadSingletonInstance(identifier: string): boolean {
   return singletonMap.delete(identifier);
 }
 
+/**
+ * Like {@link getLilypadSingletonInstance}, for an instance created asynchronously: concurrent
+ * callers share one creation. A creation that fails is forgotten, so the next call tries again.
+ */
 export async function getLilypadSingletonInstanceAsync<T>(
   identifier: string,
   createInstanceFn: () => Promise<T>,

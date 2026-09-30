@@ -3,12 +3,12 @@ import type {
   LilypadDbCacheListenSync,
   LilypadDbSyncHost,
   LilypadDbSyncStrategy,
-} from '@/cache/dbSync/LilypadDbSyncTypes';
+} from '@/dbCache/sync/LilypadDbSyncTypes';
 import {
   getLilypadNotificationRouter,
   type LilypadNotificationRouter,
   type LilypadNotificationSubscriber,
-} from '@/cache/dbSync/LilypadNotificationRouter';
+} from '@/dbCache/sync/LilypadNotificationRouter';
 import type { LilypadCacheKey } from '@/cache/LilypadCacheTypes';
 import { LilypadBackoff } from '@/internal/LilypadBackoff';
 

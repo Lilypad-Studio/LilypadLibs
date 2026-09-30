@@ -1,6 +1,6 @@
+import { LILYPAD_DEFAULT_CHANGELOG_TABLE } from '@/dbConfig/LilypadDbConfigDefaults';
 import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
 import {
-  LILYPAD_DEFAULT_CHANGELOG_TABLE,
   pruneFunctionName,
   quoteIdentifier,
   textArrayLiteral,

@@ -3,10 +3,12 @@
  * in edge runtimes. The database-backed cache is in `@lilypad-studio/libs/db`.
  */
 export { LilypadCache } from '../cache/LilypadCache';
-export { LilypadCacheCooldownError, LilypadDisposedError } from '../cache/LilypadCacheTypes';
+export { LilypadCacheCooldownError } from '../cache/LilypadCacheTypes';
+export { LilypadDisposedError } from '../internal/LilypadDisposedError';
+// Thrown by the fetches of `getOrSet` that exceed their timeout
+export { LilypadTimeoutError } from '../flow/LilypadFlowControl';
 export type {
   LilypadCacheBulkSyncOptions,
-  LilypadCacheEntryOrigin,
   LilypadCacheErrorContext,
   LilypadCacheErrorOptions,
   LilypadCacheGetOptions,

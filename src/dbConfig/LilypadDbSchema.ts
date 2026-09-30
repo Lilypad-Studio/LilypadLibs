@@ -241,7 +241,10 @@ export class LilypadDbEmptyWriteError extends Error {
   }
 }
 
-/** Thrown by `updateToTable` when no row has the primary key of the data. */
+/**
+ * Thrown by `LilypadDbTable.update` and `LilypadDbCache.sqlUpdate` when no row has the primary key of
+ * the data.
+ */
 export class LilypadDbNotFoundError extends Error {
   readonly tableName: string;
   readonly primaryKeyValue: unknown;

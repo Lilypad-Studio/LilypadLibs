@@ -1,7 +1,7 @@
-import { LILYPAD_FULL_LOAD_RATIO, LilypadDbMembers } from '@/cache/dbCache/LilypadDbMembers';
-import { LilypadEagerRefresh } from '@/cache/dbCache/LilypadEagerRefresh';
-import { LilypadOwnWrites } from '@/cache/dbCache/LilypadOwnWrites';
-import { LilypadChangelogSync } from '@/cache/dbSync/LilypadChangelogSync';
+import { LILYPAD_FULL_LOAD_RATIO, LilypadDbMembers } from '@/dbCache/LilypadDbMembers';
+import { LilypadEagerRefresh } from '@/dbCache/LilypadEagerRefresh';
+import { LilypadOwnWrites } from '@/dbCache/LilypadOwnWrites';
+import { LilypadChangelogSync } from '@/dbCache/sync/LilypadChangelogSync';
 import {
   lilypadNoSync,
   type LilypadDbCacheSyncOverrides,
@@ -9,12 +9,11 @@ import {
   type LilypadDbRowChange,
   type LilypadDbSyncHost,
   type LilypadDbSyncStrategy,
-} from '@/cache/dbSync/LilypadDbSyncTypes';
-import { LilypadListenSync } from '@/cache/dbSync/LilypadListenSync';
+} from '@/dbCache/sync/LilypadDbSyncTypes';
+import { LilypadListenSync } from '@/dbCache/sync/LilypadListenSync';
 import { LilypadCacheEngine } from '@/cache/LilypadCacheEngine';
 import { LilypadReadFlights } from '@/cache/LilypadReadFlights';
 import {
-  LilypadDisposedError,
   type LilypadCacheBulkSyncOptions,
   type LilypadCachedValueType,
   type LilypadCacheEntry,
@@ -41,6 +40,7 @@ import {
 } from '@/dbConfig/LilypadDbSchema';
 import type { LilypadDbTable } from '@/dbGate/LilypadDbTable';
 import { LilypadFlowControl } from '@/flow/LilypadFlowControl';
+import { LilypadDisposedError } from '@/internal/LilypadDisposedError';
 import { assertNumberOption } from '@/internal/LilypadValidation';
 import { libLog, type LilypadLibLogger } from '@/logger/LilypadLibLogger';
 import {
@@ -52,7 +52,7 @@ import {
 export type {
   LilypadDbCacheSyncOverrides,
   LilypadDbNotification,
-} from '@/cache/dbSync/LilypadDbSyncTypes';
+} from '@/dbCache/sync/LilypadDbSyncTypes';
 
 /** The key type of a table: the type of its primary key column. */
 export type LilypadDbKey<V, PK extends keyof V> = V[PK] & LilypadCacheKey;
@@ -69,7 +69,7 @@ export type LilypadDbCacheBaseOptions<V extends object, PK extends keyof V = key
   sync?: LilypadDbCacheSyncOverrides | undefined;
   /**
    * Loading the whole table (`getAll`): `timeout` bounds each load and each query by primary keys
-   * (defaults to 30 seconds); with the `none` strategy, a load stays valid for `ttl` (defaults to
+   * (also those of `getManyOrFetch`; defaults to 30 seconds); with the `none` strategy, a load stays valid for `ttl` (defaults to
    * the TTL).
    */
   bulkSync?: Omit<LilypadCacheBulkSyncOptions<LilypadDbKey<V, PK>, V>, 'fn'> | undefined;
@@ -131,7 +131,7 @@ const DEFAULT_LOAD_TIMEOUT = 30_000;
  * @remarks
  * - `get` reads memory only. `getOrFetch` queries the database on a miss; `refresh` always
  *   re-fetches the key; `getAll` loads the whole table once, then fetches only the rows it does
- *   not hold up to date.
+ *   not hold up to date; `getManyOrFetch` does the same for some keys.
  * - Changes made elsewhere reach the cache through the `sync` strategy ({@link LilypadDbTableSync}).
  *   Only keys the cache holds (or is fetching) are re-fetched or expired; for other keys it only
  *   notes that the row exists, and `getAll` fetches it.
@@ -778,7 +778,8 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
    *
    * @param options - The read options (e.g. `staleWhileRevalidate`, `timeout`, `onError`).
    * @returns The row, or `null` if it does not exist.
-   * @throws If the query fails and `onError` gives no fallback value.
+   * @throws If the query fails, a {@link LilypadTimeoutError} when it exceeds its timeout, or a
+   * {@link LilypadCacheCooldownError} within `failureCooldown`, when `onError` gives no fallback value.
    */
   async getOrFetch(
     key: LilypadDbKey<V, PK>,
@@ -813,7 +814,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
    * If a write that started later completes first, the fetched value is returned but not cached.
    *
    * @returns The row read from the database.
-   * @throws If the query fails or exceeds `fetchTimeout`.
+   * @throws If the query fails, or a {@link LilypadTimeoutError} when it exceeds `fetchTimeout`.
    */
   refresh(key: LilypadDbKey<V, PK>): Promise<LilypadCachedValueType<V>> {
     this.assertNotDisposed();
@@ -885,8 +886,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
   }
 
   /**
-   * Returns every row of the table, or the rows of `keys`, keyed by primary key (the keys without a
-   * row are left out).
+   * Returns every row of the table, keyed by primary key.
    *
    * The whole table is loaded once (again after the sync lost changes, or, with the `none`
    * strategy, after `bulkSync.ttl`). Then only the rows the cache does not hold up to date are
@@ -896,25 +896,14 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
    * `maxEntries` smaller than the table, the result is still complete, but most rows are queried
    * again at each call.
    *
-   * @throws If the rows cannot be loaded.
+   * @throws If the rows cannot be loaded, or a {@link LilypadTimeoutError} after `bulkSync.timeout`.
+   * @see {@link getManyOrFetch} for the rows of some keys
    */
-  async getAll(keys?: LilypadDbKey<V, PK>[]): Promise<Map<LilypadDbKey<V, PK>, V>> {
+  async getAll(): Promise<Map<LilypadDbKey<V, PK>, V>> {
     this.assertNotDisposed();
     const syncing = this.sync.beforeRead();
     if (syncing) {
       await syncing;
-    }
-    if (keys) {
-      // Each key once, as first given
-      const uniqueKeys = new Map<string, LilypadDbKey<V, PK>>();
-      for (const key of keys) {
-        const normalizedKey = this.engine.normalizeKey(key);
-        if (!uniqueKeys.has(normalizedKey)) {
-          uniqueKeys.set(normalizedKey, key);
-        }
-      }
-      const fetched = await this.fetchRows(this.staleKeys([...uniqueKeys.values()]));
-      return this.rowsOf([...uniqueKeys.values()], fetched);
     }
     let loaded: Map<string, V> | undefined;
     if (!this.members.isLoaded(this.sync.trustedSince(), this.loadTtl)) {
@@ -929,6 +918,32 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
     // Also the rows changed while the table was loading
     const fetched = await this.fetchRows(staleKeys);
     return this.rowsOf(this.members.keys(), fetched, loaded ?? new Map<string, V>());
+  }
+
+  /**
+   * Returns the rows of `keys`, keyed as first given (the keys without a row are left out). Only
+   * the keys the cache does not hold up to date are queried, by primary key, in one query per 1000
+   * keys; concurrent calls share the queries of the keys they have in common. Rows are cached in
+   * the memory of this instance only, not in the shared level.
+   *
+   * @throws If the rows cannot be read, or a {@link LilypadTimeoutError} after `bulkSync.timeout`.
+   */
+  async getManyOrFetch(keys: Iterable<LilypadDbKey<V, PK>>): Promise<Map<LilypadDbKey<V, PK>, V>> {
+    this.assertNotDisposed();
+    const syncing = this.sync.beforeRead();
+    if (syncing) {
+      await syncing;
+    }
+    // Each key once, as first given
+    const uniqueKeys = new Map<string, LilypadDbKey<V, PK>>();
+    for (const key of keys) {
+      const normalizedKey = this.engine.normalizeKey(key);
+      if (!uniqueKeys.has(normalizedKey)) {
+        uniqueKeys.set(normalizedKey, key);
+      }
+    }
+    const fetched = await this.fetchRows(this.staleKeys([...uniqueKeys.values()]));
+    return this.rowsOf([...uniqueKeys.values()], fetched);
   }
 
   /**

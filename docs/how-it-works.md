@@ -59,6 +59,7 @@ src/
 ├── platform/LilypadPlatform.ts     the platform contract + 4 helpers
 ├── internal/
 │   ├── LilypadValidation.ts        checks of numeric options
+│   ├── LilypadDisposedError.ts     thrown by a disposed cache or a closed gate
 │   └── LilypadBackoff.ts           exponential backoff of retried operations
 ├── logger/
 │   ├── LilypadLibLogger.ts         the minimal logger type + libLog()
@@ -73,18 +74,23 @@ src/
 │   ├── LilypadCacheEngine.ts       the engine of both caches (internal, composed by both)
 │   ├── LilypadReadFlights.ts       the reads in flight that a new read may join
 │   ├── LilypadSharedLevel.ts       the shared level (L2): keys, envelopes, locks
-│   ├── LilypadCache.ts             the generic cache: the engine with public writes
+│   └── LilypadCache.ts             the generic cache: the engine with public writes
+├── dbCache/                        (Node.js only, entry `db`)
 │   ├── LilypadDbCache.ts           the table cache (≈950 lines)
-│   └── dbSync/
+│   ├── LilypadDbMembers.ts         the keys of the rows of the table, for getAll
+│   ├── LilypadOwnWrites.ts         the writes of this instance, recognized when they come back
+│   ├── LilypadEagerRefresh.ts      the batched re-reads of notified keys
+│   └── sync/
 │       ├── LilypadDbSyncTypes.ts   sync options, the strategy and host interfaces
 │       ├── LilypadListenSync.ts    the `listen` strategy
+│       ├── LilypadNotificationRouter.ts one listener per gate and channel, for all its caches
 │       └── LilypadChangelogSync.ts the `changelog` strategy
 ├── dbConfig/
 │   ├── LilypadDbConfig.ts          defineLilypadDb / defineLilypadTable: the database configs
 │   ├── LilypadDbConfigValidation.ts the checks of a config (never of the database)
-│   ├── LilypadDbHooks.ts           bindLilypadDbHooks: the functions the application binds to a config
-│   └── loadLilypadDbConfig.ts      finds and imports a config file (Node.js only)
+│   └── LilypadDbHooks.ts           bindLilypadDbHooks: the functions the application binds to a config
 ├── dbGate/
+│   ├── loadLilypadDbConfig.ts      finds and imports a config file (Node.js only)
 │   ├── LilypadDbGate.ts            postgres.js wrapper, table handles, LISTEN
 │   ├── LilypadDbTable.ts           the CRUD helpers of one table
 │   ├── LilypadListenHeartbeat.ts   is the LISTEN connection still delivering?
@@ -125,7 +131,7 @@ LilypadLogger, LilypadDbGate, LilypadDbCache ──register in──> the single
 Three observations help when reading the code:
 
 - **The two caches share one engine, by composition.** `LilypadCacheEngine` holds the hard concurrency logic, and is internal: its methods are public but it is not exported, and it checks nothing about disposal (it only ignores writes once disposed). `LilypadCache` and `LilypadDbCache` each hold one in a private field, and expose what fits them, after checking that they are not disposed: `LilypadCache` exposes the writes (`set`, `getOrSet`, ...) and owns the bulk sync; `LilypadDbCache` exposes none of them, so that its values always come from its table (a value written with a public `set` would otherwise be renewed past its TTL as if the database had returned it). The engine tells its owner what happens through hooks (`onValueStored`, `onEntriesIncomplete`, `hasReadInFlight`).
-- **`LilypadDbCache` delegates how it follows the table to a strategy object.** The cache keeps the data logic (`applyChange`, `applyTruncate`, members, renewal); the strategy decides _when_ changes arrive and _whether_ the cache can trust that it sees them all. The two talk through small interfaces ([`LilypadDbSyncHost`, `LilypadDbSyncStrategy`](../src/cache/dbSync/LilypadDbSyncTypes.ts)).
+- **`LilypadDbCache` delegates how it follows the table to a strategy object.** The cache keeps the data logic (`applyChange`, `applyTruncate`, members, renewal); the strategy decides _when_ changes arrive and _whether_ the cache can trust that it sees them all. The two talk through small interfaces ([`LilypadDbSyncHost`, `LilypadDbSyncStrategy`](../src/dbCache/sync/LilypadDbSyncTypes.ts)).
 - **Nothing in the lower layers knows about the upper ones.** `LilypadFlowControl` knows nothing about caches; `LilypadDbGate` knows nothing about caching; `LilypadCacheEngine` knows nothing about databases.
 
 ### 2.2 How the package is cut
@@ -199,7 +205,7 @@ In every cache method:
 - `undefined` means **"I don't know"**: not cached, or expired.
 - `null` means **"I know it does not exist"**: for a table cache, no row has that primary key.
 
-This is what lets the cache remember negative results, so that repeated lookups of a missing id stop reaching the database. Internally, `LilypadCachedValueType<V>` is `V | null`, and `undefined` never gets stored. Some code relies on the distinction in subtle ways: a `DELETE` read from the changelog is cached as `null` rather than removing the entry (see [3.4](#34-tickets-ordering-asynchronous-writes)), and `LilypadDbCache` uses `null` to remove a key from its list of table rows ([LilypadDbCache.ts](../src/cache/LilypadDbCache.ts)).
+This is what lets the cache remember negative results, so that repeated lookups of a missing id stop reaching the database. Internally, `LilypadCachedValueType<V>` is `V | null`, and `undefined` never gets stored. Some code relies on the distinction in subtle ways: a `DELETE` read from the changelog is cached as `null` rather than removing the entry (see [3.4](#34-tickets-ordering-asynchronous-writes)), and `LilypadDbCache` uses `null` to remove a key from its list of table rows ([LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts)).
 
 ### 3.4 Tickets: ordering asynchronous writes
 
@@ -249,17 +255,17 @@ Three consequences worth remembering:
 
 ### 3.5 `expirationTime: 0` means "invalidated"
 
-An entry expires when `Date.now() >= entry.expirationTime` (`isStale`, [line 31](../src/cache/LilypadCacheEngine.ts)). Invalidation does not remove the entry: it sets `expirationTime` to `0` and records `invalidatedAt`. One value encodes several rules at once:
+An entry expires when `Date.now() >= entry.expirationTime` (`isLilypadEntryStale`, [LilypadCacheEngine.ts](../src/cache/LilypadCacheEngine.ts)). Invalidation does not remove the entry: it sets `expirationTime` to `0` and records `invalidatedAt`. One value encodes several rules at once:
 
 - The entry is expired, so `get` returns `undefined` and `getOrSet` fetches again.
 - It is **never served stale**: the stale window test is `now < expirationTime + staleWindow`, which is false for `0 + window`.
 - It **keeps its value**, which remains available to `onError: { fallback: 'stale' }` if the next fetch fails.
-- `LilypadDbCache.renew` refuses to extend it ([LilypadDbCache.ts](../src/cache/LilypadDbCache.ts)).
+- `LilypadDbCache.renew` refuses to extend it ([LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts)).
 - `invalidatedAt` lets `adoptShared` refuse copies from the shared level that were produced before the invalidation ([LilypadCacheEngine.ts](../src/cache/LilypadCacheEngine.ts)).
 
 ### 3.6 Keys are compared by their string form
 
-Keys can be `string | number`, but the store is a `Map<string, entry>` keyed by `normalizeKey(key) = String(key)`. So `get(7)` and `get('7')` read the same entry. This matters for databases: a notification or a changelog row carries the primary key as text (`'7'`), while the application uses numbers. Each entry keeps the **original** key (`entry.key`), so that `entries()` can return keys with the type they were stored with. `LilypadDbCache.resolveNotifiedKey` ([LilypadDbCache.ts](../src/cache/LilypadDbCache.ts)) turns a text id back into the right type.
+Keys can be `string | number`, but the store is a `Map<string, entry>` keyed by `normalizeKey(key) = String(key)`. So `get(7)` and `get('7')` read the same entry. This matters for databases: a notification or a changelog row carries the primary key as text (`'7'`), while the application uses numbers. Each entry keeps the **original** key (`entry.key`), so that `entries()` can return keys with the type they were stored with. `LilypadDbCache.resolveNotifiedKey` ([LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts)) turns a text id back into the right type.
 
 Inside the engine, you will see pairs of methods such as `delete`/`removeEntry` and `expire`/`expireNormalized`: the public one takes a key, the private one takes an already normalized string, which is what internal loops have. The disposal checks live in the caches that own the engine, so the engine calls its own methods freely.
 
@@ -300,7 +306,7 @@ From the simplest to the most complex. Each section starts with what the module 
 
 **How.**
 
-- Lines 1-7: the two maps live on `globalThis.__lilypadSingletonMap` and `globalThis.__lilypadSingletonSignatureMap`, created with `??=` so the first copy of the library creates them and every later copy reuses them. The signatures are in a _separate_ map so that older bundles, which only know the first map, can still share it.
+- The first lines: the two maps live on `globalThis.__lilypadSingletonMap` and `globalThis.__lilypadSingletonSignatureMap` (typed with a local cast rather than `declare global`, which the declarations of the package would add to the global types of the applications), created with `??=` so the first copy of the library creates them and every later copy reuses them. The signatures are in a _separate_ map so that older bundles, which only know the first map, can still share it.
 - `getLilypadSingletonInstance`: if registered, return it; otherwise create, register, return. If the registered value is a `Promise`, an async creation is in progress, and a sync caller cannot wait for it, so it throws.
 - `getLilypadSingletonInstanceAsync` is the interesting one. It stores the **creation promise** in the map right away (line 86). A concurrent caller finds the promise and returns it; since the function is `async`, returning a promise adopts it, so every caller awaits the same creation. When the creation resolves, the promise is replaced by the instance; if it rejects, the entry is removed (line 100), so the next call retries. Both steps first check `singletonMap.get(identifier) === instancePromise`, in case someone removed or replaced the entry meanwhile.
 - **Signatures** (`checkSignature`, [line 29](../src/singleton/LilypadSingleton.ts)): a later call with the same identifier but different options gets the existing instance, and its options are silently ignored. To make this visible, each `create()` passes a string describing its important options. The first one is stored; a different one triggers `onMismatch` (a warning). `LilypadDbGate` hashes its signature with SHA-256, because connection strings contain passwords and the map is global.
@@ -756,13 +762,13 @@ Every problem that the library can fix comes with the SQL that fixes it, generat
 
 ### 4.10 LilypadDbCache
 
-[src/cache/LilypadDbCache.ts](../src/cache/LilypadDbCache.ts), about 950 lines, with its sync strategies in [cache/dbSync/](../src/cache/dbSync/). A cache of one table on the engine of [4.6](#46-the-cache-engine-lilypadcachecore). What it adds:
+[src/dbCache/LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts), about 950 lines, with its sync strategies in [dbCache/sync/](../src/dbCache/sync/). A cache of one table on the engine of [4.6](#46-the-cache-engine-lilypadcachecore). What it adds:
 
 1. **Fetching**: `getOrFetch(key)` = the engine's `getOrSetDetailed(key, () => table.selectByPrimaryKey(key))`, where `table = gate.table(schema)`.
 2. **Writing through**: `sqlCreate`/`sqlUpdate`/`sqlDelete` write to the database, then cache the row the database returned.
 3. **Syncing**: learning about changes made elsewhere, through a strategy object (`listen`, `changelog` or `none`).
 4. **Trust and renewal**: while the strategy is known to see every change, entries don't need a query at their TTL.
-5. **The table as a whole**: `getAll()` returns every row (a `Map` keyed by primary key), with as few queries as possible, by tracking which keys exist (`LilypadDbMembers`, [src/cache/dbCache/LilypadDbMembers.ts](../src/cache/dbCache/LilypadDbMembers.ts)). The writes of the instance are remembered by `LilypadOwnWrites` ([src/cache/dbCache/LilypadOwnWrites.ts](../src/cache/dbCache/LilypadOwnWrites.ts)).
+5. **The table as a whole**: `getAll()` returns every row (a `Map` keyed by primary key), with as few queries as possible, by tracking which keys exist (`LilypadDbMembers`, [src/dbCache/LilypadDbMembers.ts](../src/dbCache/LilypadDbMembers.ts)). The writes of the instance are remembered by `LilypadOwnWrites` ([src/dbCache/LilypadOwnWrites.ts](../src/dbCache/LilypadOwnWrites.ts)).
 
 What it does **not** have is as important: the writes of `LilypadCache` (`set`, `bulkSet`, `getOrSet`, `bulkSync`) and its bulk reads are not exposed: they stay in its private engine. Every value of the cache comes from the table (a fetch, a load, or the row a write returned), which is what makes renewing values past their TTL safe.
 
@@ -776,19 +782,19 @@ The constructor:
 - merges the `sync` of the definition with the overrides of the cache (`maxAge`, `connect`, `applyChanges`, `onNotification`, `pollInterval`, `poll`), whose numbers it validates (those of the definition were validated by `defineLilypadDb`);
 - sets no bulk sync function: the table is loaded by its own `loadTable` (see [getAll](#members-and-getall)), which calls the engine's `replaceEntries`;
 - takes the schema of the table from the definition (`schemaName`);
-- creates the strategy (with the channel or the changelog table of the config), giving the strategy a **host** object (`syncHost()`, [line 244](../src/cache/LilypadDbCache.ts)): a few closures over the cache's own methods (`applyChange`, `applyTruncate`, `expireEverything`, `emitInvalidation`, ...), so that the strategy can act on the cache without reaching into it.
+- creates the strategy (with the channel or the changelog table of the config), giving the strategy a **host** object (`syncHost()`, [line 244](../src/dbCache/LilypadDbCache.ts)): a few closures over the cache's own methods (`applyChange`, `applyTruncate`, `expireEverything`, `emitInvalidation`, ...), so that the strategy can act on the cache without reaching into it.
 
 #### The strategies
 
-A strategy ([`LilypadDbSyncStrategy`, LilypadDbSyncTypes.ts:165](../src/cache/dbSync/LilypadDbSyncTypes.ts)) answers four questions: what to start in `create()` (`start`), what to do before a read (`beforeRead`), since when it sees every change (`trustedSince`), and whether the writes of this instance come back through it (`seesOwnWrites`). Plus `dispose`.
+A strategy ([`LilypadDbSyncStrategy`, LilypadDbSyncTypes.ts:165](../src/dbCache/sync/LilypadDbSyncTypes.ts)) answers four questions: what to start in `create()` (`start`), what to do before a read (`beforeRead`), since when it sees every change (`trustedSince`), and whether the writes of this instance come back through it (`seesOwnWrites`). Plus `dispose`.
 
 - **`lilypadNoSync`**: nothing to start, nothing to wait for, never trusted.
-- **`LilypadListenSync`** ([LilypadListenSync.ts](../src/cache/dbSync/LilypadListenSync.ts)): subscribes to the `LilypadNotificationRouter` of its gate ([LilypadNotificationRouter.ts](../src/cache/dbSync/LilypadNotificationRouter.ts)), which registers **one** callback on the channel of the config (`cache_events` by default) for every cache of the gate (`callbackId: 'lilypad_notification_router'`), parses each notification once, and hands it to the caches of its table (the last cache to unsubscribe removes the listener). `startListening` subscribes; if the cache was disposed while `LISTEN` was starting, it unsubscribes again (otherwise a lazy `LISTEN` started by a read just before `dispose()` would leave a callback registered forever on the gate). `dispose` waits for a `LISTEN` still starting before removing the listener, for the same reason. `trustedSince` is the time `LISTEN` became active (reset by `onReconnect`), but only **while `gate.isListenHealthy()`**: without recent heartbeats, the cache does not trust it.
-- **`LilypadChangelogSync`** ([LilypadChangelogSync.ts](../src/cache/dbSync/LilypadChangelogSync.ts)): subscribes to the gate's reader, keeps the cursor, and reads the changelog before a read when `pollInterval` has passed. `trustedSince` is the start of the unbroken chain of cursor reads; `undefined` without a cursor, when the last read is older than `maxGap`, or when no read was applied within `pollInterval` (two intervals with `poll: 'background'`): a change committed since is still unapplied. The whole strategy is described in [4.11](#411-the-changelog-strategy-end-to-end).
+- **`LilypadListenSync`** ([LilypadListenSync.ts](../src/dbCache/sync/LilypadListenSync.ts)): subscribes to the `LilypadNotificationRouter` of its gate ([LilypadNotificationRouter.ts](../src/dbCache/sync/LilypadNotificationRouter.ts)), which registers **one** callback on the channel of the config (`cache_events` by default) for every cache of the gate (`callbackId: 'lilypad_notification_router'`), parses each notification once, and hands it to the caches of its table (the last cache to unsubscribe removes the listener). `startListening` subscribes; if the cache was disposed while `LISTEN` was starting, it unsubscribes again (otherwise a lazy `LISTEN` started by a read just before `dispose()` would leave a callback registered forever on the gate). `dispose` waits for a `LISTEN` still starting before removing the listener, for the same reason. `trustedSince` is the time `LISTEN` became active (reset by `onReconnect`), but only **while `gate.isListenHealthy()`**: without recent heartbeats, the cache does not trust it.
+- **`LilypadChangelogSync`** ([LilypadChangelogSync.ts](../src/dbCache/sync/LilypadChangelogSync.ts)): subscribes to the gate's reader, keeps the cursor, and reads the changelog before a read when `pollInterval` has passed. `trustedSince` is the start of the unbroken chain of cursor reads; `undefined` without a cursor, when the last read is older than `maxGap`, or when no read was applied within `pollInterval` (two intervals with `poll: 'background'`): a change committed since is still unapplied. The whole strategy is described in [4.11](#411-the-changelog-strategy-end-to-end).
 
 #### Syncing before a read
 
-The async reads (`getOrFetchDetailed`, [line 673](../src/cache/LilypadDbCache.ts), and `getAll`) start with:
+The async reads (`getOrFetchDetailed`, [LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts), `getAll` and `getManyOrFetch`) start with:
 
 ```ts
 const syncing = this.sync.beforeRead();
@@ -842,32 +848,32 @@ The two modes differ in **how much the cache trusts the change**. A changelog ro
 3. `DELETE` from the changelog: if the key is held (an entry, or a read in flight), cache it as `null` (the `null` entry also blocks a fetch in flight from storing the deleted row), even for a protected key. Otherwise, no entry: remove the key from `members` and from L2. A mass delete, or the lookback of a cold start, thus creates no entries, which would evict the rows the instance holds.
 4. Otherwise, `INSERT`/`UPDATE` note the key as a member of the table. Then:
    - key **not held** (no entry, no read in flight; a write of the key in flight counts as a read, a load of the table does not: `isHeld`): no query at all. Nobody asked for this row here. Remove it from L2 (other instances may have cached an old copy), and, while a load of the table waits for its rows, expire it too (`forgetUnheld`): its fence discards the row the load may have read before the change. An eager `DELETE` of such a key leaves it among the members: `getAll` will fetch it, and learn whether it is really gone.
-   - held, `eager` (notifications, including `DELETE`): `eagerRefresh`, a `LilypadEagerRefresh` ([LilypadEagerRefresh.ts](../src/cache/dbCache/LilypadEagerRefresh.ts)), re-fetches it now, together with the other keys notified meanwhile: the batch is sent a microtask later, once the notifications received in the same chunk have been handled, with one `selectByPrimaryKeys` (`rereadNotified`; a statement that changes many rows notifies each of them, and one query per row would flood the pool). The keys of a failed batch are expired. It counts the keys of the pending and running batches (`has`), for `hasReadInFlight`. The query of a batch starts after the notifications of its keys, so it sees their changes even if an older read of the key is still running (the older result loses by its ticket). A forged `DELETE` thus costs part of one query and changes nothing; a real one caches `null`.
+   - held, `eager` (notifications, including `DELETE`): `eagerRefresh`, a `LilypadEagerRefresh` ([LilypadEagerRefresh.ts](../src/dbCache/LilypadEagerRefresh.ts)), re-fetches it now, together with the other keys notified meanwhile: the batch is sent a microtask later, once the notifications received in the same chunk have been handled, with one `selectByPrimaryKeys` (`rereadNotified`; a statement that changes many rows notifies each of them, and one query per row would flood the pool). The keys of a failed batch are expired. It counts the keys of the pending and running batches (`has`), for `hasReadInFlight`. The query of a batch starts after the notifications of its keys, so it sees their changes even if an older read of the key is still running (the older result loses by its ticket). A forged `DELETE` thus costs part of one query and changes nothing; a real one caches `null`.
    - held, `lazy` (changelog): `markInvalid`, no query; the next read fetches it. The new ticket also discards a read in flight.
 
 Why lazy for the changelog? A changelog read can return hundreds of changes at once (on a lookback, for instance); re-fetching them all eagerly would turn a poll into hundreds of queries, most of them for rows no one will ask for again.
 
-`applyTruncate(mode)` expires everything, removes every cached key from L2, calls `rejectSharedBefore(now)` (L2 copies older than the truncate are refused from now on, even for keys this instance did not hold), empties `members` and raises `membersFloor` (a table load that started before the truncate must not bring back the old rows). From the changelog, the table is then known to be empty, with no query. From a notification, it also marks the table as not loaded, so the next `getAll()` loads it again: a forged `TRUNCATE` costs one load, not an empty result.
+`applyTruncate(mode)` expires everything, removes every cached key from L2, calls `rejectSharedBefore(now)` (L2 copies older than the truncate are refused from now on, even for keys this instance did not hold), empties `members` and raises its floor (`members.forget`: a table load that started before the truncate must not bring back the old rows). From the changelog, the table is then known to be empty, with no query. From a notification, it also marks the table as not loaded, so the next `getAll()` loads it again: a forged `TRUNCATE` costs one load, not an empty result.
 
 `applyBulkChange()` is the same as an eager `TRUNCATE` without the L2 removal of each key (the older L2 copies are ignored through `rejectSharedBefore`): it applies a `BULK` notification (a statement changed more rows than the `notifyBulkThreshold` of the trigger), and a changelog read with more than 1000 keys (`LILYPAD_BULK_CHANGE_THRESHOLD`). Following each key would cost, on every instance, one L2 removal and one tag per key.
 
 Notifications are untrusted, so their re-reads have a budget: at most 1000 keys per second per cache (`LilypadEagerRefresh`, on the monotonic clock; a key already in the batch being gathered costs nothing). Beyond it, a notified key is only expired (`markInvalid`, no query), and read again when the application asks for it.
 
-`LilypadChangelogSync.apply` ([LilypadChangelogSync.ts](../src/cache/dbSync/LilypadChangelogSync.ts)) wraps it for a changelog read:
+`LilypadChangelogSync.apply` ([LilypadChangelogSync.ts](../src/dbCache/sync/LilypadChangelogSync.ts)) wraps it for a changelog read:
 
 - **untrusted read** (a lookback, because there was no cursor or the gap exceeded `maxGap`): the local memory may have missed anything, so `expireEverything()`; then apply the lookback's changes anyway, because they remove L2 copies that other instances may still serve. The chain of trust starts at `readAt`.
 - reduce the changes with `lilypadNetChanges`: a `TRUNCATE` drops the changes read before it (and is applied once), and only the last change of each row is kept, since the changes of a row are ordered by the lock of the row. Beyond 1000 rows, `applyBulkChange()` instead of one `applyChange` per row;
 - apply each remaining change (each is returned once by a cursor read, see [4.8](#48-the-changelog));
-- after applying, forget the own writes the new cursor covers (`forgetOwnWritesCoveredBy`, [LilypadDbCache.ts](../src/cache/LilypadDbCache.ts)): their changes can no longer be returned;
+- after applying, forget the own writes the new cursor covers (`forgetOwnWritesCoveredBy`, [LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts)): their changes can no longer be returned;
 - store the cursor, reset the backoff, emit one `changelog` event, with each key once (`keys: []` and the tag of the cache for a bulk change or a `TRUNCATE`).
 
-The **notification** path is `LilypadListenSync.handleNotification` ([LilypadListenSync.ts](../src/cache/dbSync/LilypadListenSync.ts)): it ignores notifications once the cache is disposed; `parseLilypadNotification` validates the JSON (a known `op`, a non-empty `table`, a string or number `id` except for `TRUNCATE` and `BULK`, string `schema` and `xid`); the router does it once for every cache of the gate and anything else is logged as a warning and ignored; then it checks the table and schema, applies eagerly, emits a `notification` event, and calls the user's `onNotification`. With `applyChanges: false` it only calls `onNotification`, and the sync is not trusted.
+The **notification** path is `LilypadListenSync.handleNotification` ([LilypadListenSync.ts](../src/dbCache/sync/LilypadListenSync.ts)): it ignores notifications once the cache is disposed; `parseLilypadNotification` validates the JSON (a known `op`, a non-empty `table`, a string or number `id` except for `TRUNCATE` and `BULK`, string `schema` and `xid`); the router does it once for every cache of the gate and anything else is logged as a warning and ignored; then it checks the table and schema, applies eagerly, emits a `notification` event, and calls the user's `onNotification`. With `applyChanges: false` it only calls `onNotification`, and the sync is not trusted.
 
 #### Own writes
 
 When this instance runs `sqlUpdate`, it caches the row the database returned. Seconds later, its own change comes back through the changelog or a notification. Applying it would expire the fresh row and cost a query, for nothing.
 
-- `storeWritten` records `(key, xid, ticket of the stored entry)` in `ownWrites` (`ownWrites.record`, [LilypadOwnWrites.ts](../src/cache/dbCache/LilypadOwnWrites.ts)), if the strategy `seesOwnWrites` (not `listen` with `applyChanges: false`, which applies no change).
+- `storeWritten` records `(key, xid, ticket of the stored entry)` in `ownWrites` (`ownWrites.record`, [LilypadOwnWrites.ts](../src/dbCache/LilypadOwnWrites.ts)), if the strategy `seesOwnWrites` (not `listen` with `applyChanges: false`, which applies no change).
 - `ownWrites.consume(key, xid)` removes the xid from the set and returns `true` only if the entry **still has the ticket** of that write. If anything replaced the entry since (another change, a fetch), the change is applied normally.
 
 `ownWrites` is bounded two ways: by the changelog cursor (`lilypadCursorCovers`: a transaction still in `xip` is kept, so a write whose transaction was still running at a read is recognised when its change comes later), and, for `listen` where there is no cursor, by a 10-minute retention (on the monotonic clock). The map is kept in the order of the last write (delete + set), so pruning stops at the first recent entry. A key written again and again is never older than the retention, and the change of some of its writes may never come back (a lost notification, or one received before the write returned): each key keeps its last 32 transactions only.
@@ -914,23 +920,23 @@ return rowsOf(members, fetched, loaded)
 
 Three subtleties:
 
-- **With `maxEntries`**, a load may store more rows than the cache can hold; the evicted ones would then count as stale and be fetched again immediately. So `loadTable` does not rely on the store: `loadRows` (with `beginRead`, `replaceMembers` and the engine's `replaceEntries`) returns the loaded rows, and concurrent callers share the promise of one load (`tableLoad`), bounded by `bulkSync.timeout`. `staleKeys` treats a key missing from the store but present in `loaded` as fresh, and `rowsOf` takes each value from, in order: the fresh entry, the rows just fetched, the rows just loaded, the expired entry.
+- **With `maxEntries`**, a load may store more rows than the cache can hold; the evicted ones would then count as stale and be fetched again immediately. So `loadTable` does not rely on the store: `loadRows` (with `beginRead`, `members.replace` and the engine's `replaceEntries`) returns the loaded rows, and concurrent callers share the promise of one load (`tableLoad`), bounded by `bulkSync.timeout`. `staleKeys` treats a key missing from the store but present in `loaded` as fresh, and `rowsOf` takes each value from, in order: the fresh entry, the rows just fetched, the rows just loaded, the expired entry.
 - **A change during a load** is newer than the load, which may have read the old row. While a load waits for its rows (`loadsReading`), every key counts as read (`hasReadInFlight`), so that a change of a key the cache does not hold expires it with no query, and its fence discards the loaded row. Not while the load stores its rows: its evictions beyond `maxEntries` must leave no fence. `loadRows` then leaves out of `loaded` the rows whose `currentTicket` exceeds its ticket, so that neither `staleKeys` nor `rowsOf` uses them: those keys are fetched by key.
-- **`loadTable` does not use the engine's bulk sync**: `getAll` decides freshness with `isTableLoaded`, not with the engine's timer.
+- **`loadTable` does not use the engine's bulk sync**: `getAll` decides freshness with `members.isLoaded`, not with the engine's timer.
 
-`fetchRows` is single-flight **per key**: keys already being fetched join those queries, the rest go into one new query (`queryRows`, [line 581](../src/cache/LilypadDbCache.ts)), which stores each row with `read.store` (this instance only, not L2, like the table loads) and caches `null` for keys without a row.
+`fetchRows` is single-flight **per key**: keys already being fetched join those queries, the rest go into one new query (`queryRows`, [line 581](../src/dbCache/LilypadDbCache.ts)), which stores each row with `read.store` (this instance only, not L2, like the table loads) and caches `null` for keys without a row.
 
-`getAll(keys)` skips the members: it fetches only the given keys that are stale.
+`getManyOrFetch(keys)` skips the members: it fetches only the given keys that are stale.
 
 #### dispose
 
-[LilypadDbCache.ts](../src/cache/LilypadDbCache.ts): return if already disposed; release the singleton; dispose the engine (from now on, notifications and changelog reads that arrive are ignored); clear the database bookkeeping; then `sync.dispose()`, which unsubscribes from the changelog reader, or waits for a `LISTEN` still starting and removes the listener.
+[LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts): return if already disposed; release the singleton; dispose the engine (from now on, notifications and changelog reads that arrive are ignored); clear the database bookkeeping; then `sync.dispose()`, which unsubscribes from the changelog reader, or waits for a `LISTEN` still starting and removes the listener.
 
 ### 4.11 The changelog strategy, end to end
 
 Sections [4.8](#48-the-changelog) and [4.10](#410-lilypaddbcache) describe the parts one at a time: the SQL and the cursor, the reader, how a change is applied, renewal. This section puts them together. It follows one `LilypadDbCache` created with `sync: { strategy: 'changelog', pollInterval }` through its whole life: what runs in the database, what the instance remembers, when it polls, what it does with what it reads, why it can then trust its memory, and what happens when something goes wrong. The traces [5.1](#51-three-concurrent-getorfetch42-on-a-cold-instance), [5.3](#53-an-update-from-psql-reaches-a-serverless-instance), [5.4](#54-sqlupdate-and-its-echo) and [5.5](#55-the-changelog-query-clause-by-clause) run the same code with concrete values.
 
-The code: [LilypadChangelogSync.ts](../src/cache/dbSync/LilypadChangelogSync.ts) (the strategy, about 150 lines), [LilypadChangelogReader.ts](../src/dbGate/LilypadChangelogReader.ts) (batching), [LilypadChangelog.ts](../src/dbGate/LilypadChangelog.ts) (SQL and the query), and the host methods of [LilypadDbCache.ts](../src/cache/LilypadDbCache.ts) that the strategy calls.
+The code: [LilypadChangelogSync.ts](../src/dbCache/sync/LilypadChangelogSync.ts) (the strategy, about 150 lines), [LilypadChangelogReader.ts](../src/dbGate/LilypadChangelogReader.ts) (batching), [LilypadChangelog.ts](../src/dbGate/LilypadChangelog.ts) (SQL and the query), and the host methods of [LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts) that the strategy calls.
 
 #### The whole picture
 
@@ -987,7 +993,7 @@ The distinction matters because the two ways of being misconfigured fail differe
 
 #### Step 1: creating the cache
 
-The constructor of `LilypadDbCache` checks the numeric options (`pollInterval` is required and may be `0`) and builds the strategy ([LilypadDbCache.ts](../src/cache/LilypadDbCache.ts)). The strategy's constructor ([LilypadChangelogSync.ts](../src/cache/dbSync/LilypadChangelogSync.ts)):
+The constructor of `LilypadDbCache` checks the numeric options (`pollInterval` is required and may be `0`) and builds the strategy ([LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts)). The strategy's constructor ([LilypadChangelogSync.ts](../src/dbCache/sync/LilypadChangelogSync.ts)):
 
 - creates its backoff, with a base of `max(pollInterval, 1 s)`;
 - gets the reader shared by every cache of the gate that uses the same changelog table (`getLilypadChangelogReader`, [LilypadChangelogReader.ts](../src/dbGate/LilypadChangelogReader.ts)), and subscribes with two closures: `request` (what to read for me) and `apply` (apply what was read for me).
@@ -996,7 +1002,7 @@ The constructor of `LilypadDbCache` checks the numeric options (`pollInterval` i
 
 #### Step 2: when a poll happens
 
-`beforeRead()` ([LilypadChangelogSync.ts](../src/cache/dbSync/LilypadChangelogSync.ts)) is called at the start of `getOrFetch`/`getOrFetchDetailed` and `getAll`. It is not called by `get` and `peek`, which are synchronous, nor by the writes.
+`beforeRead()` ([LilypadChangelogSync.ts](../src/dbCache/sync/LilypadChangelogSync.ts)) is called at the start of `getOrFetch`/`getOrFetchDetailed`, `getAll` and `getManyOrFetch`. It is not called by `get` and `peek`, which are synchronous, nor by the writes.
 
 ```
 now - lastRead < pollInterval   → undefined: nothing to wait for
@@ -1017,20 +1023,20 @@ A few consequences:
 
 #### Step 3: what is read
 
-`reader.read(subscriber)` starts a read, shares the running one, or queues one after it for late subscribers ([4.8](#the-reader-one-query-for-all-the-caches-of-a-gate)). `readAll` ([LilypadChangelogReader.ts](../src/dbGate/LilypadChangelogReader.ts)) takes one `readAt = Date.now()` and asks **every** subscribed cache for its request, not only the one that triggered the read. `request(readAt)` ([LilypadChangelogSync.ts](../src/cache/dbSync/LilypadChangelogSync.ts)) returns one of two things:
+`reader.read(subscriber)` starts a read, shares the running one, or queues one after it for late subscribers ([4.8](#the-reader-one-query-for-all-the-caches-of-a-gate)). `readAll` ([LilypadChangelogReader.ts](../src/dbGate/LilypadChangelogReader.ts)) takes one `readAt = Date.now()` and asks **every** subscribed cache for its request, not only the one that triggered the read. `request(readAt)` ([LilypadChangelogSync.ts](../src/dbCache/sync/LilypadChangelogSync.ts)) returns one of two things:
 
 - `{ cursor }` if the cache has a cursor and `readAt - lastRead <= maxGap`: a **trusted** read, which continues the chain;
-- `{ lookback }` otherwise: an **untrusted** read of the changes of the last `lookback` ms (`sync.lookback`, or by default TTL + `staleWhileRevalidate` + 1 minute, from `defaultLookback` at [LilypadDbCache.ts](../src/cache/LilypadDbCache.ts)). This happens on the first read, or after a gap longer than `maxGap`.
+- `{ lookback }` otherwise: an **untrusted** read of the changes of the last `lookback` ms (`sync.lookback`, or by default TTL + `staleWhileRevalidate` + 1 minute, from `defaultLookback` at [LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts)). This happens on the first read, or after a gap longer than `maxGap`.
 
 All the requests go into one `readLilypadChangesBatch` ([LilypadChangelog.ts](../src/dbGate/LilypadChangelog.ts), clause by clause in [5.5](#55-the-changelog-query-clause-by-clause)). It returns the changes of each request, and **one** next cursor taken from the snapshot of that statement, which is valid for every request. Caches in different states share the query: an old cache continuing its cursor and a new one reading a lookback are served by the same statement. Each cache's `apply` then runs under `Promise.allSettled`, so one failing cache does not stop the others.
 
 #### Step 4: applying what was read
 
-`apply` ([LilypadChangelogSync.ts](../src/cache/dbSync/LilypadChangelogSync.ts)):
+`apply` ([LilypadChangelogSync.ts](../src/dbCache/sync/LilypadChangelogSync.ts)):
 
 1. If the cache was disposed meanwhile, stop.
 2. **Untrusted read** (a lookback): `expireEverything()` ([LilypadCacheEngine.ts](../src/cache/LilypadCacheEngine.ts)). Every entry is expired, which means never served stale but still usable as an `onError` fallback. `ticketFloor` is raised, so reads in flight, which may have read rows before changes this instance never saw, store nothing. Then `chainStartedAt = readAt`: a new chain starts.
-3. Apply each change, in the order they were recorded (`ORDER BY id`): `TRUNCATE` → `applyTruncate('lazy')` ([LilypadDbCache.ts](../src/cache/LilypadDbCache.ts)), any other operation → `applyChange(op, rowId, 'lazy', xid)`.
+3. Apply each change, in the order they were recorded (`ORDER BY id`): `TRUNCATE` → `applyTruncate('lazy')` ([LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts)), any other operation → `applyChange(op, rowId, 'lazy', xid)`.
 4. `forgetOwnWritesCoveredBy(cursor)`: drop the own writes whose change this read has returned or can no longer return. Transactions still in `xip` are kept.
 5. Store the new `cursor`, set `lastRead = readAt`, reset the backoff.
 6. `emitInvalidation('changelog', keys, { wholeCache: truncated })`: `platform.onInvalidate` in the background, e.g. to expire tags of a CDN or of the Runtime Cache.
@@ -1052,14 +1058,14 @@ Two design choices in that table. **Changes are applied lazily**, by expiring ra
 
 #### Step 5: trust, and what it buys
 
-`trustedSince()` ([LilypadChangelogSync.ts](../src/cache/dbSync/LilypadChangelogSync.ts)) is `undefined` without a cursor, when the last applied read is older than `maxGap`, or when no read was applied within `pollInterval` (two intervals with `poll: 'background'`), and `chainStartedAt` otherwise.
+`trustedSince()` ([LilypadChangelogSync.ts](../src/dbCache/sync/LilypadChangelogSync.ts)) is `undefined` without a cursor, when the last applied read is older than `maxGap`, or when no read was applied within `pollInterval` (two intervals with `poll: 'background'`), and `chainStartedAt` otherwise.
 
 Why an unbroken chain means "this instance sees every change". The chain starts with a lookback read, which expired everything held at that moment and discarded the reads in flight. Every later read starts exactly where the previous one stopped (the cursor), and the cursor reads return each change exactly once, whatever the order of the commits ([4.8](#the-cursor-the-transactions-a-read-could-not-see)). Take an entry fetched after `chainStartedAt` that no change has invalidated. A change of its row made after the fetch would have been returned by one of the reads since, and would have invalidated the entry. So the entry is up to date **as of the last applied read**, which is why the trust also needs that read to be recent: `get` never reads the changelog, and a read may fail, while the chain itself holds for up to `maxGap`.
 
 Two things rely on it:
 
 - **Renewal** ([Trust and renewal](#trust-and-renewal)): an entry that reaches its TTL with no change is extended without a query, up to `maxAge`. With the changelog, the TTL costs no query while the chain holds.
-- **`getAll`**: `isTableLoaded()` ([LilypadDbCache.ts](../src/cache/LilypadDbCache.ts)) is true when the table was loaded after the chain started. `getAll` then never reloads the whole table; it fetches only the members whose entries are missing or invalidated.
+- **`getAll`**: `members.isLoaded()` ([LilypadDbMembers.ts](../src/dbCache/LilypadDbMembers.ts)) is true when the table was loaded after the chain started. `getAll` then never reloads the whole table; it fetches only the members whose entries are missing or invalidated.
 
 When no read was applied for `pollInterval` (reads failing, or none triggered), `trustedSince()` is `undefined` until the next applied read, which continues the chain. When the chain breaks (no applied read for `maxGap`), `trustedSince()` turns `undefined` too. Entries then expire at their TTL, and `getAll` trusts its members only for `bulkSync.ttl`. The next successful read is a lookback, which expires everything and starts a new chain.
 
@@ -1118,7 +1124,7 @@ Why the inequalities:
 
 - **Trust is measured against `maxGap`, not against `pollInterval`.** After an instance has been idle for a while (less than `maxGap`), its chain is still trusted, although the changes of the idle period have not been read yet. Reads that poll and wait (`getOrFetch`, `getAll` with `poll: 'await'`) apply them first, so they are unaffected. But `get()`, `peek()`, and the reads with `poll: 'background'` renew entries **before** that poll is applied. They can serve a row that changed while the instance was idle, up to the length of the idle period.
 - **A transaction longer than the retention.** `changed_at` is the time of the write, not of the commit. A transaction that stays open longer than the retention, and commits just before a prune, can have its changelog rows deleted before any instance reads them. Keep the retention far above the longest transaction.
-- **Own writes are forgotten after 10 minutes** (`OWN_WRITE_RETENTION`, [LilypadDbCache.ts](../src/cache/LilypadDbCache.ts)), besides being pruned by the cursor. On an instance idle for longer, the echo of its own write is applied as a foreign change: one extra fetch, never a wrong value.
+- **Own writes are forgotten after 10 minutes** (`OWN_WRITE_RETENTION`, [LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts)), besides being pruned by the cursor. On an instance idle for longer, the echo of its own write is applied as a foreign change: one extra fetch, never a wrong value.
 - **A write-heavy table** makes each poll return many rows, and every cold start's lookback returns every change of the last `lookback` ms. That stays one query, and applying changes of rows not held costs no row query, but the size of the result grows with the write rate.
 - **The shared level has a rare race**, described in the [Known limits of the Next.js guide](nextjs-vercel.md#9-known-limits): keep the TTL of database caches with `shared` short.
 
@@ -1129,7 +1135,7 @@ Why the inequalities:
 - **Database, on each write, with the `prune` option:** on about one statement in `every`, an indexed lookup of the rows older than the retention, and the deletion of up to `batchSize` of them (`FOR UPDATE SKIP LOCKED`, so concurrent prunes never wait for each other). It runs in the writing transaction, only in `READ COMMITTED`: in `REPEATABLE READ` or `SERIALIZABLE`, deleting a row that a concurrent prune deleted raises a serialization failure, which would fail the write. The deletion is a `SECURITY DEFINER` function without parameters, so the writing roles need no `DELETE` privilege, and calling it by hand does nothing the trigger would not do. It names the changelog with its schema and searches `pg_temp` last (`SET search_path = pg_catalog, pg_temp`): otherwise a role could create a temporary table of the same name, which PostgreSQL searches first, and make the function delete from it with the privileges of its owner. The trigger function records the options in a comment (`lilypad-prune: ...`), which the schema check reads to keep them in the SQL it suggests.
 - **Storage:** one row per changed row, bounded by the retention (`olderThan`).
 
-The tests of the strategy are the `changelog sync`, `database traffic`, `changelog failures and reads in flight` and `own writes and the changelog cursor` groups of [LilypadDbCache.test.ts](../src/cache/LilypadDbCache.test.ts). The cursor itself is tested against PostgreSQL in [LilypadDbGate.integration.test.ts](../src/dbGate/LilypadDbGate.integration.test.ts) ("should not miss a transaction that commits after a later one", "should not return again the changes committed while a long transaction runs").
+The tests of the strategy are the `changelog sync`, `database traffic`, `changelog failures and reads in flight` and `own writes and the changelog cursor` groups of [LilypadDbCache.test.ts](../src/dbCache/LilypadDbCache.test.ts). The cursor itself is tested against PostgreSQL in [LilypadDbGate.integration.test.ts](../src/dbGate/LilypadDbGate.integration.test.ts) ("should not miss a transaction that commits after a later one", "should not return again the changes committed while a long transaction runs").
 
 ---
 
@@ -1143,7 +1149,7 @@ Setup: a `LilypadDbCache` of `users` with `sync: { strategy: 'changelog', pollIn
 
 **A:**
 
-1. `getOrFetch` → `getOrFetchDetailed` ([DbCache 673](../src/cache/LilypadDbCache.ts)): `assertNotDisposed()`, then `this.sync.beforeRead()` (line 680) → `LilypadChangelogSync.beforeRead`. `lastRead` is `0`, so a poll is due (line 64). `read()` → `reader.read(subscriber)`: nothing is running, so `start()` includes every subscriber and runs `readAll`.
+1. `getOrFetch` → `getOrFetchDetailed` ([DbCache 673](../src/dbCache/LilypadDbCache.ts)): `assertNotDisposed()`, then `this.sync.beforeRead()` (line 680) → `LilypadChangelogSync.beforeRead`. `lastRead` is `0`, so a poll is due (line 64). `read()` → `reader.read(subscriber)`: nothing is running, so `start()` includes every subscriber and runs `readAll`.
 2. `readAll` calls `subscriber.request(readAt)` → `request`: no cursor yet, so `{ lookback: ttl + swr + 60 000 }`. Then the batched query runs. A awaits it.
 
 **B and C** arrive while A is awaiting. `lastRead` is still `0` (it is set only after the read is applied), so their `beforeRead` also calls `reader.read(subscriber)`. This time `current` exists and includes the subscriber, so they get **the same promise**. One query for three callers.
@@ -1194,7 +1200,7 @@ Without the fence, the fetch, which may have read the row _before_ the change, w
 | Entry `c` exists                                             |                                                             | entry = 8     |
 | `getOrSet('c', slowFn, { skipCache: true })` starts          | `beginRead()`                                               | read = 9      |
 | A change for `c` → `expireNormalized('c')`                   | the entry is rewritten with `expirationTime: 0`             | entry = 10    |
-| `cleanupOnAccess` → `purgeEntries` removes the expired entry | `dropEntry`: a read is in flight → fence = entry ticket     | fence(c) = 10 |
+| `cleanupOnAccess` → `purgeExpired` removes the expired entry | `dropEntry`: a read is in flight → fence = entry ticket     | fence(c) = 10 |
 | `slowFn` resolves with the row read before the change        | `setIfNewer(..., 9)`: `currentTicket = max(floor, 10) = 10` | discarded     |
 
 Without `dropEntry`'s fence, the key would have no entry and no fence at this point, and the pre-change row would be stored; in a `LilypadDbCache` it would then be renewed until `maxAge`.
@@ -1242,7 +1248,7 @@ Same instance. The application calls `accounts.sqlUpdate({ id: 7, plan: 'team' }
 
 **Variation:** the poll ran while transaction 9200 was still committing, so its cursor lists 9200 in `xip` and does not return the change. `forgetOwnWritesCoveredBy` keeps 9200 (`lilypadCursorCovers` is false for a transaction in `xip`), and the next poll returns the change and recognises it.
 
-**Variation:** between step 4 and the poll, another instance updated row 7, and this instance applied that change first (ticket 70). At the echo, `store.get('7').ticket` is 70, not 61 → `isOwnWrite` returns `false`, and the echo is applied normally. That is correct: the entry no longer holds our write's result.
+**Variation:** between step 4 and the poll, another instance updated row 7, and this instance applied that change first (ticket 70). At the echo, `store.get('7').ticket` is 70, not 61 → `ownWrites.consume` returns `false`, and the echo is applied normally. That is correct: the entry no longer holds our write's result.
 
 **Variation:** while the `UPDATE` of step 3 was running, a poll applied someone else's change to row 7 (entry ticket becomes 62 > 60). The library cannot know which write committed last, so `storeWritten` calls `markInvalid` instead of caching the row, and the next read queries the database.
 
@@ -1342,9 +1348,9 @@ For each target, one of the two branches returns rows (the other one's first con
 
 - [LilypadCache.test.ts](../src/cache/LilypadCache.test.ts): tickets, fences (including "entries removed while a read is in flight"), bulk sync, eviction (everything runs on fake timers, `vi.advanceTimersByTimeAsync`);
 - [LilypadCache.shared.test.ts](../src/cache/LilypadCache.shared.test.ts): L2, its key format, stale-while-revalidate and the cooldown, with an in-memory store that clones values;
-- [LilypadDbCache.test.ts](../src/cache/LilypadDbCache.test.ts): the sync strategies, untrusted notifications, `getAll`, own writes, against an in-memory fake gate and a mocked changelog;
+- [LilypadDbCache.test.ts](../src/dbCache/LilypadDbCache.test.ts): the sync strategies, untrusted notifications, `getAll`, own writes, against an in-memory fake gate and a mocked changelog;
 - [LilypadChangelogReader.test.ts](../src/dbGate/LilypadChangelogReader.test.ts), [LilypadSchemaCheck.test.ts](../src/dbGate/LilypadSchemaCheck.test.ts) and [LilypadSchemaShape.test.ts](../src/dbGate/LilypadSchemaShape.test.ts): the batching of changelog reads, and every rule of the schema check, without a database;
-- [LilypadDbConfig.test.ts](../src/dbConfig/LilypadDbConfig.test.ts) and [loadLilypadDbConfig.test.ts](../src/dbConfig/loadLilypadDbConfig.test.ts): how a config is validated and resolved, and how its file is found;
+- [LilypadDbConfig.test.ts](../src/dbConfig/LilypadDbConfig.test.ts) and [loadLilypadDbConfig.test.ts](../src/dbGate/loadLilypadDbConfig.test.ts): how a config is validated and resolved, and how its file is found;
 - [LilypadDbGate.integration.test.ts](../src/dbGate/LilypadDbGate.integration.test.ts): the real thing against PostgreSQL in Docker, including the out-of-order commit test for the changelog cursor ("should not miss a transaction that commits after a later one"), the long-transaction test, the heartbeat, a reference `NOTIFY` trigger, and the shape check (the fix SQL creates the tables of a config, and the check then finds nothing).
 
 To see a behaviour in action, run a single test by name: `npx vitest run --project unit -t "<part of the test name>"`.

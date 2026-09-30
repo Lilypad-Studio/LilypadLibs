@@ -5,8 +5,6 @@ import {
 import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
 import { assertNumberOption } from '@/internal/LilypadValidation';
 
-export { LILYPAD_DEFAULT_CHANGELOG_TABLE };
-
 /**
  * The changelog records every change of the cached tables in a table, so that each instance can
  * read the changes made since its last check with one query. It needs no long-lived connection
@@ -141,8 +139,11 @@ function escapeFormat(value: string): string {
 }
 
 export type LilypadChangelogSqlOptions = {
-  /** Name of the changelog table. Defaults to `lilypad_cache_changes`. */
-  table?: string | undefined;
+  /**
+   * Name of the changelog table (`table` or `schema.table`), as in the other changelog helpers.
+   * Defaults to `lilypad_cache_changes`.
+   */
+  changelogTable?: string | undefined;
   /**
    * Channel on which the trigger also sends a `NOTIFY` for the `listen` strategy, or `false` to
    * send none. Defaults to `cache_events`.
@@ -274,7 +275,13 @@ END
  * Then attach the trigger to every cached table with {@link lilypadChangelogTriggerSql}.
  */
 export function lilypadChangelogSql(options: LilypadChangelogSqlOptions = {}): string {
-  const table = options.table ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
+  if (Object.hasOwn(options, 'table')) {
+    // The option of versions 0.7 and earlier: `table` is the cached table in the other helpers
+    throw new Error(
+      'lilypadChangelogSql: the `table` option is now `changelogTable` (the name of the changelog table).'
+    );
+  }
+  const table = options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
   const channel = options.notifyChannel ?? LILYPAD_DEFAULT_NOTIFY_CHANNEL;
   const prune = resolvePruneOptions('lilypadChangelogSql', options.prune);
   assertNumberOption(

@@ -11,8 +11,8 @@ import eslintConfigPrettier from 'eslint-config-prettier/flat';
 const edgeModules = [
   'src/index.ts',
   'src/entries/!(db).ts',
-  'src/cache/*.ts',
-  'src/dbConfig/*.ts',
+  'src/cache/**/*.ts',
+  'src/dbConfig/**/*.ts',
   'src/flow/**/*.ts',
   'src/internal/**/*.ts',
   'src/logger/**/*.ts',
@@ -20,11 +20,7 @@ const edgeModules = [
   'src/serializer/**/*.ts',
   'src/singleton/**/*.ts',
 ];
-const nodeOnlyModules = [
-  'src/cache/LilypadDbCache.ts',
-  'src/dbConfig/loadLilypadDbConfig.ts',
-  '**/*.test.ts',
-];
+const nodeOnlyModules = ['**/*.test.ts'];
 
 export default defineConfig([
   globalIgnores(['dist/', 'coverage/', 'api-docs/']),

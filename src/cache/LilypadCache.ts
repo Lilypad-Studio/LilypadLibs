@@ -1,6 +1,5 @@
 import { LilypadCacheEngine } from '@/cache/LilypadCacheEngine';
 import {
-  LilypadDisposedError,
   type LilypadCachedValueType,
   type LilypadCacheGetOptions,
   type LilypadCacheKey,
@@ -11,6 +10,7 @@ import {
   type LilypadCacheValueFn,
 } from '@/cache/LilypadCacheTypes';
 import { LilypadFlowControl } from '@/flow/LilypadFlowControl';
+import { LilypadDisposedError } from '@/internal/LilypadDisposedError';
 import { assertNumberOption } from '@/internal/LilypadValidation';
 
 export * from '@/cache/LilypadCacheTypes';
@@ -157,7 +157,8 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
    * the same key share one fetch; the `onError` options still apply separately to each caller.
    *
    * @param valueFn - Produces the value; it receives a signal aborted when the fetch times out.
-   * @throws The error of `valueFn` (or the timeout error) when `onError` gives no fallback value.
+   * @throws The error of `valueFn`, a {@link LilypadTimeoutError} when it exceeds its timeout, or a
+   * {@link LilypadCacheCooldownError} within `failureCooldown`, when `onError` gives no fallback value.
    * @throws {RangeError} If `ttl`, `staleWhileRevalidate`, `timeout` or `onError.ttl` is not valid.
    * @see {@link getOrSetDetailed} to also know where the value comes from
    */

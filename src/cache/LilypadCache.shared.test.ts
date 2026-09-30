@@ -1,10 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import {
-  LilypadCache,
-  LilypadCacheCooldownError,
-  LilypadDisposedError,
-  type LilypadSharedCodec,
-} from './LilypadCache';
+import { LilypadCache, LilypadCacheCooldownError, type LilypadSharedCodec } from './LilypadCache';
+import { LilypadDisposedError } from '@/internal/LilypadDisposedError';
 import type { LilypadLibLogger } from '@/logger/LilypadLogger';
 import type { LilypadPlatform, LilypadSharedStore } from '@/platform/LilypadPlatform';
 

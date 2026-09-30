@@ -13,7 +13,7 @@ You review changes to `@lilypad-studio/libs`, an internal TypeScript library (ca
 1. Get the diff: `git diff HEAD` (plus `git diff main...HEAD` on a branch). If a scope was given to you, restrict to it.
 2. For each changed module, read its section of `docs/architecture.md` and the surrounding code before judging.
 3. Check, and report only real violations:
-   - **Cache engine** (`src/cache/`): async reads go through `beginRead()` and store with `read.store` / `read.storeFetched`; removals go through `removeEntry`/`dropEntry`, never `store.delete`; a read joins a fetch in flight only if its ticket is above `currentTicket(key)`; `beforeRead()` of a sync strategy is awaited inline (`const syncing = ...; if (syncing) await syncing;`), never inside an `async` helper.
+   - **Cache engine** (`src/cache/`, and `src/dbCache/` on top of it): async reads go through `beginRead()` and store with `read.store` / `read.storeFetched`; removals go through `removeEntry`/`dropEntry`, never `store.delete`; a read joins a fetch in flight only if its ticket is above `currentTicket(key)`; `beforeRead()` of a sync strategy is awaited inline (`const syncing = ...; if (syncing) await syncing;`), never inside an `async` helper.
    - **`undefined` vs `null`**: `undefined` is "not cached / expired", `null` is "cached as not existing". Flag any code that conflates them.
    - **Background work**: nothing that can reject without a handler; logger channel methods return `void` and never throw.
    - **Gate**: the main `sql` client keeps `prepare: false`; no postgres.js `.cancel()`.

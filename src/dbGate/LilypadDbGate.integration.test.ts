@@ -5,7 +5,7 @@ import { LilypadDbGate } from './LilypadDbGate';
 import { LilypadDbEmptyWriteError, LilypadDbNotFoundError } from '@/dbConfig/LilypadDbSchema';
 import { defineLilypadDb, defineLilypadTable } from '@/dbConfig/LilypadDbConfig';
 import { bindLilypadDbHooks, type LilypadDbTableHooks } from '@/dbConfig/LilypadDbHooks';
-import { LilypadDbCache } from '@/cache/LilypadDbCache';
+import { LilypadDbCache } from '@/dbCache/LilypadDbCache';
 import { LilypadDbTable } from './LilypadDbTable';
 import {
   lilypadChangelogPruneScheduleSql,
@@ -867,7 +867,9 @@ describe('LilypadDbGate (integration)', () => {
           `);
 
         beforeEach(async () => {
-          await admin.unsafe(lilypadChangelogSql({ table: changes, notifyChannel: false }));
+          await admin.unsafe(
+            lilypadChangelogSql({ changelogTable: changes, notifyChannel: false })
+          );
         });
 
         afterEach(async () => {
@@ -917,7 +919,7 @@ describe('LilypadDbGate (integration)', () => {
         it('should report a trigger that prunes rows the caches still need, as an error', async () => {
           await admin.unsafe(
             lilypadChangelogSql({
-              table: changes,
+              changelogTable: changes,
               notifyChannel: false,
               prune: { olderThan: 30 * 60_000 },
             })
@@ -1227,7 +1229,7 @@ describe('LilypadDbGate (integration)', () => {
       try {
         await admin.unsafe(
           lilypadChangelogSql({
-            table: changelogTable,
+            changelogTable,
             notifyChannel: channel,
             prune: { olderThan: 60 * 60_000 },
           })
@@ -1389,7 +1391,9 @@ describe('LilypadDbGate (integration)', () => {
     });
 
     it('should report a changelog installed by version 1, and upgrade it', async () => {
-      await admin.unsafe(lilypadChangelogSql({ table: 'legacy_changes', notifyChannel: false }));
+      await admin.unsafe(
+        lilypadChangelogSql({ changelogTable: 'legacy_changes', notifyChannel: false })
+      );
       // What version 1 installed: no schema column, no version comment
       await admin`ALTER TABLE legacy_changes DROP COLUMN table_schema`;
       await admin`COMMENT ON FUNCTION legacy_changes_record() IS NULL`;
@@ -1416,7 +1420,7 @@ describe('LilypadDbGate (integration)', () => {
       await admin.unsafe(lilypadChangelogTriggerSql({ table: 'archive.users', primaryKey: 'id' }));
       // A second changelog, whose trigger function also sends notifications on cache_events. Its
       // triggers are created by hand: the generated ones have the same names as the triggers above.
-      await admin.unsafe(lilypadChangelogSql({ table: 'archive.changes' }));
+      await admin.unsafe(lilypadChangelogSql({ changelogTable: 'archive.changes' }));
       await admin.unsafe(`
         CREATE TRIGGER archive_users_notify_insert AFTER INSERT ON archive.users
           REFERENCING NEW TABLE AS lilypad_new
@@ -1647,7 +1651,7 @@ describe('LilypadDbGate (integration)', () => {
     it('should send one BULK notification for a statement above the threshold', async () => {
       await admin.unsafe(
         lilypadChangelogSql({
-          table: 'bulk_changes',
+          changelogTable: 'bulk_changes',
           notifyChannel: 'bulk_events',
           notifyBulkThreshold: 2,
         })

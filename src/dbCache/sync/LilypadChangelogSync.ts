@@ -2,7 +2,7 @@ import type {
   LilypadDbCacheChangelogSync,
   LilypadDbSyncHost,
   LilypadDbSyncStrategy,
-} from '@/cache/dbSync/LilypadDbSyncTypes';
+} from '@/dbCache/sync/LilypadDbSyncTypes';
 import type { LilypadCacheKey } from '@/cache/LilypadCacheTypes';
 import type {
   LilypadChange,

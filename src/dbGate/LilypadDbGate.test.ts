@@ -1,6 +1,6 @@
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { LilypadDbGate, lilypadServerlessPool } from './LilypadDbGate';
-import { LilypadDisposedError } from '@/cache/LilypadCacheTypes';
+import { LilypadDisposedError } from '@/internal/LilypadDisposedError';
 import { defineLilypadDb, defineLilypadTable } from '@/dbConfig/LilypadDbConfig';
 import { bindLilypadDbHooks } from '@/dbConfig/LilypadDbHooks';
 import { LilypadDbTable } from './LilypadDbTable';
@@ -316,6 +316,20 @@ describe('LilypadDbGate close', () => {
       // @ts-expect-error: a table must come from defineLilypadDb
       expect(() => gate.table(schema)).toThrow(
         'must be a table of a config made with defineLilypadDb'
+      );
+      await gate.close();
+    });
+
+    it('should check the definition given to the constructor, and apply the hooks of the gate', async () => {
+      const select = (row: Record<string, unknown>) => ({ id: Number(row.id) });
+      const appDb = bindLilypadDbHooks(db, { items: { select } });
+      const gate = await LilypadDbGate.create({ connectionString: unreachable, config: appDb });
+      const schema = { tableName: 'items', primaryKey: 'id' as const, cols: { id: {} } };
+
+      expect(new LilypadDbTable(gate, db.tables.items).definition.hooks?.select).toBe(select);
+      // @ts-expect-error: a table must come from defineLilypadDb
+      expect(() => new LilypadDbTable(gate, schema)).toThrow(
+        'LilypadDbTable: the table must be a table of a config made with defineLilypadDb'
       );
       await gate.close();
     });

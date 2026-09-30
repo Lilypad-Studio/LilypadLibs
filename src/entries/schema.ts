@@ -37,8 +37,11 @@ export type {
   LilypadDbTableHooks,
   LilypadDbTableHooksBase,
 } from '../dbConfig/LilypadDbHooks';
-export { LILYPAD_DEFAULT_DB_CONFIG_NAME } from '../dbConfig/LilypadDbConfigDefaults';
-export { lilypadColumnTypesOfPgType } from '../dbConfig/LilypadPgTypes';
+export {
+  LILYPAD_DEFAULT_CHANGELOG_TABLE,
+  LILYPAD_DEFAULT_DB_CONFIG_NAME,
+} from '../dbConfig/LilypadDbConfigDefaults';
+export { lilypadColumnTypesOfPgType, normalizeLilypadPgType } from '../dbConfig/LilypadPgTypes';
 export type {
   LilypadDbColumnType,
   LilypadDbColumnTypeOf,

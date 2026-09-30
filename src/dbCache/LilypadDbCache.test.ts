@@ -971,14 +971,29 @@ describe('LilypadDbCache', () => {
       expect(queries()).toEqual({ table: 1, byKey: 0, byKeys: [['1']] });
     });
 
-    it('should fetch only the requested keys with getAll(keys)', async () => {
+    it('should fetch only the requested keys with getManyOrFetch(keys)', async () => {
       const cache = await createCache({ sync: { strategy: 'none' } });
 
-      expect(await rowsOf(cache.getAll(['2', '2', 'missing']))).toEqual([
+      expect(await rowsOf(cache.getManyOrFetch(['2', '2', 'missing']))).toEqual([
         { id: '2', name: 'row 2' },
       ]);
-      expect(await rowsOf(cache.getAll(['2']))).toEqual([{ id: '2', name: 'row 2' }]);
+      expect(await rowsOf(cache.getManyOrFetch(['2']))).toEqual([{ id: '2', name: 'row 2' }]);
       expect(queries()).toEqual({ table: 0, byKey: 0, byKeys: [['2', 'missing']] });
+    });
+
+    it('should take the keys of getManyOrFetch as any iterable, read once', async () => {
+      const cache = await createCache({ sync: { strategy: 'none' } });
+      function* keys() {
+        yield '1';
+        yield '2';
+      }
+
+      expect(await rowsOf(cache.getManyOrFetch(keys()))).toEqual([
+        { id: '1', name: 'row 1' },
+        { id: '2', name: 'row 2' },
+      ]);
+      expect(await rowsOf(cache.getManyOrFetch(new Set(['1', '2'])))).toHaveLength(2);
+      expect(queries()).toEqual({ table: 0, byKey: 0, byKeys: [['1', '2']] });
     });
 
     it('should not keep past its TTL a row copied from the shared level', async () => {
@@ -1361,7 +1376,7 @@ describe('LilypadDbCache', () => {
     });
   });
 
-  describe('getAll(keys) in parallel', () => {
+  describe('getManyOrFetch in parallel', () => {
     it('should not mix up key sets that join to the same string', async () => {
       fake = createFakeGate([
         { id: 'a', name: 'A' },
@@ -1371,8 +1386,8 @@ describe('LilypadDbCache', () => {
       const cache = await createCache({ sync: { strategy: 'none' } });
 
       const [joined, separate] = await Promise.all([
-        cache.getAll(['a,b']),
-        cache.getAll(['a', 'b']),
+        cache.getManyOrFetch(['a,b']),
+        cache.getManyOrFetch(['a', 'b']),
       ]);
 
       expect([...joined.keys()]).toEqual(['a,b']);
@@ -1382,7 +1397,7 @@ describe('LilypadDbCache', () => {
     it('should share the query of a key already being fetched', async () => {
       const cache = await createCache({ sync: { strategy: 'none' } });
 
-      await Promise.all([cache.getAll(['1', '2']), cache.getAll(['2'])]);
+      await Promise.all([cache.getManyOrFetch(['1', '2']), cache.getManyOrFetch(['2'])]);
 
       expect(fake.mocks.selectByPrimaryKeys).toHaveBeenCalledOnce();
     });
@@ -1424,7 +1439,7 @@ describe('LilypadDbCache', () => {
 
     it('should discard a read in flight when its row changes, without a query', async () => {
       const cache = await createChangelogCache();
-      await cache.getAll(['2']); // first read of the changelog
+      await cache.getManyOrFetch(['2']); // first read of the changelog
       let release!: (row: Item | null) => void;
       fake.mocks.selectByPrimaryKey.mockReturnValueOnce(
         new Promise((resolve) => (release = resolve))
@@ -1437,7 +1452,7 @@ describe('LilypadDbCache', () => {
 
       // The changelog read of a later read applies the change while the fetch is in flight
       await vi.advanceTimersByTimeAsync(1000);
-      await cache.getAll(['2']);
+      await cache.getManyOrFetch(['2']);
       release({ id: '1', name: 'before the change' });
       await pending;
 
@@ -1500,7 +1515,7 @@ describe('LilypadDbCache', () => {
       await cache.dispose();
     });
 
-    it('should key the rows of getAll(keys) as first given, when a key is given twice', async () => {
+    it('should key the rows of getManyOrFetch as first given, when a key is given twice', async () => {
       const numericFake = createFakeGate();
       numericFake.mocks.selectByPrimaryKeys.mockResolvedValueOnce([
         { id: 7, name: 'seven' } as unknown as Item,
@@ -1510,7 +1525,7 @@ describe('LilypadDbCache', () => {
         table: numericTable(numericInput),
       });
 
-      const rows = await cache.getAll([7, '7' as unknown as number]);
+      const rows = await cache.getManyOrFetch([7, '7' as unknown as number]);
 
       expect([...rows.keys()]).toEqual([7]);
       await cache.dispose();
@@ -1766,7 +1781,7 @@ describe('LilypadDbCache', () => {
       expect(cache.get('1')).toEqual({ id: '1', name: 'changed' });
     });
 
-    it('should not return the rows of getAll(keys) read before an invalidation', async () => {
+    it('should not return the rows of getManyOrFetch read before an invalidation', async () => {
       const cache = await createCache({ sync: { strategy: 'none' } });
       let release!: () => void;
       fake.mocks.selectByPrimaryKeys.mockImplementationOnce(async (keys) => {
@@ -1774,11 +1789,11 @@ describe('LilypadDbCache', () => {
         await new Promise<void>((resolve) => (release = resolve));
         return rows;
       });
-      const slow = cache.getAll(['1']);
+      const slow = cache.getManyOrFetch(['1']);
       fake.rows.set('1', { id: '1', name: 'changed' });
       cache.invalidate('1');
 
-      const after = cache.getAll(['1']);
+      const after = cache.getManyOrFetch(['1']);
       release();
 
       expect(await rowsOf(after)).toEqual([{ id: '1', name: 'changed' }]);
@@ -1788,10 +1803,10 @@ describe('LilypadDbCache', () => {
       expect(fake.mocks.selectByPrimaryKeys).toHaveBeenCalledTimes(2);
     });
 
-    it('should still share a query of getAll(keys) when nothing changed', async () => {
+    it('should still share a query of getManyOrFetch when nothing changed', async () => {
       const cache = await createCache({ sync: { strategy: 'none' } });
 
-      await Promise.all([cache.getAll(['1']), cache.getAll(['1'])]);
+      await Promise.all([cache.getManyOrFetch(['1']), cache.getManyOrFetch(['1'])]);
 
       expect(fake.mocks.selectByPrimaryKeys).toHaveBeenCalledOnce();
     });

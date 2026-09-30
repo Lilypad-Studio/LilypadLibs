@@ -80,7 +80,8 @@ type ChannelMethods<T extends string> = Record<T, ChannelMethodFunction>;
  *
  * @remarks
  * The logger creates dynamic methods on the instance for each log type defined in the constructor options.
- * Each method accepts a message string and routes it to all registered components of that type.
+ * Each method accepts any number of values, formats them into one message and routes it to all
+ * registered components of that type.
  * Errors thrown by components are caught and handled via the errorLogging callback if provided.
  */
 export class LilypadLogger<T extends string> {

@@ -1,6 +1,5 @@
 import {
   LilypadCacheCooldownError,
-  LilypadDisposedError,
   type LilypadCachedValueType,
   type LilypadCacheEntry,
   type LilypadCacheEntryOrigin,
@@ -19,6 +18,7 @@ import {
   type LilypadSharedEntry,
 } from '@/cache/LilypadSharedLevel';
 import { LilypadFlowControl } from '@/flow/LilypadFlowControl';
+import { LilypadDisposedError } from '@/internal/LilypadDisposedError';
 import { assertNumberOption } from '@/internal/LilypadValidation';
 import { libLog, type LilypadLibLogger } from '@/logger/LilypadLibLogger';
 import {

@@ -1,4 +1,4 @@
-import type { LilypadDbNotification } from '@/cache/dbSync/LilypadDbSyncTypes';
+import type { LilypadDbNotification } from '@/dbCache/sync/LilypadDbSyncTypes';
 import type { LilypadDbGate, LilypadDbListener } from '@/dbGate/LilypadDbGate';
 import type { LilypadLibLogLevel } from '@/logger/LilypadLibLogger';
 

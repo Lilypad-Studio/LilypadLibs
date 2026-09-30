@@ -9,9 +9,12 @@ export type {
   LilypadDbPoolOptions,
 } from '../dbGate/LilypadDbGate';
 export { LilypadDbTable } from '../dbGate/LilypadDbTable';
-export { LilypadDisposedError } from '../cache/LilypadCacheTypes';
+// The errors of the cache engine, which `LilypadDbCache` throws too
+export { LilypadCacheCooldownError } from '../cache/LilypadCacheTypes';
+export { LilypadDisposedError } from '../internal/LilypadDisposedError';
+export { LilypadTimeoutError } from '../flow/LilypadFlowControl';
 
-export { LilypadDbCache } from '../cache/LilypadDbCache';
+export { LilypadDbCache } from '../dbCache/LilypadDbCache';
 export type {
   LilypadDbCacheBaseOptions,
   LilypadDbCacheGateNamedOptions,
@@ -20,13 +23,12 @@ export type {
   LilypadDbCacheSyncOverrides,
   LilypadDbKey,
   LilypadDbNotification,
-} from '../cache/LilypadDbCache';
+} from '../dbCache/LilypadDbCache';
 
 export * from './schema';
-export { loadLilypadDbConfig, lilypadDbConfigFileNames } from '../dbConfig/loadLilypadDbConfig';
+export { loadLilypadDbConfig, lilypadDbConfigFileNames } from '../dbGate/loadLilypadDbConfig';
 
 export {
-  LILYPAD_DEFAULT_CHANGELOG_TABLE,
   LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD,
   LILYPAD_MIN_CHANGELOG_RETENTION,
   lilypadChangelogPruneScheduleSql,
@@ -45,7 +47,6 @@ export type {
 } from '../dbGate/LilypadChangelog';
 
 export { checkLilypadSchema, LilypadSchemaCheckError } from '../dbGate/LilypadSchemaCheck';
-export { normalizeLilypadPgType } from '../dbConfig/LilypadPgTypes';
 export { lilypadSchemaCheckOptions, runLilypadDoctor } from '../dbGate/LilypadDoctor';
 export type { LilypadDoctorOptions, LilypadDoctorReport } from '../dbGate/LilypadDoctor';
 export type {

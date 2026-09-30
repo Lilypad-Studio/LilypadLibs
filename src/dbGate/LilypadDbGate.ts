@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { LilypadDisposedError } from '@/cache/LilypadCacheTypes';
+import { LilypadDisposedError } from '@/internal/LilypadDisposedError';
 import {
   resolveLilypadDbTable,
   type LilypadDbConfig,
@@ -143,7 +143,7 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
   public readonly config: C;
   /** Only when `listenerConnectionString` differs: otherwise `sql` listens. */
   private readonly listenerClient?: postgres.Sql | undefined;
-  protected logger?: LilypadLibLogger | undefined;
+  private readonly logger?: LilypadLibLogger | undefined;
   private listeners = new Map<string, ChannelListener>();
   private releaseSingleton: LilypadSingletonRelease = () => {};
   private readonly heartbeat?: LilypadListenHeartbeat | undefined;
@@ -501,7 +501,12 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
     return this.closing !== undefined;
   }
 
-  /** @throws {LilypadDisposedError} If the gate is closed. */
+  /**
+   * Used by the table handles and the changelog helpers before each query: check `closed` instead.
+   *
+   * @internal
+   * @throws {LilypadDisposedError} If the gate is closed.
+   */
   assertOpen(): void {
     if (this.closing) {
       throw new LilypadDisposedError(`LilypadDbGate "${this.id}"`, 'closed');

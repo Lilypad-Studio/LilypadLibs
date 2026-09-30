@@ -1,4 +1,4 @@
-import type { LilypadDbTableDefinition } from '@/dbConfig/LilypadDbConfig';
+import { resolveLilypadDbTable, type LilypadDbTableDefinition } from '@/dbConfig/LilypadDbConfig';
 import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
 import {
   LilypadDbEmptyWriteError,
@@ -38,10 +38,24 @@ const XID_COLUMN = '__lilypad_xid';
  * ```
  */
 export class LilypadDbTable<T, PK extends keyof T = keyof T> {
+  readonly definition: LilypadDbTableDefinition<T, PK>;
+
+  /**
+   * Prefer `gate.table(...)`. The definition is checked, and takes the hooks that the config of the
+   * gate binds to its table, as with `gate.table`: the hooks cannot be skipped this way.
+   *
+   * @throws If `definition` is not a table of a config made with `defineLilypadDb`.
+   */
   constructor(
     private readonly gate: LilypadDbGate,
-    readonly definition: LilypadDbTableDefinition<T, PK>
-  ) {}
+    definition: LilypadDbTableDefinition<T, PK>
+  ) {
+    this.definition = resolveLilypadDbTable(
+      'LilypadDbTable',
+      definition,
+      gate.config
+    ) as LilypadDbTableDefinition<T, PK>;
+  }
 
   private get sql(): postgres.Sql {
     return this.gate.sql;

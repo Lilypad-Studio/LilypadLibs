@@ -70,4 +70,17 @@ describe('package entries', () => {
       'postgres',
     ]);
   });
+
+  it('should export the errors a module throws from its entry, as the same classes', async () => {
+    const [cache, db, flow] = await Promise.all([
+      import('./cache'),
+      import('./db'),
+      import('./flow'),
+    ]);
+
+    expect(cache.LilypadTimeoutError).toBe(flow.LilypadTimeoutError);
+    expect(db.LilypadTimeoutError).toBe(flow.LilypadTimeoutError);
+    expect(db.LilypadCacheCooldownError).toBe(cache.LilypadCacheCooldownError);
+    expect(db.LilypadDisposedError).toBe(cache.LilypadDisposedError);
+  });
 });

@@ -225,7 +225,7 @@ export function evaluateLilypadSchema(
         ? installedChannel
         : tableChannels[0]!;
   const sqlWith = (prune: LilypadChangelogPruneOptions | false) =>
-    lilypadChangelogSql({ table: fixChangelog.custom, notifyChannel: fixChannel, prune });
+    lilypadChangelogSql({ changelogTable: fixChangelog.custom, notifyChannel: fixChannel, prune });
 
   // Reported after the other problems, which the caches need first. Without the pruning check,
   // the fixes keep the installed pruning; with it, they install the suggested one

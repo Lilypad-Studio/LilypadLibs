@@ -7,11 +7,12 @@ import {
 /**
  * A logger component that outputs messages to the console.
  *
- * @template T - A string literal type representing the logger's category or name.
+ * @template T - The channels of the logger it is registered on (e.g. `'error' | 'info'`).
  *
  * @example
  * ```typescript
- * const logger = new LilypadConsoleLogger<'app'>();
+ * const output = new LilypadConsoleLogger<'error' | 'info'>();
+ * const logger = LilypadLogger.create({ components: { error: [output], info: [output] } });
  * ```
  *
  * @remarks

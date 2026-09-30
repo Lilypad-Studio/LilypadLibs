@@ -50,13 +50,23 @@ describe('lilypadChangelogSql prune option', () => {
   });
 
   it('should name the prune function after the changelog table', () => {
-    const sql = lilypadChangelogSql({ table: 'archive.changes', prune: { olderThan: 60_000 } });
+    const sql = lilypadChangelogSql({
+      changelogTable: 'archive.changes',
+      prune: { olderThan: 60_000 },
+    });
 
     expect(sql).toContain('PERFORM "archive_changes_prune"();');
     // Qualified with its schema by the migration, in the DO block that creates the function
     expect(sql).toContain(`WHERE c.oid = '"archive"."changes"'::regclass`);
     expect(sql).toContain('DELETE FROM %1$s WHERE id IN');
     expect(sql).toContain(`'"archive_changes_prune"', format($body$`);
+  });
+
+  it('should refuse the `table` option of earlier versions, which the trigger helper uses for the cached table', () => {
+    // @ts-expect-error: the option is `changelogTable`
+    expect(() => lilypadChangelogSql({ table: 'accounts' })).toThrow(
+      'the `table` option is now `changelogTable`'
+    );
   });
 
   it.each([
@@ -188,7 +198,7 @@ describe('lilypadChangelogTriggerSql', () => {
 describe('lilypadChangelogSql dollar quotes', () => {
   it('should quote the bodies with tags that the names do not contain', () => {
     const sql = lilypadChangelogSql({
-      table: 'odd$$record$lilypad$function$',
+      changelogTable: 'odd$$record$lilypad$function$',
       notifyChannel: 'odd$notify$',
       prune: { olderThan: 86_400_000 },
     });

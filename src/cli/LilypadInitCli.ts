@@ -3,7 +3,7 @@ import { basename, dirname, extname, isAbsolute, relative, resolve } from 'node:
 import { parseArgs } from 'node:util';
 import { lilypadDbConfigTemplate } from '@/cli/lilypadDbConfigTemplate';
 import { LILYPAD_DEFAULT_DB_CONFIG_NAME } from '@/dbConfig/LilypadDbConfigDefaults';
-import { lilypadDbConfigFileNames } from '@/dbConfig/loadLilypadDbConfig';
+import { lilypadDbConfigFileNames } from '@/dbGate/loadLilypadDbConfig';
 
 const LILYPAD_INIT_USAGE = `Usage: lilypad-doctor init [options]
 
