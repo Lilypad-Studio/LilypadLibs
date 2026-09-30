@@ -30,6 +30,7 @@ const config: ViteUserConfig = defineConfig({
           environment: 'edge-runtime',
           include: [
             'src/cache/LilypadCache*.test.ts',
+            'src/cache/LilypadReadFlights.test.ts',
             'src/dbConfig/LilypadDbConfig*.test.ts',
             'src/dbConfig/LilypadDbHooks.test.ts',
             'src/dbConfig/LilypadPgTypes.test.ts',

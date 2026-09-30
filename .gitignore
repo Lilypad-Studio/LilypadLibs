@@ -12,6 +12,9 @@
 !.env.example
 .npmrc
 
+# personal Claude Code settings (the shared ones are in .claude/settings.json)
+.claude/settings.local.json
+
 # test and debug output
 /coverage
 *.log
