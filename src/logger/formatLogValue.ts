@@ -2,6 +2,14 @@
 const MAX_TEXT_DEPTH = 4;
 /** Nesting levels kept in the JSON form: beyond, a value is abbreviated too (pathological depth). */
 const MAX_JSON_DEPTH = 64;
+/** Items printed per array, set, map or object in the text form; the others are counted. */
+const MAX_TEXT_ITEMS = 100;
+/**
+ * Objects walked per value, in both forms: beyond, they are abbreviated as `[…]`. An object
+ * referenced twice is walked twice (only a reference to an ancestor is circular), so a value whose
+ * levels share their children doubles at each level: the budget bounds the work whatever the shape.
+ */
+const MAX_WALKED_OBJECTS = 10_000;
 
 /**
  * The keys whose values the logger replaces with `[Redacted]` by default, wherever they appear in
@@ -54,19 +62,22 @@ type LogNode =
   /** `[Circular]`, `[Redacted]`, `[Getter threw]`, `[Object]`...: never quoted. */
   | { kind: 'marker'; text: string }
   | { kind: 'date'; iso: string | null }
-  | { kind: 'array'; items: LogNode[] }
-  | { kind: 'map'; entries: [LogNode, LogNode][] }
-  | { kind: 'set'; items: LogNode[] }
-  | { kind: 'object'; properties: [string, LogNode][] }
+  /** `more`: the items left out beyond `MAX_TEXT_ITEMS` (text form only). */
+  | { kind: 'array'; items: LogNode[]; more: number }
+  | { kind: 'map'; entries: [LogNode, LogNode][]; more: number }
+  | { kind: 'set'; items: LogNode[]; more: number }
+  | { kind: 'object'; properties: WalkedProperties }
   | {
       kind: 'error';
       name: string;
       message: string;
       stack: string | undefined;
       /** Its own properties; `undefined` beyond the depth of the text form. */
-      properties: [string, LogNode][] | undefined;
+      properties: WalkedProperties | undefined;
       cause: LogNode | undefined;
     };
+
+type WalkedProperties = { entries: [string, LogNode][]; more: number };
 
 const marker = (text: string): LogNode => ({ kind: 'marker', text });
 const REDACTED = marker('[Redacted]');
@@ -78,12 +89,28 @@ type WalkState = {
   /** The JSON form follows `toJSON`, as `JSON.stringify` would; the text form prints the object. */
   json: boolean;
   maxDepth: number;
+  maxItems: number;
+  /** The objects that can still be walked (see `MAX_WALKED_OBJECTS`). */
+  budget: number;
 };
 
 /** Properties of errors printed by the stack, or separately. */
 const ERROR_OWN_KEYS = new Set(['name', 'stack', 'message', 'cause']);
+const AGGREGATE_ERROR_OWN_KEYS = new Set([...ERROR_OWN_KEYS, 'errors']);
 
+/**
+ * Walks a value. A part that cannot be read (a `toJSON` or an iterator that throws, a Proxy trap)
+ * becomes `[Unformattable value]` without losing the rest of the value.
+ */
 function walk(value: unknown, depth: number, state: WalkState): LogNode {
+  try {
+    return walkValue(value, depth, state);
+  } catch {
+    return marker('[Unformattable value]');
+  }
+}
+
+function walkValue(value: unknown, depth: number, state: WalkState): LogNode {
   switch (typeof value) {
     case 'string':
       return { kind: 'string', value };
@@ -104,6 +131,9 @@ function walk(value: unknown, depth: number, state: WalkState): LogNode {
   const { seen } = state;
   if (seen.has(value)) {
     return marker('[Circular]');
+  }
+  if (--state.budget < 0) {
+    return marker('[…]');
   }
   if (value instanceof Error) {
     return walkError(value, depth, state);
@@ -141,19 +171,35 @@ function walk(value: unknown, depth: number, state: WalkState): LogNode {
   seen.add(value);
   try {
     if (Array.isArray(value)) {
-      return { kind: 'array', items: value.map((item) => walk(item, depth + 1, state)) };
+      const items: LogNode[] = [];
+      const shown = Math.min(value.length, state.maxItems);
+      for (let index = 0; index < shown; index++) {
+        items.push(walk(value[index], depth + 1, state));
+      }
+      return { kind: 'array', items, more: value.length - shown };
     }
     if (value instanceof Map) {
-      return {
-        kind: 'map',
-        entries: [...value].map(([key, item]) => [
+      const entries: [LogNode, LogNode][] = [];
+      for (const [key, item] of value as Map<unknown, unknown>) {
+        if (entries.length === state.maxItems) {
+          break;
+        }
+        entries.push([
           walk(key, depth + 1, state),
           isRedacted(key, state.redaction) ? REDACTED : walk(item, depth + 1, state),
-        ]),
-      };
+        ]);
+      }
+      return { kind: 'map', entries, more: value.size - entries.length };
     }
     if (value instanceof Set) {
-      return { kind: 'set', items: [...value].map((item) => walk(item, depth + 1, state)) };
+      const items: LogNode[] = [];
+      for (const item of value as Set<unknown>) {
+        if (items.length === state.maxItems) {
+          break;
+        }
+        items.push(walk(item, depth + 1, state));
+      }
+      return { kind: 'set', items, more: value.size - items.length };
     }
     return { kind: 'object', properties: walkProperties(value, depth, state) };
   } finally {
@@ -164,13 +210,24 @@ function walk(value: unknown, depth: number, state: WalkState): LogNode {
 function walkError(error: Error, depth: number, state: WalkState): LogNode {
   state.seen.add(error);
   try {
+    const aggregate = error instanceof AggregateError;
+    const properties =
+      depth < state.maxDepth
+        ? walkProperties(error, depth, state, aggregate ? AGGREGATE_ERROR_OWN_KEYS : ERROR_OWN_KEYS)
+        : undefined;
+    if (properties && aggregate) {
+      // Not enumerable, and often what explains the error (e.g. each address a connection tried)
+      properties.entries.push([
+        'errors',
+        isRedacted('errors', state.redaction) ? REDACTED : walk(error.errors, depth + 1, state),
+      ]);
+    }
     return {
       kind: 'error',
       name: error.name,
       message: error.message,
       stack: error.stack,
-      properties:
-        depth < state.maxDepth ? walkProperties(error, depth, state, ERROR_OWN_KEYS) : undefined,
+      properties,
       cause: error.cause !== undefined ? walk(error.cause, depth + 1, state) : undefined,
     };
   } finally {
@@ -178,38 +235,39 @@ function walkError(error: Error, depth: number, state: WalkState): LogNode {
   }
 }
 
-/** The own enumerable properties of an object. A getter that throws does not stop the others. */
+/**
+ * The own enumerable properties of an object, at most `maxItems`. A getter that throws does not
+ * stop the others.
+ */
 function walkProperties(
   value: object,
   depth: number,
   state: WalkState,
   excluded?: Set<string>
-): [string, LogNode][] {
-  const properties: [string, LogNode][] = [];
-  for (const key of Object.keys(value)) {
-    if (excluded?.has(key)) {
-      continue;
-    }
+): WalkedProperties {
+  const keys = Object.keys(value).filter((key) => !excluded?.has(key));
+  const entries: [string, LogNode][] = [];
+  for (const key of keys.slice(0, state.maxItems)) {
     if (isRedacted(key, state.redaction)) {
-      properties.push([key, REDACTED]);
+      entries.push([key, REDACTED]);
       continue;
     }
     let item: unknown;
     try {
       item = (value as Record<string, unknown>)[key];
     } catch {
-      properties.push([key, marker('[Getter threw]')]);
+      entries.push([key, marker('[Getter threw]')]);
       continue;
     }
-    properties.push([key, walk(item, depth + 1, state)]);
+    entries.push([key, walk(item, depth + 1, state)]);
   }
-  return properties;
+  return { entries, more: keys.length - entries.length };
 }
 
 function renderText(node: LogNode, depth: number): string {
   switch (node.kind) {
     case 'string':
-      return depth === 0 ? node.value : `'${node.value.replace(/'/g, "\\'")}'`;
+      return depth === 0 ? node.value : quote(node.value);
     case 'scalar':
       return String(node.value);
     case 'text':
@@ -218,18 +276,32 @@ function renderText(node: LogNode, depth: number): string {
     case 'date':
       return node.iso ?? 'Invalid Date';
     case 'array': {
-      const items = node.items.map((item) => renderText(item, depth + 1));
+      const items = withMore(
+        node.items.map((item) => renderText(item, depth + 1)),
+        node.more,
+        'items'
+      );
       return items.length === 0 ? '[]' : `[ ${items.join(', ')} ]`;
     }
     case 'map': {
-      const items = node.entries.map(
-        ([key, item]) => `${renderText(key, depth + 1)} => ${renderText(item, depth + 1)}`
+      const items = withMore(
+        node.entries.map(
+          ([key, item]) => `${renderText(key, depth + 1)} => ${renderText(item, depth + 1)}`
+        ),
+        node.more,
+        'items'
       );
-      return `Map(${items.length}) {${items.length ? ` ${items.join(', ')} ` : ''}}`;
+      const size = node.entries.length + node.more;
+      return `Map(${size}) {${items.length ? ` ${items.join(', ')} ` : ''}}`;
     }
     case 'set': {
-      const items = node.items.map((item) => renderText(item, depth + 1));
-      return `Set(${items.length}) {${items.length ? ` ${items.join(', ')} ` : ''}}`;
+      const items = withMore(
+        node.items.map((item) => renderText(item, depth + 1)),
+        node.more,
+        'items'
+      );
+      const size = node.items.length + node.more;
+      return `Set(${size}) {${items.length ? ` ${items.join(', ')} ` : ''}}`;
     }
     case 'object':
       return renderProperties(node.properties, depth);
@@ -249,15 +321,31 @@ function renderText(node: LogNode, depth: number): string {
   }
 }
 
-function renderProperties(properties: [string, LogNode][], depth: number): string {
-  const entries = properties.map(
-    ([key, item]) => `${formatKey(key)}: ${renderText(item, depth + 1)}`
+function renderProperties(properties: WalkedProperties, depth: number): string {
+  const entries = withMore(
+    properties.entries.map(([key, item]) => `${formatKey(key)}: ${renderText(item, depth + 1)}`),
+    properties.more,
+    'properties'
   );
   return entries.length === 0 ? '{}' : `{ ${entries.join(', ')} }`;
 }
 
+/** The rendered items, followed by the count of those left out, like `util.inspect`. */
+function withMore(items: string[], more: number, noun: 'items' | 'properties'): string[] {
+  return more > 0 ? [...items, `… ${more} more ${noun}`] : items;
+}
+
 function formatKey(key: string): string {
-  return /^[A-Za-z_$][\w$]*$/.test(key) ? key : `'${key}'`;
+  return /^[A-Za-z_$][\w$]*$/.test(key) ? key : quote(key);
+}
+
+/**
+ * A nested string or a key between single quotes, with its line breaks and control characters
+ * escaped as in JSON: a logged value cannot start a new line of the output.
+ */
+function quote(text: string): string {
+  const escaped = JSON.stringify(text).slice(1, -1).replace(/\\"/g, '"').replace(/'/g, "\\'");
+  return `'${escaped}'`;
 }
 
 function renderJson(node: LogNode): unknown {
@@ -281,14 +369,16 @@ function renderJson(node: LogNode): unknown {
         ])
       );
     case 'object':
-      return Object.fromEntries(node.properties.map(([key, item]) => [key, renderJson(item)]));
+      return Object.fromEntries(
+        node.properties.entries.map(([key, item]) => [key, renderJson(item)])
+      );
     case 'error':
       return {
         name: node.name,
         message: node.message,
         stack: node.stack,
         ...Object.fromEntries(
-          (node.properties ?? []).map(([key, item]) => [key, renderJson(item)])
+          (node.properties?.entries ?? []).map(([key, item]) => [key, renderJson(item)])
         ),
         ...(node.cause && { cause: renderJson(node.cause) }),
       };
@@ -302,7 +392,11 @@ function renderJson(node: LogNode): unknown {
  * - Errors keep their stack (or name and message), their own properties (e.g. the `code` and
  *   `detail` of a database error) and their `cause`.
  * - It never throws: circular references print as `[Circular]`, BigInts as `10n`, a getter
- *   that throws as `[Getter threw]`.
+ *   that throws as `[Getter threw]`, any other part that cannot be read (a Proxy trap, an
+ *   iterator that throws) as `[Unformattable value]`.
+ * - An `AggregateError` also prints its `errors`.
+ * - Its size is bounded: 100 items per array, set, map or object (then `… 900 more items`), 4
+ *   levels of nesting (then `[Object]`), 10,000 objects in all (then `[…]`).
  * - The values of the keys of `redaction` print as `[Redacted]` (by default, the keys of
  *   {@link LILYPAD_DEFAULT_REDACTED_KEYS}).
  */
@@ -319,10 +413,12 @@ export function formatLogValue(
       redaction,
       json: false,
       maxDepth: MAX_TEXT_DEPTH,
+      maxItems: MAX_TEXT_ITEMS,
+      budget: MAX_WALKED_OBJECTS,
     });
     return renderText(node, 0);
   } catch {
-    // e.g. a Proxy whose traps throw
+    // The walk already isolates each value: e.g. an output too long to build a string
     return '[Unformattable value]';
   }
 }
@@ -331,8 +427,10 @@ export function formatLogValue(
  * The JSON-safe copy of a logged value (the context of a record, a JSON log line), with the values
  * of the keys of `redaction` replaced with `[Redacted]` at any depth. It follows `toJSON` as
  * `JSON.stringify` does, then redacts what it returns; errors become `{ name, message, stack }`
- * with their own properties and their `cause`; BigInts become `10n`; a reference to an ancestor
- * becomes `[Circular]`. It never throws.
+ * with their own properties and their `cause` (and an `AggregateError` its `errors`); BigInts
+ * become `10n`; a part that cannot be read becomes `[Unformattable value]`; a reference to an ancestor
+ * becomes `[Circular]`. It keeps every item, up to 64 levels of nesting and 10,000 objects in all
+ * (then `[…]`). It never throws.
  */
 export function toLogJson(
   value: unknown,
@@ -340,10 +438,17 @@ export function toLogJson(
 ): unknown {
   try {
     return renderJson(
-      walk(value, 0, { seen: new Set(), redaction, json: true, maxDepth: MAX_JSON_DEPTH })
+      walk(value, 0, {
+        seen: new Set(),
+        redaction,
+        json: true,
+        maxDepth: MAX_JSON_DEPTH,
+        maxItems: Number.POSITIVE_INFINITY,
+        budget: MAX_WALKED_OBJECTS,
+      })
     );
   } catch {
-    // e.g. a getter of a nested value or a Proxy trap that throws
+    // The walk already isolates each value: e.g. a stack overflow
     return '[Unformattable value]';
   }
 }

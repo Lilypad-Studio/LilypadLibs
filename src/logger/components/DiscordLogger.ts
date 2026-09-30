@@ -35,6 +35,8 @@ type QueuedMessage = {
   content: string;
   resolve: () => void;
   reject: (error: unknown) => void;
+  /** The notice of the dropped messages: not a logged message. */
+  notice?: boolean | undefined;
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -63,7 +65,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
  * - Requests are throttled (see {@link LilypadDiscordLoggerOptions}): messages logged while a request
  *   is pending or too recent are batched into one Discord message, up to 2000 characters.
  * - A rate limited request (429) is retried after the `retry-after` time given by Discord, when
- *   it is at most 30 seconds.
+ *   it is at most 30 seconds. Beyond, the batches fail without a request until that time.
  * - A failed request makes `write` reject for one message of the batch (with the number of
  *   messages lost), so the logger reports it once through its `errorLogging` callback.
  * - At most `maxQueueSize` messages wait to be sent: during a flood of messages the oldest are
@@ -79,7 +81,10 @@ export class LilypadDiscordLogger<T extends string> extends LilypadLoggerCompone
   /** Messages dropped since the last batch, announced in the next one. */
   private dropped = 0;
   private flushing = false;
+  /** On the monotonic clock (`performance.now()`), like {@link rateLimitedUntil}. */
   private nextRequestAt = 0;
+  /** Until when Discord refuses the requests, after a `retry-after` beyond the longest wait. */
+  private rateLimitedUntil = 0;
 
   /** @throws If a numeric option is not valid (e.g. `NaN`, which would leave the queue unbounded). */
   constructor(webhookUrl: string, options: LilypadDiscordLoggerOptions = {}) {
@@ -105,7 +110,7 @@ export class LilypadDiscordLogger<T extends string> extends LilypadLoggerCompone
 
   private enqueue(message: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.queue.push({ content: message.slice(0, DISCORD_MAX_CONTENT_LENGTH), resolve, reject });
+      this.queue.push({ content: truncate(message), resolve, reject });
       while (this.queue.length > this.maxQueueSize) {
         // Resolved, not rejected: a rejection per dropped message would flood errorLogging too
         this.queue.shift()?.resolve();
@@ -126,7 +131,7 @@ export class LilypadDiscordLogger<T extends string> extends LilypadLoggerCompone
     this.flushing = true;
     try {
       while (this.queue.length > 0) {
-        const wait = this.nextRequestAt - Date.now();
+        const wait = this.nextRequestAt - performance.now();
         if (wait > 0) {
           await sleep(wait);
         }
@@ -142,7 +147,7 @@ export class LilypadDiscordLogger<T extends string> extends LilypadLoggerCompone
     if (this.dropped > 0) {
       const notice = `… ${this.dropped} log messages dropped (queue full)`;
       this.dropped = 0;
-      this.queue.unshift({ content: notice, resolve: () => {}, reject: () => {} });
+      this.queue.unshift({ content: notice, resolve: () => {}, reject: () => {}, notice: true });
     }
     let length = this.queue[0]!.content.length;
     let count = 1;
@@ -159,9 +164,12 @@ export class LilypadDiscordLogger<T extends string> extends LilypadLoggerCompone
   private async sendBatch(batch: QueuedMessage[]): Promise<void> {
     const content = batch.map((message) => message.content).join('\n');
     try {
+      if (performance.now() < this.rateLimitedUntil) {
+        throw new Error('Discord webhook request not sent: rate limited by Discord');
+      }
       for (let attempt = 0; ; attempt++) {
         const response = await this.post(content);
-        this.nextRequestAt = Date.now() + this.minRequestInterval;
+        this.nextRequestAt = performance.now() + this.minRequestInterval;
         // An unread body keeps the connection busy until it is garbage collected
         void response.body?.cancel().catch(() => {});
 
@@ -171,9 +179,17 @@ export class LilypadDiscordLogger<T extends string> extends LilypadLoggerCompone
           retryAfter <= MAX_RETRY_AFTER &&
           attempt < this.rateLimitRetries
         ) {
-          this.nextRequestAt = Date.now() + retryAfter;
+          this.nextRequestAt = performance.now() + retryAfter;
           await sleep(retryAfter);
           continue;
+        }
+        if (retryAfter !== undefined) {
+          // Not retried: the next batches wait as well, or fail without a request beyond the limit
+          if (retryAfter <= MAX_RETRY_AFTER) {
+            this.nextRequestAt = performance.now() + retryAfter;
+          } else {
+            this.rateLimitedUntil = performance.now() + retryAfter;
+          }
         }
         if (!response.ok) {
           throw new Error(
@@ -184,14 +200,22 @@ export class LilypadDiscordLogger<T extends string> extends LilypadLoggerCompone
         return;
       }
     } catch (error) {
-      this.nextRequestAt = Math.max(this.nextRequestAt, Date.now() + this.minRequestInterval);
+      this.nextRequestAt = Math.max(
+        this.nextRequestAt,
+        performance.now() + this.minRequestInterval
+      );
       // One rejection for the batch: one per message would flood errorLogging with the same error
-      const [reported, ...others] = batch.slice().reverse();
-      others.forEach((message) => message.resolve());
+      const lost = batch.filter((message) => !message.notice);
+      const reported = lost.at(-1);
+      batch.forEach((message) => {
+        if (message !== reported) {
+          message.resolve();
+        }
+      });
       reported?.reject(
-        batch.length === 1
+        lost.length === 1
           ? error
-          : new Error(`${batch.length} log messages could not be sent to Discord`, {
+          : new Error(`${lost.length} log messages could not be sent to Discord`, {
               cause: error,
             })
       );
@@ -208,6 +232,16 @@ export class LilypadDiscordLogger<T extends string> extends LilypadLoggerCompone
       signal: AbortSignal.timeout(DISCORD_REQUEST_TIMEOUT),
     });
   }
+}
+
+/** Cuts a message to the Discord limit, without splitting a surrogate pair (e.g. an emoji). */
+function truncate(message: string): string {
+  if (message.length <= DISCORD_MAX_CONTENT_LENGTH) {
+    return message;
+  }
+  const cut = message.slice(0, DISCORD_MAX_CONTENT_LENGTH);
+  const last = cut.charCodeAt(cut.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
 }
 
 /** The wait requested by a 429 response: `retry-after` is in seconds. */

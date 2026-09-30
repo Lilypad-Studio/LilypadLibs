@@ -1,6 +1,6 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { type LilypadLoggerComponent } from './LilypadLoggerComponent';
-import { LilypadLogger } from './LilypadLogger';
+import { LilypadLogger, type LilypadLoggerType } from './LilypadLogger';
 import { LilypadJsonConsoleLogger } from './components/JsonConsoleLogger';
 import {
   getLilypadSingletonInstanceAsync,
@@ -110,6 +110,17 @@ describe('LilypadLogger', () => {
       'Logger type "debug" was not defined'
     );
   });
+
+  it.each(['constructor', 'toString'])(
+    'should throw a clear error when registering the inherited name "%s"',
+    (type) => {
+      const logger = LilypadLogger.create<string>({ components: { info: [] } });
+
+      expect(() => logger.register({ [type]: [mockComponent] })).toThrow(
+        `Logger type "${type}" was not defined`
+      );
+    }
+  );
 
   it('should route messages to all registered components', async () => {
     const logger = LilypadLogger.create<mockType>({
@@ -278,6 +289,32 @@ describe('LilypadLogger', () => {
 
     expect(consoleSpy).toHaveBeenCalledWith(expect.any(String), expect.any(Error));
     expect(consoleSpy).toHaveBeenCalledTimes(2); // the errorLogging failure and the original error
+    consoleSpy.mockRestore();
+  });
+
+  it('should not loop when errorLogging logs on the same logger', async () => {
+    let writes = 0;
+    mockComponent.write = vi.fn(async () => {
+      // Bounded, so that a regression fails the test instead of hanging the event loop
+      if (++writes <= 10) {
+        throw new Error('Component error');
+      }
+    });
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const logger: LilypadLoggerType<mockType> = LilypadLogger.create<mockType>({
+      components: { info: [], error: [mockComponent] },
+      errorLogging: (error) => {
+        logger.error('Logging failed:', error);
+      },
+    });
+
+    logger.error('first');
+
+    await logger.flush();
+
+    // The message, then the report of its failure, whose own failure goes to console.error
+    expect(mockComponent.write).toHaveBeenCalledTimes(2);
+    expect(consoleSpy).toHaveBeenCalledOnce();
     consoleSpy.mockRestore();
   });
 
@@ -477,5 +514,60 @@ describe('LilypadLogger redaction of objects with toJSON', () => {
       request: { url: '/users', headers: { authorization: '[Redacted]' } },
       at: '1970-01-01T00:00:00.000Z',
     });
+  });
+});
+
+describe('LilypadLogger context that cannot be formatted', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('should lose only the part that cannot be formatted, and keep the context an object', async () => {
+    const write = vi.fn(async () => {});
+    const lines: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((line: string) => lines.push(line));
+    const logger = LilypadLogger.create<'info'>({
+      components: {
+        info: [
+          { write } as unknown as LilypadLoggerComponent<'info'>,
+          new LilypadJsonConsoleLogger(),
+        ],
+      },
+      context: () => ({
+        requestId: 'req-1',
+        user: {
+          toJSON() {
+            throw new Error('no user');
+          },
+        },
+      }),
+    });
+
+    logger.info('message');
+
+    await logger.flush();
+
+    expect(write).toHaveBeenCalledWith(
+      expect.objectContaining({ context: { requestId: 'req-1', user: '[Unformattable value]' } })
+    );
+    const line = JSON.parse(lines[0]!) as Record<string, unknown>;
+    expect(line).toMatchObject({ requestId: 'req-1', user: '[Unformattable value]' });
+    expect(line).not.toHaveProperty('0');
+  });
+
+  it('should keep under context a context that is not an object once serialized', async () => {
+    const write = vi.fn(async () => {});
+    const logger = LilypadLogger.create<'info'>({
+      components: { info: [{ write } as unknown as LilypadLoggerComponent<'info'>] },
+      context: () => ({ toJSON: () => 'anonymous' }),
+    });
+
+    logger.info('message');
+
+    await logger.flush();
+
+    expect(write).toHaveBeenCalledWith(
+      expect.objectContaining({ context: { context: 'anonymous' } })
+    );
   });
 });

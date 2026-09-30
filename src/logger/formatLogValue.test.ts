@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatLogValue, toLogJson } from './formatLogValue';
+import { formatLogValue, lilypadRedaction, toLogJson } from './formatLogValue';
 
 describe('formatLogValue', () => {
   it.each([
@@ -18,6 +18,8 @@ describe('formatLogValue', () => {
     ['dates', new Date('2026-01-02T03:04:05.000Z'), '2026-01-02T03:04:05.000Z'],
     ['maps', new Map([['k', 1]]), "Map(1) { 'k' => 1 }"],
     ['sets', new Set([1]), 'Set(1) { 1 }'],
+    ['nested line breaks escaped', { a: 'one\ntwo "q"' }, `{ a: 'one\\ntwo "q"' }`],
+    ['quoted keys escaped', { "it's\n": 1 }, "{ 'it\\'s\\n': 1 }"],
   ])('should format %s', (_name, value, expected) => {
     expect(formatLogValue(value)).toBe(expected);
   });
@@ -88,6 +90,56 @@ describe('formatLogValue robustness', () => {
     expect(formatLogValue(value)).toBe('{ ok: 1, broken: [Getter threw] }');
   });
 
+  it('should print the errors of an AggregateError, such as the addresses a connection tried', () => {
+    const error = Object.assign(
+      new AggregateError(
+        [
+          new Error('connect ECONNREFUSED ::1:5432'),
+          new Error('connect ECONNREFUSED 127.0.0.1:5432'),
+        ],
+        ''
+      ),
+      { code: 'ECONNREFUSED' }
+    );
+
+    const formatted = formatLogValue(error);
+
+    expect(formatted).toContain("code: 'ECONNREFUSED'");
+    expect(formatted).toContain('Error: connect ECONNREFUSED ::1:5432');
+    expect(formatted).toContain('Error: connect ECONNREFUSED 127.0.0.1:5432');
+    expect(toLogJson(error)).toMatchObject({
+      code: 'ECONNREFUSED',
+      errors: [
+        { message: 'connect ECONNREFUSED ::1:5432' },
+        { message: 'connect ECONNREFUSED 127.0.0.1:5432' },
+      ],
+    });
+  });
+
+  it('should redact the errors of an AggregateError when errors is a redacted key', () => {
+    const error = new AggregateError([new Error('secret detail')], 'failed');
+
+    expect(formatLogValue(error, lilypadRedaction(['errors']))).not.toContain('secret detail');
+  });
+
+  it('should lose only the part that cannot be read', () => {
+    const map = new Map([[1, 2]]);
+    map[Symbol.iterator] = () => {
+      throw new Error('iterator');
+    };
+    const withToJson = {
+      ok: 1,
+      bad: {
+        toJSON() {
+          throw new Error('toJSON');
+        },
+      },
+    };
+
+    expect(formatLogValue({ ok: 1, map })).toBe('{ ok: 1, map: [Unformattable value] }');
+    expect(toLogJson(withToJson)).toEqual({ ok: 1, bad: '[Unformattable value]' });
+  });
+
   it('should never throw, even for a Proxy whose traps throw', () => {
     const hostile = new Proxy(
       {},
@@ -147,5 +199,41 @@ describe('toLogJson', () => {
 
     expect(formatLogValue(deep)).toBe('{ a: { b: { c: { d: [Object] } } } }');
     expect(toLogJson(deep)).toEqual(deep);
+  });
+});
+
+describe('size bounds', () => {
+  it('should walk a value whose levels share their children in bounded time', () => {
+    let node: unknown = { leaf: true };
+    for (let level = 0; level < 30; level++) {
+      node = { a: node, b: node };
+    }
+
+    // Without a bound, the JSON form walks 2^30 objects
+    const start = performance.now();
+    const json = JSON.stringify(toLogJson(node));
+    formatLogValue(node);
+
+    expect(performance.now() - start).toBeLessThan(1000);
+    expect(json).toContain('[…]');
+  });
+
+  it('should print at most 100 items per collection in the text form, and keep all in JSON', () => {
+    const numbers = Array.from({ length: 1000 }, (_, index) => index);
+
+    const formatted = formatLogValue(numbers);
+
+    expect(formatted).toMatch(/^\[ 0, 1, .*, 99, … 900 more items \]$/);
+    expect(toLogJson(numbers)).toEqual(numbers);
+  });
+
+  it('should count the entries and properties left out of maps, sets and objects', () => {
+    const entries = Array.from({ length: 150 }, (_, index) => [`k${index}`, index] as const);
+
+    expect(formatLogValue(new Map(entries))).toMatch(/^Map\(150\) \{ .*, … 50 more items \}$/);
+    expect(formatLogValue(new Set(entries.map(([key]) => key)))).toMatch(
+      /^Set\(150\) \{ .*, … 50 more items \}$/
+    );
+    expect(formatLogValue(Object.fromEntries(entries))).toMatch(/, … 50 more properties \}$/);
   });
 });

@@ -1,5 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
-import { libLog, lilypadPinoLogger, type LilypadLibLogger } from './LilypadLibLogger';
+import {
+  libLog,
+  lilypadPinoLogger,
+  type LilypadLibLogger,
+  type LilypadPinoLike,
+} from './LilypadLibLogger';
 import { LilypadLogger } from './LilypadLogger';
 
 describe('libLog', () => {
@@ -74,5 +79,16 @@ describe('lilypadPinoLogger', () => {
       'failed'
     );
     expect(logger.debug).toBeUndefined();
+  });
+
+  it('should follow the level changes of pino, which replace its methods', () => {
+    const lines: string[] = [];
+    const pino: LilypadPinoLike = { debug: () => {} };
+    const logger = lilypadPinoLogger(pino);
+
+    pino.debug = (_fields, message) => lines.push(message);
+    libLog(logger, 'debug', 'cache', 'visible');
+
+    expect(lines).toEqual(['visible']);
   });
 });

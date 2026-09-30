@@ -132,6 +132,25 @@ describe('LilypadDiscordLogger', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it('should make the next batch wait for retry-after once the retries run out', async () => {
+    vi.useFakeTimers();
+    const fetchMock = stubFetch({
+      ok: false,
+      status: 429,
+      statusText: 'Too Many Requests',
+      headers: new Headers({ 'retry-after': '5' }),
+    });
+    const logger = new LilypadDiscordLogger<'info'>(webhookUrl, { rateLimitRetries: 0 });
+    await expect(logger.write(record('info', 'first'))).rejects.toThrow('status 429');
+
+    logger.write(record('info', 'second')).catch(() => {});
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it('should reject when Discord keeps rate limiting the request', async () => {
     vi.useFakeTimers();
     stubFetch({ ok: false, status: 429, statusText: 'Too Many Requests' });
@@ -182,6 +201,52 @@ describe('LilypadDiscordLogger', () => {
     await expect(batch[2]).rejects.toMatchObject({
       cause: expect.objectContaining({ message: expect.stringContaining('status 500') }),
     });
+  });
+
+  it('should not split an emoji when truncating a message', async () => {
+    const fetchMock = stubFetch();
+
+    await new LilypadDiscordLogger<'info'>(webhookUrl).write(record('info', '😀'.repeat(1500)));
+
+    const content: string = sentBody(fetchMock).content;
+    expect(content.length).toBeLessThanOrEqual(2000);
+    // Throws on a lone surrogate
+    expect(() => encodeURIComponent(content)).not.toThrow();
+  });
+
+  it('should throttle on the monotonic clock, whatever the wall clock does', async () => {
+    vi.useFakeTimers({ now: new Date('2026-09-30T12:00:00.000Z') });
+    const fetchMock = stubFetch();
+    const logger = new LilypadDiscordLogger<'info'>(webhookUrl);
+    await logger.write(record('info', 'first'));
+
+    // e.g. an NTP correction
+    vi.setSystemTime(new Date('2026-09-30T11:00:00.000Z'));
+    const second = logger.write(record('info', 'second'));
+    await vi.advanceTimersByTimeAsync(1000);
+
+    await second;
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('should fail the next batches without a request while rate limited beyond 30 seconds', async () => {
+    vi.useFakeTimers();
+    const fetchMock = stubFetch({
+      ok: false,
+      status: 429,
+      statusText: 'Too Many Requests',
+      headers: new Headers({ 'retry-after': '3600' }),
+    });
+    const logger = new LilypadDiscordLogger<'info'>(webhookUrl);
+    await expect(logger.write(record('info', 'first'))).rejects.toThrow('status 429');
+
+    const second = logger.write(record('info', 'second'));
+    // eslint-disable-next-line vitest/valid-expect -- awaited once the fake timers have advanced
+    const assertion = expect(second).rejects.toThrow('rate limited by Discord');
+    await vi.advanceTimersByTimeAsync(1000);
+
+    await assertion;
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it('should reject when the request times out', async () => {
@@ -272,6 +337,30 @@ describe('LilypadDiscordLogger queue limit', () => {
       expect.stringContaining('[INFO]: m4'),
       expect.stringContaining('[INFO]: m5'),
     ]);
+  });
+
+  it('should not count the notice of the dropped messages as a lost message', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () => ({ ok: false, status: 500, statusText: 'Internal Server Error' }) as Response
+      )
+    );
+    const logger = new LilypadDiscordLogger<'info'>(webhookUrl, { maxQueueSize: 2 });
+
+    // m1 is sent at once, m2 is dropped, m3 and m4 follow the notice in the next batch
+    const sent = ['m1', 'm2', 'm3', 'm4'].map((message) => logger.write(record('info', message)));
+    const settled = Promise.allSettled(sent);
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect((await settled).map((result) => result.status)).toEqual([
+      'rejected',
+      'fulfilled',
+      'fulfilled',
+      'rejected',
+    ]);
+    await expect(sent[3]).rejects.toThrow('2 log messages could not be sent to Discord');
   });
 
   it('should release the body of the responses', async () => {

@@ -23,6 +23,8 @@ import type { LilypadLibLogLevel } from '@/logger/LilypadLibLogger';
  * @property {Record<T, LilypadLoggerComponent<T>[]>} components - A record mapping component names to arrays of logger components.
  * @property {(error: unknown) => void | Promise<void>} [errorLogging] - Optional callback function to handle logging errors.
  * It is called once for each failing component. If it fails as well, both errors are written to `console.error`.
+ * The failures of the messages it logs synchronously on this logger go to `console.error` only, so
+ * that a failing component does not loop through it; it must not log on this logger after an `await`.
  */
 export type LilypadLoggerConstructorOptions<T extends string> = {
   components: Record<T, LilypadLoggerComponent<T>[]>;
@@ -93,6 +95,9 @@ export class LilypadLogger<T extends string> {
   /** The messages still being sent, awaited by `flush`. */
   private _pending = new Set<Promise<void>>();
 
+  /** Above 0 while `errorLogging` runs synchronously: the messages it logs are marked. */
+  private _reporting = 0;
+
   /**
    * Creates a new LilypadLogger instance or retrieves a singleton instance.
    *
@@ -138,7 +143,15 @@ export class LilypadLogger<T extends string> {
     // (e.g. `constructor`, `toString`); fields are listed explicitly because, depending on the
     // compilation target, they may not be defined on the instance yet. `then` would make the logger
     // a thenable: returning it from an async function would call it instead of resolving to it.
-    const reservedKeys = new Set(['components', 'register', 'flush', 'name', '_pending', 'then']);
+    const reservedKeys = new Set([
+      'components',
+      'register',
+      'flush',
+      'name',
+      '_pending',
+      '_reporting',
+      'then',
+    ]);
     for (const key of Object.keys(options.components)) {
       if (reservedKeys.has(key) || key in this) {
         throw new Error(`Logger type "${key}" is reserved and cannot be used as a log channel.`);
@@ -159,9 +172,25 @@ export class LilypadLogger<T extends string> {
       this.components[type] = [...comps];
     }
 
+    const { errorLogging } = options;
+    const report =
+      errorLogging &&
+      ((error: unknown): void | Promise<void> => {
+        this._reporting++;
+        try {
+          return errorLogging(error);
+        } finally {
+          this._reporting--;
+        }
+      });
+
     for (const type of Object.keys(this.components) as T[]) {
       // Create the function that logs to components
-      const send = async (message: unknown[], context: Record<string, unknown> | undefined) => {
+      const send = async (
+        message: unknown[],
+        context: Record<string, unknown> | undefined,
+        fromErrorLogging: boolean
+      ) => {
         let errors: unknown[];
         try {
           // Formatting stays inside the try: it must never make the returned promise reject
@@ -171,7 +200,7 @@ export class LilypadLogger<T extends string> {
             parts: message,
             timestamp: new Date(),
             loggerName: this.name,
-            context: toLogJson(context, redaction) as Record<string, unknown> | undefined,
+            context: toLogContext(context, redaction),
           };
           // allSettled: a failing component must neither stop nor hide the errors of the others
           const results = await Promise.allSettled(
@@ -184,13 +213,14 @@ export class LilypadLogger<T extends string> {
           errors = [error];
         }
         for (const error of errors) {
-          await reportComponentError(type, error, options.errorLogging);
+          // A message logged by errorLogging that fails would call it again, without end
+          await reportComponentError(type, error, fromErrorLogging ? undefined : report);
         }
       };
 
       const logFn = (...message: unknown[]): void => {
         // The context is read synchronously, while the caller's async context is still active
-        const task = send(message, readContext(options.context));
+        const task = send(message, readContext(options.context), this._reporting > 0);
         this._pending.add(task);
         void task.finally(() => this._pending.delete(task));
         // `task` never rejects: the error handler is only required by runInBackground
@@ -209,7 +239,8 @@ export class LilypadLogger<T extends string> {
    */
   register(newComponents: Partial<Record<T, LilypadLoggerComponent<T>[]>>): this {
     for (const type of Object.keys(newComponents) as T[]) {
-      if (!this.components[type]) {
+      // hasOwn: `constructor` or `toString` would be found on the prototype
+      if (!Object.hasOwn(this.components, type)) {
         throw new Error(
           `Logger type "${type}" was not defined when the logger was created and cannot be registered.`
         );
@@ -238,6 +269,23 @@ function readContext(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The JSON-safe copy of the context, always an object: what is not one (e.g. the marker of a
+ * context that could not be formatted) is kept under `context`.
+ */
+function toLogContext(
+  context: Record<string, unknown> | undefined,
+  redaction: ReadonlySet<string>
+): Record<string, unknown> | undefined {
+  if (context === undefined) {
+    return undefined;
+  }
+  const json = toLogJson(context, redaction);
+  return typeof json === 'object' && json !== null && !Array.isArray(json)
+    ? (json as Record<string, unknown>)
+    : { context: json };
 }
 
 /**

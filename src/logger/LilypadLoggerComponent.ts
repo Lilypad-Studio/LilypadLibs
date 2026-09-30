@@ -32,8 +32,7 @@ export type LilypadLogRecord<T extends string = string> = {
  * ```typescript
  * class StderrLogger extends LilypadLoggerComponent<'info' | 'error'> {
  *   async write(record: LilypadLogRecord<'info' | 'error'>): Promise<void> {
- *     process.stderr.write(this.formatRecord(record) + '
-');
+ *     process.stderr.write(this.formatRecord(record) + '\n');
  *   }
  * }
  * ```

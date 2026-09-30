@@ -74,10 +74,10 @@ export type LilypadPinoLike = Partial<
 export function lilypadPinoLogger(pino: LilypadPinoLike): LilypadLibLogger {
   const logger: LilypadLibLogger = {};
   for (const level of ['error', 'warn', 'info', 'debug'] as const) {
-    const method = pino[level];
-    if (method) {
+    if (pino[level]) {
+      // Read at each call: pino changes its level by replacing these methods on the instance
       logger[level] = (message, { source, error, detail }) =>
-        method.call(pino, { source, err: error, detail }, message);
+        pino[level]?.call(pino, { source, err: error, detail }, message);
     }
   }
   return logger;
