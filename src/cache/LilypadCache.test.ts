@@ -1470,6 +1470,95 @@ describe('LilypadCache', () => {
     it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])('should reject a ttl of %s', (ttl) => {
       expect(() => new LilypadCache<string, number>({ ttl })).toThrow('ttl must be');
     });
+
+    // A NaN TTL never expires; an infinite one cannot be shared
+    it.each([Number.NaN, Number.POSITIVE_INFINITY])(
+      'should reject a per-call ttl of %s',
+      async (ttl) => {
+        const fetch = vi.fn(async () => 1);
+
+        expect(() => cache.set('k', 1, ttl)).toThrow('ttl must be a finite number');
+        await expect(cache.getOrSet('k', fetch, { ttl })).rejects.toThrow(
+          'ttl must be a finite number'
+        );
+        await expect(cache.getOrSet('k', fetch, { onError: { ttl } })).rejects.toThrow(
+          'onError.ttl must be a finite number'
+        );
+        expect(fetch).not.toHaveBeenCalled();
+      }
+    );
+
+    // An infinite stale window would serve invalidated values
+    it.each([-1, Number.NaN, Number.POSITIVE_INFINITY])(
+      'should reject a per-call staleWhileRevalidate of %s',
+      async (staleWhileRevalidate) => {
+        const fetch = vi.fn(async () => 1);
+
+        await expect(cache.getOrSet('k', fetch, { staleWhileRevalidate })).rejects.toThrow(
+          'staleWhileRevalidate must be'
+        );
+        expect(fetch).not.toHaveBeenCalled();
+      }
+    );
+  });
+
+  describe('bookkeeping without a purge', () => {
+    it('should keep the failures of distinct keys bounded, beyond maxEntries', async () => {
+      const target = new LilypadCache<string, number>({ ttl: 1000, maxEntries: 10 });
+
+      for (let i = 0; i < 3000; i++) {
+        await target.getOrSet(`k${i}`, () => Promise.reject(new Error('down'))).catch(() => {});
+      }
+
+      expect(target['engine']['failures'].size).toBeLessThanOrEqual(1000);
+      await target.dispose();
+    });
+
+    it('should keep the failed refresh of a stale value reported after a purge', async () => {
+      const target = new LilypadCache<string, number>({ ttl: 1000, staleWhileRevalidate: 5000 });
+      const failing = () => Promise.reject(new Error('down'));
+      target.set('k', 1);
+      await vi.advanceTimersByTimeAsync(1001);
+      await target.getOrSetDetailed('k', failing); // STALE, refreshed in the background
+      await vi.advanceTimersByTimeAsync(0);
+
+      target.purgeExpired();
+
+      await expect(target.getOrSetDetailed('k', failing)).resolves.toEqual({
+        value: 1,
+        status: 'STALE',
+        refreshFailed: true,
+      });
+      await target.dispose();
+    });
+  });
+
+  describe('least recently used order', () => {
+    it('should not make an invalidated entry the most recently used one', () => {
+      const target = new LilypadCache<string, number>({ ttl: 1000, maxEntries: 2 });
+      target.set('a', 1);
+      target.set('b', 2);
+
+      target.invalidate('a');
+      target.set('c', 3);
+
+      expect(target.peek('a').type).toBe('miss');
+      expect(target.get('b')).toBe(2);
+      void target.dispose();
+    });
+
+    it('should evict at once the keys beyond maxEntries that lose their protection', () => {
+      const target = new LilypadCache<string, number>({ ttl: 1000, maxEntries: 1 });
+      target.addProtectedKeys(['a', 'b']);
+      target.set('a', 1);
+      target.set('b', 2);
+
+      target.removeProtectedKeys(['a']);
+
+      expect(target.peek('a').type).toBe('miss');
+      expect(target.get('b')).toBe(2);
+      void target.dispose();
+    });
   });
 });
 
@@ -1544,6 +1633,41 @@ describe('LilypadCache reads after a change', () => {
     await Promise.all([first, second]);
 
     expect(target.peek('k').type).toBe('miss');
+    await target.dispose();
+  });
+
+  it('should discard a fetch started between two invalidations of the key', async () => {
+    const target = new LilypadCache<string, string>({ ttl: 1000 });
+    target.set('k', 'v1');
+    target.invalidate('k');
+    const read = deferred<string>();
+    const pending = target.getOrSet('k', () => read.promise);
+
+    // e.g. two quick changes of the same row: the fetch may have read the first one only
+    target.invalidate('k');
+    read.resolve('read before the second change');
+    await pending;
+
+    expect(target.peek('k')).toMatchObject({ type: 'expired', value: 'v1' });
+    await target.dispose();
+  });
+
+  it('should not let the fallback of a fetch started before an invalidation replace a newer fetch', async () => {
+    const target = new LilypadCache<string, string>({ ttl: 1000 });
+    target.set('k', 'old', -1);
+    const old = deferred<string>();
+    const newer = deferred<string>();
+    const first = target.getOrSet('k', () => old.promise, { onError: { fallback: 'stale' } });
+    target.invalidate('k');
+    const second = target.getOrSet('k', () => newer.promise);
+
+    // The older fetch fails first: its fallback is the value from before the invalidation
+    old.reject(new Error('source down'));
+    await expect(first).resolves.toBe('old');
+    newer.resolve('new');
+    await expect(second).resolves.toBe('new');
+
+    expect(target.get('k')).toBe('new');
     await target.dispose();
   });
 

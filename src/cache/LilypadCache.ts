@@ -137,6 +137,7 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
    * Stores a value in the cache, and in the shared level (in the background).
    *
    * @param ttl - Time to live in milliseconds; defaults to the cache's TTL.
+   * @throws {RangeError} If `ttl` is not a finite number (0 or less stores an expired value).
    */
   set(key: K, value: LilypadCachedValueType<V>, ttl?: number): void {
     this.assertNotDisposed();
@@ -157,6 +158,7 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
    *
    * @param valueFn - Produces the value; it receives a signal aborted when the fetch times out.
    * @throws The error of `valueFn` (or the timeout error) when `onError` gives no fallback value.
+   * @throws {RangeError} If `ttl`, `staleWhileRevalidate`, `timeout` or `onError.ttl` is not valid.
    * @see {@link getOrSetDetailed} to also know where the value comes from
    */
   async getOrSet(

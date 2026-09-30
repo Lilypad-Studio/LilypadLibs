@@ -10,6 +10,8 @@
 const LILYPAD_MAX_TIMER_DELAY = 2_147_483_647;
 
 type NumberRule =
+  /** Any finite number, e.g. a TTL where 0 or less means already expired. */
+  | 'finite'
   | 'positive'
   | 'non-negative'
   | 'positive-integer'
@@ -20,6 +22,7 @@ type NumberRule =
   | 'non-negative-delay';
 
 const DESCRIPTIONS: Record<NumberRule, string> = {
+  finite: 'a finite number',
   positive: 'a positive finite number',
   'non-negative': 'a non-negative finite number',
   'positive-integer': 'a positive integer',
@@ -30,6 +33,8 @@ const DESCRIPTIONS: Record<NumberRule, string> = {
 
 function satisfies(value: number, rule: NumberRule): boolean {
   switch (rule) {
+    case 'finite':
+      return Number.isFinite(value);
     case 'positive':
       return Number.isFinite(value) && value > 0;
     case 'non-negative':

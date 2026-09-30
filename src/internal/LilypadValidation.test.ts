@@ -3,6 +3,8 @@ import { assertNumberOption } from './LilypadValidation';
 
 describe('assertNumberOption', () => {
   it.each([
+    [-1, 'finite'],
+    [0, 'finite'],
     [1, 'positive'],
     [0, 'non-negative'],
     [3, 'positive-integer'],
@@ -15,6 +17,8 @@ describe('assertNumberOption', () => {
   });
 
   it.each([
+    [Number.NaN, 'finite'],
+    [-Infinity, 'finite'],
     [0, 'positive'],
     [Number.NaN, 'positive'],
     [Infinity, 'positive'],

@@ -1,5 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { LilypadCache, LilypadCacheCooldownError, type LilypadSharedCodec } from './LilypadCache';
+import {
+  LilypadCache,
+  LilypadCacheCooldownError,
+  LilypadDisposedError,
+  type LilypadSharedCodec,
+} from './LilypadCache';
 import type { LilypadLibLogger } from '@/logger/LilypadLogger';
 import type { LilypadPlatform, LilypadSharedStore } from '@/platform/LilypadPlatform';
 
@@ -389,6 +394,107 @@ describe('LilypadCache platform features', () => {
 
       expect(fake.store.set).not.toHaveBeenCalled();
     });
+
+    // e.g. a fetch cut short by the shutdown: the other instances must not go into cooldown
+    it('should not record the failure of a fetch that fails after dispose', async () => {
+      const cache = createInstance<number>({ failureCooldown: 10_000 });
+      const fetch = deferred<number>();
+      const pending = cache.getOrSet('p1', () => fetch.promise).catch(() => {});
+      await settle();
+
+      await cache.dispose();
+      fetch.reject(new Error('gate closed'));
+      await pending;
+      await settle();
+
+      expect(fake.store.set).not.toHaveBeenCalled();
+    });
+
+    it('should not start a refresh scheduled before dispose', async () => {
+      let scheduled: (() => Promise<unknown>) | undefined;
+      const cache = createInstance<number>({
+        staleWhileRevalidate: 5000,
+        platform: { afterResponse: (work) => (scheduled = work) },
+      });
+      cache.set('p1', 1, 10);
+      await vi.advanceTimersByTimeAsync(20);
+      const fetch = vi.fn(async () => 2);
+      await expect(cache.getOrSetDetailed('p1', fetch)).resolves.toMatchObject({
+        status: 'STALE',
+      });
+
+      await cache.dispose();
+      await scheduled?.();
+
+      expect(scheduled).toBeDefined();
+      expect(fetch).not.toHaveBeenCalled();
+    });
+
+    it('should fail a read disposed while it read the shared level, without fetching', async () => {
+      const cache = createInstance<number>();
+      const fetch = vi.fn(async () => 1);
+      const pending = cache.getOrSet('p1', fetch);
+
+      await cache.dispose();
+
+      await expect(pending).rejects.toBeInstanceOf(LilypadDisposedError);
+      expect(fetch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('malformed shared entries', () => {
+    it.each([
+      ['a NaN fetchedAt', { fetchedAt: Number.NaN }],
+      ['an infinite expiresAt', { expiresAt: Number.POSITIVE_INFINITY }],
+      ['an undefined value', { value: undefined }],
+    ])('should ignore a shared entry with %s', async (_case, override) => {
+      const logger = createMockLogger();
+      fake.data.set('lilypad:2:products:v:p1', {
+        value: {
+          lilypad: 2,
+          value: 1,
+          fetchedAt: Date.now(),
+          expiresAt: Date.now() + 1000,
+          ...override,
+        },
+        expiresAt: Date.now() + 1000,
+      });
+      const cache = createInstance<number>({ logger });
+
+      await expect(cache.getOrSetDetailed('p1', async () => 2)).resolves.toMatchObject({
+        value: 2,
+        status: 'MISS',
+      });
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('malformed shared entry'),
+        expect.anything()
+      );
+    });
+
+    it('should ignore an infinite failure time', async () => {
+      fake.data.set('lilypad:2:products:f:p1', {
+        value: Number.POSITIVE_INFINITY,
+        expiresAt: Date.now() + 1000,
+      });
+      const cache = createInstance<number>({ failureCooldown: 1000 });
+
+      await expect(cache.getOrSet('p1', async () => 1)).resolves.toBe(1);
+    });
+
+    // The clock of the instance that failed is ahead: the cooldown must not last until it
+    it('should not keep a key in cooldown past the shared failure for a failure time in the future', async () => {
+      fake.data.set('lilypad:2:products:f:p1', {
+        value: Date.now() + 86_400_000,
+        expiresAt: Date.now() + 1000,
+      });
+      const cache = createInstance<number>({ failureCooldown: 1000 });
+      const fetch = vi.fn(async () => 1);
+
+      await expect(cache.getOrSet('p1', fetch)).rejects.toBeInstanceOf(LilypadCacheCooldownError);
+      await vi.advanceTimersByTimeAsync(2001);
+
+      await expect(cache.getOrSet('p1', fetch)).resolves.toBe(1);
+    });
   });
 
   describe('stale-while-revalidate', () => {
@@ -719,6 +825,91 @@ describe('LilypadCache platform features', () => {
       await expect(cache.getOrSetDetailed('p1', async () => 3)).resolves.toMatchObject({
         value: 3,
         status: 'MISS',
+      });
+    });
+
+    it.each([
+      [
+        'invalidated without an entry',
+        (cache: LilypadCache<string, number>) => cache.invalidate('p1'),
+      ],
+      ['deleted without an entry', (cache: LilypadCache<string, number>) => cache.delete('p1')],
+    ])(
+      'should not adopt the shared copy of a key %s when its removal fails',
+      async (_case, change) => {
+        const writer = createInstance<number>();
+        writer.set('p1', 1);
+        await settle();
+        await vi.advanceTimersByTimeAsync(10);
+        const reader = createInstance<number>();
+        fake.store.delete.mockRejectedValueOnce(new Error('store down'));
+
+        change(reader);
+        await settle();
+
+        await expect(reader.getOrSetDetailed('p1', async () => 2)).resolves.toMatchObject({
+          value: 2,
+          status: 'MISS',
+        });
+      }
+    );
+
+    it('should not adopt the shared copy of an invalidated key once its entry is purged', async () => {
+      const cache = createInstance<number>();
+      await cache.getOrSet('p1', async () => 1);
+      await settle();
+      await vi.advanceTimersByTimeAsync(10);
+      fake.store.delete.mockRejectedValueOnce(new Error('store down'));
+      cache.invalidate('p1');
+      await settle();
+
+      cache.purgeExpired();
+      expect(cache.peek('p1').type).toBe('miss');
+
+      await expect(cache.getOrSetDetailed('p1', async () => 2)).resolves.toMatchObject({
+        value: 2,
+        status: 'MISS',
+      });
+    });
+
+    it('should keep refusing the old shared copies once a stale fallback replaces the invalidated entry', async () => {
+      const reader = createInstance<number>({ errorTtl: 100 });
+      await reader.getOrSet('p1', async () => 1);
+      await vi.advanceTimersByTimeAsync(10);
+      // Newer than the value of the reader, older than the invalidation
+      const writer = createInstance<number>({ ttl: 10_000 });
+      writer.set('p1', 2);
+      await settle();
+      await vi.advanceTimersByTimeAsync(10);
+      fake.store.delete.mockRejectedValueOnce(new Error('store down'));
+      reader.invalidate('p1');
+      await settle();
+
+      // The stale fallback keeps the age of the value from before the invalidation
+      await expect(
+        reader.getOrSet('p1', () => Promise.reject(new Error('down')), {
+          onError: { fallback: 'stale' },
+        })
+      ).resolves.toBe(1);
+      await vi.advanceTimersByTimeAsync(101);
+
+      await expect(reader.getOrSetDetailed('p1', async () => 3)).resolves.toMatchObject({
+        value: 3,
+        status: 'MISS',
+      });
+    });
+
+    it('should still adopt a shared copy produced after the invalidation of a key without an entry', async () => {
+      const reader = createInstance<number>();
+      reader.invalidate('p1');
+      await vi.advanceTimersByTimeAsync(10);
+      const writer = createInstance<number>();
+      writer.set('p1', 1);
+      await settle();
+
+      await expect(reader.getOrSetDetailed('p1', async () => 2)).resolves.toMatchObject({
+        value: 1,
+        status: 'L2-HIT',
       });
     });
   });

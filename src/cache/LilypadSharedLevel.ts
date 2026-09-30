@@ -151,7 +151,12 @@ export class LilypadSharedLevel<V> {
     ]);
     return {
       entry: this.decode(normalizedKey, raw),
-      failedAt: typeof failedAt === 'number' ? failedAt : undefined,
+      // Never in the future: the clock of another instance ahead of this one would otherwise
+      // stretch the cooldown (forever for an infinite time)
+      failedAt:
+        typeof failedAt === 'number' && Number.isFinite(failedAt)
+          ? Math.min(failedAt, Date.now())
+          : undefined,
       locked: typeof lock === 'string',
     };
   }
@@ -161,12 +166,16 @@ export class LilypadSharedLevel<V> {
       return undefined;
     }
     const envelope = raw as Partial<LilypadSharedEnvelope>;
+    // A store that does not go through JSON can hold NaN or Infinity: such an entry would never
+    // expire, and would pass the invalidation checks. `undefined` is no value (not cached).
     const valid =
       typeof raw === 'object' &&
       envelope.lilypad === SHARED_FORMAT_VERSION &&
       typeof envelope.fetchedAt === 'number' &&
+      Number.isFinite(envelope.fetchedAt) &&
       typeof envelope.expiresAt === 'number' &&
-      'value' in envelope;
+      Number.isFinite(envelope.expiresAt) &&
+      envelope.value !== undefined;
     if (!valid) {
       this.options.warn(`Ignoring a malformed shared entry for "${normalizedKey}"`);
       return undefined;
