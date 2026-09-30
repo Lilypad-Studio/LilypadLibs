@@ -4,6 +4,7 @@ import { LilypadDisposedError } from '@/cache/LilypadCacheTypes';
 import { defineLilypadDb, defineLilypadTable } from '@/dbConfig/LilypadDbConfig';
 import { bindLilypadDbHooks } from '@/dbConfig/LilypadDbHooks';
 import { LilypadDbTable } from './LilypadDbTable';
+import { pruneLilypadChangelog, readLilypadChanges } from './LilypadChangelog';
 
 const db = defineLilypadDb({
   tables: {
@@ -133,6 +134,109 @@ describe('LilypadDbGate (without database)', () => {
       expect(gate.isListenHealthy()).toBe(true);
       await gate.close();
     });
+
+    it('should count LISTEN as healthy without heartbeat only once it is active', async () => {
+      const gate = await LilypadDbGate.create({
+        connectionString: unreachable,
+        listenHeartbeat: false,
+      });
+      let resolveListen!: (meta: { unlisten: () => Promise<void> }) => void;
+      vi.spyOn(gate.sql, 'listen').mockImplementation(
+        ((_channel: string, _fn: unknown, onlisten: () => void) =>
+          new Promise((resolve) => {
+            resolveListen = (meta) => {
+              onlisten();
+              resolve(meta);
+            };
+          })) as unknown as typeof gate.sql.listen
+      );
+
+      const adding = gate.addListener({ channel: 'c', callbackId: 'a', callback: () => {} });
+
+      expect(gate.isListenHealthy()).toBe(false);
+      resolveListen({ unlisten: async () => {} });
+      await adding;
+      expect(gate.isListenHealthy()).toBe(true);
+      await gate.close();
+    });
+  });
+
+  describe('listeners of a failed LISTEN', () => {
+    it('should ignore the notifications and reconnections of a LISTEN that failed', async () => {
+      const gate = await LilypadDbGate.create({
+        connectionString: unreachable,
+        listenHeartbeat: false,
+      });
+      // postgres.js keeps the listener of a failed LISTEN, and listens to it again on every
+      // reconnection: these are the callbacks it keeps
+      const registered: { fn: (payload: string) => void; onlisten: () => void }[] = [];
+      let fail = true;
+      vi.spyOn(gate.sql, 'listen').mockImplementation(((
+        _channel: string,
+        fn: (payload: string) => void,
+        onlisten: () => void
+      ) => {
+        registered.push({ fn, onlisten });
+        if (fail) {
+          return Promise.reject(new Error('connection refused'));
+        }
+        // Like postgres.js, after LISTEN has run
+        return Promise.resolve().then(() => {
+          onlisten();
+          return { state: {}, unlisten: async () => {} };
+        });
+      }) as unknown as typeof gate.sql.listen);
+      const callback = vi.fn();
+      const onReconnect = vi.fn();
+      const listener = { channel: 'c', callbackId: 'a', callback, onReconnect };
+
+      await expect(gate.addListener(listener)).rejects.toThrow('connection refused');
+      fail = false;
+      await gate.addListener(listener);
+      const [failed, current] = registered;
+      // The failed LISTEN is listened to again, then the connection is lost and re-established
+      failed!.onlisten();
+      failed!.onlisten();
+      failed!.fn('payload');
+      current!.fn('payload');
+      await vi.waitFor(() => expect(callback).toHaveBeenCalled());
+
+      expect(callback).toHaveBeenCalledOnce();
+      expect(onReconnect).not.toHaveBeenCalled();
+      current!.onlisten();
+      await vi.waitFor(() => expect(onReconnect).toHaveBeenCalledOnce());
+      await gate.close();
+    });
+  });
+
+  describe('singleton', () => {
+    it('should warn when an existing singleton is created again with other listeners', async () => {
+      const warn = vi.fn();
+      const gate = await LilypadDbGate.create({
+        connectionString: unreachable,
+        singleton: 'gate-listeners',
+      });
+
+      const again = await LilypadDbGate.create({
+        connectionString: unreachable,
+        singleton: 'gate-listeners',
+        logger: { warn },
+        listen: [{ channel: 'c', callbackId: 'a', callback: () => {} }],
+      });
+
+      const withoutListeners = await LilypadDbGate.create({
+        connectionString: unreachable,
+        singleton: 'gate-listeners',
+        logger: { warn },
+        listen: [],
+      });
+
+      expect(again).toBe(gate);
+      expect(withoutListeners).toBe(gate);
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn.mock.calls[0]![0]).toContain('different connection options, config or listeners');
+      await gate.close();
+    });
   });
 });
 
@@ -153,6 +257,12 @@ describe('LilypadDbGate close', () => {
     await gate.close();
 
     await expect(gate.table(db.tables.items).selectByPrimaryKey(1)).rejects.toThrow(
+      LilypadDisposedError
+    );
+    await expect(
+      readLilypadChanges(gate, { tableName: 'items', since: { lookback: 60_000 } })
+    ).rejects.toThrow(LilypadDisposedError);
+    await expect(pruneLilypadChangelog(gate, { olderThan: 86_400_000 })).rejects.toThrow(
       LilypadDisposedError
     );
   });

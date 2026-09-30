@@ -298,6 +298,30 @@ describe('LilypadDbGate (integration)', () => {
       await limitedGate.close();
     });
 
+    it('should read a table through a cursor for longer than statementTimeout', async () => {
+      await admin`INSERT INTO users (name) SELECT 'user' || i FROM generate_series(1, 3000) AS i`;
+      const limitedGate = await LilypadDbGate.create({
+        connectionString: container.getConnectionUri(),
+        statementTimeout: 300,
+      });
+      // Each batch is fetched at once, but mapping the three batches takes about 600 ms
+      const slowSelect = usersWithHooks({
+        select: (row) => {
+          const end = performance.now() + 0.2;
+          while (performance.now() < end) {
+            // busy wait
+          }
+          return row as User;
+        },
+      });
+
+      try {
+        expect(await limitedGate.table(slowSelect).selectAll()).toHaveLength(3000);
+      } finally {
+        await limitedGate.close();
+      }
+    });
+
     it('should escape table names', async () => {
       const schema = usersTable({ tableName: 'users; DROP TABLE users; --' });
 
@@ -713,6 +737,28 @@ describe('LilypadDbGate (integration)', () => {
           });
 
           expect(await countChanges()).toEqual({ old: 1, recent: 1 });
+        });
+
+        it('should delete from the changelog, never from a temporary table of the caller', async () => {
+          await recordOldChanges(3);
+          const connection = await admin.reserve();
+          try {
+            // Any role can create a temporary table, and call the function
+            await connection`SET ROLE lilypad_writer`;
+            await connection`CREATE TEMP TABLE lilypad_cache_changes (id bigint, changed_at timestamptz)`;
+            await connection`INSERT INTO lilypad_cache_changes VALUES (1, now() - interval '2 hours')`;
+            await connection`SELECT lilypad_cache_changes_prune()`;
+
+            const [temporary] = await connection`
+              SELECT count(*)::int AS count FROM pg_temp.lilypad_cache_changes
+            `;
+            expect(temporary!.count).toBe(1);
+          } finally {
+            await connection`DROP TABLE IF EXISTS pg_temp.lilypad_cache_changes`;
+            await connection`RESET ROLE`;
+            connection.release();
+          }
+          expect(await countChanges()).toEqual({ old: 1, recent: 0 });
         });
 
         it('should not prune in a transaction stricter than READ COMMITTED', async () => {
@@ -1135,6 +1181,82 @@ describe('LilypadDbGate (integration)', () => {
       }
     });
 
+    it('should record the changes of a table whose trigger names PostgreSQL would truncate', async () => {
+      const table = 'x'.repeat(50);
+      await admin.unsafe(`CREATE TABLE "${table}" (id int PRIMARY KEY)`);
+      try {
+        // Version 5 gave the four triggers names that PostgreSQL truncated to one: the last one
+        // created, for TRUNCATE, replaced the others
+        await admin.unsafe(`
+          CREATE TRIGGER "public_${table}_lilypad_truncate" AFTER TRUNCATE ON "${table}"
+          FOR EACH STATEMENT EXECUTE FUNCTION lilypad_cache_changes_record('id')
+        `);
+
+        await admin.unsafe(
+          lilypadChangelogTriggerSql({ table: `public.${table}`, primaryKey: 'id' })
+        );
+        await admin.unsafe(`INSERT INTO "${table}" VALUES (1)`);
+        await admin.unsafe(`UPDATE "${table}" SET id = 1`);
+        await admin.unsafe(`DELETE FROM "${table}"`);
+
+        const { changes } = await readLilypadChanges(gate, {
+          tableName: table,
+          since: { lookback: 60_000 },
+        });
+        expect(changes.map((change) => change.op)).toEqual(['INSERT', 'UPDATE', 'DELETE']);
+        const [triggers] = await admin`
+          SELECT count(*)::int AS count FROM pg_trigger
+          WHERE tgrelid = ${table}::regclass AND NOT tgisinternal
+        `;
+        expect(triggers!.count).toBe(4);
+        expect((await check({ tables: [{ table: `public.${table}`, primaryKey: 'id' }] })).ok).toBe(
+          true
+        );
+      } finally {
+        await admin.unsafe(`DROP TABLE "${table}"`);
+      }
+    });
+
+    it('should install a changelog whose names contain dollar quotes', async () => {
+      const changelogTable = 'odd$$record$lilypad$function$';
+      const channel = 'odd$notify$';
+      await admin`CREATE TABLE dollars (id int PRIMARY KEY)`;
+      const notifications: string[] = [];
+      const listening = await admin.listen(channel, (payload) => notifications.push(payload));
+      try {
+        await admin.unsafe(
+          lilypadChangelogSql({
+            table: changelogTable,
+            notifyChannel: channel,
+            prune: { olderThan: 60 * 60_000 },
+          })
+        );
+        await admin.unsafe(
+          lilypadChangelogTriggerSql({ table: 'dollars', primaryKey: 'id', changelogTable })
+        );
+
+        await admin`INSERT INTO dollars VALUES (1)`;
+
+        const { changes } = await readLilypadChanges(gate, {
+          tableName: 'dollars',
+          changelogTable,
+          since: { lookback: 60_000 },
+        });
+        expect(changes.map((change) => change.rowId)).toEqual(['1']);
+        await vi.waitFor(() => expect(notifications).toHaveLength(1));
+        expect(JSON.parse(notifications[0]!)).toMatchObject({ table: 'dollars', id: '1' });
+        await admin.unsafe(`SELECT "odd__record_lilypad_function__prune"()`);
+      } finally {
+        await listening.unlisten();
+        await admin`DROP TABLE dollars`;
+        await admin.unsafe(`
+          DROP TABLE IF EXISTS "${changelogTable.replace(/"/g, '""')}";
+          DROP FUNCTION IF EXISTS "odd__record_lilypad_function__record"();
+          DROP FUNCTION IF EXISTS "odd__record_lilypad_function__prune"();
+        `);
+      }
+    });
+
     it('should report a table whose TRUNCATE is not recorded', async () => {
       await admin`CREATE TABLE unwatched (id int PRIMARY KEY)`;
       // The statement triggers without the TRUNCATE one
@@ -1445,6 +1567,24 @@ describe('LilypadDbGate (integration)', () => {
 
       expect(second).not.toBe(first);
       await second.close();
+    });
+
+    it('should warn only when a singleton is created again with other listeners', async () => {
+      const logger = createMockLogger();
+      const options = (callbackId: string) => ({
+        connectionString: container.getConnectionUri(),
+        singleton: 'LilypadDbGate.integration-listeners',
+        logger,
+        listen: [{ channel: 'singleton_channel', callbackId, callback: () => {} }],
+      });
+      const first = await LilypadDbGate.create(options('a'));
+
+      // The same channel and callback id, with another callback function
+      expect(await LilypadDbGate.create(options('a'))).toBe(first);
+      expect(logger.warn).not.toHaveBeenCalled();
+      expect(await LilypadDbGate.create(options('b'))).toBe(first);
+      expect(logger.warn).toHaveBeenCalledOnce();
+      await first.close();
     });
   });
 

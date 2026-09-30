@@ -5,6 +5,9 @@
  * connection is down: until it is back, notifications are lost silently. The heartbeat sends a
  * notification to itself every `interval` (through the main pool), and counts the connection as
  * unhealthy when none has come back for {@link UNHEALTHY_AFTER_INTERVALS} intervals.
+ *
+ * Time is measured on the monotonic clock (`performance.now()`): a step back of the wall clock
+ * would otherwise keep a dead connection healthy until the clock catches up.
  */
 export class LilypadListenHeartbeat {
   /** Missed beats (as a number of intervals) after which the connection counts as unhealthy. */
@@ -26,7 +29,7 @@ export class LilypadListenHeartbeat {
   ) {}
 
   /** Starts sending heartbeats; the connection counts as healthy from now. */
-  start(now: number = Date.now()): void {
+  start(now: number = performance.now()): void {
     if (this.timer) {
       return;
     }
@@ -39,7 +42,7 @@ export class LilypadListenHeartbeat {
   }
 
   /** Records a heartbeat received on the `LISTEN` connection. */
-  beat(now: number = Date.now()): void {
+  beat(now: number = performance.now()): void {
     if (this.timer) {
       this.lastBeat = now;
     }
@@ -58,7 +61,7 @@ export class LilypadListenHeartbeat {
   }
 
   /** Whether a heartbeat came back recently. `false` when stopped. */
-  healthy(now: number = Date.now()): boolean {
+  healthy(now: number = performance.now()): boolean {
     return (
       this.lastBeat !== undefined &&
       now - this.lastBeat <= this.interval * LilypadListenHeartbeat.UNHEALTHY_AFTER_INTERVALS

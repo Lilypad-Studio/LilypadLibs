@@ -218,6 +218,9 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
               options.pool,
               options.listenHeartbeat,
               options.config?.name,
+              // The callbacks themselves cannot be compared: a gate reused without the listeners
+              // of this call at least warns
+              (options.listen ?? []).map(({ channel, callbackId }) => [channel, callbackId]),
             ])
           )
           .digest('hex'),
@@ -226,7 +229,7 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
             options.logger,
             'warn',
             'LilypadDbGate',
-            `Singleton "${options.singleton ?? ''}" already exists with different connection options or config: the new options are ignored.`
+            `Singleton "${options.singleton ?? ''}" already exists with different connection options, config or listeners: the new options are ignored (add the listeners with addListener).`
           ),
       }
     );
@@ -284,18 +287,30 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
    * The listener entry is registered immediately, before LISTEN is active, so that concurrent
    * `addListener` calls for the same channel share it and await the same `ready` promise.
    * If LISTEN fails, the entry is removed, so that a later `addListener` call retries it.
+   *
+   * The postgres.js callbacks act only while the entry is the current one of the channel: a LISTEN
+   * that failed stays registered in postgres.js (which gives no `unlisten` for it, and listens to it
+   * again on every reconnection), and a removed entry is still called until its UNLISTEN is sent.
    */
   private initializeListener(channel: string): ChannelListener {
     libLog(this.logger, 'debug', this.id, `Initializing listener for channel "${channel}".`);
+    const isCurrent = () => this.listeners.get(channel) === listener;
     const listener: ChannelListener = {
       callbacks: new Map(),
       listening: false,
       ready: this.listenClient()
         .listen(
           channel,
-          (payload) => this.executeAllListenerCallbacks(channel, payload),
+          (payload) => {
+            if (isCurrent()) {
+              this.executeAllListenerCallbacks(channel, listener, payload);
+            }
+          },
           // postgres.js calls it on the first LISTEN and again after every reconnection
           () => {
+            if (!isCurrent()) {
+              return;
+            }
             if (listener.listening) {
               this.executeReconnectCallbacks(channel, listener);
             }
@@ -304,9 +319,11 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
         )
         .then((meta) => () => meta.unlisten())
         .catch((error: unknown) => {
-          if (this.listeners.get(channel) === listener) {
+          if (isCurrent()) {
             this.listeners.delete(channel);
           }
+          // postgres.js keeps the callbacks: do not keep the listeners alive through them
+          listener.callbacks.clear();
           throw error;
         }),
     };
@@ -337,11 +354,11 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
   }
 
   /** Runs every callback of a channel with the payload of a notification. */
-  private executeAllListenerCallbacks(channel: string, payload: unknown) {
-    const listener = this.listeners.get(channel);
-    if (!listener) {
-      return;
-    }
+  private executeAllListenerCallbacks(
+    channel: string,
+    listener: ChannelListener,
+    payload: unknown
+  ) {
     for (const [callbackId, { callback }] of listener.callbacks) {
       this.runCallbackSafely(channel, callbackId, () => callback(payload));
     }
@@ -465,12 +482,12 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
 
   /**
    * Whether the `LISTEN` connection is known to deliver notifications: a heartbeat came back
-   * recently. Without heartbeat (`listenHeartbeat: false`), `true` as soon as a channel is
-   * listened to. `false` while no channel is listened to.
+   * recently. Without heartbeat (`listenHeartbeat: false`), `true` as soon as LISTEN is active on
+   * a channel. `false` while no channel is listened to.
    */
   isListenHealthy(): boolean {
     if (!this.heartbeat) {
-      return this.listeners.size > 0;
+      return [...this.listeners.values()].some((listener) => listener.listening);
     }
     if (!this.heartbeatStop && this.listeners.size > 0 && this.heartbeatBackoff.ready()) {
       // The heartbeat could not start: retried here, since the caches ask this before trusting

@@ -4,6 +4,7 @@ import {
   LILYPAD_CHANGELOG_VERSION,
   lilypadChangelogPruneScheduleSql,
   lilypadChangelogSql,
+  lilypadChangelogTriggerSql,
   pruneLilypadChangelog,
 } from './LilypadChangelog';
 import type { LilypadDbGate } from './LilypadDbGate';
@@ -21,7 +22,8 @@ describe('lilypadChangelogSql prune option', () => {
   it('should call the prune function before each return of the trigger function', () => {
     const sql = lilypadChangelogSql({ prune: { olderThan: 86_400_000 } });
 
-    expect(sql).toContain('CREATE OR REPLACE FUNCTION "lilypad_cache_changes_prune"()');
+    expect(sql).toContain('CREATE OR REPLACE FUNCTION %s() RETURNS void AS %L');
+    expect(sql).toContain(`'"lilypad_cache_changes_prune"', format($body$`);
     expect(sql).toContain('make_interval(secs => 86400)');
     expect(sql).toContain('LIMIT 1000');
     expect(sql).toContain('SECURITY DEFINER');
@@ -40,11 +42,21 @@ describe('lilypadChangelogSql prune option', () => {
     ).toEqual({ olderThan: 60_000, every: 20, batchSize: 1000 });
   });
 
+  it('should search pg_temp last, so that a temporary table cannot stand for the changelog', () => {
+    const sql = lilypadChangelogSql({ prune: { olderThan: 86_400_000 } });
+
+    expect(sql).toContain('SECURITY DEFINER SET search_path = pg_catalog, pg_temp');
+    expect(sql).not.toContain('FROM CURRENT');
+  });
+
   it('should name the prune function after the changelog table', () => {
     const sql = lilypadChangelogSql({ table: 'archive.changes', prune: { olderThan: 60_000 } });
 
-    expect(sql).toContain('FUNCTION "archive_changes_prune"()');
-    expect(sql).toContain('DELETE FROM "archive"."changes"');
+    expect(sql).toContain('PERFORM "archive_changes_prune"();');
+    // Qualified with its schema by the migration, in the DO block that creates the function
+    expect(sql).toContain(`WHERE c.oid = '"archive"."changes"'::regclass`);
+    expect(sql).toContain('DELETE FROM %1$s WHERE id IN');
+    expect(sql).toContain(`'"archive_changes_prune"', format($body$`);
   });
 
   it.each([
@@ -136,5 +148,63 @@ describe('pruneLilypadChangelog', () => {
     [{ olderThan: 86_400 }, 'less than one hour'],
   ])('should reject %o', async (options, message) => {
     await expect(pruneLilypadChangelog(gate, options)).rejects.toThrow(message);
+  });
+});
+
+describe('lilypadChangelogTriggerSql', () => {
+  const triggerNames = (sql: string) =>
+    [...sql.matchAll(/CREATE TRIGGER "([^"]+)"/g)].map((match) => match[1]!);
+
+  it('should name the triggers after the table', () => {
+    expect(
+      triggerNames(lilypadChangelogTriggerSql({ table: 'public.users', primaryKey: 'id' }))
+    ).toEqual([
+      'public_users_lilypad_insert',
+      'public_users_lilypad_update',
+      'public_users_lilypad_delete',
+      'public_users_lilypad_truncate',
+    ]);
+  });
+
+  it('should keep distinct trigger names that PostgreSQL does not truncate, for a long table name', () => {
+    const table = `public.${'x'.repeat(50)}`;
+    const sql = lilypadChangelogTriggerSql({ table, primaryKey: 'id' });
+    const names = triggerNames(sql);
+
+    expect(new Set(names).size).toBe(4);
+    for (const name of names) {
+      expect(name.length).toBeLessThanOrEqual(63);
+    }
+    expect(
+      triggerNames(
+        lilypadChangelogTriggerSql({ table: `public.${'x'.repeat(51)}`, primaryKey: 'id' })
+      )
+    ).not.toEqual(names);
+    // The names of the earlier versions, which PostgreSQL truncated alike, are dropped
+    expect(sql).toContain(`DROP TRIGGER IF EXISTS "public_${'x'.repeat(50)}_lilypad_insert"`);
+  });
+});
+
+describe('lilypadChangelogSql dollar quotes', () => {
+  it('should quote the bodies with tags that the names do not contain', () => {
+    const sql = lilypadChangelogSql({
+      table: 'odd$$record$lilypad$function$',
+      notifyChannel: 'odd$notify$',
+      prune: { olderThan: 86_400_000 },
+    });
+
+    expect(sql).toContain('DO $lilypad_$');
+    expect(sql).toContain('format($body$');
+    expect(sql).toContain('RETURNS trigger AS $_$');
+    expect(sql).toContain('EXECUTE format($record_$');
+    expect(sql).toContain('EXECUTE format($notify_$');
+  });
+
+  it('should leave the SQL of ordinary names as it is', () => {
+    const sql = lilypadChangelogSql();
+
+    expect(sql).toContain('RETURNS trigger AS $$');
+    expect(sql).toContain('EXECUTE format($record$');
+    expect(sql).toContain('EXECUTE format($notify$');
   });
 });

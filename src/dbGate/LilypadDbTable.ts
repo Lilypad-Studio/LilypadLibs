@@ -146,6 +146,10 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
    * Selects every row of the table. Rows are read in batches through a cursor, so the raw result
    * of the whole table is never held in memory at once.
    *
+   * The cursor is an SQL one (`DECLARE`, then one `FETCH` per batch, in a transaction): the
+   * `statementTimeout` of the gate bounds each batch. A postgres.js cursor is one statement, which
+   * the timeout would cancel once the whole table takes longer to read.
+   *
    * @param options.signal - Stops reading (and closes the cursor) once aborted: the promise then
    * rejects with the reason of the signal.
    */
@@ -154,15 +158,20 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
     const { signal } = options;
     signal?.throwIfAborted();
     const typedRows: T[] = [];
-    const cursor = this.sql`
-      SELECT ${this.selectedColumns()} FROM ${this.tableName}
-    `.cursor(SELECT_ALL_BATCH_SIZE);
-
-    for await (const rows of cursor) {
-      // Leaving the loop closes the cursor
-      signal?.throwIfAborted();
-      this.mapRows(rows, typedRows);
-    }
+    // Ending the transaction, or rolling it back on a throw, closes the cursor
+    await this.sql.begin(async (sql) => {
+      await sql`
+        DECLARE lilypad_select_all NO SCROLL CURSOR FOR
+        SELECT ${this.selectedColumns()} FROM ${this.tableName}
+      `;
+      let rows: postgres.RowList<postgres.Row[]>;
+      do {
+        signal?.throwIfAborted();
+        rows =
+          await sql`FETCH ${sql.unsafe(String(SELECT_ALL_BATCH_SIZE))} FROM lilypad_select_all`;
+        this.mapRows(rows, typedRows);
+      } while (rows.length === SELECT_ALL_BATCH_SIZE);
+    });
     return typedRows;
   }
 

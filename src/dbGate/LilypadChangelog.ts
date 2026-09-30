@@ -19,7 +19,7 @@ export { LILYPAD_DEFAULT_CHANGELOG_TABLE };
  * The function carries it in its comment (`lilypad-changelog:<version>`), so that
  * `checkLilypadSchema` can tell an installation made by an older version of the library.
  */
-export const LILYPAD_CHANGELOG_VERSION = 5;
+export const LILYPAD_CHANGELOG_VERSION = 6;
 export const LILYPAD_CHANGELOG_VERSION_PREFIX = 'lilypad-changelog:';
 /**
  * The oldest version that the caches still read correctly: an older installation is an error of
@@ -46,6 +46,41 @@ function identifierPrefix(name: string): string {
   return name.replace(/\W/g, '_');
 }
 
+/** PostgreSQL truncates longer identifiers (`NAMEDATALEN - 1`). */
+const MAX_IDENTIFIER_BYTES = 63;
+
+/**
+ * A name derived from a table name, at most {@link MAX_IDENTIFIER_BYTES} long: a longer prefix is
+ * cut and followed by a hash of the whole prefix, so that the suffixes stay distinct instead of
+ * being truncated away (the prefix is ASCII: one byte per character).
+ */
+function derivedName(prefix: string, suffix: string): string {
+  if (prefix.length + suffix.length <= MAX_IDENTIFIER_BYTES) {
+    return prefix + suffix;
+  }
+  // FNV-1a, 32 bits
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < prefix.length; index++) {
+    hash = Math.imul(hash ^ prefix.charCodeAt(index), 0x01000193);
+  }
+  const tag = (hash >>> 0).toString(16).padStart(8, '0');
+  return `${prefix.slice(0, MAX_IDENTIFIER_BYTES - suffix.length - tag.length - 1)}_${tag}${suffix}`;
+}
+
+/**
+ * Dollar-quotes a body with a tag that it does not contain: the names of a config may contain `$`.
+ * The tag is lengthened with `_` until it is unique.
+ */
+function dollarQuote(body: string, tag = ''): string {
+  let delimiter = `$${tag}$`;
+  // Also when the end of the body and the delimiter form one (`...$` followed by `$$`)
+  while (`${body}${delimiter}`.indexOf(delimiter) !== body.length) {
+    tag += '_';
+    delimiter = `$${tag}$`;
+  }
+  return `${delimiter}${body}${delimiter}`;
+}
+
 /** Quotes an identifier; `schema.table` is quoted part by part. */
 export function quoteIdentifier(identifier: string): string {
   return identifier
@@ -68,25 +103,35 @@ export function pruneFunctionName(changelogTable: string): string {
   return `${identifierPrefix(changelogTable)}_prune`;
 }
 
+const TRIGGER_SUFFIXES = {
+  insert: '_lilypad_insert',
+  update: '_lilypad_update',
+  delete: '_lilypad_delete',
+  truncate: '_lilypad_truncate',
+  legacyRow: '_lilypad_changes',
+} as const;
+
 /**
  * The names of the triggers that record the changes of a table: one statement trigger per event,
  * and the row trigger that versions 3 and earlier installed instead of the first three (which
  * `lilypadChangelogTriggerSql` drops).
+ *
+ * With `unshortened`, the names of versions 5 and earlier: PostgreSQL truncated the long ones (so
+ * that the four statement triggers of a long table name were one), and truncates them the same way
+ * in a `DROP TRIGGER`.
  */
-function changelogTriggerNames(table: string): {
-  insert: string;
-  update: string;
-  delete: string;
-  truncate: string;
-  legacyRow: string;
-} {
+function changelogTriggerNames(
+  table: string,
+  unshortened = false
+): Record<keyof typeof TRIGGER_SUFFIXES, string> {
   const prefix = identifierPrefix(table);
+  const name = (suffix: string) => (unshortened ? prefix + suffix : derivedName(prefix, suffix));
   return {
-    insert: `${prefix}_lilypad_insert`,
-    update: `${prefix}_lilypad_update`,
-    delete: `${prefix}_lilypad_delete`,
-    truncate: `${prefix}_lilypad_truncate`,
-    legacyRow: `${prefix}_lilypad_changes`,
+    insert: name(TRIGGER_SUFFIXES.insert),
+    update: name(TRIGGER_SUFFIXES.update),
+    delete: name(TRIGGER_SUFFIXES.delete),
+    truncate: name(TRIGGER_SUFFIXES.truncate),
+    legacyRow: name(TRIGGER_SUFFIXES.legacyRow),
   };
 }
 
@@ -186,6 +231,43 @@ export function olderThanCondition(olderThan: number): string {
 }
 
 /**
+ * The body of the `DO` block that creates the prune function: `format()` puts the changelog table,
+ * qualified with its schema, in the function, whose body is then passed as a literal (`%L`): the
+ * schema, known only there, may contain `$`.
+ */
+function pruneDoBody(
+  pruneFunction: string,
+  quotedTable: string,
+  prune: Required<LilypadChangelogPruneOptions>
+): string {
+  const functionBody = `
+  DELETE FROM %1$s WHERE id IN (
+    SELECT id FROM %1$s
+    WHERE ${escapeFormat(olderThanCondition(prune.olderThan))}
+    ORDER BY changed_at
+    LIMIT ${prune.batchSize}
+    FOR UPDATE SKIP LOCKED
+  );
+`;
+  return dollarQuote(
+    `
+DECLARE
+  changelog text := (
+    SELECT format('%I.%I', n.nspname, c.relname)
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.oid = ${quoteLiteral(quotedTable)}::regclass
+  );
+BEGIN
+  EXECUTE format(
+    'CREATE OR REPLACE FUNCTION %s() RETURNS void AS %L LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp',
+    ${quoteLiteral(pruneFunction)}, format(${dollarQuote(functionBody, 'body')}, changelog));
+END
+`,
+    'lilypad'
+  );
+}
+
+/**
  * The SQL that creates the changelog table and its trigger function. Run it once, in a migration.
  * It is idempotent (`IF NOT EXISTS` / `CREATE OR REPLACE`).
  *
@@ -239,12 +321,15 @@ ${indent}END IF;`
       'xid', pg_current_xact_id()::text
     )::text);
   ELSIF recorded > 0 THEN
-    EXECUTE format($notify$
+    EXECUTE format(${dollarQuote(
+      `
       SELECT pg_notify(${escapeFormat(quoteLiteral(channel))}, json_build_object(
         'schema', $1, 'table', $2, 'id', changed.row_id, 'op', changed.op,
         'xid', pg_current_xact_id()::text
       )::text) FROM (%s) AS changed
-    $notify$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;
+    `,
+      'notify'
+    )}, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;
   END IF;`;
 
   return `CREATE TABLE IF NOT EXISTS ${quotedTable} (
@@ -268,24 +353,18 @@ ${
   prune
     ? `
 -- Deletes up to ${prune.batchSize} changelog rows older than the retention, for the trigger function.
--- SECURITY DEFINER, so that the writing roles need no DELETE privilege on the changelog, with the
--- search_path of this migration, where the changelog table is. SKIP LOCKED: concurrent prunes
--- delete different rows and never wait for each other.
-CREATE OR REPLACE FUNCTION ${pruneFunction}() RETURNS void AS $$
-  DELETE FROM ${quotedTable} WHERE id IN (
-    SELECT id FROM ${quotedTable}
-    WHERE ${olderThanCondition(prune.olderThan)}
-    ORDER BY changed_at
-    LIMIT ${prune.batchSize}
-    FOR UPDATE SKIP LOCKED
-  );
-$$ LANGUAGE sql SECURITY DEFINER SET search_path FROM CURRENT;
+-- SECURITY DEFINER, so that the writing roles need no DELETE privilege on the changelog. The
+-- changelog table is qualified with the schema this migration resolves it to, and pg_temp comes
+-- last in the search_path: otherwise it is searched first, and any role could make the function
+-- delete from a temporary table of its own, whose triggers would run with the privileges of the
+-- owner. SKIP LOCKED: concurrent prunes delete different rows and never wait for each other.
+DO ${pruneDoBody(pruneFunction, quotedTable, prune)};
 `
     : ''
 }
 -- Records the changes of the rows of a statement, or a TRUNCATE of the table; the trigger argument
 -- is the primary key column.
-CREATE OR REPLACE FUNCTION ${functionName}() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION ${functionName}() RETURNS trigger AS ${dollarQuote(`
 DECLARE
   changed text;
   recorded bigint;
@@ -324,13 +403,16 @@ BEGIN${
       || 'UNION ALL SELECT to_jsonb(n.%1$I) #>> ''{}'', ''UPDATE'' FROM ${newRows} n',
       TG_ARGV[0])
   END;
-  EXECUTE format($record$
+  EXECUTE format(${dollarQuote(
+    `
     INSERT INTO ${escapeFormat(quotedTable)} (table_schema, table_name, row_id, op)
     SELECT $1, $2, changed.row_id, changed.op FROM (%s) AS changed
-  $record$, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;${notifyChanged}${pruneCall('  ')}
+  `,
+    'record'
+  )}, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;${notifyChanged}${pruneCall('  ')}
   RETURN NULL;
 END;
-$$ LANGUAGE plpgsql;
+`)} LANGUAGE plpgsql;
 COMMENT ON FUNCTION ${functionName}() IS ${quoteLiteral(`${LILYPAD_CHANGELOG_VERSION_PREFIX}${LILYPAD_CHANGELOG_VERSION}`)};
 ${prune ? '' : `DROP FUNCTION IF EXISTS ${pruneFunction}();\n`}`;
 }
@@ -411,10 +493,15 @@ export function lilypadChangelogTriggerSql(options: {
   const changelogTable = options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
   const names = changelogTriggerNames(options.table);
   const table = quoteIdentifier(options.table);
+  // The names of versions 5 and earlier that were too long, as PostgreSQL truncated them
+  const dropUnshortened = Object.values(changelogTriggerNames(options.table, true))
+    .filter((name) => !Object.values(names).includes(name))
+    .map((name) => `DROP TRIGGER IF EXISTS ${quoteIdentifier(name)} ON ${table};\n`)
+    .join('');
   const execute = `EXECUTE FUNCTION ${quoteIdentifier(triggerFunctionName(changelogTable))}(${quoteLiteral(options.primaryKey)})`;
   const oldRows = LILYPAD_CHANGELOG_OLD_ROWS;
   const newRows = LILYPAD_CHANGELOG_NEW_ROWS;
-  return `DROP TRIGGER IF EXISTS ${quoteIdentifier(names.legacyRow)} ON ${table};
+  return `${dropUnshortened}DROP TRIGGER IF EXISTS ${quoteIdentifier(names.legacyRow)} ON ${table};
 DROP TRIGGER IF EXISTS ${quoteIdentifier(names.insert)} ON ${table};
 CREATE TRIGGER ${quoteIdentifier(names.insert)}
   AFTER INSERT ON ${table} REFERENCING NEW TABLE AS ${newRows}
@@ -506,6 +593,7 @@ export async function readLilypadChangesBatch(
   gate: LilypadDbGate,
   options: { requests: LilypadChangesRequest[]; changelogTable?: string | undefined }
 ): Promise<{ changes: LilypadChange[][]; cursor: LilypadChangelogCursor }> {
+  gate.assertOpen();
   const sql = gate.sql;
   const changelogTable = sql(options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE);
   // Passed as text arrays: an empty xmax selects the lookback of the request, and the running
@@ -627,6 +715,7 @@ export async function pruneLilypadChangelog(
       `${owner}: olderThan is ${options.olderThan} ms, less than one hour: the caches may still need these rows (it is in milliseconds). Pass force: true to prune them anyway.`
     );
   }
+  gate.assertOpen();
   const changelogTable = gate.sql(options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE);
   const batchSize = options.batchSize ?? 10_000;
   let deleted = 0;

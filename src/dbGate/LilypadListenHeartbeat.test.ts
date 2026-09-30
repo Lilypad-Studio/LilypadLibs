@@ -54,6 +54,17 @@ describe('LilypadListenHeartbeat', () => {
     heartbeat.stop();
   });
 
+  it('should not stay healthy when the wall clock steps back', async () => {
+    const heartbeat = new LilypadListenHeartbeat(1000, async () => {}, vi.fn());
+    heartbeat.start();
+
+    vi.setSystemTime(Date.now() - 60 * 60_000);
+    await vi.advanceTimersByTimeAsync(3000);
+
+    expect(heartbeat.healthy()).toBe(false);
+    heartbeat.stop();
+  });
+
   it('should ignore beats once stopped', () => {
     const heartbeat = new LilypadListenHeartbeat(1000, async () => {}, vi.fn());
     heartbeat.start();

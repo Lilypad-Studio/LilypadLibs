@@ -403,9 +403,7 @@ export function evaluateLilypadSchema(
         severity: compatible ? 'warning' : 'error',
         message:
           `The changelog "${changelog.table}" was installed by an older version of the library (version ${version}, expected ${LILYPAD_CHANGELOG_VERSION})` +
-          (compatible
-            ? ': the caches read it, but a statement that changes many rows notifies each of them instead of sending one BULK notification.'
-            : '.'),
+          (compatible ? `: the caches read it, but ${outdatedChangelogReason(version)}.` : '.'),
         fix: changelogSql,
       });
     }
@@ -555,4 +553,13 @@ export function evaluateLilypadSchema(
 
   problems.push(...deferred, ...pruningProblems);
   return { ok: !problems.some((problem) => problem.severity === 'error'), problems, tables };
+}
+
+/** What a changelog of a compatible older version lacks (see `LILYPAD_CHANGELOG_VERSION`). */
+function outdatedChangelogReason(version: number): string {
+  const beforeVersion6 =
+    'its prune function (`prune` option) can be made to run the code of any role with the privileges of its owner, the triggers of a long table name record only TRUNCATE, and a name containing `$` breaks its SQL';
+  return version < 5
+    ? `a statement that changes many rows notifies each of them instead of sending one BULK notification; ${beforeVersion6}`
+    : beforeVersion6;
 }

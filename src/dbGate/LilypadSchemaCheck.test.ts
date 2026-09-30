@@ -147,6 +147,18 @@ describe('evaluateLilypadSchema', () => {
     expect(result.ok).toBe(true);
   });
 
+  it('should warn about the prune function of a changelog of version 5', () => {
+    const result = evaluateLilypadSchema(
+      facts({ changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:5' } }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['outdated-changelog']);
+    expect(result.problems[0]!.severity).toBe('warning');
+    expect(result.problems[0]!.message).toContain('prune function');
+    expect(result.problems[0]!.message).not.toContain('BULK');
+  });
+
   describe('notifications of the changelog fix', () => {
     const missing = facts({ changelog: noChangelog });
     const outdated = (functionSource: string) =>
