@@ -13,8 +13,10 @@ export async function withLilypadTimeout<T>(
   const timeoutPromise = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       const error = createError();
-      controller.abort(error);
+      // Rejected first: the abort listeners run synchronously, and an operation that rejects from
+      // one with an error of its own would otherwise win the race
       reject(error);
+      controller.abort(error);
     }, timeout);
   });
   try {

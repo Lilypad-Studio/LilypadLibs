@@ -35,6 +35,14 @@ export class LilypadDbMembers<K extends LilypadCacheKey> {
     return this.loadedAt !== undefined || this.loading > 0;
   }
 
+  /**
+   * Whether the members are the rows of the table: a load completed, and no change of the whole
+   * table voided it since (a `forget` without `empty`, or, during the first load, any `forget`).
+   */
+  get known(): boolean {
+    return this.loadedAt !== undefined;
+  }
+
   get size(): number {
     return this.members.size;
   }
@@ -81,8 +89,7 @@ export class LilypadDbMembers<K extends LilypadCacheKey> {
    * Notes a row that exists in the table, without fetching it. Beyond a quarter of the table (and
    * at least {@link MIN_UNVERIFIED}), the rows noted this way are forgotten instead: `getAll` would
    * load the whole table rather than fetch them anyway. Not while a load runs: it would void the
-   * load, whose `getAll` would then return the rows noted since only; the next `add` after it
-   * checks again.
+   * load, whose `getAll` would then load the table again; the next `add` after it checks again.
    *
    * @param ticket - A ticket taken now.
    */

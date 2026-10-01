@@ -1,6 +1,7 @@
 import { LILYPAD_DEFAULT_CHANGELOG_TABLE } from '@/dbConfig/LilypadDbConfigDefaults';
 import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
 import {
+  lilypadSafeKeyTypeSql,
   pruneFunctionName,
   quoteIdentifier,
   textArrayLiteral,
@@ -150,6 +151,18 @@ export type LilypadTableFacts = {
   /** The schema of a missing `schema.table`, when it does not exist either. */
   missingSchema?: string | undefined;
   triggers: LilypadTriggerInfo[];
+  /**
+   * The type of the primary key column (`format_type`) when the changelog triggers refuse to record
+   * it: an enum or base type not owned by a superuser, or whose output function or a json/jsonb cast
+   * function is not owned by a superuser (nor built in), a user-defined (non-built-in) composite,
+   * range or multirange type, or an array or domain over one (the rule of `lilypadSafeKeyTypeSql`).
+   * `null` for a safe key (a built-in type, a base or enum type whose type, output function and json
+   * cast functions are owned by superusers, or an array/domain of one), or when the column does not
+   * exist.
+   */
+  keyUserType?: string | null | undefined;
+  /** Whether the primary key column does not exist (renamed or dropped after the triggers). */
+  keyColumnMissing?: boolean | undefined;
   columns?: LilypadColumnInfo[] | undefined;
   constraints?: LilypadConstraintInfo[] | undefined;
   indexes?: LilypadIndexInfo[] | undefined;
@@ -335,6 +348,7 @@ async function readTableFacts(
   const sql = gate.sql;
   const changelog = readChangelogTarget(options);
   const tableRefs = options.tables.map(({ table }) => quoteIdentifier(table));
+  const primaryKeys = options.tables.map(({ primaryKey }) => primaryKey);
   const withShape = options.tables.some((table) => table.shape !== undefined);
   const shapeColumns = withShape
     ? sql`,
@@ -432,9 +446,29 @@ async function readTableFacts(
         )), '[]'::json)
         FROM pg_trigger tr JOIN pg_proc p ON p.oid = tr.tgfoid
         WHERE tr.tgrelid = t.oid AND NOT tr.tgisinternal
-      ) AS triggers
+      ) AS triggers,
+      -- Whether the primary key column is missing (renamed or dropped). The name is cast to the name
+      -- type, so it is clipped to 63 bytes as the trigger's %I is.
+      NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_attribute a
+        WHERE a.attrelid = t.oid AND a.attname = requested.primary_key::pg_catalog.name
+          AND a.attnum > 0 AND NOT a.attisdropped
+      ) AS key_column_missing,
+      -- The type of the primary key column when it is not safe to record, i.e. when converting it
+      -- with to_jsonb (as the changelog owner) could run a non-superuser's code. The safety rule is
+      -- the one the trigger function applies (lilypadSafeKeyTypeSql, the single source of truth): a
+      -- walk with no result counts as unsafe (coalesce to false there). Null when safe, or when the
+      -- column is missing.
+      (
+        SELECT CASE WHEN NOT (${sql.unsafe(lilypadSafeKeyTypeSql('a.atttypid'))})
+          THEN pg_catalog.format_type(a.atttypid, a.atttypmod) END
+        FROM pg_catalog.pg_attribute a
+        WHERE a.attrelid = t.oid AND a.attname = requested.primary_key::pg_catalog.name
+          AND a.attnum > 0 AND NOT a.attisdropped
+      ) AS key_user_type
       ${shapeColumns}
-    FROM unnest(${textArrayLiteral(tableRefs)}::text[]) WITH ORDINALITY AS requested(ref, position)
+    FROM unnest(${textArrayLiteral(tableRefs)}::text[], ${textArrayLiteral(primaryKeys)}::text[])
+      WITH ORDINALITY AS requested(ref, primary_key, position)
     JOIN pg_class t ON t.oid = to_regclass(requested.ref)
     JOIN pg_namespace n ON n.oid = t.relnamespace
   `;
@@ -481,6 +515,8 @@ async function readTableFacts(
         ...trigger,
         args: decodeLilypadTriggerArgs(trigger.args),
       })),
+      keyUserType: (row.key_user_type as string | null | undefined) ?? null,
+      keyColumnMissing: (row.key_column_missing as boolean | undefined) ?? false,
     };
     if (table.shape !== undefined) {
       facts.columns = parseJsonColumn(row.columns) as LilypadColumnInfo[];

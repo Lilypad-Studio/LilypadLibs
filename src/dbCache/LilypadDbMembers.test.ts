@@ -57,6 +57,22 @@ describe('LilypadDbMembers', () => {
     expect(members.isLoaded(undefined, 60_000)).toBe(false);
   });
 
+  it('should know the rows once loaded, until a change of the whole table voids the load', () => {
+    const members = new LilypadDbMembers<string>();
+    expect(members.known).toBe(false);
+    members.replace(loaded('a'), 1, Date.now(), () => false);
+    expect(members.known).toBe(true);
+
+    // A TRUNCATE read from the changelog: the table is known to be empty
+    members.forget(2, true);
+    members.replace(loaded('a'), 1, Date.now(), () => false);
+    expect(members.known).toBe(true);
+    // A BULK change: a load started before it does not make the rows known again
+    members.forget(3, false);
+    members.replace(loaded('a'), 2, Date.now(), () => false);
+    expect(members.known).toBe(false);
+  });
+
   it('should not count a load made before the sync became trusted again, even within the TTL', () => {
     const members = new LilypadDbMembers<string>();
     const loadedAt = Date.now();

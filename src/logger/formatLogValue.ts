@@ -47,7 +47,7 @@ export function lilypadRedaction(keys: readonly string[]): ReadonlySet<string> {
 const URL_PASSWORD = /(\b[a-z][a-z\d+.-]*:\/\/[^\s/?#@:]*:)[^\s/?#]*@/gi;
 
 /** Masks the passwords of the URLs of a string, unless redaction is off ({@link NO_REDACTION}). */
-export function redactUrlPasswords(text: string, redaction: ReadonlySet<string>): string {
+function redactUrlPasswords(text: string, redaction: ReadonlySet<string>): string {
   return redaction !== NO_REDACTION && text.includes('://')
     ? text.replace(URL_PASSWORD, '$1[Redacted]@')
     : text;
@@ -56,6 +56,11 @@ export function redactUrlPasswords(text: string, redaction: ReadonlySet<string>)
 const DEFAULT_REDACTION = lilypadRedaction(LILYPAD_DEFAULT_REDACTED_KEYS);
 /** Redaction off (`redact: false`): no key, and the passwords of URLs are kept too. */
 export const NO_REDACTION: ReadonlySet<string> = new Set();
+
+/** A typed array (a Node.js `Buffer` is one), not a `DataView`. */
+function isTypedArray(value: object): value is ArrayLike<number | bigint> {
+  return ArrayBuffer.isView(value) && !(value instanceof DataView);
+}
 
 function isRedacted(key: unknown, redaction: ReadonlySet<string>): boolean {
   return typeof key === 'string' && redaction.size > 0 && redaction.has(normalizeRedactedKey(key));
@@ -73,8 +78,11 @@ type LogNode =
   /** `[Circular]`, `[Redacted]`, `[Getter threw]`, `[Object]`...: never quoted. */
   | { kind: 'marker'; text: string }
   | { kind: 'date'; iso: string | null }
-  /** `more`: the items left out beyond `MAX_TEXT_ITEMS` (text form only). */
-  | { kind: 'array'; items: LogNode[]; more: number }
+  /**
+   * `more`: the items left out beyond `MAX_TEXT_ITEMS` (text form only). `label`: the type and
+   * length of a typed array (text form only).
+   */
+  | { kind: 'array'; items: LogNode[]; more: number; label?: string | undefined }
   | { kind: 'map'; entries: [LogNode, LogNode][]; more: number }
   | { kind: 'set'; items: LogNode[]; more: number }
   | { kind: 'object'; properties: WalkedProperties }
@@ -155,6 +163,16 @@ function walkValue(value: unknown, depth: number, state: WalkState): LogNode {
   if (value instanceof RegExp) {
     return { kind: 'text', text: value.toString() };
   }
+  if (!state.json && isTypedArray(value) && depth < state.maxDepth) {
+    // By index, like an array: listing its keys (e.g. of a large Buffer) would take seconds
+    const items: LogNode[] = [];
+    const shown = Math.min(value.length, state.maxItems);
+    for (let index = 0; index < shown; index++) {
+      items.push(walk(value[index], depth + 1, state));
+    }
+    const label = `${Object.prototype.toString.call(value).slice(8, -1)}(${value.length})`;
+    return { kind: 'array', label, items, more: value.length - shown };
+  }
   if (state.json) {
     const toJSON = (value as { toJSON?: unknown }).toJSON;
     if (typeof toJSON === 'function') {
@@ -228,23 +246,71 @@ function walkError(error: Error, depth: number, state: WalkState): LogNode {
         : undefined;
     if (properties && aggregate) {
       // Not enumerable, and often what explains the error (e.g. each address a connection tried)
-      properties.entries.push([
-        'errors',
-        isRedacted('errors', state.redaction) ? REDACTED : walk(error.errors, depth + 1, state),
-      ]);
+      const errors = walkErrorField(error, 'errors', depth, state);
+      if (errors) {
+        properties.entries.push(['errors', errors]);
+      }
     }
     return {
       kind: 'error',
-      name: error.name,
-      message: redactUrlPasswords(error.message, state.redaction),
-      stack:
-        error.stack === undefined ? undefined : redactUrlPasswords(error.stack, state.redaction),
+      ...lilypadErrorSummary(error, state.redaction),
       properties,
-      cause: error.cause !== undefined ? walk(error.cause, depth + 1, state) : undefined,
+      cause: walkErrorField(error, 'cause', depth, state),
     };
   } finally {
     state.seen.delete(error);
   }
+}
+
+/**
+ * The `cause` of an error, or the `errors` of an `AggregateError`: `undefined` when missing, and
+ * redacted like the other keys. A getter that throws loses only this field.
+ */
+function walkErrorField(
+  error: Error,
+  key: 'cause' | 'errors',
+  depth: number,
+  state: WalkState
+): LogNode | undefined {
+  let item: unknown;
+  try {
+    item = (error as unknown as Record<string, unknown>)[key];
+  } catch {
+    return marker('[Getter threw]');
+  }
+  if (item === undefined) {
+    return undefined;
+  }
+  return isRedacted(key, state.redaction) ? REDACTED : walk(item, depth + 1, state);
+}
+
+/** A text field of an error as a string; `undefined` when it is missing or cannot be read. */
+function readErrorText(error: Error, key: 'name' | 'message' | 'stack'): string | undefined {
+  try {
+    const text: unknown = error[key];
+    // eslint-disable-next-line @typescript-eslint/no-base-to-string -- as Error.prototype.toString does
+    return text === undefined || text === null ? undefined : String(text);
+  } catch {
+    // e.g. a getter, or an `Error.prepareStackTrace` for `stack`, that throws
+    return undefined;
+  }
+}
+
+/**
+ * The name, message and stack of an error, with the passwords of their URLs masked (see
+ * {@link redactUrlPasswords}). It never throws: a field that is not a string is converted, and
+ * one that cannot be read is left out (`Error` for the name, an empty message).
+ */
+export function lilypadErrorSummary(
+  error: Error,
+  redaction: ReadonlySet<string>
+): { name: string; message: string; stack: string | undefined } {
+  const stack = readErrorText(error, 'stack');
+  return {
+    name: readErrorText(error, 'name') ?? 'Error',
+    message: redactUrlPasswords(readErrorText(error, 'message') ?? '', redaction),
+    stack: stack === undefined ? undefined : redactUrlPasswords(stack, redaction),
+  };
 }
 
 /**
@@ -293,7 +359,8 @@ function renderText(node: LogNode, depth: number): string {
         node.more,
         'items'
       );
-      return items.length === 0 ? '[]' : `[ ${items.join(', ')} ]`;
+      const list = items.length === 0 ? '[]' : `[ ${items.join(', ')} ]`;
+      return node.label === undefined ? list : `${node.label} ${list}`;
     }
     case 'map': {
       const items = withMore(
@@ -407,9 +474,10 @@ function renderJson(node: LogNode): unknown {
  * - It never throws: circular references print as `[Circular]`, BigInts as `10n`, a getter
  *   that throws as `[Getter threw]`, any other part that cannot be read (a Proxy trap, an
  *   iterator that throws) as `[Unformattable value]`.
- * - An `AggregateError` also prints its `errors`.
- * - Its size is bounded: 100 items per array, set, map or object (then `… 900 more items`), 4
- *   levels of nesting (then `[Object]`), 10,000 objects in all (then `[…]`).
+ * - An `AggregateError` also prints its `errors`. A typed array (e.g. a `Buffer`) prints as
+ *   `Uint8Array(3) [ 1, 2, 3 ]`.
+ * - Its size is bounded: 100 items per array, typed array, set, map or object (then
+ *   `… 900 more items`), 4 levels of nesting (then `[Object]`), 10,000 objects in all (then `[…]`).
  * - The values of the keys of `redaction` print as `[Redacted]` (by default, the keys of
  *   {@link LILYPAD_DEFAULT_REDACTED_KEYS}).
  */

@@ -61,6 +61,37 @@ describe('lilypadInitTarget', () => {
     expect(lilypadInitTarget('./db/database.mjs', cwd, exists).existing).toEqual([]);
   });
 
+  it('should take lilypad.default.config.* for a file of its own, which only its path loads', () => {
+    const path = resolve(cwd, 'lilypad.default.config.ts');
+    const others = [path, resolve(cwd, 'lilypad.config.ts')];
+
+    // The loader looks for the default config in lilypad.config.*: both files may stay
+    expect(
+      lilypadInitTarget('./lilypad.default.config.ts', cwd, (file) => others.includes(file))
+    ).toEqual({ path, name: 'default', existing: [path] });
+  });
+
+  it('should overwrite lilypad.default.config.ts with --force', () => {
+    const out = output();
+    const fs = files('lilypad.default.config.ts');
+    const deps = {
+      ...fs.deps,
+      // As writeFileSync with the `wx` flag: an existing file is replaced only with `overwrite`
+      writeFile: (path: string, content: string, overwrite: boolean) => {
+        if (!overwrite && fs.written.has(path)) {
+          throw new Error(`EEXIST: file already exists, open '${path}'`);
+        }
+        fs.written.set(path, content);
+      },
+    };
+
+    expect(
+      runLilypadInitCli(['--config', './lilypad.default.config.ts', '--force'], out, deps)
+    ).toBe(0);
+
+    expect(fs.written.get(resolve(cwd, 'lilypad.default.config.ts'))).toContain('defineLilypadDb');
+  });
+
   it('should reject a path that Node.js cannot load as a module', () => {
     expect(() => lilypadInitTarget('./db/config.json', cwd, none)).toThrow(
       'must end with .ts, .mts, .mjs or .js'

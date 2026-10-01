@@ -24,7 +24,7 @@ Read the matching section of `docs/architecture.md` (and `docs/how-it-works.md` 
 
 ## A new PostgreSQL type
 
-`src/dbConfig/LilypadPgTypes.ts` is the only place that knows the PostgreSQL types: add it to `PG_TYPES` (with the column type postgres.js returns it as). A new column type also goes in `LilypadDbColumnValues` and `LILYPAD_DB_COLUMN_TYPES`. Test it in `LilypadPgTypes.test.ts` (plus an `@ts-expect-error` case in `LilypadDbConfig.test.ts` if the typing of the columns changes).
+`src/dbConfig/LilypadPgTypes.ts` is the only place that knows the PostgreSQL types: add it to `PG_TYPES` (with the column type postgres.js returns it as). A new column type also goes in `LilypadDbColumnValues` and `LILYPAD_DB_COLUMN_TYPES`. A spelling that `format_type` writes otherwise (a default modifier such as `numeric(10,0)`, an array syntax) is handled in `normalizeLilypadPgType`, and in `LilypadPgTypeOf` for the types. Test it in `LilypadPgTypes.test.ts` (plus an `@ts-expect-error` case in `LilypadDbConfig.test.ts` if the typing of the columns changes), and check what `format_type` writes for it on PostgreSQL (the shape spellings test of `LilypadDbGate.integration.test.ts`).
 
 ## Changing the changelog SQL
 

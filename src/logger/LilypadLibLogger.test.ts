@@ -6,6 +6,7 @@ import {
   type LilypadPinoLike,
 } from './LilypadLibLogger';
 import { LilypadLogger } from './LilypadLogger';
+import { LilypadConsoleLogger } from './components/ConsoleLogger';
 
 describe('libLog', () => {
   it('should call the method of the level with the logger as this, the message and the meta', () => {
@@ -62,6 +63,26 @@ describe('libLog', () => {
 
     expect(fromConsole.error).toBeTypeOf('function');
     expect(fromLilypad.debug).toBeTypeOf('function');
+  });
+
+  it('should infer the channels of a LilypadLogger from the keys of components, not from the components', () => {
+    // `new LilypadConsoleLogger()` is a component of `string`: it must not widen the channels to
+    // `string`, which made the logger unusable as a LilypadLibLogger (type test: npm run typecheck)
+    const logger = LilypadLogger.create({
+      components: {
+        error: [new LilypadConsoleLogger()],
+        warn: [new LilypadConsoleLogger()],
+        info: [],
+        debug: [],
+      },
+    });
+    const asLibLogger: LilypadLibLogger = logger;
+    const cacheOptions: { logger?: LilypadLibLogger | undefined } = { logger };
+    // @ts-expect-error -- the logger has no `audit` channel: it would throw at runtime
+    expect(() => logger.audit('message')).toThrow(TypeError);
+
+    expect(asLibLogger.warn).toBeTypeOf('function');
+    expect(cacheOptions.logger).toBe(logger);
   });
 });
 

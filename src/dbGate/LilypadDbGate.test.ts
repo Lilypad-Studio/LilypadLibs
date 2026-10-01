@@ -92,6 +92,24 @@ describe('LilypadDbGate (without database)', () => {
       ).rejects.toThrow('is closed');
       await expect(gate.removeListener('c', 'a')).resolves.toBe(false);
     });
+
+    it('should close the gate it created when a listener of `listen` fails', async () => {
+      const close = vi.spyOn(LilypadDbGate.prototype, 'close');
+      try {
+        await expect(
+          LilypadDbGate.create({
+            connectionString: unreachable,
+            listen: [{ channel: '', callbackId: 'cb', callback: () => {} }],
+          })
+        ).rejects.toThrow('the channel must be a non-empty string');
+
+        // Its connection pools are released: the caller never receives the gate to close it
+        expect(close).toHaveBeenCalledOnce();
+        await expect(close.mock.results[0]!.value).resolves.toBeUndefined();
+      } finally {
+        close.mockRestore();
+      }
+    });
   });
 
   describe('heartbeat', () => {
@@ -352,6 +370,47 @@ describe('LilypadDbGate close', () => {
       await gate.close();
     });
   });
+
+  it.each([
+    [{ statementTimeout: 2 ** 31 }, 'statementTimeout must be'],
+    [{ statementTimeout: Number.NaN }, 'statementTimeout must be'],
+    // postgres.js would open no connection, and every query would wait forever
+    [{ pool: { max: 0 } }, 'pool.max must be'],
+    [{ pool: { max: 1.5 } }, 'pool.max must be'],
+    [{ pool: { idleTimeout: Number.NaN } }, 'pool.idleTimeout must be'],
+    [{ pool: { connectTimeout: -1 } }, 'pool.connectTimeout must be'],
+    [{ pool: { maxLifetime: Infinity } }, 'pool.maxLifetime must be'],
+  ])('should reject the options %o', async (options, message) => {
+    await expect(
+      LilypadDbGate.create({ connectionString: unreachable, ...options })
+    ).rejects.toThrow(message);
+  });
+
+  it('should accept the pool timeouts of 0, which postgres.js takes for never', async () => {
+    const gate = await LilypadDbGate.create({
+      connectionString: unreachable,
+      pool: { idleTimeout: 0, connectTimeout: 0, maxLifetime: 0 },
+    });
+
+    expect(gate.sql.options).toMatchObject({
+      idle_timeout: 0,
+      connect_timeout: 0,
+      max_lifetime: 0,
+    });
+    await gate.close();
+  });
+
+  it.each([['a'.repeat(64)], ['']])(
+    'should reject a listener on the channel %j, whose notifications would never arrive',
+    async (channel) => {
+      const gate = await LilypadDbGate.create({ connectionString: unreachable });
+
+      await expect(
+        gate.addListener({ channel, callbackId: 'a', callback: () => {} })
+      ).rejects.toThrow('LilypadDbGate: the channel');
+      await gate.close();
+    }
+  );
 
   it('should reject a listenHeartbeat that a timer cannot hold', async () => {
     await expect(

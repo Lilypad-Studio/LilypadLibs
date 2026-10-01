@@ -18,7 +18,7 @@ import type {
   LilypadTriggerInfo,
 } from './LilypadSchemaFacts';
 import { lilypadCommandDeletesFrom, lilypadPruneCommandRetention } from './LilypadSchemaPruning';
-import type { LilypadSchemaCheckOptions } from './LilypadSchemaTypes';
+import type { LilypadSchemaCheckOptions, LilypadSchemaTableShape } from './LilypadSchemaTypes';
 
 // pg_trigger.tgtype: ROW = 1, INSERT = 4, DELETE = 8, UPDATE = 16, TRUNCATE = 32
 const ROW_TRIGGER = 1 | 4 | 8 | 16;
@@ -176,6 +176,410 @@ describe('evaluateLilypadSchema', () => {
     expect(result.problems[0]!.severity).toBe('warning');
     expect(result.problems[0]!.message).toContain('privileges of the writing roles');
     expect(result.problems[0]!.message).not.toContain('prune function');
+    // The placeholders appeared in version 7, the long names broke before
+    expect(result.problems[0]!.message).not.toContain('__lilypad_');
+    expect(result.problems[0]!.message).toContain('62 characters or longer');
+  });
+
+  it('should warn that a changelog of version 7 breaks with some names', () => {
+    const result = evaluateLilypadSchema(
+      facts({ changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:7' } }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['outdated-changelog']);
+    expect(result.problems[0]!.severity).toBe('warning');
+    expect(result.problems[0]!.message).toContain(
+      `(version 7, expected ${LILYPAD_CHANGELOG_VERSION})`
+    );
+    expect(result.problems[0]!.message).toContain('62 characters or longer');
+    expect(result.problems[0]!.message).toContain('a placeholder of its SQL (`__lilypad_`)');
+    expect(result.problems[0]!.message).toContain('json cast function a non-superuser owns');
+    expect(result.problems[0]!.message).not.toContain('privileges of the writing roles');
+  });
+
+  it('should warn that a changelog of version 8 converts a user-defined key as the owner', () => {
+    const result = evaluateLilypadSchema(
+      facts({ changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:8' } }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['outdated-changelog']);
+    expect(result.problems[0]!.severity).toBe('warning');
+    expect(result.problems[0]!.message).toContain(
+      `(version 8, expected ${LILYPAD_CHANGELOG_VERSION})`
+    );
+    expect(result.problems[0]!.message).toContain('json cast function a non-superuser owns');
+    // Version 8 already handled these
+    expect(result.problems[0]!.message).not.toContain('62 characters or longer');
+    expect(result.problems[0]!.message).not.toContain('__lilypad_');
+  });
+
+  it('should report a primary key of a user-defined type that the changelog cannot record', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        tables: [
+          {
+            schema: 'public',
+            triggers: [...changelogStatements, changelogTruncate],
+            keyUserType: 'item_status',
+          },
+        ],
+      }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toContain('unsupported-key-type');
+    const problem = result.problems.find((p) => p.code === 'unsupported-key-type')!;
+    expect(problem.severity).toBe('error');
+    expect(problem.table).toBe('items');
+    expect(problem.message).toContain('item_status');
+    expect(problem.message).toContain('the writes of the table fail');
+    expect(result.ok).toBe(false);
+  });
+
+  it('should say an older install still converts the key as the owner', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:8' },
+        tables: [
+          {
+            schema: 'public',
+            triggers: [...changelogStatements, changelogTruncate],
+            keyUserType: 'item_status',
+          },
+        ],
+      }),
+      changelogOptions
+    );
+
+    const problem = result.problems.find((p) => p.code === 'unsupported-key-type')!;
+    expect(problem.severity).toBe('error');
+    expect(problem.message).toContain('version 8');
+    expect(problem.message).toContain("changelog owner's privileges");
+    expect(problem.message).toContain(
+      `once version ${LILYPAD_CHANGELOG_VERSION} is installed, every write of the table fails`
+    );
+    expect(problem.message).toContain(`before installing version ${LILYPAD_CHANGELOG_VERSION}`);
+  });
+
+  it('should tell an install older than version 7 to change the key before version 9', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:5' },
+        tables: [
+          {
+            schema: 'public',
+            triggers: [...changelogStatements, changelogTruncate],
+            keyUserType: 'item_status',
+          },
+        ],
+      }),
+      changelogOptions
+    );
+
+    const problem = result.problems.find((p) => p.code === 'unsupported-key-type')!;
+    expect(problem.message).toContain(
+      `once version ${LILYPAD_CHANGELOG_VERSION} is installed, every write of the table fails`
+    );
+    expect(problem.message).toContain(`before installing version ${LILYPAD_CHANGELOG_VERSION}`);
+    // Before version 7, the trigger function ran with the privileges of the writing role
+    expect(problem.message).not.toContain("changelog owner's privileges");
+  });
+
+  it('should not claim that an older install converts the key of a table it has no trigger on', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:8' },
+        tables: [{ schema: 'public', triggers: [], keyUserType: 'item_status' }],
+      }),
+      listenOptions
+    );
+
+    const problem = result.problems.find((p) => p.code === 'unsupported-key-type')!;
+    expect(problem.message).toContain(`once version ${LILYPAD_CHANGELOG_VERSION} is installed`);
+    expect(problem.message).not.toContain("changelog owner's privileges");
+  });
+
+  describe('a key that the changelog triggers refuse', () => {
+    const withheld =
+      'withheld until the primary key of "items" is changed (see unsupported-key-type / missing-column); run the check again then.';
+    const notifying = (trigger: LilypadTriggerInfo) => ({
+      ...trigger,
+      source: notifySource('cache_events'),
+    });
+    /** `items` recorded by the changelog triggers, `orders` without any trigger. */
+    const twoTables = (
+      items: Partial<LilypadSchemaFacts['tables'][0]>,
+      changelog: Partial<LilypadSchemaFacts['changelog']> = {},
+      triggers = [...changelogStatements, changelogTruncate]
+    ) =>
+      facts({
+        changelog: { ...facts().changelog, ...changelog },
+        tables: [
+          { schema: 'public', triggers, ...items },
+          { schema: 'public', triggers: [] },
+        ],
+      });
+    const twoTableOptions = (options: LilypadSchemaCheckOptions) => ({
+      ...options,
+      tables: [...options.tables, { table: 'orders', primaryKey: 'id' }],
+    });
+    const outdated = { functionComment: 'lilypad-changelog:5', writers: 'app' };
+
+    it('should withhold the changelog SQL, its triggers and the REVOKE of an older install', () => {
+      const result = evaluateLilypadSchema(
+        twoTables({ keyUserType: 'item_status' }, outdated),
+        twoTableOptions(changelogOptions)
+      );
+
+      expect(codes(result)).toEqual([
+        'outdated-changelog',
+        'writable-changelog',
+        'unsupported-key-type',
+        'missing-changelog-trigger',
+      ]);
+      expect(result.ok).toBe(false);
+      expect(formatLilypadSchemaFixSql(result.problems)).toBe('');
+      for (const problem of [result.problems[0]!, result.problems[1]!, result.problems[3]!]) {
+        expect(problem.fix).toBeUndefined();
+        expect(problem.message).toContain(`Its fix is ${withheld}`);
+      }
+    });
+
+    it('should keep the fixes of a config without such a key', () => {
+      const result = evaluateLilypadSchema(
+        twoTables({}, outdated),
+        twoTableOptions(changelogOptions)
+      );
+
+      expect(codes(result)).toEqual([
+        'outdated-changelog',
+        'writable-changelog',
+        'missing-changelog-trigger',
+      ]);
+      const sql = formatLilypadSchemaFixSql(result.problems);
+      expect(sql).toContain('REVOKE INSERT, UPDATE, DELETE, TRUNCATE');
+      expect(sql).toContain(lilypadChangelogSql({ notifyChannel: false }));
+      expect(sql).toContain(lilypadChangelogTriggerSql({ table: 'orders', primaryKey: 'id' }));
+      expect(result.problems.every((p) => !p.message.includes('withheld'))).toBe(true);
+    });
+
+    it('should withhold the notify fixes of a listen-only config', () => {
+      const result = evaluateLilypadSchema(
+        twoTables(
+          { keyUserType: 'item_status' },
+          {},
+          [...changelogStatements, changelogTruncate].map(notifying)
+        ),
+        twoTableOptions(listenOptions)
+      );
+
+      expect(codes(result)).toEqual(['unsupported-key-type', 'missing-notify-trigger']);
+      expect(result.problems[1]!.table).toBe('orders');
+      expect(result.problems[1]!.fix).toBeUndefined();
+      expect(result.problems[1]!.message).toContain(`Its fix is ${withheld}`);
+      expect(formatLilypadSchemaFixSql(result.problems)).toBe('');
+    });
+
+    it('should withhold the notify fix that would give the changelog triggers to the table', () => {
+      const result = evaluateLilypadSchema(
+        facts({ tables: [{ schema: 'public', triggers: [], keyUserType: 'item_status' }] }),
+        listenOptions
+      );
+
+      expect(codes(result)).toEqual(['unsupported-key-type', 'missing-notify-trigger']);
+      expect(result.problems[0]!.message).toContain(
+        'the writes of the table fail once its changelog triggers are installed'
+      );
+      expect(result.problems[1]!.fix).toBeUndefined();
+    });
+
+    it('should withhold the trigger fixes of every table when the changelog table was dropped', () => {
+      const result = evaluateLilypadSchema(
+        twoTables({ keyColumnMissing: true }, { hasTable: false }),
+        twoTableOptions(changelogOptions)
+      );
+
+      expect(codes(result)).toEqual([
+        'missing-changelog',
+        'missing-column',
+        'missing-changelog-trigger',
+      ]);
+      expect(result.problems[2]!.table).toBe('orders');
+      expect(formatLilypadSchemaFixSql(result.problems)).toBe('');
+    });
+
+    it('should still create a missing table, without its changelog triggers', () => {
+      const shape: LilypadSchemaTableShape = {
+        cols: { id: { pgType: 'integer' } },
+        unique: [],
+        foreignKeys: [],
+        indexes: [],
+        checks: [],
+        strict: false,
+      };
+      const result = evaluateLilypadSchema(
+        facts({
+          tables: [
+            {
+              schema: 'public',
+              triggers: [...changelogStatements, changelogTruncate],
+              keyUserType: 'item_status',
+            },
+            { schema: null, triggers: [] },
+          ],
+        }),
+        { tables: [...changelogOptions.tables, { table: 'orders', primaryKey: 'id', shape }] }
+      );
+
+      const missing = result.problems.find((p) => p.code === 'missing-table')!;
+      expect(missing.fix).toContain('CREATE TABLE');
+      expect(missing.fix).not.toContain('CREATE TRIGGER');
+      expect(missing.message).toContain(`The changelog triggers of its fix are ${withheld}`);
+    });
+
+    it('should withhold the pruning that installs or schedules against the changelog', () => {
+      const result = evaluateLilypadSchema(
+        facts({
+          cron: { available: false, installed: false, database: null, jobs: null },
+          tables: [
+            {
+              schema: 'public',
+              triggers: [...changelogStatements, changelogTruncate],
+              keyUserType: 'item_status',
+            },
+          ],
+        }),
+        changelogOptions
+      );
+
+      const pruning = result.problems.find((p) => p.code === 'no-changelog-pruning')!;
+      expect(pruning.fix).toBeUndefined();
+      expect(pruning.message).toContain(`Its fix is ${withheld}`);
+      expect(result.problems.every((p) => p.fix !== '')).toBe(true);
+    });
+
+    it('should report the key of a table recorded by the changelog triggers that notify it', () => {
+      const result = evaluateLilypadSchema(
+        facts({
+          tables: [
+            {
+              schema: 'public',
+              triggers: [...changelogStatements, changelogTruncate].map(notifying),
+              keyUserType: 'item_status',
+            },
+          ],
+        }),
+        listenOptions
+      );
+
+      expect(codes(result)).toEqual(['unsupported-key-type']);
+      expect(result.problems[0]!.message).toContain('the writes of the table fail.');
+    });
+
+    it('should report a missing key column that the changelog triggers notifying it read', () => {
+      const result = evaluateLilypadSchema(
+        facts({
+          tables: [
+            {
+              schema: 'public',
+              triggers: [...changelogStatements, changelogTruncate].map(notifying),
+              keyColumnMissing: true,
+            },
+          ],
+        }),
+        listenOptions
+      );
+
+      expect(codes(result)).toEqual(['missing-column']);
+    });
+
+    it('should not report the key of a table notified by triggers of its own', () => {
+      const ownNotifiers: LilypadTriggerInfo[] = [
+        { changelog: false, args: [], type: ROW_TRIGGER, enabled: true, source: '' },
+        { changelog: false, args: [], type: TRUNCATE_TRIGGER, enabled: true, source: '' },
+      ].map(notifying);
+      const result = evaluateLilypadSchema(
+        facts({
+          tables: [
+            {
+              schema: 'public',
+              triggers: ownNotifiers,
+              keyUserType: 'item_status',
+              keyColumnMissing: true,
+            },
+          ],
+        }),
+        listenOptions
+      );
+
+      expect(result.ok).toBe(true);
+    });
+  });
+
+  it('should report a primary key column that does not exist (changelog-only table)', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        tables: [
+          {
+            schema: 'public',
+            triggers: [...changelogStatements, changelogTruncate],
+            keyColumnMissing: true,
+          },
+        ],
+      }),
+      changelogOptions
+    );
+
+    const problem = result.problems.find((p) => p.code === 'missing-column')!;
+    expect(problem.severity).toBe('error');
+    expect(problem.table).toBe('items');
+    expect(problem.message).toContain('does not exist');
+    expect(result.ok).toBe(false);
+  });
+
+  it('should report a missing key column even when a shape omits it', () => {
+    // A shape whose cols do not describe the key column would otherwise hide it
+    const shapeWithoutKey: LilypadSchemaTableShape = {
+      cols: { other: {} },
+      unique: [],
+      foreignKeys: [],
+      indexes: [],
+      checks: [],
+      strict: false,
+    };
+    const result = evaluateLilypadSchema(
+      facts({
+        tables: [
+          {
+            schema: 'public',
+            triggers: [...changelogStatements, changelogTruncate],
+            keyColumnMissing: true,
+          },
+        ],
+      }),
+      { tables: [{ table: 'items', primaryKey: 'id', shape: shapeWithoutKey }] }
+    );
+
+    expect(codes(result)).toContain('missing-column');
+  });
+
+  it('should not report a built-in primary key type', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        tables: [
+          {
+            schema: 'public',
+            triggers: [...changelogStatements, changelogTruncate],
+            keyUserType: null,
+          },
+        ],
+      }),
+      changelogOptions
+    );
+
+    expect(codes(result)).not.toContain('unsupported-key-type');
   });
 
   it('should warn about the roles other than its owner that can write the changelog', () => {
@@ -289,7 +693,7 @@ describe('evaluateLilypadSchema', () => {
       );
 
       expect(fix(result)).toContain('DROP FUNCTION IF EXISTS "lilypad_cache_changes_prune"()');
-      expect(fix(result)).not.toContain('PERFORM __lilypad_prune__()');
+      expect(fix(result)).not.toContain('PERFORM %3$s()');
     });
   });
 
@@ -537,6 +941,22 @@ describe('evaluateLilypadSchema', () => {
       expect(codes(rejected)).toEqual(['missing-notify-trigger']);
     });
 
+    it('should match the channel with its case, and pg_notify in any case', () => {
+      const triggers = (source: string) => [
+        { ...notifier('cache_events', ROW_TRIGGER), source },
+        { ...notifier('cache_events', TRUNCATE_TRIGGER), source },
+      ];
+      const check = (source: string) =>
+        evaluateLilypadSchema(
+          facts({ tables: [{ schema: 'public', triggers: triggers(source) }] }),
+          listenOptions
+        );
+
+      // LISTEN "cache_events" never receives the notifications of 'Cache_Events'
+      expect(codes(check(notifySource('Cache_Events')))).toEqual(['missing-notify-trigger']);
+      expect(check("BEGIN PERFORM PG_NOTIFY('cache_events', payload); END").ok).toBe(true);
+    });
+
     it('should report a TRUNCATE that is not notified', () => {
       const result = evaluateLilypadSchema(
         facts({
@@ -563,7 +983,9 @@ describe('the pruning of the changelog', () => {
     unpruned(
       {},
       {
-        functionSource: lilypadChangelogSql({ prune: { olderThan, every: 10, batchSize: 500 } }),
+        functionSource: lilypadChangelogSql({
+          prune: { olderThan, every: 10, batchSize: 500, force: true },
+        }),
         hasPruneFunction,
       }
     );
@@ -603,7 +1025,7 @@ describe('the pruning of the changelog', () => {
     it('should mention pg_cron when the server has it, but it is not known to run', () => {
       const result = evaluateLilypadSchema(unpruned({ available: true }), changelogOptions);
 
-      expect(result.problems[0]!.fix).toContain('PERFORM __lilypad_prune__()');
+      expect(result.problems[0]!.fix).toContain('PERFORM %3$s()');
       expect(result.problems[0]!.message).toContain('pg_cron is available on this server');
     });
 
@@ -615,6 +1037,17 @@ describe('the pruning of the changelog', () => {
 
       expect(result.problems[0]!.fix).toBe(lilypadChangelogPruneScheduleSql({ olderThan: DAY }));
       expect(result.problems[0]!.message).toContain('the jobs of the other roles are not visible');
+    });
+
+    it('should say that the jobs could not be read, rather than that there is none', () => {
+      const result = evaluateLilypadSchema(
+        unpruned({ available: true, installed: true, database: 'app', jobs: null }),
+        changelogOptions
+      );
+
+      expect(result.problems[0]!.fix).toBe(lilypadChangelogPruneScheduleSql({ olderThan: DAY }));
+      expect(result.problems[0]!.message).toContain('the role of the check cannot read its jobs');
+      expect(result.problems[0]!.message).not.toContain('with no job of this role');
     });
 
     it('should install pg_cron where it runs but is not installed yet', () => {
@@ -706,7 +1139,7 @@ describe('the pruning of the changelog', () => {
         );
 
         expect(codes(result)).toEqual(['missing-changelog', 'no-changelog-pruning']);
-        expect(result.problems[0]!.fix).toContain('PERFORM __lilypad_prune__()');
+        expect(result.problems[0]!.fix).toContain('PERFORM %3$s()');
       });
 
       it('should still accept a pg_cron job found', () => {
@@ -761,7 +1194,7 @@ describe('the pruning of the changelog', () => {
 
         expect(codes(result)).toEqual(['missing-changelog', 'no-changelog-pruning']);
         // The changelog is installed without the prune option
-        expect(result.problems[0]!.fix).not.toContain('PERFORM __lilypad_prune__()');
+        expect(result.problems[0]!.fix).not.toContain('PERFORM %3$s()');
         expect(result.problems[1]!.fix).toContain(
           lilypadChangelogPruneScheduleSql({
             olderThan: DAY,
@@ -785,7 +1218,7 @@ describe('the pruning of the changelog', () => {
       expect(codes(result)).toEqual(['missing-changelog', 'no-changelog-pruning']);
       // One SQL does both: the report shows it once
       expect(result.problems[0]!.fix).toBe(result.problems[1]!.fix);
-      expect(result.problems[0]!.fix).toContain('PERFORM __lilypad_prune__()');
+      expect(result.problems[0]!.fix).toContain('PERFORM %3$s()');
     });
 
     it('should recommend a retention far longer than the one the caches need', () => {
@@ -973,6 +1406,87 @@ describe('the pruning of the changelog', () => {
       );
     });
 
+    it('should read the retention of the statement of a job that deletes from the changelog', () => {
+      const result = evaluateLilypadSchema(
+        withJob({
+          command:
+            "DELETE FROM sessions WHERE expires_at < now() - interval '30 minutes'; DELETE FROM lilypad_cache_changes WHERE changed_at < now() - interval '7 days'",
+        }),
+        changelogOptions
+      );
+
+      expect(result.problems).toEqual([]);
+    });
+
+    it('should report the short retention of a job that does more, without scheduling it again', () => {
+      const result = evaluateLilypadSchema(
+        withJob({
+          command:
+            "DELETE FROM lilypad_cache_changes WHERE changed_at < now() - interval '30 minutes'; VACUUM lilypad_cache_changes",
+        }),
+        changelogOptions
+      );
+
+      expect(codes(result)).toEqual(['short-changelog-retention']);
+      // Scheduled again, the job would lose its VACUUM
+      expect(result.problems[0]!.fix).toBeUndefined();
+      expect(result.problems[0]!.message).toContain('change its interval there');
+    });
+
+    it('should reschedule a job of the library with a short retention', () => {
+      const result = evaluateLilypadSchema(
+        withJob({
+          command:
+            'DELETE FROM "public"."lilypad_cache_changes" WHERE changed_at < clock_timestamp() - make_interval(secs => 1800);',
+        }),
+        changelogOptions
+      );
+
+      expect(codes(result)).toEqual(['short-changelog-retention']);
+      expect(result.problems[0]!.fix).toContain(
+        "SELECT cron.schedule('lilypad_cache_changes_prune'"
+      );
+    });
+
+    it('should not reschedule a job whose DELETE has another condition', () => {
+      const result = evaluateLilypadSchema(
+        withJob({
+          command:
+            "DELETE FROM lilypad_cache_changes WHERE changed_at < now() - interval '30 minutes' AND table_name = 'users'",
+        }),
+        changelogOptions
+      );
+
+      expect(codes(result)).toEqual(['short-changelog-retention']);
+      // Scheduled again, the job would delete the rows of every table
+      expect(result.problems[0]!.fix).toBeUndefined();
+    });
+
+    it('should not read the retention of a DELETE in a CTE, whose job does more', () => {
+      const result = evaluateLilypadSchema(
+        withJob({
+          command:
+            "WITH gone AS (DELETE FROM lilypad_cache_changes WHERE changed_at < now() - interval '30 minutes' RETURNING *) INSERT INTO archive SELECT * FROM gone",
+        }),
+        changelogOptions
+      );
+
+      expect(result.problems).toEqual([]);
+    });
+
+    it('should not take the job of a changelog of the same name in another schema', () => {
+      const result = evaluateLilypadSchema(
+        withJob({
+          command:
+            "DELETE FROM archive.lilypad_cache_changes WHERE changed_at < now() - interval '30 minutes'",
+        }),
+        changelogOptions
+      );
+
+      // Not a short retention of this changelog, whose fix would take over the other job
+      expect(codes(result)).toEqual(['no-changelog-pruning']);
+    });
+
     it('should accept a job whose retention it cannot read', () => {
       const result = evaluateLilypadSchema(
         withJob({
@@ -1047,12 +1561,49 @@ describe('lilypadPruneCommandRetention', () => {
     // A comment is not the condition
     ["now() - interval '7 days' -- interval '1 minute'", 7 * 86_400_000],
     ["/* interval '1 minute' */ now() - interval '7 days'", 7 * 86_400_000],
+    ["now() - interval '7 days' /* /* nested */ interval '1 minute' */", 7 * 86_400_000],
+    ["now() - interval '7 days';", 7 * 86_400_000],
+    // Two intervals: either may be the retention
+    ["now() - interval '1 year' AND changed_at > now() - interval '1 minute'", undefined],
   ])('should read %s', (condition, expected) => {
     expect(
       lilypadPruneCommandRetention(
-        `DELETE FROM lilypad_cache_changes WHERE changed_at < ${condition}`
+        `DELETE FROM lilypad_cache_changes WHERE changed_at < ${condition}`,
+        'lilypad_cache_changes'
       )
     ).toBe(expected);
+  });
+
+  it.each([
+    [
+      'the DELETE of the changelog among other statements',
+      "DELETE FROM sessions WHERE expires_at < now() - interval '1 minute'; DELETE FROM lilypad_cache_changes WHERE changed_at < now() - interval '7 days'",
+      7 * 86_400_000,
+    ],
+    [
+      'two statements that delete from the changelog',
+      "DELETE FROM lilypad_cache_changes WHERE op = 'TRUNCATE'; DELETE FROM lilypad_cache_changes WHERE changed_at < now() - interval '7 days'",
+      undefined,
+    ],
+    [
+      // The -- of a dollar-quoted string is no comment: two intervals
+      'a dollar-quoted string',
+      "DELETE FROM lilypad_cache_changes WHERE changed_at < now() - interval '7 days' AND note <> $$--$$ OR changed_at < now() - interval '1 minute'",
+      undefined,
+    ],
+    [
+      'a DELETE in a DO block',
+      "DO $$ BEGIN DELETE FROM lilypad_cache_changes WHERE changed_at < now() - interval '1 hour'; END $$",
+      undefined,
+    ],
+    [
+      // The escape string is ' -- ': the rest of the line is not a comment
+      'a condition after an escape string',
+      "DELETE FROM lilypad_cache_changes WHERE op <> E'\\' -- ' AND changed_at < now() - interval '30 minutes'",
+      30 * 60_000,
+    ],
+  ])('should read %s', (_case, command, expected) => {
+    expect(lilypadPruneCommandRetention(command, 'lilypad_cache_changes')).toBe(expected);
   });
 });
 
@@ -1075,6 +1626,25 @@ describe('lilypadCommandDeletesFrom', () => {
     ['DELETE FROM mychanges WHERE true', 'MyChanges', false],
     ['DELETE FROM "MYCHANGES" WHERE true', 'MyChanges', false],
     ['WITH gone AS (DELETE FROM changes RETURNING id) SELECT 1', 'changes', true],
+    // PostgreSQL nests the block comments, and a command left open is not understood
+    ['SELECT 1 /* a /* b */ DELETE FROM lilypad_cache_changes */', 'lilypad_cache_changes', false],
+    ['SELECT 1 /* DELETE FROM lilypad_cache_changes', 'lilypad_cache_changes', false],
+    ["SELECT 'x; DELETE FROM lilypad_cache_changes", 'lilypad_cache_changes', false],
+    // The body of a DO block is code, any other dollar-quoted string a literal
+    ['DO $$ BEGIN DELETE FROM lilypad_cache_changes; END $$', 'lilypad_cache_changes', true],
+    ['DO $body$ BEGIN DELETE FROM a$b; END $body$', 'a$b', true],
+    [
+      'DO LANGUAGE plpgsql $$ BEGIN DELETE FROM lilypad_cache_changes; END $$',
+      'lilypad_cache_changes',
+      true,
+    ],
+    ['SELECT $$DELETE FROM lilypad_cache_changes$$', 'lilypad_cache_changes', false],
+    ['SELECT $$ DELETE FROM lilypad_cache_changes', 'lilypad_cache_changes', false],
+    [
+      "DO $$ BEGIN DELETE FROM lilypad_cache_changes WHERE 'x; END $$",
+      'lilypad_cache_changes',
+      false,
+    ],
   ])('%s (%s): %s', (command, table, expected) => {
     expect(lilypadCommandDeletesFrom(command, table)).toBe(expected);
   });

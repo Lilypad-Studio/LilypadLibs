@@ -33,6 +33,14 @@ function isLilypadEntryStale(entry: { expirationTime: number }): boolean {
   return Date.now() >= entry.expirationTime;
 }
 
+/**
+ * Until when an entry may be served as a stale value, within `staleWindow`. Never for an
+ * invalidated entry (expiration time 0), even with a window longer than the time since the epoch.
+ */
+function staleUntil(entry: { expirationTime: number }, staleWindow: number): number {
+  return entry.expirationTime === 0 ? 0 : entry.expirationTime + staleWindow;
+}
+
 const DEFAULT_TTL = 60_000;
 const DEFAULT_ERROR_TTL = 5 * 60 * 1000; // 5 minutes
 const DEFAULT_FETCH_TIMEOUT = 5000;
@@ -70,7 +78,8 @@ export type LilypadCacheEngineHooks<K extends LilypadCacheKey, V> = {
   onValueStored?(entry: LilypadCacheEntry<K, V>): void;
   /**
    * Called when entries were removed or expired while the source still has them (an eviction,
-   * `clear`, `expireEverything`): the entries no longer hold the whole source.
+   * `clear`, the `delete` of a fresh entry, `expireEverything`): the entries no longer hold the
+   * whole source.
    */
   onEntriesIncomplete?(): void;
   /** Whether the owner reads the key from the source in another way than `getOrSet`. */
@@ -327,14 +336,16 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
       return undefined;
     }
     const normalizedKey = this.normalizeKey(entry.key);
-    // A value produced before the last invalidation of the key (e.g. a stale fallback) keeps its
-    // mark, so that the shared copies of that time are still refused
+    // The new entry keeps the mark of the last invalidation of the key, so that the shared copies
+    // of that time are still refused once it is removed: a value produced before the mark (e.g. a
+    // stale fallback) always, and a newer one while such a copy may live, since it may not have
+    // replaced it in the shared level (a bulk sync or a load writes this instance only)
     const invalidatedAt =
       this.store.get(normalizedKey)?.invalidatedAt ?? this.invalidatedMissing.get(normalizedKey);
     const stored =
       entry.invalidatedAt === undefined &&
       invalidatedAt !== undefined &&
-      entry.fetchedAt < invalidatedAt
+      (entry.fetchedAt < invalidatedAt || Date.now() - invalidatedAt < this.invalidationMemory)
         ? { ...entry, invalidatedAt }
         : entry;
     this.store.set(normalizedKey, stored);
@@ -618,11 +629,17 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
 
   private inCooldown(normalizedKey: string): boolean {
     const failedAt = this.failures.get(normalizedKey);
-    return (
-      this.failureCooldown > 0 &&
-      failedAt !== undefined &&
-      Date.now() - failedAt < this.failureCooldown
-    );
+    if (this.failureCooldown <= 0 || failedAt === undefined) {
+      return false;
+    }
+    const now = Date.now();
+    if (failedAt > now) {
+      // The wall clock stepped back since the failure: like a shared failure time in the future,
+      // it counts as now, so that the cooldown does not last as long as the step
+      this.failures.set(normalizedKey, now);
+      return true;
+    }
+    return now - failedAt < this.failureCooldown;
   }
 
   private recordFailure(normalizedKey: string) {
@@ -694,6 +711,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
             normalizedKey,
             Math.max(remote.failedAt, this.failures.get(normalizedKey) ?? 0)
           );
+          this.sweepBookkeepingIfLarge();
         }
         const adopted = remote.entry && this.adoptShared(key, remote.entry, read.ticket);
         const current = this.store.get(normalizedKey);
@@ -704,7 +722,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
 
       const current = this.store.get(normalizedKey);
       const staleWindow = options.staleWhileRevalidate ?? this.defaultStaleWhileRevalidate;
-      if (current && staleWindow > 0 && Date.now() < current.expirationTime + staleWindow) {
+      if (current && staleWindow > 0 && Date.now() < staleUntil(current, staleWindow)) {
         this.refreshInBackground(key, valueFn, options, refreshLocked);
         const failedAt = this.failures.get(normalizedKey);
         return {
@@ -815,9 +833,14 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
         if (this.isDisposed) {
           return;
         }
-        const owner = await this.shared?.acquireLock(normalizedKey);
+        let owner: string | null | undefined;
         try {
-          await this.fetchAndStore(key, valueFn, options);
+          owner = await this.shared?.acquireLock(normalizedKey);
+          // Another instance took the lock since the read that scheduled the refresh (it may run
+          // after the response), or the cache was disposed while the lock was taken
+          if (owner !== null && !this.isDisposed) {
+            await this.fetchAndStore(key, valueFn, options);
+          }
         } finally {
           // A newer refresh may have replaced a stuck one meanwhile
           if (this.refreshing.get(normalizedKey) === scheduledAt) {
@@ -1099,9 +1122,15 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
    * @returns `false` if the key is protected and was left untouched.
    */
   delete(key: K, options: { force?: boolean | undefined } = {}): boolean {
-    const deleted = this.removeEntry(this.normalizeKey(key), options.force);
+    const normalizedKey = this.normalizeKey(key);
+    const entry = this.store.get(normalizedKey);
+    const deleted = this.removeEntry(normalizedKey, options.force);
     if (deleted) {
       this.deleteShared(key);
+      // The source may still have the key: a fresh entry removed leaves the entries incomplete
+      if (entry && !isLilypadEntryStale(entry)) {
+        this.hooks.onEntriesIncomplete?.();
+      }
     }
     return deleted;
   }
@@ -1141,7 +1170,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
     }
     const now = Date.now();
     for (const [normalizedKey, entry] of [...this.store]) {
-      if (now >= entry.expirationTime + this.defaultStaleWhileRevalidate) {
+      if (now >= staleUntil(entry, this.defaultStaleWhileRevalidate)) {
         this.removeEntry(normalizedKey, options.force);
       }
     }

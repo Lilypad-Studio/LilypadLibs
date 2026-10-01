@@ -86,14 +86,105 @@ function parseInterval(text: string): number | undefined {
   return parts[0] === '' ? undefined : total;
 }
 
+/** Whether the text ends with a character of an identifier (a `$` or `E` there is part of it). */
+const ENDS_IN_IDENTIFIER = /[\w$]$/;
+/** A dollar quote delimiter: `$$` or `$tag$` (sticky: read at `lastIndex`). */
+const DOLLAR_QUOTE = /\$(?:[A-Za-z_]\w*)?\$/y;
+/** A `DO` statement up to its body: `DO`, or `DO LANGUAGE x`. */
+const DO_STATEMENT = /^do(?:\s+language\s+\w+)?$/i;
+
 /**
- * A SQL command without its comments (`-- ...`, `/* ... *\/`), which are replaced with a space. The
- * string literals and quoted identifiers are kept as they are.
+ * The statements of a SQL command, as the pruning check reads them: split at the semicolons outside
+ * the literals and quoted identifiers, which are kept as they are, without their comments (replaced
+ * with a space; PostgreSQL nests the block comments). An escape string (`E'...'`, whose `\'` does
+ * not end it) and a dollar-quoted string become `''`, except the dollar-quoted body of a `DO`
+ * block, which is code: its statements, read the same way, stay in the `DO` statement. `undefined`
+ * when a comment, a literal (dollar-quoted too) or a quoted identifier is not closed, or the body of
+ * a `DO` block is not understood: the command is not understood.
  */
-function withoutComments(command: string): string {
-  return command.replace(/'(?:[^']|'')*'|"(?:[^"]|"")*"|--[^\n]*|\/\*[\s\S]*?\*\//g, (token) =>
-    token.startsWith('--') || token.startsWith('/*') ? ' ' : token
-  );
+function commandStatements(command: string): string[] | undefined {
+  const statements: string[] = [];
+  let current = '';
+  let index = 0;
+  while (index < command.length) {
+    const char = command[index]!;
+    if (char === "'" || char === '"') {
+      const escapes =
+        char === "'" && /[eE]$/.test(current) && !ENDS_IN_IDENTIFIER.test(current.slice(0, -1));
+      let end = index + 1;
+      for (;;) {
+        if (end >= command.length) {
+          return undefined;
+        }
+        if (escapes && command[end] === '\\') {
+          end += 2;
+        } else if (command[end] !== char) {
+          end++;
+        } else if (command[end + 1] === char) {
+          end += 2;
+        } else {
+          break;
+        }
+      }
+      current = escapes ? `${current.slice(0, -1)}''` : current + command.slice(index, end + 1);
+      index = end + 1;
+    } else if (command.startsWith('--', index)) {
+      const end = command.indexOf('\n', index);
+      current += ' ';
+      index = end === -1 ? command.length : end;
+    } else if (command.startsWith('/*', index)) {
+      let depth = 0;
+      do {
+        if (index >= command.length) {
+          return undefined;
+        }
+        if (command.startsWith('/*', index)) {
+          depth++;
+          index += 2;
+        } else if (command.startsWith('*/', index)) {
+          depth--;
+          index += 2;
+        } else {
+          index++;
+        }
+      } while (depth > 0);
+      current += ' ';
+    } else if (char === ';') {
+      statements.push(current);
+      current = '';
+      index++;
+    } else {
+      DOLLAR_QUOTE.lastIndex = index;
+      const delimiter =
+        char !== '$' || ENDS_IN_IDENTIFIER.test(current)
+          ? undefined
+          : DOLLAR_QUOTE.exec(command)?.[0];
+      if (delimiter === undefined) {
+        current += char;
+        index++;
+        continue;
+      }
+      const start = index + delimiter.length;
+      const end = command.indexOf(delimiter, start);
+      if (end === -1) {
+        return undefined;
+      }
+      if (DO_STATEMENT.test(current.trim())) {
+        // The body of a DO block is code: read the same way, in the DO statement
+        const body = commandStatements(command.slice(start, end));
+        if (body === undefined) {
+          return undefined;
+        }
+        current += ` ${body.join('; ')} `;
+      } else {
+        // Any other dollar-quoted string is a literal
+        current += "''";
+      }
+      index = end + delimiter.length;
+    }
+  }
+  statements.push(current);
+  return statements.map((statement) => statement.trim()).filter((statement) => statement !== '');
 }
 
 // An identifier: quoted (its case kept) or not (folded to lower case, as PostgreSQL does)
@@ -110,39 +201,73 @@ function nameParts(name: string): string[] {
   );
 }
 
+/** `make_interval(secs => ...)` (the SQL of the library), `interval '...'` or `'...'::interval`. */
+const INTERVAL =
+  /make_interval\s*\(\s*secs\s*=>\s*'?(\d+(?:\.\d+)?)'?\s*\)|\binterval\s*'([^']*)'|'([^']*)'\s*::\s*interval\b/gi;
+
 /**
- * The retention of a pruning command, from `make_interval(secs => ...)` (the SQL of the library)
- * or an interval literal (`interval '7 days'`, `'1 day'::interval`); `undefined` if not found.
+ * Whether a statement (see `commandStatements`) deletes rows from the changelog table: a
+ * `DELETE FROM` of the same table name, in the same schema when both name one. The names are
+ * compared as PostgreSQL does: an unquoted name of the command in lower case, the name of the
+ * changelog table as it is (the library quotes it).
  */
-export function lilypadPruneCommandRetention(command: string): number | undefined {
-  command = withoutComments(command);
-  const seconds = /make_interval\s*\(\s*secs\s*=>\s*'?(\d+(?:\.\d+)?)'?\s*\)/i.exec(command);
-  if (seconds) {
-    return Number(seconds[1]) * 1000;
-  }
-  const literal = /interval\s*'([^']*)'|'([^']*)'\s*::\s*interval/i.exec(command);
-  const text = literal?.[1] ?? literal?.[2];
-  return text === undefined ? undefined : parseInterval(text);
+function statementDeletesFrom(statement: string, changelogTable: string): boolean {
+  const target = changelogTable.split('.');
+  return [...statement.matchAll(DELETE_FROM)].some(([, name]) => {
+    const parts = nameParts(name!);
+    return (
+      parts.at(-1) === target.at(-1) &&
+      (parts.length === 1 || target.length === 1 || parts.at(-2) === target.at(-2))
+    );
+  });
+}
+
+/** Whether a command deletes rows from the changelog table (a command not understood does not). */
+export function lilypadCommandDeletesFrom(command: string, changelogTable: string): boolean {
+  return (commandStatements(command) ?? []).some((statement) =>
+    statementDeletesFrom(statement, changelogTable)
+  );
 }
 
 /**
- * Whether a command deletes rows from the changelog table: a `DELETE FROM` of the same table name,
- * in the same schema when both name one. The comments are ignored, and the names compared as
- * PostgreSQL does: an unquoted name of the command in lower case, the name of the changelog table
- * as it is (the library quotes it).
+ * The retention of a command that prunes the changelog: the interval (`make_interval(secs => ...)`,
+ * the SQL of the library, or a literal: `interval '7 days'`, `'1 day'::interval`) of the one
+ * statement that deletes from it, a `DELETE` with one interval. `undefined` in any other case, or
+ * if the interval is not understood: an interval may be that of another statement or condition.
  */
-export function lilypadCommandDeletesFrom(command: string, changelogTable: string): boolean {
-  const target = changelogTable.split('.');
-  for (const [, name] of withoutComments(command).matchAll(DELETE_FROM)) {
-    const parts = nameParts(name!);
-    if (
-      parts.at(-1) === target.at(-1) &&
-      (parts.length === 1 || target.length === 1 || parts.at(-2) === target.at(-2))
-    ) {
-      return true;
-    }
+export function lilypadPruneCommandRetention(
+  command: string,
+  changelogTable: string
+): number | undefined {
+  const deleting = (commandStatements(command) ?? []).filter((statement) =>
+    statementDeletesFrom(statement, changelogTable)
+  );
+  const [statement] = deleting;
+  if (deleting.length !== 1 || !/^delete\s+from\b/i.test(statement!)) {
+    return undefined;
   }
-  return false;
+  const intervals = [...statement!.matchAll(INTERVAL)];
+  if (intervals.length !== 1) {
+    return undefined;
+  }
+  const [, seconds, literal, cast] = intervals[0]!;
+  return seconds !== undefined ? Number(seconds) * 1000 : parseInterval(literal ?? cast ?? '');
+}
+
+/**
+ * A statement that only deletes the old rows, as the job of the library does: `DELETE FROM <name>
+ * WHERE changed_at < <now> - <interval>`, and nothing else. Only a job whose command is this one
+ * statement can be scheduled again with another retention without losing part of its command.
+ */
+const PRUNE_ONLY = new RegExp(
+  String.raw`^delete\s+from\s+(?:only\s+)?${IDENTIFIER}(?:\s*\.\s*${IDENTIFIER})?\s+where\s+"?changed_at"?\s*<=?\s*(?:now\s*\(\s*\)|current_timestamp|clock_timestamp\s*\(\s*\))\s*-\s*(?:make_interval\s*\(\s*secs\s*=>\s*'?\d+(?:\.\d+)?'?\s*\)|interval\s*'[^']*'|'[^']*'\s*::\s*interval)$`,
+  'i'
+);
+
+/** Whether a command is one statement that only deletes the old rows (see `PRUNE_ONLY`). */
+function onlyPrunes(command: string): boolean {
+  const statements = commandStatements(command);
+  return statements?.length === 1 && PRUNE_ONLY.test(statements[0]!);
 }
 
 /** A way the changelog is known to be pruned. */
@@ -150,8 +275,11 @@ type DetectedPruning = {
   /** For the messages, e.g. `the pg_cron job "x"`. */
   by: string;
   retention: number | undefined;
-  /** The SQL that makes it prune with another retention. */
-  fixWith: (olderThan: number) => string;
+  /**
+   * The SQL that makes it prune with another retention: none for a job whose command does more than
+   * delete the old rows (scheduled again, it would lose the rest of its command).
+   */
+  fixWith: ((olderThan: number) => string) | undefined;
 };
 
 /**
@@ -187,26 +315,33 @@ export function evaluatePruning(
     });
   }
 
-  // The jobs of this database that delete from the changelog table
+  // The jobs of this database that delete from the changelog table: in the schema it resolves to,
+  // when a job qualifies the name (not the table of the same name in another schema)
+  const jobTarget =
+    changelog.table.includes('.') || facts.changelog.schema === null
+      ? changelog.table
+      : `${facts.changelog.schema}.${changelog.table}`;
   const cronJobs = (facts.cron.jobs ?? []).filter(
     (job) =>
       (job.database === null || job.database === facts.database) &&
-      lilypadCommandDeletesFrom(job.command, changelog.table)
+      lilypadCommandDeletesFrom(job.command, jobTarget)
   );
   for (const job of cronJobs.filter((job) => job.active)) {
     const by =
       job.name !== null ? `the pg_cron job "${job.name}"` : `the pg_cron job ${job.id ?? ''}`;
     detected.push({
       by,
-      retention: lilypadPruneCommandRetention(job.command),
-      fixWith: (olderThan) =>
-        (job.name === null && job.id !== null ? `SELECT cron.unschedule(${job.id});\n` : '') +
-        lilypadChangelogPruneScheduleSql({
-          olderThan,
-          schedule: job.schedule || undefined,
-          changelogTable: changelog.custom,
-          jobName: job.name ?? undefined,
-        }),
+      retention: lilypadPruneCommandRetention(job.command, jobTarget),
+      fixWith: onlyPrunes(job.command)
+        ? (olderThan) =>
+            (job.name === null && job.id !== null ? `SELECT cron.unschedule(${job.id});\n` : '') +
+            lilypadChangelogPruneScheduleSql({
+              olderThan,
+              schedule: job.schedule || undefined,
+              changelogTable: changelog.custom,
+              jobName: job.name ?? undefined,
+            })
+        : undefined,
     });
   }
 
@@ -215,8 +350,12 @@ export function evaluatePruning(
       problems.push({
         code: 'short-changelog-retention',
         severity: 'error',
-        message: `${capitalize(by)} deletes the changelog rows older than ${formatDuration(retention)}, but the caches need them for ${formatDuration(minRetention)} (their maxGap and lookback): a cache could miss changes without knowing it. Keep them far longer, e.g. ${formatDuration(recommended)}.`,
-        fix: fixWith(recommended),
+        message:
+          `${capitalize(by)} deletes the changelog rows older than ${formatDuration(retention)}, but the caches need them for ${formatDuration(minRetention)} (their maxGap and lookback): a cache could miss changes without knowing it. Keep them far longer, e.g. ${formatDuration(recommended)}.` +
+          (fixWith
+            ? ''
+            : ' Its command does more than delete the old rows: change its interval there (scheduling the job again would drop the rest).'),
+        ...(fixWith && { fix: fixWith(recommended) }),
       });
     }
   }
@@ -309,9 +448,11 @@ function suggestPruning(
   }
   if (cron.installed || cron.database === facts.database) {
     return {
-      message: cron.installed
-        ? `pg_cron is installed, with no job of this role that deletes them (the jobs of the other roles are not visible): the fix schedules a daily one, which deletes the rows older than ${retention}.`
-        : `pg_cron runs in this database: the fix installs it and schedules a daily job that deletes the rows older than ${retention}.`,
+      message: !cron.installed
+        ? `pg_cron runs in this database: the fix installs it and schedules a daily job that deletes the rows older than ${retention}.`
+        : cron.jobs === null
+          ? `pg_cron is installed, but the role of the check cannot read its jobs (cron.job, in the schema cron): if none deletes them, the fix schedules a daily one, which deletes the rows older than ${retention}.`
+          : `pg_cron is installed, with no job of this role that deletes them (the jobs of the other roles are not visible): the fix schedules a daily one, which deletes the rows older than ${retention}.`,
       fix:
         (cron.installed ? '' : 'CREATE EXTENSION IF NOT EXISTS pg_cron;\n') +
         lilypadChangelogPruneScheduleSql({ olderThan, changelogTable: changelog.custom }),

@@ -8,6 +8,7 @@ import {
   type LilypadDbTableDefinition,
   type LilypadDbTableName,
 } from '@/dbConfig/LilypadDbConfig';
+import { assertLilypadChannel } from '@/dbGate/LilypadChangelog';
 import { LilypadDbTable } from '@/dbGate/LilypadDbTable';
 import { LilypadListenHeartbeat } from '@/dbGate/LilypadListenHeartbeat';
 import { LilypadBackoff } from '@/internal/LilypadBackoff';
@@ -48,13 +49,16 @@ export type LilypadDbGateOptions<
   listen?: LilypadDbListener[] | undefined;
   /**
    * Maximum duration of each query of the main client, in milliseconds (Postgres
-   * `statement_timeout`): the server cancels longer queries. A caller that times out (e.g. after
-   * the `fetchTimeout` of a cache) does not stop its query: without this bound, slow queries would
-   * keep the connections of the pool busy, and the queries behind them would wait. Defaults to
-   * 30 seconds; `false` leaves the setting of the database.
+   * `statement_timeout`, at most 2147483647): the server cancels longer queries. A caller that
+   * times out (e.g. after the `fetchTimeout` of a cache) does not stop its query: without this
+   * bound, slow queries would keep the connections of the pool busy, and the queries behind them
+   * would wait. Defaults to 30 seconds; `false` leaves the setting of the database.
    */
   statementTimeout?: number | false | undefined;
-  /** Connection pool of the main client. Every duration is in milliseconds. */
+  /**
+   * Connection pool of the main client. Every duration is in milliseconds (at most 2147483647; `0`
+   * disables it, as postgres.js does).
+   */
   pool?: LilypadDbPoolOptions | undefined;
   /**
    * While channels are listened to, a notification is sent to a private channel every this many
@@ -65,7 +69,7 @@ export type LilypadDbGateOptions<
 };
 
 export type LilypadDbPoolOptions = {
-  /** Maximum number of connections (postgres.js default: 10). */
+  /** Maximum number of connections, a positive integer (postgres.js default: 10). */
   max?: number | undefined;
   /** Closes connections idle for this long (postgres.js default: never). */
   idleTimeout?: number | undefined;
@@ -155,8 +159,15 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
 
   private constructor(options: LilypadDbGateOptions<C>) {
     if (options.statementTimeout !== false) {
-      assertNumberOption('LilypadDbGate', 'statementTimeout', options.statementTimeout, 'positive');
+      // The bound of the setting is the bound of a timer: 2^31 - 1 ms
+      assertNumberOption(
+        'LilypadDbGate',
+        'statementTimeout',
+        options.statementTimeout,
+        'positive-delay'
+      );
     }
+    assertPoolOptions(options.pool);
     if (options.listenHeartbeat !== false) {
       assertNumberOption(
         'LilypadDbGate',
@@ -383,11 +394,14 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
    * same channel replaces the previous one.
    *
    * @returns A promise that resolves once LISTEN is active on the channel.
+   * @throws If the channel is empty or longer than 63 bytes (PostgreSQL would listen to it
+   * truncated, and its notifications would never be delivered).
    * @throws If LISTEN fails; in that case the callback is not registered.
    */
   async addListener(identifier: LilypadDbListener): Promise<void> {
     this.assertOpen();
     const { channel, callbackId } = identifier;
+    assertLilypadChannel('LilypadDbGate', channel);
     libLog(
       this.logger,
       'debug',
@@ -413,7 +427,10 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
   /**
    * Removes a listener callback. When the channel has no callbacks left, it stops listening to it.
    * It never rejects: a failed UNLISTEN is logged (the connection keeps the channel, whose
-   * notifications are then ignored).
+   * notifications are then ignored). After the listener connection was re-established, postgres.js
+   * no longer sends the UNLISTEN (it listens again with new listeners, which the function it gave
+   * for the first LISTEN does not remove): the channel stays listened to, its notifications
+   * ignored, without a log.
    *
    * @returns `true` if the callback was registered.
    */
@@ -563,6 +580,17 @@ function createClient(
       throw new Error(`LilypadDbGate: ${option} is not a valid URL (${error.message}).`);
     }
     throw error;
+  }
+}
+
+/**
+ * Checks the pool options: postgres.js waits forever without connections (`max: 0`), fires a
+ * negative timeout at once, and takes `NaN` for "never".
+ */
+function assertPoolOptions(pool: LilypadDbPoolOptions | undefined): void {
+  assertNumberOption('LilypadDbGate', 'pool.max', pool?.max, 'positive-integer');
+  for (const name of ['idleTimeout', 'connectTimeout', 'maxLifetime'] as const) {
+    assertNumberOption('LilypadDbGate', `pool.${name}`, pool?.[name], 'non-negative-delay');
   }
 }
 

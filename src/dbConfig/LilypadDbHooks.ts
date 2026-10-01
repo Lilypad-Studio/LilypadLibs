@@ -37,7 +37,7 @@ export type LilypadDbTableHooksBase = {
 
 /** The hooks of some tables of a config, by key, typed with the rows of each table. */
 export type LilypadDbHooks<C extends LilypadDbConfig> = {
-  readonly [N in LilypadDbTableName<C>]?: LilypadDbTableHooks<LilypadDbRow<C, N>>;
+  readonly [N in LilypadDbTableName<C>]?: LilypadDbTableHooks<LilypadDbRow<C, N>> | undefined;
 };
 
 const OWNER = 'bindLilypadDbHooks';

@@ -334,6 +334,39 @@ describe('LilypadSerializer', () => {
         });
       expect(create).toBeTypeOf('function');
     });
+
+    it('should reject key mappings with a union target', () => {
+      type TwoKeys = {
+        a: number;
+        b: number;
+      };
+      type ThreeKeys = {
+        x: number;
+        y: number;
+        z: number;
+      };
+      // 'a' claims 'x' and 'y', but its runtime target writes only one of them
+      const create = () =>
+        new LilypadSerializer<TwoKeys, ThreeKeys, { a: 'x' | 'y'; b: 'z' }>({
+          serialization: {
+            a: {
+              // @ts-expect-error 'a' maps to a union of targets
+              target: 'x',
+              serialize: (item) => item.a,
+              deserialize: (item) => item.x,
+              default: 0,
+            },
+            b: {
+              // @ts-expect-error 'a' maps to a union of targets
+              target: 'z',
+              serialize: (item) => item.b,
+              deserialize: (item) => item.z,
+              default: 0,
+            },
+          },
+        });
+      expect(create).toBeTypeOf('function');
+    });
   });
 });
 
@@ -388,5 +421,36 @@ describe('LilypadSerializer runtime keys', () => {
 
   it('should give a missing target key its default', () => {
     expect(createSerializer().deserialize([{ x: 5 } as Target])).toEqual([{ a: 5, b: '' }]);
+  });
+
+  it('should map keys named like the properties of Object.prototype as own keys', () => {
+    type Named = { constructor: number; toString: string };
+    type Packed = { valueOf: number; hasOwnProperty: string };
+    const serializer = new LilypadSerializer<
+      Named,
+      Packed,
+      { constructor: 'valueOf'; toString: 'hasOwnProperty' }
+    >({
+      serialization: {
+        constructor: {
+          target: 'valueOf',
+          serialize: (item) => item.constructor,
+          deserialize: (item) => item.valueOf,
+          default: 0,
+        },
+        toString: {
+          target: 'hasOwnProperty',
+          serialize: (item) => item.toString,
+          deserialize: (item) => item.hasOwnProperty,
+          default: '',
+        },
+      },
+    });
+
+    const packed = serializer.serialize([{ constructor: 1, toString: 's' }]);
+
+    expect(Object.hasOwn(packed[0] ?? {}, 'valueOf')).toBe(true);
+    expect(packed).toEqual([{ valueOf: 1, hasOwnProperty: 's' }]);
+    expect(serializer.deserialize(packed)).toEqual([{ constructor: 1, toString: 's' }]);
   });
 });

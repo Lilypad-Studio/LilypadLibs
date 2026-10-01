@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `@lilypad-studio/libs` is an internal TypeScript utility library of Lilypad Studio (cache, Postgres gateway, logger, flow control, serializer, singleton helpers). It is ES modules only, for Node.js 22.12+ (which also loads them with `require()`), and is published to **GitHub Packages** (`publishConfig.registry`; the scope must be the GitHub owner, `Lilypad-Studio`) by the release workflow: `dist/` is never committed. It has no runtime dependency: `postgres` (porsager/postgres) is an optional peer dependency, needed by the `db` entry and the `lilypad-doctor` command only (and a dev dependency for the tests).
 
-The development tools need Node.js 22.22.1+ (`devEngines`; `.nvmrc`: 24) and npm. `@types/node` stays on 22.12 (`~22.12.0`, and Dependabot skips its minor updates), so that the typecheck rejects the Node.js APIs the lowest supported version lacks.
+The development tools need Node.js 22.22.1+, 24.11+ or 26+ (`devEngines`, from the `engines` of lint-staged and tsdown; `.nvmrc`: 24) and npm. `@types/node` stays on 22.12 (`~22.12.0`, and Dependabot skips its minor updates), so that the typecheck rejects the Node.js APIs the lowest supported version lacks.
 
 ## Commands
 
@@ -26,7 +26,7 @@ The development tools need Node.js 22.22.1+ (`devEngines`; `.nvmrc`: 24) and npm
 
 **CI** (`.github/workflows/ci.yml`, on pull requests, and called by the release workflow on every push to `main`): format, lint, typecheck, tests, build (with its package checks), `git diff --exit-code -- package.json` (the generated `exports`), knip on Node.js 22, 24 and 26 (`npm audit` and `npm pack` on 24 only); the packed tarball installed in an empty project on Node.js **22.12.0** (with `postgres@3.4.7`, the lowest version of the peer dependency) and loaded with `import` and `require()` by `scripts/smoke-test.mjs`; the integration tests on 22, 24 and 26 (PostgreSQL 16), and on 24 with PostgreSQL 13 and 18. **Release** (`.github/workflows/release.yml`): runs CI (`workflow_call`) and goes on only if it passes; changesets then opens the "chore: version packages" PR, and publishes to GitHub Packages once it is merged. Actions are pinned by SHA; Dependabot updates them and the npm dependencies.
 
-ESLint uses typescript-eslint `strictTypeChecked` + `stylisticTypeChecked` (`projectService`), import-x (`no-cycle`, `no-extraneous-dependencies`) and the vitest plugin; `eslint.config.mjs` explains each rule it turns off. The edge modules may not import `node:*`, `postgres` or the gate (`@typescript-eslint/no-restricted-imports`), nor use `import()` (`no-restricted-syntax`: the typecheck resolves `import('postgres')`). Object types are declared with `type`, not `interface`.
+ESLint uses typescript-eslint `strictTypeChecked` + `stylisticTypeChecked` (`projectService`), import-x (`no-cycle`, `no-extraneous-dependencies`) and the vitest plugin; `eslint.config.mjs` explains each rule it turns off. The edge modules may not import `node:*`, `postgres` or the `nodeOnlyFolders` of `edge.config.ts`, by alias or relative path (`@typescript-eslint/no-restricted-imports`), nor use `import()` (`no-restricted-syntax`: the typecheck resolves `import('postgres')`). Object types are declared with `type`, not `interface`.
 
 Files are LF: when a script rewrites a file on Windows, write it with `newline='\n'` (Python) or equivalent.
 

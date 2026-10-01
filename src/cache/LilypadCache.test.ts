@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { LilypadDisposedError } from '@/internal/LilypadDisposedError';
-import { LilypadCache, type LilypadCacheKey } from './LilypadCache';
+import { LilypadCache, LilypadCacheCooldownError, type LilypadCacheKey } from './LilypadCache';
 import type { LilypadLoggerType } from '@/logger/LilypadLogger';
 
 describe('LilypadCache', () => {
@@ -735,6 +735,18 @@ describe('LilypadCache', () => {
           void syncedCache.dispose();
         });
 
+        it('should sync again after delete', async () => {
+          const { syncedCache, syncFn } = createSyncedCache();
+          await syncedCache.getAll();
+
+          syncedCache.delete('key1');
+          const values = await syncedCache.getAll();
+
+          expect(syncFn).toHaveBeenCalledTimes(2);
+          expect(values.get('key1')).toBe(1);
+          void syncedCache.dispose();
+        });
+
         it('should sync again after an entry is evicted by maxEntries', async () => {
           const { syncedCache, syncFn } = createSyncedCache();
           await syncedCache.getAll();
@@ -1093,6 +1105,97 @@ describe('LilypadCache', () => {
       void customCache.dispose();
     });
 
+    it('should not cache the value a bulk sync read before an invalidation of a key it did not hold', async () => {
+      const sync = deferred<[string, number][]>();
+      const customCache = new LilypadCache<string, number>({
+        ttl: 1000,
+        bulkSync: { fn: () => sync.promise },
+      });
+      const syncing = customCache.bulkSync();
+
+      customCache.invalidate('key1');
+      sync.resolve([
+        ['key1', 1],
+        ['key2', 2],
+      ]);
+
+      await expect(syncing).resolves.toBe(true);
+      expect(customCache.peek('key1').type).toBe('miss');
+      expect(customCache.get('key2')).toBe(2);
+      void customCache.dispose();
+    });
+
+    it('should not let a bulk sync started before an invalidation answer a later call', async () => {
+      const resolvers: ((data: [string, number][]) => void)[] = [];
+      const bulkSyncFn = vi.fn(
+        () => new Promise<[string, number][]>((resolve) => resolvers.push(resolve))
+      );
+      const customCache = new LilypadCache<string, number>({
+        ttl: 1000,
+        bulkSync: { fn: bulkSyncFn },
+      });
+      const first = customCache.getAll();
+
+      customCache.invalidate('key1');
+      const second = customCache.getAll();
+      resolvers[0]?.([['key1', 1]]); // read before the change
+      resolvers[1]?.([['key1', 2]]);
+      await first;
+
+      await expect(second).resolves.toEqual(new Map([['key1', 2]]));
+      expect(bulkSyncFn).toHaveBeenCalledTimes(2);
+      void customCache.dispose();
+    });
+
+    it('should not count a bulk sync fresh beyond an entry written while it ran', async () => {
+      const bulkSyncFn = vi.fn(
+        () =>
+          new Promise<[string, number][]>((resolve) =>
+            setTimeout(() => resolve([['key1', 1]]), 500)
+          )
+      );
+      const customCache = new LilypadCache<string, number>({
+        ttl: 1000,
+        bulkSync: { fn: bulkSyncFn },
+      });
+      const syncing = customCache.bulkSync();
+      await vi.advanceTimersByTimeAsync(100);
+      customCache.set('key1', 10); // newer than the sync's data: kept, expires 400 ms before it
+      await vi.advanceTimersByTimeAsync(400);
+      await expect(syncing).resolves.toBe(true);
+
+      await vi.advanceTimersByTimeAsync(700); // key1 has expired
+      const values = customCache.getAll();
+      await vi.advanceTimersByTimeAsync(500);
+
+      await expect(values).resolves.toEqual(new Map([['key1', 1]]));
+      expect(bulkSyncFn).toHaveBeenCalledTimes(2);
+      void customCache.dispose();
+    });
+
+    it('should keep a bulk sync fresh after an invalidation that leaves it so, while it ran', async () => {
+      const sync = deferred<[string, number][]>();
+      const bulkSyncFn = vi.fn(() => sync.promise);
+      const customCache = new LilypadCache<string, number>({
+        ttl: 1000,
+        bulkSync: { fn: bulkSyncFn },
+      });
+      customCache.set('key1', 1);
+      const first = customCache.getAll();
+
+      customCache.invalidate('key1', { invalidateBulkSync: false });
+      sync.resolve([
+        ['key1', 1],
+        ['key2', 2],
+      ]);
+      await first;
+      const second = await customCache.getAll();
+
+      expect(bulkSyncFn).toHaveBeenCalledOnce();
+      expect(second).toEqual(new Map([['key2', 2]])); // key1 left out until the next sync
+      void customCache.dispose();
+    });
+
     it('should ignore fetches that complete after dispose', async () => {
       const fetch = deferred<number>();
       const promise = cache.getOrSet('key1', () => fetch.promise);
@@ -1123,6 +1226,22 @@ describe('LilypadCache', () => {
 
       expect(customCache.get('key1')).toBeUndefined();
       expect(customCache.get('key0')).toBe(0);
+      void customCache.dispose();
+    });
+
+    it('should stop counting a timed out bulk sync as a read in flight', async () => {
+      const customCache = new LilypadCache<string, number>({
+        ttl: 1000,
+        bulkSync: { timeout: 100, fn: () => new Promise(() => {}) }, // ignores its signal
+      });
+      const syncing = customCache.bulkSync();
+      customCache.invalidate('during'); // the sync may have read it: fenced
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(syncing).resolves.toBe(false);
+
+      customCache.invalidate('after');
+
+      expect([...customCache['engine']['fences'].keys()]).toEqual(['during']);
       void customCache.dispose();
     });
 
@@ -1560,6 +1679,21 @@ describe('LilypadCache', () => {
       await target.dispose();
     });
 
+    it('should not extend the failure cooldown by a step back of the wall clock', async () => {
+      const target = new LilypadCache<string, number>({ ttl: 1000, failureCooldown: 10_000 });
+      await expect(target.getOrSet('k', () => Promise.reject(new Error('down')))).rejects.toThrow(
+        'down'
+      );
+      const fetch = vi.fn(async () => 1);
+
+      vi.setSystemTime(Date.now() - HOUR);
+      await expect(target.getOrSet('k', fetch)).rejects.toBeInstanceOf(LilypadCacheCooldownError);
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      await expect(target.getOrSet('k', fetch)).resolves.toBe(1);
+      await target.dispose();
+    });
+
     it('should purge on access when the wall clock steps back', async () => {
       const target = new LilypadCache<string, number>({ ttl: 1000, cleanupOnAccessEvery: 10_000 });
       vi.setSystemTime(Date.now() - HOUR);
@@ -1569,6 +1703,28 @@ describe('LilypadCache', () => {
       target.get('other');
 
       expect(target['engine'].store.has('k')).toBe(false);
+      await target.dispose();
+    });
+  });
+
+  describe('invalidated entries and a long stale window', () => {
+    // A window longer than the time since the epoch would reach an expiration time of 0
+    it('should neither serve as stale nor keep at purge an invalidated entry', async () => {
+      const target = new LilypadCache<string, number>({
+        ttl: 1000,
+        staleWhileRevalidate: Number.MAX_SAFE_INTEGER,
+      });
+      target.set('k', 1);
+      target.set('purged', 1);
+      target.invalidate('k');
+      target.invalidate('purged');
+
+      await expect(target.getOrSetDetailed('k', async () => 2)).resolves.toMatchObject({
+        value: 2,
+        status: 'MISS',
+      });
+      target.purgeExpired();
+      expect(target.peek('purged').type).toBe('miss');
       await target.dispose();
     });
   });

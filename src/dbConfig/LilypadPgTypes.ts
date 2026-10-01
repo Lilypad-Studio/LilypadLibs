@@ -54,10 +54,10 @@ const PG_TYPES = {
   bigint: { types: ['bigint', 'string'], aliases: ['int8'], serials: ['bigserial', 'serial8'] },
   real: { types: ['number'], aliases: ['float4'] },
   'double precision': { types: ['number'], aliases: ['float8', 'float'] },
-  numeric: { types: ['string', 'bigint'], aliases: ['decimal'] },
+  numeric: { types: ['string', 'bigint'], aliases: ['decimal', 'dec'] },
   money: { types: ['string'] },
   text: { types: ['string'] },
-  'character varying': { types: ['string'], aliases: ['varchar'] },
+  'character varying': { types: ['string'], aliases: ['varchar', 'char varying'] },
   character: { types: ['string'], aliases: ['char', 'bpchar'] },
   name: { types: ['string'] },
   citext: { types: ['string'] },
@@ -122,18 +122,24 @@ const CATEGORY_TYPES: Readonly<Record<string, ColumnTypes>> = {
   T: ['string'],
 };
 
+/** An array suffix: `[]`, `[3]` or the SQL `ARRAY` (lower case). */
+const ARRAY_SUFFIX = /(?: ?\[\d*\]| array)$/;
+
 /**
  * A PostgreSQL type as `format_type` writes it: lower case, aliases resolved (`int4` is
  * `integer`, `varchar(64)` is `character varying(64)`, `timestamptz(3)` is
- * `timestamp(3) with time zone`), array suffixes kept.
+ * `timestamp(3) with time zone`), the default modifiers written (`numeric(10)` is
+ * `numeric(10,0)`, `bit` is `bit(1)`), and any array one `[]` (`integer[3][]` and
+ * `integer ARRAY` are `integer[]`: PostgreSQL ignores the dimensions of an array and their sizes).
  */
 export function normalizeLilypadPgType(type: string): string {
   let text = type.trim().toLowerCase().replace(/\s+/g, ' ');
-  let arrays = '';
-  while (text.endsWith('[]')) {
-    arrays += '[]';
-    text = text.slice(0, -2).trimEnd();
+  let array = false;
+  for (let suffix = ARRAY_SUFFIX.exec(text); suffix; suffix = ARRAY_SUFFIX.exec(text)) {
+    array = true;
+    text = text.slice(0, suffix.index);
   }
+  const arrays = array ? '[]' : '';
   // `name(args) rest`, e.g. `timestamp(3) with time zone`
   const open = text.indexOf('(');
   const close = open < 0 ? -1 : text.indexOf(')', open);
@@ -147,9 +153,17 @@ export function normalizeLilypadPgType(type: string): string {
   if (name === 'float' && args) {
     return `${Number(args.slice(1, -1)) <= 24 ? 'real' : 'double precision'}${arrays}`;
   }
+  // `bpchar` without a length is not `character(1)`: it has none
+  if (name === 'bpchar' && !args) {
+    return `bpchar${arrays}`;
+  }
   const resolved = ALIASES.get(name) ?? name;
-  if (resolved === 'character' && !args) {
-    return `character(1)${arrays}`;
+  if ((resolved === 'character' || resolved === 'bit') && !args) {
+    return `${resolved}(1)${arrays}`;
+  }
+  // `numeric(10)` has a scale of 0
+  if (resolved === 'numeric' && /^\(-?\d+\)$/.test(args)) {
+    return `numeric${args.slice(0, -1)},0)${arrays}`;
   }
   // `timestamptz(3)`: the precision goes before the time zone
   const zone = /^(timestamp|time) (with|without) time zone$/.exec(resolved);
@@ -161,7 +175,9 @@ export function normalizeLilypadPgType(type: string): string {
 
 /** The known type of a `pgType`, without its modifiers (`character varying(64)` is `character varying`). */
 function knownType(pgType: string): PgTypeEntry | undefined {
-  const name = normalizeLilypadPgType(pgType).replace(/\([^)]*\)/, '');
+  const written = normalizeLilypadPgType(pgType).replace(/\([^)]*\)/, '');
+  // `bpchar` stays as it is, but is a `character`
+  const name = ALIASES.get(written) ?? written;
   return Object.hasOwn(PG_TYPES, name) ? PG_TYPES[name as PgTypeName] : undefined;
 }
 
@@ -233,10 +249,11 @@ type PgTypeSpelling<C extends LilypadDbColumnType> = {
 /**
  * The `pgType`s whose column type is known to fit `C` (see {@link lilypadColumnTypesOfPgType}), in
  * lower case: `'int4'`, `'varchar(64)'`, `'numeric(10, 2)'`, `'timestamp(3) with time zone'`...
- * Any array (`'text[]'`, `'mood[]'`) fits `array`.
+ * Any array (`'text[]'`, `'mood[]'`, `'int[3]'`, `'integer array'`, `'integer array[4]'`) fits
+ * `array`.
  */
 export type LilypadPgTypeOf<C extends LilypadDbColumnType> = C extends 'array'
-  ? `${string}[]`
+  ? `${string}[]` | `${string}[${number}]` | `${string} array` | `${string} array[${number}]`
   : PgTypeSpelling<C>;
 
 /**

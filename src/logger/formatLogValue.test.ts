@@ -140,6 +140,40 @@ describe('formatLogValue robustness', () => {
     expect(toLogJson(withToJson)).toEqual({ ok: 1, bad: '[Unformattable value]' });
   });
 
+  it('should keep an error whose fields cannot be read or are not strings', () => {
+    const error = Object.assign(new Error('boom'), { code: 'E1' });
+    // e.g. a failing Error.prepareStackTrace
+    Object.defineProperty(error, 'stack', {
+      get() {
+        throw new Error('no stack');
+      },
+    });
+    Object.defineProperty(error, 'cause', {
+      get() {
+        throw new Error('no cause');
+      },
+    });
+    const odd = Object.assign(new Error('odd'), { message: 42 });
+
+    expect(formatLogValue(error)).toBe("Error: boom { code: 'E1' }\n[cause]: [Getter threw]");
+    expect(toLogJson(error)).toEqual({
+      name: 'Error',
+      message: 'boom',
+      code: 'E1',
+      cause: '[Getter threw]',
+    });
+    // V8 builds the stack lazily, from the message it finds
+    expect(formatLogValue(odd)).toMatch(/^Error: 42\n/);
+    expect(toLogJson(odd)).toMatchObject({ name: 'Error', message: '42' });
+  });
+
+  it('should redact the cause of an error when cause is a redacted key', () => {
+    const error = new Error('outer', { cause: new Error('secret detail') });
+
+    expect(formatLogValue(error, lilypadRedaction(['cause']))).toContain('[cause]: [Redacted]');
+    expect(JSON.stringify(toLogJson(error, lilypadRedaction(['cause'])))).not.toContain('secret');
+  });
+
   it('should never throw, even for a Proxy whose traps throw', () => {
     const hostile = new Proxy(
       {},
@@ -242,6 +276,26 @@ describe('size bounds', () => {
 
     expect(formatted).toMatch(/^\[ 0, 1, .*, 99, … 900 more items \]$/);
     expect(toLogJson(numbers)).toEqual(numbers);
+  });
+
+  it('should print a typed array by index, with its type and length', () => {
+    expect(formatLogValue(new Uint8Array([1, 2, 3]))).toBe('Uint8Array(3) [ 1, 2, 3 ]');
+    expect(formatLogValue({ data: new BigInt64Array([10n]) })).toBe(
+      '{ data: BigInt64Array(1) [ 10n ] }'
+    );
+    // The JSON form is what JSON.stringify writes
+    expect(toLogJson(new Uint8Array([1, 2]))).toEqual({ 0: 1, 1: 2 });
+  });
+
+  it('should print a large typed array (e.g. a Buffer) without listing all its keys', () => {
+    const large = new Uint8Array(5_000_000);
+
+    const start = performance.now();
+    const formatted = formatLogValue(large);
+
+    // Listing its 5 million keys took about 500 ms
+    expect(performance.now() - start).toBeLessThan(100);
+    expect(formatted).toMatch(/^Uint8Array\(5000000\) \[ 0, 0, .*, … 4999900 more items \]$/);
   });
 
   it('should count the entries and properties left out of maps, sets and objects', () => {

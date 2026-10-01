@@ -190,6 +190,14 @@ describe('LilypadDbGate (integration)', () => {
       expect(await gate.table(usersSchema).selectByPrimaryKeys([])).toEqual([]);
     });
 
+    it('should return once the row of a key given in two batches of primary keys', async () => {
+      await admin`INSERT INTO users (name) VALUES ('Ada')`;
+
+      const rows = await gate.table(usersSchema).selectByPrimaryKeys([...Array(1000).fill(1), 1]);
+
+      expect(rows.map((row) => row.name)).toEqual(['Ada']);
+    });
+
     it('should stop selecting the batches of primary keys once its signal is aborted', async () => {
       const signal = AbortSignal.abort(new Error('timed out'));
 
@@ -473,13 +481,19 @@ describe('LilypadDbGate (integration)', () => {
         listenHeartbeat: 100,
       });
       expect(beatingGate.isListenHealthy()).toBe(false);
+      const beat = vi.spyOn(beatingGate['heartbeat']!, 'beat');
 
       await beatingGate.addListener({
         channel: 'beating_channel',
         callbackId: 'cb',
         callback: vi.fn(),
       });
-      await vi.waitFor(() => expect(beatingGate.isListenHealthy()).toBe(true), { timeout: 2000 });
+      // The heartbeat counts as healthy for 2.5 intervals after it starts: only the heartbeats that
+      // came back through PostgreSQL keep it healthy beyond them
+      await vi.waitFor(() => expect(beat.mock.calls.length).toBeGreaterThanOrEqual(3), {
+        timeout: 2000,
+      });
+      expect(beatingGate.isListenHealthy()).toBe(true);
 
       await beatingGate.removeListener('beating_channel', 'cb');
       expect(beatingGate.isListenHealthy()).toBe(false);
@@ -782,6 +796,195 @@ describe('LilypadDbGate (integration)', () => {
       });
     });
 
+    describe('the type of the primary key', () => {
+      // A non-superuser role owns the "unsafe" types; the superuser-owned ones and citext are safe.
+      beforeAll(async () => {
+        await admin.unsafe(`
+          CREATE EXTENSION IF NOT EXISTS citext;
+          CREATE ROLE kt_app LOGIN;
+          GRANT CREATE ON SCHEMA public TO kt_app;
+          -- Superuser-owned types (safe)
+          CREATE TYPE kt_su_enum AS ENUM ('a', 'b');
+          -- Superuser-owned enum, but its json cast function is owned by a non-superuser (unsafe)
+          CREATE TYPE kt_badcast AS ENUM ('a', 'b');
+          SET ROLE kt_app;
+          CREATE FUNCTION kt_badcast_json(kt_badcast) RETURNS json LANGUAGE sql IMMUTABLE
+            AS $fn$ SELECT to_json($1::text) $fn$;
+          RESET ROLE;
+          CREATE CAST (kt_badcast AS json) WITH FUNCTION kt_badcast_json(kt_badcast);
+          -- Non-superuser-owned types (unsafe)
+          SET ROLE kt_app;
+          CREATE TYPE kt_enum AS ENUM ('a', 'b');
+          CREATE DOMAIN kt_enum_dom AS kt_enum;
+          CREATE TYPE kt_comp AS (x int);
+          RESET ROLE;
+          -- Domains over built-in types (safe)
+          CREATE DOMAIN kt_userid AS int;
+          CREATE DOMAIN kt_ids AS int[];
+          CREATE TABLE kt_int (id int PRIMARY KEY);
+          CREATE TABLE kt_userid_t (id kt_userid PRIMARY KEY);
+          CREATE TABLE kt_ids_t (id kt_ids PRIMARY KEY);
+          CREATE TABLE kt_citext (id citext PRIMARY KEY);
+          CREATE TABLE kt_citext_arr (id citext[] PRIMARY KEY);
+          CREATE TABLE kt_userid_arr (id kt_userid[] PRIMARY KEY);
+          CREATE TABLE kt_su_enum_t (id kt_su_enum PRIMARY KEY);
+          CREATE TABLE kt_badcast_t (id kt_badcast PRIMARY KEY);
+          CREATE TABLE kt_enum_t (id kt_enum PRIMARY KEY);
+          CREATE TABLE kt_enum_arr (id kt_enum[] PRIMARY KEY);
+          CREATE TABLE kt_enum_dom_t (id kt_enum_dom PRIMARY KEY);
+          CREATE TABLE kt_comp_t (id kt_comp PRIMARY KEY);
+        `);
+        for (const table of [
+          'kt_int',
+          'kt_userid_t',
+          'kt_ids_t',
+          'kt_citext',
+          'kt_citext_arr',
+          'kt_userid_arr',
+          'kt_su_enum_t',
+          'kt_badcast_t',
+          'kt_enum_t',
+          'kt_enum_arr',
+          'kt_enum_dom_t',
+          'kt_comp_t',
+        ]) {
+          await admin.unsafe(lilypadChangelogTriggerSql({ table, primaryKey: 'id' }));
+        }
+      });
+
+      afterAll(async () => {
+        await admin.unsafe(`
+          DROP TABLE IF EXISTS kt_int, kt_userid_t, kt_ids_t, kt_citext, kt_citext_arr,
+            kt_userid_arr, kt_su_enum_t, kt_badcast_t, kt_enum_t, kt_enum_arr, kt_enum_dom_t,
+            kt_comp_t CASCADE;
+        `);
+        await admin.unsafe('DROP OWNED BY kt_app CASCADE; DROP ROLE kt_app;');
+        await admin.unsafe(`
+          DROP TYPE IF EXISTS kt_su_enum, kt_badcast CASCADE;
+          DROP DOMAIN IF EXISTS kt_userid, kt_ids, kt_enum_dom CASCADE;
+        `);
+      });
+
+      // For each key type: the write succeeds exactly when the check reports no unsupported-key-type.
+      it.each([
+        { table: 'kt_int', value: '1', safe: true },
+        { table: 'kt_userid_t', value: '1', safe: true },
+        { table: 'kt_ids_t', value: `'{1,2}'`, safe: true },
+        { table: 'kt_citext', value: `'K'`, safe: true },
+        { table: 'kt_citext_arr', value: `ARRAY['a','b']::citext[]`, safe: true },
+        { table: 'kt_userid_arr', value: `ARRAY[1,2]::kt_userid[]`, safe: true },
+        { table: 'kt_su_enum_t', value: `'a'`, safe: true },
+        { table: 'kt_badcast_t', value: `'a'`, safe: false },
+        { table: 'kt_enum_t', value: `'a'`, safe: false },
+        { table: 'kt_enum_arr', value: `ARRAY['a']::kt_enum[]`, safe: false },
+        { table: 'kt_enum_dom_t', value: "'a'", safe: false },
+        { table: 'kt_comp_t', value: `ROW(1)::kt_comp`, safe: false },
+      ])(
+        '$table: write succeeds iff the check passes (safe=$safe)',
+        async ({ table, value, safe }) => {
+          const wrote = await admin.unsafe(`INSERT INTO ${table} (id) VALUES (${value})`).then(
+            () => true,
+            () => false
+          );
+          const result = await checkLilypadSchema(gate, {
+            tables: [{ table, primaryKey: 'id' }],
+          });
+          const reported = result.problems.some((p) => p.code === 'unsupported-key-type');
+
+          expect(wrote).toBe(safe);
+          expect(reported).toBe(!safe);
+          // The trigger and the schema check agree
+          expect(wrote).toBe(!reported);
+        }
+      );
+
+      it.each([
+        { table: 'kt_int', safe: true },
+        { table: 'kt_enum_t', safe: false },
+      ])(
+        '$table checked as a listen table: the key type is reported iff unsafe (safe=$safe)',
+        async ({ table, safe }) => {
+          // The changelog triggers notify it too: its writes go through the same key-type guard
+          const result = await checkLilypadSchema(gate, {
+            tables: [{ table, primaryKey: 'id' }],
+            changelog: false,
+            notifyChannel: 'cache_events',
+          });
+
+          expect(result.problems.some((p) => p.code === 'unsupported-key-type')).toBe(!safe);
+        }
+      );
+
+      it('refuses an escalation attempt, so it cannot run the owner of the changelog', async () => {
+        // A role that owns its own cached table and gives its key a cast that runs its own code
+        await admin.unsafe(`
+          CREATE ROLE lilypad_escalator;
+          GRANT CREATE ON SCHEMA public TO lilypad_escalator;
+          SET ROLE lilypad_escalator;
+          CREATE TYPE escalation AS ENUM ('a', 'b');
+          CREATE FUNCTION escalation_json(escalation) RETURNS json LANGUAGE plpgsql AS $$
+            BEGIN
+              -- Only a superuser may do this: it works only if the function runs as the owner
+              ALTER ROLE lilypad_escalator SUPERUSER;
+              RETURN to_json($1::text);
+            END $$;
+          CREATE CAST (escalation AS json) WITH FUNCTION escalation_json(escalation);
+          CREATE TABLE escalate (id escalation PRIMARY KEY);
+          RESET ROLE;
+        `);
+        try {
+          // The migration attaches the changelog triggers (as the changelog owner)
+          await admin.unsafe(lilypadChangelogTriggerSql({ table: 'escalate', primaryKey: 'id' }));
+
+          const wrote = await admin
+            .begin(async (tx) => {
+              await tx`SET LOCAL ROLE lilypad_escalator`;
+              await tx`INSERT INTO escalate VALUES ('a')`;
+            })
+            .then(
+              () => 'written',
+              (error: unknown) => (error as Error).message
+            );
+
+          expect(wrote).toContain('unsafe type');
+          const [role] = await admin`
+            SELECT rolsuper FROM pg_roles WHERE rolname = 'lilypad_escalator'
+          `;
+          expect(role!.rolsuper).toBe(false);
+        } finally {
+          await admin.unsafe(
+            'DROP OWNED BY lilypad_escalator CASCADE; DROP ROLE lilypad_escalator;'
+          );
+        }
+      });
+
+      it('refuses a key column renamed after the triggers (fail closed)', async () => {
+        await admin.unsafe(`CREATE TABLE renamed_key (id int PRIMARY KEY, name text)`);
+        try {
+          await admin.unsafe(
+            lilypadChangelogTriggerSql({ table: 'renamed_key', primaryKey: 'id' })
+          );
+          await admin.unsafe(`ALTER TABLE renamed_key RENAME COLUMN id TO id2`);
+
+          const wrote = await admin
+            .unsafe(`INSERT INTO renamed_key (id2, name) VALUES (1, 'Ada')`)
+            .then(
+              () => 'written',
+              (error: unknown) => (error as Error).message
+            );
+
+          expect(wrote).toContain('does not exist');
+          const { changes } = await readLilypadChanges(gate, {
+            tableName: 'renamed_key',
+            since: { lookback: 60_000 },
+          });
+          expect(changes).toEqual([]);
+        } finally {
+          await admin.unsafe('DROP TABLE IF EXISTS renamed_key');
+        }
+      });
+    });
+
     it('should ignore a changelog row of a transaction that had not started, which only a forger writes', async () => {
       const { cursor } = await readAll();
       await admin`
@@ -831,6 +1034,100 @@ describe('LilypadDbGate (integration)', () => {
           DROP FUNCTION IF EXISTS archive_changes_prune();
         `);
       }
+    });
+
+    describe('a changelog whose name its SQL could mistake', () => {
+      /** Installs `changelogTable` for a new table, records an insert, and reads it back. */
+      const recordInto = async (
+        changelogTable: string,
+        prune: { olderThan: number; every: number } | false
+      ) => {
+        const table = `odd_items_${Math.random().toString(36).slice(2, 8)}`;
+        await admin.unsafe(`CREATE TABLE ${table} (id int PRIMARY KEY)`);
+        await admin.unsafe(
+          lilypadChangelogSql({ changelogTable, notifyChannel: false, prune }) +
+            lilypadChangelogTriggerSql({ table, primaryKey: 'id', changelogTable })
+        );
+        await admin.unsafe(`INSERT INTO ${table} VALUES (1)`);
+        const { changes } = await readLilypadChanges(gate, {
+          tableName: table,
+          changelogTable,
+          since: { lookback: 60_000 },
+        });
+        return { table, changes: changes.map((change) => change.rowId) };
+      };
+      /** Drops the tables and the functions of the changelog `name`. */
+      const dropChangelog = async (name: string, table: string) => {
+        const functions = await admin`
+          SELECT oid::regprocedure::text AS signature FROM pg_proc
+          WHERE proname LIKE ${`${name.slice(0, 20)}%`}
+        `;
+        await admin.unsafe(`
+          DROP TABLE IF EXISTS ${table};
+          DROP TABLE IF EXISTS "${name}";
+          ${functions.map(({ signature }) => `DROP FUNCTION ${signature as string};`).join('\n')}
+        `);
+      };
+
+      it.each([
+        ['x__lilypad_changelog__', false],
+        ['x__lilypad_changelog_literal__', false],
+        ['x__lilypad_prune__', { olderThan: 60 * 60_000, every: 1 }],
+      ] as const)(
+        'should record into the changelog %s, which contains a placeholder of its SQL',
+        async (changelogTable, prune) => {
+          let table = '';
+          try {
+            const recorded = await recordInto(changelogTable, prune);
+            table = recorded.table;
+
+            expect(recorded.changes).toEqual(['1']);
+          } finally {
+            await dropChangelog(changelogTable, table || 'no_table');
+          }
+        }
+      );
+
+      it.each([false, { olderThan: 60 * 60_000, every: 1 }] as const)(
+        'should install a changelog of 62 characters, whose names PostgreSQL would truncate into one (prune: %o)',
+        async (prune) => {
+          const changelogTable = `long_${'c'.repeat(57)}`;
+          let table = '';
+          try {
+            // What version 7 left: one index, under the name PostgreSQL truncated both to
+            await admin.unsafe(lilypadChangelogSql({ changelogTable, notifyChannel: false }));
+            await admin.unsafe(`
+              DO $$ DECLARE i text; BEGIN
+                FOR i IN SELECT indexname FROM pg_indexes
+                  WHERE tablename = '${changelogTable}' AND indexname NOT LIKE '%_pkey'
+                LOOP EXECUTE format('DROP INDEX %I', i); END LOOP;
+              END $$;
+              CREATE INDEX "${changelogTable}_table_xid_idx" ON "${changelogTable}" (table_name, xid);
+            `);
+
+            const recorded = await recordInto(changelogTable, prune);
+            table = recorded.table;
+
+            expect(recorded.changes).toEqual(['1']);
+            const [indexes] = await admin`
+              SELECT count(*)::int AS count FROM pg_indexes WHERE tablename = ${changelogTable}
+            `;
+            // The primary key, (table_name, xid) and (changed_at): the truncated one is gone
+            expect(indexes!.count).toBe(3);
+            const [truncated] = await admin`
+              SELECT count(*)::int AS count FROM pg_indexes WHERE indexname = ${changelogTable.slice(0, 62) + '_'}
+            `;
+            expect(truncated!.count).toBe(0);
+            const result = await checkLilypadSchema(gate, {
+              tables: [{ table, primaryKey: 'id' }],
+              changelog: { table: changelogTable, checkPruning: false },
+            });
+            expect(result.problems).toEqual([]);
+          } finally {
+            await dropChangelog(changelogTable, table || 'no_table');
+          }
+        }
+      );
     });
 
     it('should delete the rows older than the retention', async () => {
@@ -1085,7 +1382,7 @@ describe('LilypadDbGate (integration)', () => {
             lilypadChangelogSql({
               changelogTable: changes,
               notifyChannel: false,
-              prune: { olderThan: 30 * 60_000 },
+              prune: { olderThan: 30 * 60_000, force: true },
             })
           );
 
@@ -1782,6 +2079,29 @@ describe('LilypadDbGate (integration)', () => {
 
       await cache.dispose();
     });
+
+    it('should not fail getAll for good on a notified id that the primary key cannot hold', async () => {
+      const cache = await LilypadDbCache.create({
+        ttl: 60000,
+        gate,
+        table: usersSchema,
+        logger: createMockLogger(),
+      });
+      try {
+        await admin`INSERT INTO users (name) SELECT 'user ' || n FROM generate_series(1, 8) n`;
+        expect((await cache.getAll()).size).toBe(8);
+
+        // Any role can NOTIFY: an id that is not an integer, which a query by key rejects
+        const forged = JSON.stringify({ table: 'users', id: 'not-a-number', op: 'INSERT' });
+        await admin`SELECT pg_notify('cache_events', ${forged})`;
+        await vi.waitFor(() => expect(cache['members'].keys()).toContain('not-a-number'));
+
+        expect((await cache.getAll()).size).toBe(8);
+        expect(cache['members'].keys()).not.toContain('not-a-number');
+      } finally {
+        await cache.dispose();
+      }
+    });
   });
 
   describe('writes and notifications of large statements', () => {
@@ -2052,7 +2372,7 @@ describe('LilypadDbGate (integration)', () => {
     };
 
     afterEach(async () => {
-      await admin`DROP TABLE IF EXISTS shape_members, shape_teams`;
+      await admin`DROP TABLE IF EXISTS shape_members, shape_teams, shape_spellings`;
     });
 
     it('should create the missing tables with the SQL of the fixes, and find nothing after', async () => {
@@ -2082,6 +2402,38 @@ describe('LilypadDbGate (integration)', () => {
         .insert({ teamId: team!.id, email: 'ada@example.com' } as Member);
       expect(member).toMatchObject({ teamId: team!.id, score: 0, tags: [], managerId: null });
       expect(member!.joinedAt).toBeInstanceOf(Date);
+    });
+
+    it('should find nothing after the fixes for the spellings that format_type writes otherwise', async () => {
+      const spellingsDb = defineLilypadDb({
+        tables: {
+          spellings: {
+            tableName: 'shape_spellings',
+            primaryKey: 'id',
+            cols: {
+              id: { pgType: 'int4' },
+              amount: { pgType: 'numeric(10)' },
+              price: { pgType: 'dec(10,2)' },
+              flag: { pgType: 'bit' },
+              code: { pgType: 'char varying(10)' },
+              padded: { pgType: 'bpchar' },
+              letter: { pgType: 'char' },
+              sizes: { pgType: 'int[3]' },
+              grid: { pgType: 'int ARRAY[4]' },
+              matrix: { pgType: 'text[][]' },
+            },
+            sync: { strategy: 'none' },
+          },
+        },
+      });
+      const checkSpellings = () => checkLilypadSchema(gate, lilypadSchemaCheckOptions(spellingsDb));
+
+      const missing = await checkSpellings();
+      expect(codes(missing)).toEqual(['public.shape_spellings:missing-table']);
+
+      await applyFixes(missing);
+
+      expect((await checkSpellings()).problems).toEqual([]);
     });
 
     it('should report the columns, keys, foreign keys, indexes and checks that differ', async () => {
@@ -2159,6 +2511,33 @@ describe('LilypadDbGate (integration)', () => {
       expect(codes(await check())).toEqual([]);
       // With strict, the index of the database that the description lacks
       expect(codes(await check(true))).toEqual(['public.shape_members:undeclared-index']);
+    });
+
+    it('should make the database generate the keys of a table that has rows, after them', async () => {
+      await admin`CREATE TABLE shape_spellings (id int PRIMARY KEY, name text)`;
+      await admin`INSERT INTO shape_spellings VALUES (1, 'a'), (2, 'b')`;
+      const generatedDb = defineLilypadDb({
+        tables: {
+          spellings: {
+            tableName: 'shape_spellings',
+            primaryKey: 'id',
+            generatedPrimaryKey: true,
+            cols: { id: { pgType: 'int4' }, name: { pgType: 'text' } },
+            sync: { strategy: 'none' },
+          },
+        },
+      });
+      const checkGenerated = () => checkLilypadSchema(gate, lilypadSchemaCheckOptions(generatedDb));
+
+      const missing = await checkGenerated();
+      expect(codes(missing)).toEqual(['public.shape_spellings:missing-column-default']);
+
+      await applyFixes(missing);
+
+      expect((await checkGenerated()).problems).toEqual([]);
+      // The identity starts after the keys of the rows: the insert does not collide with them
+      const { row } = await gate.table(generatedDb.tables.spellings).insert({ name: 'c' });
+      expect(row).toMatchObject({ id: 3, name: 'c' });
     });
 
     it('should judge the columns of a domain by its base type, through nested domains', async () => {

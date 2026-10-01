@@ -616,6 +616,80 @@ describe('LilypadCache platform features', () => {
       expect(fake.data.has('lilypad:2:products:l:p1')).toBe(false);
     });
 
+    it('should not refresh when another instance took the lock after the read that scheduled it', async () => {
+      const works: (() => Promise<unknown>)[] = [];
+      const options = {
+        staleWhileRevalidate: 5000,
+        shared: { store: fake.store, refreshLockTtl: 10_000 },
+        platform: { afterResponse: (work: () => Promise<unknown>) => works.push(work) },
+      };
+      const first = createInstance<number>(options);
+      const second = createInstance<number>(options);
+      await first.getOrSet('p1', async () => 1);
+      await settle();
+      await second.getOrSet('p1', async () => 1);
+      await vi.advanceTimersByTimeAsync(1500);
+      const firstFetch = deferred<number>();
+      const secondFetch = vi.fn(async () => 3);
+
+      // Both serve the stale value before either refresh runs, after their responses
+      await expect(first.getOrSetDetailed('p1', () => firstFetch.promise)).resolves.toMatchObject({
+        status: 'STALE',
+      });
+      await expect(second.getOrSetDetailed('p1', secondFetch)).resolves.toMatchObject({
+        status: 'STALE',
+      });
+      const firstRefresh = works[0]!();
+      await settle();
+      await works[1]!();
+
+      expect(secondFetch).not.toHaveBeenCalled();
+      firstFetch.resolve(2);
+      await firstRefresh;
+      expect(fake.data.has('lilypad:2:products:l:p1')).toBe(false);
+    });
+
+    it('should leave a refresh lock that another instance took over', async () => {
+      const cache = createInstance<number>({
+        staleWhileRevalidate: 5000,
+        shared: { store: fake.store, refreshLockTtl: 10_000 },
+      });
+      await cache.getOrSet('p1', async () => 1);
+      await vi.advanceTimersByTimeAsync(1500);
+      fake.data.delete('lilypad:2:products:v:p1');
+      const refresh = deferred<number>();
+      await cache.getOrSetDetailed('p1', () => refresh.promise);
+      await settle();
+
+      // e.g. its lock expired during a long fetch, and another instance took it
+      await fake.store.set('lilypad:2:products:l:p1', 'other-instance');
+      refresh.resolve(2);
+      await settle();
+
+      expect(cache.get('p1')).toBe(2);
+      expect(fake.data.get('lilypad:2:products:l:p1')?.value).toBe('other-instance');
+    });
+
+    it('should not fetch when disposed while its refresh takes the lock', async () => {
+      const cache = createInstance<number>({
+        staleWhileRevalidate: 5000,
+        shared: { store: fake.store, refreshLockTtl: 10_000 },
+      });
+      await cache.getOrSet('p1', async () => 1);
+      await vi.advanceTimersByTimeAsync(1500);
+      fake.data.delete('lilypad:2:products:v:p1');
+      fake.behaviour.delay = 100;
+      const fetch = vi.fn(async () => 2);
+      const pending = cache.getOrSetDetailed('p1', fetch);
+      await vi.advanceTimersByTimeAsync(100); // the shared read: the refresh starts at once
+      await expect(pending).resolves.toMatchObject({ status: 'STALE' });
+
+      await cache.dispose();
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(fetch).not.toHaveBeenCalled();
+    });
+
     it('should keep entries within the stale window when purging', async () => {
       const cache = createInstance<number>({ staleWhileRevalidate: 5000 });
       cache.set('p1', 1);
@@ -673,6 +747,26 @@ describe('LilypadCache platform features', () => {
 
       await expect(second.getOrSet('p1', fetch)).rejects.toBeInstanceOf(LilypadCacheCooldownError);
       expect(fetch).not.toHaveBeenCalled();
+    });
+
+    it('should keep the failures read from the shared level bounded without a purge', async () => {
+      const cache = createInstance<number>({ failureCooldown: 1000 });
+
+      // e.g. another instance fails on a stream of distinct keys
+      for (let index = 0; index < 3000; index++) {
+        fake.data.set(`lilypad:2:products:f:k${index}`, {
+          value: Date.now(),
+          expiresAt: Date.now() + 1000,
+        });
+        await expect(cache.getOrSet(`k${index}`, async () => 1)).rejects.toBeInstanceOf(
+          LilypadCacheCooldownError
+        );
+        if (index % 100 === 99) {
+          await vi.advanceTimersByTimeAsync(1000);
+        }
+      }
+
+      expect(cache['engine']['failures'].size).toBeLessThanOrEqual(1000);
     });
 
     it('should report a failed refresh on the stale value it serves', async () => {
@@ -971,6 +1065,26 @@ describe('LilypadCache platform features', () => {
       await vi.advanceTimersByTimeAsync(101);
 
       await expect(reader.getOrSetDetailed('p1', async () => 3)).resolves.toMatchObject({
+        value: 3,
+        status: 'MISS',
+      });
+    });
+
+    it('should keep refusing the old shared copy once a value of this instance only replaces the invalidated entry', async () => {
+      const cache = createInstance<number>({ bulkSync: { fn: async () => [['p1', 2]] } });
+      await cache.getOrSet('p1', async () => 1);
+      await settle();
+      await vi.advanceTimersByTimeAsync(10);
+      fake.store.delete.mockRejectedValueOnce(new Error('store down'));
+      cache.invalidate('p1');
+      await settle();
+
+      // A bulk sync fills this instance only: the shared level keeps the copy from before
+      await cache.bulkSync();
+      expect(cache.get('p1')).toBe(2);
+      cache.clear();
+
+      await expect(cache.getOrSetDetailed('p1', async () => 3)).resolves.toMatchObject({
         value: 3,
         status: 'MISS',
       });

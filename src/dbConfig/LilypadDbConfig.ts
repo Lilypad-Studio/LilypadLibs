@@ -509,17 +509,26 @@ export function defineLilypadDb<Tables extends Record<string, LilypadDbTableInpu
     );
     return { key, table, schema, tableName, qualifiedName: `${schema}.${tableName}` };
   });
-  // The tables of the config, by qualified and by unqualified name, for the references. An
-  // unqualified name shared by several schemas is the table of the default schema, or else the first
-  const byName = new Map<string, (typeof located)[number]>();
-  for (const entry of located) {
-    byName.set(entry.qualifiedName, entry);
-    if (!byName.has(entry.tableName) || entry.schema === defaultSchema) {
-      byName.set(entry.tableName, entry);
+  const byQualifiedName = new Map(located.map((entry) => [entry.qualifiedName, entry]));
+  // The table of the config a reference names: an unqualified name is its table of the default
+  // schema, or else its only table of that name; several, in other schemas, are ambiguous
+  const tableOf = (name: string, owner: string) => {
+    if (name.includes('.')) {
+      return byQualifiedName.get(name);
     }
-  }
+    const candidates = located.filter((entry) => entry.tableName === name);
+    const target =
+      byQualifiedName.get(`${defaultSchema}.${name}`) ??
+      (candidates.length === 1 ? candidates[0] : undefined);
+    if (!target && candidates.length > 1) {
+      throw new Error(
+        `defineLilypadDb: ${owner} references "${name}", which is a table of several schemas (${candidates.map((entry) => entry.qualifiedName).join(', ')}): qualify it.`
+      );
+    }
+    return target;
+  };
   const referenced = (name: string, owner: string, columns: readonly string[] | undefined) => {
-    const target = byName.get(name);
+    const target = tableOf(name, owner);
     const qualified = qualify(name, defaultSchema);
     const table = target?.qualifiedName ?? `${qualified.schema}.${qualified.table}`;
     const resolvedColumns = columns ?? (target ? [String(target.table.primaryKey)] : undefined);

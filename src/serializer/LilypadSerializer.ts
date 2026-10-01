@@ -8,12 +8,18 @@ type IsSurjective<
   M extends Record<PropertyKey, PropertyKey>,
 > = keyof B extends M[keyof M] ? true : false;
 
-/** True if no two keys of the mapping have the same target. */
+/** True if T is a union of several types (`boolean` once distributed, hence the `extends false`). */
+type IsUnion<T, U = T> = T extends unknown ? ([U] extends [T] ? false : true) : never;
+
+/** True if no two keys of the mapping have the same target, and each key has a single target. */
 type IsInjective<M extends Record<PropertyKey, PropertyKey>> = {
+  // A union target (`'x' | 'y'`) would claim keys that the runtime `target` never writes.
   // InvertRecord<M>[M[K]] is the union of all the keys mapped to M[K]: it must be K alone
-  [K in keyof M]: M[K] extends keyof InvertRecord<M>
-    ? [InvertRecord<M>[M[K]]] extends [K]
-      ? true
+  [K in keyof M]: IsUnion<M[K]> extends false
+    ? M[K] extends keyof InvertRecord<M>
+      ? [InvertRecord<M>[M[K]]] extends [K]
+        ? true
+        : false
       : false
     : false;
 }[keyof M] extends true
@@ -27,7 +33,8 @@ type IsInjective<M extends Record<PropertyKey, PropertyKey>> = {
 type IsBijective<A extends object, B extends object, M extends Record<keyof A, keyof B>> =
   IsSurjective<B, M> extends true ? IsInjective<M> : false;
 
-export type LilypadSerializerConstructorOptions<
+/** The options of the {@link LilypadSerializer} constructor: the mapping of each key of `FROM`. */
+export type LilypadSerializerOptions<
   FROM extends object,
   TO extends object,
   KeyMap extends Record<keyof FROM, keyof TO>,
@@ -42,6 +49,13 @@ export type LilypadSerializerConstructorOptions<
     };
   };
 };
+
+/** @deprecated Renamed {@link LilypadSerializerOptions}, as the options of the other classes. */
+export type LilypadSerializerConstructorOptions<
+  FROM extends object,
+  TO extends object,
+  KeyMap extends Record<keyof FROM, keyof TO>,
+> = LilypadSerializerOptions<FROM, TO, KeyMap>;
 
 /**
  * A generic serializer/deserializer for mapping objects between two shapes (`FROM` and `TO`)
@@ -84,11 +98,11 @@ export class LilypadSerializer<
 > {
   private readonly fields: [
     keyof FROM,
-    LilypadSerializerConstructorOptions<FROM, TO, KeyMap>['serialization'][keyof FROM],
+    LilypadSerializerOptions<FROM, TO, KeyMap>['serialization'][keyof FROM],
   ][];
 
   /** @throws If a key or a `target` is `__proto__`: assigning it would set the prototype instead. */
-  constructor(options: LilypadSerializerConstructorOptions<FROM, TO, KeyMap>) {
+  constructor(options: LilypadSerializerOptions<FROM, TO, KeyMap>) {
     this.fields = Object.entries(options.serialization) as typeof this.fields;
     for (const [fromKey, field] of this.fields) {
       if (fromKey === '__proto__' || field.target === '__proto__') {

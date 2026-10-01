@@ -133,6 +133,29 @@ describe('runAfterResponse', () => {
       expect.objectContaining({ message: 'outside a request' })
     );
   });
+
+  it('should run the work once when afterResponse throws after scheduling it', async () => {
+    const scheduled: (() => Promise<unknown>)[] = [];
+    const onPlatformError = vi.fn();
+    const work = vi.fn(async () => {});
+
+    runAfterResponse(
+      {
+        afterResponse: (handed) => {
+          scheduled.push(handed);
+          throw new Error('failed after scheduling');
+        },
+      },
+      work,
+      () => {},
+      onPlatformError
+    );
+    // The platform runs what it scheduled, after the fallback started the work
+    await Promise.all(scheduled.map((handed) => handed()));
+
+    expect(work).toHaveBeenCalledOnce();
+    expect(onPlatformError).toHaveBeenCalledOnce();
+  });
 });
 
 describe('sharedStoreOperation', () => {

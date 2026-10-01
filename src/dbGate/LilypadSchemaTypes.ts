@@ -67,7 +67,8 @@ export type LilypadSchemaCheckOptions = {
   /**
    * Checks that the tables have a trigger that sends notifications on this channel (the `listen`
    * strategy), unless a table sets its own `notifyChannel`. The trigger may be the changelog trigger
-   * or one of your own: its function must call `pg_notify` with the channel name as a literal.
+   * or one of your own: its function must call `pg_notify` with the channel name as a literal,
+   * spelled exactly as the caches listen to it (case included).
    * Defaults to `false`: not checked.
    *
    * The changelog trigger function notifies on one channel, the same in every fix that installs it:
@@ -103,6 +104,18 @@ export type LilypadSchemaProblemCode =
   | 'missing-changelog-trigger'
   /** The changelog trigger of the table records another column than the primary key. */
   | 'wrong-trigger-primary-key'
+  /**
+   * The primary key column has a type the changelog triggers cannot convert with `to_jsonb` as
+   * their owner: an enum or base type not owned by a superuser, or whose output or json cast
+   * function is not, a user-defined (non-built-in) composite, range or multirange type, or an
+   * array or domain over one. Converting it
+   * would run a non-superuser's code with the changelog owner's privileges, so the trigger refuses
+   * it and the writes of the table fail. Reported for a `changelog` table, and for a `listen` table
+   * that the changelog triggers notify (or that the fix of its notifications gives them). Use a
+   * built-in type, a superuser-owned extension type (e.g. `citext`), or a domain over one, before
+   * installing the changelog SQL of the current version.
+   */
+  | 'unsupported-key-type'
   /**
    * `TRUNCATE` of the table is not recorded (or not notified, with `notifyChannel`): it fires no
    * row trigger, so the caches would keep the removed rows.

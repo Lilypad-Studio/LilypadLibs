@@ -39,7 +39,7 @@ import {
   type LilypadDbUpdateData,
 } from '@/dbConfig/LilypadDbSchema';
 import type { LilypadDbTable } from '@/dbGate/LilypadDbTable';
-import { LilypadFlowControl } from '@/flow/LilypadFlowControl';
+import { LilypadFlowControl, LilypadTimeoutError } from '@/flow/LilypadFlowControl';
 import { LilypadDisposedError } from '@/internal/LilypadDisposedError';
 import { assertNumberOption } from '@/internal/LilypadValidation';
 import { libLog, type LilypadLibLogger } from '@/logger/LilypadLibLogger';
@@ -108,6 +108,20 @@ export type LilypadDbCacheGateNamedOptions<
 const DEFAULT_MAX_AGE = 60 * 60 * 1000; // 1 hour
 const DEFAULT_LOAD_TIMEOUT = 30_000;
 
+/** A load of the whole table (see `loadRows`). */
+type TableLoad<V> = {
+  /**
+   * The rows loaded, by normalized key: those no change superseded, or, when the load was voided,
+   * every row it read.
+   */
+  rows: Map<string, V>;
+  /**
+   * Whether the members are known after the load: `false` when a change of the whole table (a
+   * `BULK` notification, a reconnection...) voided it, since its rows may predate the change.
+   */
+  complete: boolean;
+};
+
 /**
  * A cache of the rows of one table, kept up to date with the changes made elsewhere.
  *
@@ -151,7 +165,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
   /** The keys of the rows of the table, for `getAll`. */
   private members = new LilypadDbMembers<LilypadDbKey<V, PK>>();
   /** The load of the whole table in flight, shared by concurrent callers. */
-  private tableLoad?: Promise<Map<string, V>> | undefined;
+  private tableLoad?: Promise<TableLoad<V>> | undefined;
   /**
    * The loads of the table waiting for their rows: meanwhile every key counts as read, so that a
    * change applied then leaves a fence that discards the row loaded before it.
@@ -547,15 +561,16 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
    * for the rows, every key counts as read (`hasReadInFlight`), and until it ends the members are
    * tracked: a change applied meanwhile, which the load may predate, is newer than it.
    *
-   * @returns The rows loaded that no change superseded, by normalized key: with `maxEntries`, the
-   * cache may not hold them all.
+   * @returns The rows loaded that no change superseded, by normalized key (with `maxEntries`, the
+   * cache may not hold them all), or every row read if a change of the whole table voided the load.
    */
-  private async loadRows(signal: AbortSignal): Promise<Map<string, V>> {
+  private async loadRows(signal: AbortSignal): Promise<TableLoad<V>> {
     const { engine } = this;
     const read = engine.beginRead();
     const primaryKey = this.definition.primaryKey;
     const rows = new Map<string, V>();
     const entries: [LilypadDbKey<V, PK>, V][] = [];
+    let complete = true;
     this.members.beginLoad();
     try {
       let loaded: V[];
@@ -596,27 +611,33 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
           }
         );
         engine.replaceEntries(read, entries);
-        // A row changed since the load started: its loaded value may be the old one
-        for (const normalizedKey of [...rows.keys()]) {
-          if (engine.currentTicket(normalizedKey) > read.ticket) {
-            rows.delete(normalizedKey);
+        // A change of the whole table during the load (`members.forget`) left no members to fetch:
+        // the caller gets every row read
+        complete = this.members.known;
+        if (complete) {
+          // A row changed since the load started: its loaded value may be the old one
+          for (const normalizedKey of [...rows.keys()]) {
+            if (engine.currentTicket(normalizedKey) > read.ticket) {
+              rows.delete(normalizedKey);
+            }
           }
         }
       }
     } finally {
       this.members.endLoad();
     }
-    return rows;
+    return { rows, complete };
   }
 
   /**
    * Loads the whole table, bounded by `bulkSync.timeout`. Concurrent calls share one load.
    *
-   * @returns The rows loaded, by normalized key: with `maxEntries`, the cache may not hold them all.
+   * @returns The load (see {@link TableLoad}): its rows by normalized key (with `maxEntries`, the
+   * cache may not hold them all), and whether it is `complete` or was voided.
    */
-  private loadTable(): Promise<Map<string, V>> {
+  private loadTable(): Promise<TableLoad<V>> {
     if (!this.tableLoad) {
-      const loading: Promise<Map<string, V>> = this.loadFlowControl
+      const loading: Promise<TableLoad<V>> = this.loadFlowControl
         .executeWithTimeout((signal) => this.loadRows(signal))
         .catch((error: unknown) => {
           this.engine.log('error', 'Error loading the table:', error);
@@ -630,6 +651,25 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
       this.tableLoad = loading;
     }
     return this.tableLoad;
+  }
+
+  /**
+   * Loads the whole table for a call of `getAll`. A load voided by a change of the whole table may
+   * have started before the call, and read the rows before the change: the table is loaded again.
+   * That second load started during the call: if it is voided too, its rows as read are still a
+   * state of the table since the call started.
+   */
+  private async loadTableForCall(): Promise<TableLoad<V>> {
+    const load = await this.loadTable();
+    return load.complete ? load : this.loadTable();
+  }
+
+  /** The rows of a voided load, keyed by primary key. */
+  private keyedRows(rows: Map<string, V>): Map<LilypadDbKey<V, PK>, V> {
+    const primaryKey = this.definition.primaryKey;
+    return new Map(
+      [...rows.values()].map((row) => [row[primaryKey] as LilypadDbKey<V, PK>, row] as const)
+    );
   }
 
   /**
@@ -935,7 +975,9 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
    * are more than a quarter of the table, the whole table is loaded instead.
    * Rows are cached in the memory of this instance only, not in the shared level. With
    * `maxEntries` smaller than the table, the result is still complete, but most rows are queried
-   * again at each call.
+   * again at each call. When the query by primary keys fails (e.g. on an id that no row can have,
+   * which any role can notify), the whole table is loaded instead, once (not after a timeout, nor
+   * when the call already loaded the table, nor once the gate is closed).
    *
    * @throws If the rows cannot be loaded, or a {@link LilypadTimeoutError} after `bulkSync.timeout`.
    * @see {@link getManyOrFetch} for the rows of some keys
@@ -947,17 +989,41 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
       await syncing;
     }
     let loaded: Map<string, V> | undefined;
-    if (!this.members.isLoaded(this.sync.trustedSince(), this.loadTtl)) {
-      loaded = await this.loadTable();
-    }
-    let staleKeys = this.staleKeys(this.members.keys(), loaded);
-    // Not again after a load of this call: what is still stale changed while it ran
-    if (!loaded && staleKeys.length > this.members.size * LILYPAD_FULL_LOAD_RATIO) {
-      loaded = await this.loadTable();
+    let staleKeys = this.members.isLoaded(this.sync.trustedSince(), this.loadTtl)
+      ? this.staleKeys(this.members.keys())
+      : undefined;
+    // Not loaded, or more rows to fetch than a load of the whole table is worth
+    if (staleKeys === undefined || staleKeys.length > this.members.size * LILYPAD_FULL_LOAD_RATIO) {
+      const load = await this.loadTableForCall();
+      if (!load.complete) {
+        return this.keyedRows(load.rows);
+      }
+      loaded = load.rows;
       staleKeys = this.staleKeys(this.members.keys(), loaded);
     }
-    // Also the rows changed while the table was loading
-    const fetched = await this.fetchRows(staleKeys);
+    let fetched: Map<string, LilypadCachedValueType<V>>;
+    try {
+      // Also the rows changed while the table was loading
+      fetched = await this.fetchRows(staleKeys);
+    } catch (error) {
+      // A member noted from a notification may hold an id that the database rejects: a load reads
+      // no member by key, and replaces them. Not after a load (what is still stale changed while it
+      // ran), nor after a timeout, nor once the gate is closed or the cache disposed
+      if (
+        loaded ||
+        error instanceof LilypadTimeoutError ||
+        error instanceof LilypadDisposedError ||
+        this.engine.disposed
+      ) {
+        throw error;
+      }
+      const load = await this.loadTableForCall();
+      if (!load.complete) {
+        return this.keyedRows(load.rows);
+      }
+      loaded = load.rows;
+      fetched = await this.fetchRows(this.staleKeys(this.members.keys(), loaded));
+    }
     return this.rowsOf(this.members.keys(), fetched, loaded ?? new Map<string, V>());
   }
 

@@ -2,7 +2,12 @@
  * `@lilypad-studio/libs/logger`: the logger and its components. Runs in Node.js and in edge runtimes.
  */
 export { LilypadLogger } from '../logger/LilypadLogger';
-export type { LilypadLoggerConstructorOptions, LilypadLoggerType } from '../logger/LilypadLogger';
+export type {
+  // eslint-disable-next-line @typescript-eslint/no-deprecated -- kept for the applications until 1.0
+  LilypadLoggerConstructorOptions,
+  LilypadLoggerOptions,
+  LilypadLoggerType,
+} from '../logger/LilypadLogger';
 export { lilypadPinoLogger } from '../logger/LilypadLibLogger';
 export type {
   LilypadLibLogger,

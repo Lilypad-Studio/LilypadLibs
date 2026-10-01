@@ -105,9 +105,9 @@ export type LilypadCacheSharedOptions<V> = {
   timeout?: number | undefined;
   /**
    * If set, a background refresh holds a lock in the shared store for this long (ms), so that the
-   * other instances do not refresh the same key at the same time. It is a soft lock (read and
-   * write are not atomic): rarely, two instances still refresh together. Set it to the maximum
-   * duration of a fetch.
+   * other instances do not refresh the same key at the same time; the lock is read again when the
+   * refresh starts. It is a soft lock (read and write are not atomic): rarely, two instances still
+   * refresh together. Set it to the maximum duration of a fetch.
    */
   refreshLockTtl?: number | undefined;
   /**
@@ -143,8 +143,9 @@ export type LilypadCacheEntryOrigin = 'source' | 'fallback' | 'shared';
  * @property ticket Orders the writes: see {@link LilypadCacheRead}.
  * @property origin Where the value comes from: the source or a write (`source`), a fallback chosen
  * after a failed fetch (`fallback`), or the shared level (`shared`).
- * @property invalidatedAt When the entry was expired by an invalidation: copies of the shared level
- * produced before it are not adopted.
+ * @property invalidatedAt When the key was last invalidated: copies of the shared level produced
+ * before it are not adopted. Set by the invalidation, and kept by the entries written after it
+ * while such a copy may still live.
  */
 export type LilypadCacheEntry<K, V> = {
   key: K;

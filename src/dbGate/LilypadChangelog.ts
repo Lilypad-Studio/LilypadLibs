@@ -1,6 +1,7 @@
 import {
   LILYPAD_DEFAULT_CHANGELOG_TABLE,
   LILYPAD_DEFAULT_NOTIFY_CHANNEL,
+  LILYPAD_RESERVED_CHANNEL_PART,
 } from '@/dbConfig/LilypadDbConfigDefaults';
 import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
 import { assertNumberOption } from '@/internal/LilypadValidation';
@@ -17,8 +18,74 @@ import { assertNumberOption } from '@/internal/LilypadValidation';
  * The function carries it in its comment (`lilypad-changelog:<version>`), so that
  * `checkLilypadSchema` can tell an installation made by an older version of the library.
  */
-export const LILYPAD_CHANGELOG_VERSION = 7;
+export const LILYPAD_CHANGELOG_VERSION = 9;
 export const LILYPAD_CHANGELOG_VERSION_PREFIX = 'lilypad-changelog:';
+
+/**
+ * PostgreSQL's `FirstNormalObjectId`: types, functions and casts whose OID is below it are built-in
+ * (assigned by `initdb`); the rest are user-defined. Only a superuser can attach a cast to, or an
+ * I/O function of, a built-in type, so a built-in type is trusted.
+ */
+const LILYPAD_FIRST_NORMAL_OBJECT_ID = 16384;
+
+/** The deepest chain of domains/arrays the key-type check walks; beyond it, the key is refused. */
+const KEY_TYPE_MAX_DEPTH = 32;
+
+/**
+ * A SQL boolean expression that is true only when the type `startOid` is safe to convert with
+ * `to_jsonb` while running as the changelog owner. `to_jsonb` of a non-built-in value runs its cast
+ * to `json` if one exists, else its output function, and recurses into the elements of an array and
+ * the fields of a composite; a cast or I/O function a role owns runs that role's code. So a type is
+ * safe only when every node it is built from (resolving domains to their base and arrays to their
+ * element) is either built-in (OID below {@link LILYPAD_FIRST_NORMAL_OBJECT_ID}), or a base or enum
+ * type whose type, output function and every `json`/`jsonb` cast function are owned by a superuser
+ * (or built in). A user-defined (non-built-in) composite, range or multirange type, or a chain
+ * deeper than {@link KEY_TYPE_MAX_DEPTH}, is refused (built-in ones, such as `int4range`, pass). It fails closed: an empty walk is unsafe. The same fragment guards the trigger and the
+ * schema check, so they cannot drift. It reads only `pg_catalog`; `startOid` must be trusted SQL.
+ */
+export function lilypadSafeKeyTypeSql(startOid: string): string {
+  const fno = LILYPAD_FIRST_NORMAL_OBJECT_ID;
+  return `coalesce((
+    WITH RECURSIVE walk(oid, typtype, typbasetype, typelem, typowner, typoutput, depth) AS (
+      SELECT ty.oid, ty.typtype, ty.typbasetype, ty.typelem, ty.typowner, ty.typoutput, 0
+      FROM pg_catalog.pg_type ty WHERE ty.oid = ${startOid}
+      UNION ALL
+      SELECT nt.oid, nt.typtype, nt.typbasetype, nt.typelem, nt.typowner, nt.typoutput, walk.depth + 1
+      FROM walk JOIN pg_catalog.pg_type nt ON nt.oid = CASE
+        WHEN walk.typtype = 'd' THEN walk.typbasetype
+        WHEN walk.typelem <> 0 THEN walk.typelem
+        ELSE NULL END
+      WHERE walk.depth < ${KEY_TYPE_MAX_DEPTH}
+    )
+    SELECT bool_and(
+      -- A domain or a registered array type is passed through (resolved above), not checked itself
+      CASE WHEN node.typtype = 'd'
+            OR (node.typelem <> 0 AND EXISTS (
+                 SELECT 1 FROM pg_catalog.pg_type e
+                 WHERE e.oid = node.typelem AND e.typarray = node.oid))
+        THEN true
+        ELSE node.oid < ${fno}
+          OR (
+            node.typtype IN ('b', 'e')
+            AND coalesce(town.rolsuper, false)
+            AND (node.typoutput < ${fno} OR coalesce(oown.rolsuper, false))
+            AND NOT EXISTS (
+              SELECT 1 FROM pg_catalog.pg_cast cs
+              JOIN pg_catalog.pg_proc cp ON cp.oid = cs.castfunc
+              JOIN pg_catalog.pg_roles cr ON cr.oid = cp.proowner
+              WHERE cs.castsource = node.oid
+                AND cs.casttarget IN ('pg_catalog.json'::regtype, 'pg_catalog.jsonb'::regtype)
+                AND cs.castfunc >= ${fno} AND NOT cr.rolsuper
+            )
+          )
+      END
+    ) AND max(node.depth) < ${KEY_TYPE_MAX_DEPTH}
+    FROM walk AS node
+    LEFT JOIN pg_catalog.pg_roles town ON town.oid = node.typowner
+    LEFT JOIN pg_catalog.pg_proc op ON op.oid = node.typoutput
+    LEFT JOIN pg_catalog.pg_roles oown ON oown.oid = op.proowner
+  ), false)`;
+}
 /**
  * The oldest version that the caches still read correctly: an older installation is an error of
  * the schema check, a newer one that is not the current version only a warning (version 4 notifies
@@ -47,6 +114,28 @@ function identifierPrefix(name: string): string {
 /** PostgreSQL truncates longer identifiers (`NAMEDATALEN - 1`). */
 const MAX_IDENTIFIER_BYTES = 63;
 
+const encoder = new TextEncoder();
+
+/**
+ * Checks a notification channel: `pg_notify` rejects an empty name and a name longer than
+ * {@link MAX_IDENTIFIER_BYTES} bytes (a trigger that notifies on it would fail every write), and
+ * `LISTEN` truncates a longer one (its notifications would never be delivered).
+ *
+ * @throws If the channel is not a non-empty string of at most 63 bytes.
+ */
+export function assertLilypadChannel(owner: string, channel: unknown): void {
+  if (typeof channel !== 'string' || channel === '') {
+    throw new Error(
+      `${owner}: the channel must be a non-empty string (got ${JSON.stringify(channel)}).`
+    );
+  }
+  if (encoder.encode(channel).length > MAX_IDENTIFIER_BYTES) {
+    throw new Error(
+      `${owner}: the channel "${channel}" is longer than ${MAX_IDENTIFIER_BYTES} bytes, which PostgreSQL rejects or truncates.`
+    );
+  }
+}
+
 /**
  * A name derived from a table name, at most {@link MAX_IDENTIFIER_BYTES} long: a longer prefix is
  * cut and followed by a hash of the whole prefix, so that the suffixes stay distinct instead of
@@ -63,6 +152,17 @@ function derivedName(prefix: string, suffix: string): string {
   }
   const tag = (hash >>> 0).toString(16).padStart(8, '0');
   return `${prefix.slice(0, MAX_IDENTIFIER_BYTES - suffix.length - tag.length - 1)}_${tag}${suffix}`;
+}
+
+/**
+ * A name derived from the name of the changelog table (its functions and indexes). Their suffixes
+ * differ from their second character, so the names that PostgreSQL truncates stay distinct while
+ * the prefix is shorter than 62 bytes: they are kept as they are, as earlier versions installed
+ * them. From 62 bytes, PostgreSQL would truncate two of them into one: they are cut with a hash
+ * instead ({@link derivedName}).
+ */
+function changelogObjectName(prefix: string, suffix: string): string {
+  return prefix.length < MAX_IDENTIFIER_BYTES - 1 ? prefix + suffix : derivedName(prefix, suffix);
 }
 
 /**
@@ -87,18 +187,19 @@ export function quoteIdentifier(identifier: string): string {
     .join('.');
 }
 
-function quoteLiteral(value: string): string {
+/** Quotes a string literal (with `standard_conforming_strings`, on since PostgreSQL 9.1). */
+export function quoteLiteral(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
 /** The trigger function name for a changelog table. */
 export function triggerFunctionName(changelogTable: string): string {
-  return `${identifierPrefix(changelogTable)}_record`;
+  return changelogObjectName(identifierPrefix(changelogTable), '_record');
 }
 
 /** The name of the function that deletes the old rows of a changelog table (`prune` option). */
 export function pruneFunctionName(changelogTable: string): string {
-  return `${identifierPrefix(changelogTable)}_prune`;
+  return changelogObjectName(identifierPrefix(changelogTable), '_prune');
 }
 
 const TRIGGER_SUFFIXES = {
@@ -178,11 +279,17 @@ export type LilypadChangelogPruneOptions = {
   every?: number | undefined;
   /** The most rows one prune deletes. Defaults to 1000. */
   batchSize?: number | undefined;
+  /**
+   * Accepts an `olderThan` below one hour ({@link LILYPAD_MIN_CHANGELOG_RETENTION}), which
+   * otherwise throws: it deletes rows that the caches may still have to read.
+   */
+  force?: boolean | undefined;
 };
 
 /**
  * The placeholders of the body of the trigger function: the changelog table (as an identifier, and
- * as a literal) and the prune function, which the `DO` block that creates it qualifies.
+ * as a literal) and the prune function, which the `DO` block that creates it qualifies (see
+ * `recordDoBody`).
  */
 const CHANGELOG_TOKEN = '__lilypad_changelog__';
 const CHANGELOG_LITERAL_TOKEN = '__lilypad_changelog_literal__';
@@ -191,16 +298,36 @@ const PRUNE_TOKEN = '__lilypad_prune__';
 /** The comment of the trigger function that records its prune options (read back by the schema check). */
 const PRUNE_MARKER = 'lilypad-prune:';
 
+type ResolvedPruneOptions = Required<Omit<LilypadChangelogPruneOptions, 'force'>>;
+
+/**
+ * Throws for a retention below one hour without `force`: it is in milliseconds, and a retention
+ * given in seconds by mistake would delete rows that the caches still have to read.
+ */
+function assertRetention(
+  owner: string,
+  name: string,
+  olderThan: number,
+  force: boolean | undefined
+): void {
+  if (olderThan < LILYPAD_MIN_CHANGELOG_RETENTION && force !== true) {
+    throw new Error(
+      `${owner}: ${name} is ${olderThan} ms, less than one hour: the caches may still need these rows (it is in milliseconds). Pass force: true to prune them anyway.`
+    );
+  }
+}
+
 function resolvePruneOptions(
   owner: string,
   prune: LilypadChangelogPruneOptions | false | undefined
-): Required<LilypadChangelogPruneOptions> | undefined {
+): ResolvedPruneOptions | undefined {
   if (!prune) {
     return undefined;
   }
   assertNumberOption(owner, 'prune.olderThan', prune.olderThan, 'positive');
   assertNumberOption(owner, 'prune.every', prune.every, 'positive-integer');
   assertNumberOption(owner, 'prune.batchSize', prune.batchSize, 'positive-integer');
+  assertRetention(owner, 'prune.olderThan', prune.olderThan, prune.force);
   return {
     olderThan: prune.olderThan,
     every: prune.every ?? 20,
@@ -247,7 +374,7 @@ export function olderThanCondition(olderThan: number): string {
 function pruneDoBody(
   pruneFunction: string,
   quotedTable: string,
-  prune: Required<LilypadChangelogPruneOptions>
+  prune: ResolvedPruneOptions
 ): string {
   const functionBody = `
   DELETE FROM %1$s WHERE id IN (
@@ -291,9 +418,14 @@ export function lilypadChangelogSql(options: LilypadChangelogSqlOptions = {}): s
   }
   const table = options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
   const channel = options.notifyChannel ?? LILYPAD_DEFAULT_NOTIFY_CHANNEL;
-  if (channel !== false && channel.includes('__lilypad_')) {
-    // It would be taken for a placeholder of the trigger function
-    throw new Error(`lilypadChangelogSql: the notifyChannel "${channel}" contains "__lilypad_".`);
+  if (channel !== false) {
+    assertLilypadChannel('lilypadChangelogSql', channel);
+    if (channel.includes(LILYPAD_RESERVED_CHANNEL_PART)) {
+      // It would be taken for a placeholder of the trigger function
+      throw new Error(
+        `lilypadChangelogSql: the notifyChannel "${channel}" contains "${LILYPAD_RESERVED_CHANNEL_PART}".`
+      );
+    }
   }
   const prune = resolvePruneOptions('lilypadChangelogSql', options.prune);
   assertNumberOption(
@@ -305,6 +437,23 @@ export function lilypadChangelogSql(options: LilypadChangelogSqlOptions = {}): s
   const bulkThreshold = options.notifyBulkThreshold ?? LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD;
   const quotedTable = quoteIdentifier(table);
   const indexPrefix = identifierPrefix(table);
+  const indexName = (suffix: string) => quoteIdentifier(changelogObjectName(indexPrefix, suffix));
+  // From a 62-byte prefix, earlier versions created one index, under the name PostgreSQL truncated
+  // both to: it is dropped (in the schema of the changelog), the hashed names replace it
+  const truncatedIndex = `${indexPrefix}_table_xid_idx`.slice(0, MAX_IDENTIFIER_BYTES);
+  const schemaPrefix = table.includes('.')
+    ? `${quoteIdentifier(table.slice(0, table.lastIndexOf('.')))}.`
+    : '';
+  const hashedIndexes = ['_table_xid_idx', '_changed_at_idx'].map((suffix) =>
+    changelogObjectName(indexPrefix, suffix)
+  );
+  // Never one of the hashed indexes (a prefix that would end with the hash and the suffix)
+  const dropTruncatedIndex =
+    indexPrefix.length < MAX_IDENTIFIER_BYTES - 1 || hashedIndexes.includes(truncatedIndex)
+      ? ''
+      : `-- The index that versions 7 and earlier created for both, truncated by PostgreSQL
+DROP INDEX IF EXISTS ${schemaPrefix}${quoteIdentifier(truncatedIndex)};
+`;
   const pruneFunction = quoteIdentifier(pruneFunctionName(table));
   // Before each RETURN of the trigger function. Only in READ COMMITTED: in a stricter isolation,
   // deleting a row that a concurrent prune deleted would fail the write (serialization failure).
@@ -364,9 +513,9 @@ ${indent}END IF;`
 ALTER TABLE ${quotedTable} ADD COLUMN IF NOT EXISTS table_schema text;
 -- Version 3 records TRUNCATE, which concerns no single row
 ALTER TABLE ${quotedTable} ALTER COLUMN row_id DROP NOT NULL;
-CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${indexPrefix}_table_xid_idx`)}
+${dropTruncatedIndex}CREATE INDEX IF NOT EXISTS ${indexName('_table_xid_idx')}
   ON ${quotedTable} (table_name, xid);
-CREATE INDEX IF NOT EXISTS ${quoteIdentifier(`${indexPrefix}_changed_at_idx`)}
+CREATE INDEX IF NOT EXISTS ${indexName('_changed_at_idx')}
   ON ${quotedTable} (changed_at);
 ${
   prune
@@ -396,6 +545,7 @@ DO ${recordDoBody(
 DECLARE
   changed text;
   recorded bigint;
+  key_type oid;
 BEGIN${
       prune
         ? `
@@ -415,6 +565,24 @@ BEGIN${
     RETURN NULL;
   END IF;
 
+  -- The key column is read below with to_jsonb (and compared with it in the UPDATE branch), which
+  -- this function runs as its owner. to_jsonb resolves a cast or output function by the value's type,
+  -- not by the search_path, so a key of a type whose cast or I/O function a non-superuser owns would
+  -- run that role's code as the owner. Fail closed: refuse unless the key column exists and its type
+  -- is proven safe (see lilypadSafeKeyTypeSql: a built-in type, or a base/enum type whose type,
+  -- output function and json casts are owned by superusers, resolving domains and arrays). TG_ARGV[0]
+  -- is cast to the name type, so it is clipped to 63 bytes exactly as the parser clips the %I below.
+  SELECT a.atttypid INTO key_type
+  FROM pg_catalog.pg_attribute a
+  WHERE a.attrelid = TG_RELID AND a.attname = TG_ARGV[0]::pg_catalog.name
+    AND a.attnum > 0 AND NOT a.attisdropped;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'lilypad: the changelog cannot record %.% because its primary key column % does not exist (renamed or dropped?): reinstall the triggers with lilypadChangelogTriggerSql.', TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_ARGV[0];
+  END IF;
+  IF NOT (${lilypadSafeKeyTypeSql('key_type')}) THEN
+    RAISE EXCEPTION 'lilypad: the changelog cannot record %.% because its primary key column % has an unsafe type: converting it would run a non-superuser''s code as the changelog owner. Use a built-in key type (integer, bigint, uuid, text...), a type of a superuser-installed extension (e.g. citext), or a domain over one.', TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_ARGV[0];
+  END IF;
+
   -- Every row of the statement in one query, from the transition tables. Only the primary key
   -- column is read, instead of converting whole rows to JSON.
   changed := CASE TG_OP
@@ -425,7 +593,8 @@ BEGIN${
       'SELECT to_jsonb(o.%1$I) #>> ''{}'' AS row_id, ''DELETE'' AS op FROM ${oldRows} o',
       TG_ARGV[0])
     -- An update that changes primary keys also deletes the old keys that no row has any more
-    -- (compared as JSON: the = of a type outside pg_catalog, e.g. citext, is not on the path)
+    -- (compared as JSON: the = of a type outside pg_catalog, e.g. citext, is not on the path; the
+    -- key type is proven safe above, so to_jsonb here runs no code of a non-superuser role)
     ELSE format(
       'SELECT to_jsonb(o.%1$I) #>> ''{}'' AS row_id, ''DELETE'' AS op FROM ${oldRows} o '
       || 'WHERE NOT EXISTS (SELECT 1 FROM ${newRows} n WHERE to_jsonb(n.%1$I) = to_jsonb(o.%1$I)) '
@@ -455,6 +624,9 @@ ${prune ? `REVOKE EXECUTE ON FUNCTION ${pruneFunction}() FROM PUBLIC;` : `DROP F
 /**
  * The `DO` block that creates the trigger function from `body`, where it replaces the placeholders
  * with the changelog table and the prune function qualified with their schemas, known only there.
+ * The body becomes the format string of one `format()` (its `%` escaped, the placeholders turned
+ * into `%1$s`, `%2$s` and `%3$s`): unlike nested `replace()` calls, it never reads again the names
+ * it inserted, which may contain a placeholder.
  */
 function recordDoBody(
   functionName: string,
@@ -466,7 +638,12 @@ function recordDoBody(
   ${name} text := (
     ${query}
   );`;
-  const pruneReplace = pruneFunction === undefined ? '' : `, ${quoteLiteral(PRUNE_TOKEN)}, prune)`;
+  // The body holds no name of the config but the notification channel, which cannot contain a
+  // placeholder (see lilypadChangelogSql)
+  const template = escapeFormat(body)
+    .replaceAll(CHANGELOG_LITERAL_TOKEN, '%2$s')
+    .replaceAll(CHANGELOG_TOKEN, '%1$s')
+    .replaceAll(PRUNE_TOKEN, '%3$s');
   return dollarQuote(
     `
 DECLARE${qualify(
@@ -488,9 +665,7 @@ BEGIN
   EXECUTE format(
     'CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS %L LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp',
     ${quoteLiteral(functionName)},
-    ${pruneFunction === undefined ? '' : 'replace('}replace(replace(${dollarQuote(body)},
-      ${quoteLiteral(CHANGELOG_LITERAL_TOKEN)}, quote_literal(changelog)),
-      ${quoteLiteral(CHANGELOG_TOKEN)}, changelog)${pruneReplace}
+    format(${dollarQuote(template)}, changelog, quote_literal(changelog)${pruneFunction === undefined ? '' : ', prune'})
   );
 END
 `,
@@ -508,8 +683,16 @@ export type LilypadChangelogPruneScheduleOptions = {
   schedule?: string | undefined;
   /** Name of the changelog table, if not the default one. */
   changelogTable?: string | undefined;
-  /** Name of the job. Defaults to `<changelog table>_prune`. Scheduling it again replaces it. */
+  /**
+   * Name of the job. Defaults to `<changelog table>_prune` (never shortened: a job name is not an
+   * identifier). Scheduling it again replaces it.
+   */
   jobName?: string | undefined;
+  /**
+   * Accepts an `olderThan` below one hour ({@link LILYPAD_MIN_CHANGELOG_RETENTION}), which
+   * otherwise throws: it deletes rows that the caches may still have to read.
+   */
+  force?: boolean | undefined;
   /**
    * The database of the changelog table, when pg_cron is installed in another one (see
    * `cron.database_name`): the SQL then runs in the pg_cron database, and the job resolves
@@ -533,8 +716,15 @@ export function lilypadChangelogPruneScheduleSql(
     options.olderThan,
     'positive'
   );
+  assertRetention(
+    'lilypadChangelogPruneScheduleSql',
+    'olderThan',
+    options.olderThan,
+    options.force
+  );
   const table = options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
-  const jobName = quoteLiteral(options.jobName ?? pruneFunctionName(table));
+  // Not pruneFunctionName, which shortens a long name: a job of an earlier version would remain
+  const jobName = quoteLiteral(options.jobName ?? `${identifierPrefix(table)}_prune`);
   const schedule = quoteLiteral(options.schedule ?? '0 3 * * *');
   const condition = olderThanCondition(options.olderThan);
   if (options.database !== undefined) {
@@ -797,11 +987,7 @@ export async function pruneLilypadChangelog(
   const owner = 'pruneLilypadChangelog';
   assertNumberOption(owner, 'olderThan', options.olderThan, 'non-negative');
   assertNumberOption(owner, 'batchSize', options.batchSize, 'positive-integer');
-  if (options.olderThan < LILYPAD_MIN_CHANGELOG_RETENTION && !options.force) {
-    throw new Error(
-      `${owner}: olderThan is ${options.olderThan} ms, less than one hour: the caches may still need these rows (it is in milliseconds). Pass force: true to prune them anyway.`
-    );
-  }
+  assertRetention(owner, 'olderThan', options.olderThan, options.force);
   gate.assertOpen();
   const changelogTable = gate.sql(options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE);
   const batchSize = options.batchSize ?? 10_000;

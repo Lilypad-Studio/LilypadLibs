@@ -94,7 +94,7 @@ describe('LilypadLogger', () => {
     expect(message).toContain('10n');
   });
 
-  it.each(['components', 'register', 'name', 'then', 'constructor', 'toString'])(
+  it.each(['components', 'register', 'dispose', 'name', 'then', 'constructor', 'toString'])(
     'should reject the reserved log channel "%s"',
     (channel) => {
       expect(() =>
@@ -318,6 +318,80 @@ describe('LilypadLogger', () => {
     consoleSpy.mockRestore();
   });
 
+  it('should resolve flush while messages keep arriving', async () => {
+    vi.useFakeTimers();
+    try {
+      mockComponent.write = vi.fn(() => new Promise<void>((resolve) => setTimeout(resolve, 30)));
+      const logger = LilypadLogger.create<mockType>({
+        components: { info: [mockComponent], error: [] },
+      });
+      const stream = setInterval(() => logger.info('tick'), 10);
+      logger.info('before flush');
+
+      let flushed = false;
+      void logger.flush().then(() => (flushed = true));
+      await vi.advanceTimersByTimeAsync(100);
+      clearInterval(stream);
+
+      expect(flushed).toBe(true);
+      await vi.advanceTimersByTimeAsync(100);
+      await logger.flush();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('should wait in flush for the messages errorLogging logs about a failure', async () => {
+    let reported = false;
+    const slow = {
+      write: vi.fn(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        reported = true;
+      }),
+    } as unknown as LilypadLoggerComponent<mockType>;
+    mockComponent.write = vi.fn(async () => {
+      throw new Error('Component error');
+    });
+    const logger: LilypadLoggerType<mockType> = LilypadLogger.create<mockType>({
+      components: { info: [slow], error: [mockComponent] },
+      errorLogging: (error) => {
+        logger.info('Logging failed:', error);
+      },
+    });
+
+    logger.error('first');
+    await logger.flush();
+
+    expect(reported).toBe(true);
+  });
+
+  it('should log a message with an error whose fields cannot be read', async () => {
+    const errorLogging = vi.fn();
+    const logger = LilypadLogger.create<mockType>({
+      components: { info: [], error: [mockComponent] },
+      errorLogging,
+    });
+    const error = new Error('boom');
+    // e.g. a failing Error.prepareStackTrace
+    Object.defineProperty(error, 'stack', {
+      get() {
+        throw new Error('no stack');
+      },
+    });
+    const odd = Object.assign(new Error('odd'), { message: 42 });
+
+    logger.error('failed', error, odd);
+    await logger.flush();
+
+    expect(errorLogging).not.toHaveBeenCalled();
+    const record = vi.mocked(mockComponent.write).mock.calls[0]![0];
+    expect(record.message).toContain('failed Error: boom');
+    expect(record.errors).toEqual([
+      { name: 'Error', message: 'boom', stack: undefined },
+      { name: 'Error', message: '42', stack: odd.stack },
+    ]);
+  });
+
   it('should report the error of every failing component', async () => {
     mockComponent.write = vi.fn(async () => {
       throw new Error('first');
@@ -356,6 +430,54 @@ describe('LilypadLogger', () => {
       })
     ).toBe(logger);
     removeLilypadSingletonInstance(identifier);
+    await logger.dispose();
+  });
+
+  it('should wait for the pending messages when disposed', async () => {
+    let finishWrite!: () => void;
+    mockComponent.write = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishWrite = resolve;
+        })
+    );
+    const logger = LilypadLogger.create<mockType>({
+      components: { info: [mockComponent], error: [] },
+    });
+    logger.info('pending');
+    let disposed = false;
+
+    const disposing = logger.dispose().then(() => {
+      disposed = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mockComponent.write).toHaveBeenCalledTimes(1);
+    expect(disposed).toBe(false);
+
+    finishWrite();
+    await disposing;
+    expect(disposed).toBe(true);
+  });
+
+  it('should release its singleton when disposed, so that create builds a new one', async () => {
+    const options = {
+      singleton: 'LilypadLogger.test-dispose',
+      components: { info: [], error: [] },
+    };
+    const logger = LilypadLogger.create<mockType>(options);
+    expect(LilypadLogger.create<mockType>(options)).toBe(logger);
+
+    await logger.dispose();
+    const next = LilypadLogger.create<mockType>(options);
+
+    expect(next).not.toBe(logger);
+    // A second dispose of the old logger does not remove the new one
+    await logger.dispose();
+    expect(LilypadLogger.create<mockType>(options)).toBe(next);
+    // What `await using` calls at the end of the scope
+    await next[Symbol.asyncDispose]();
+    expect(LilypadLogger.create<mockType>(options)).not.toBe(next);
+    await LilypadLogger.create<mockType>(options).dispose();
   });
 
   describe('serverless support', () => {
