@@ -3,9 +3,9 @@
   "name": "@lilypad-studio/libs",
   "entryPoints": [
     "src/entries/schema.ts",
+    "src/entries/flow.ts",
     "src/entries/cache.ts",
     "src/entries/db.ts",
-    "src/entries/flow.ts",
     "src/entries/logger.ts",
     "src/entries/platform.ts",
     "src/entries/serializer.ts",

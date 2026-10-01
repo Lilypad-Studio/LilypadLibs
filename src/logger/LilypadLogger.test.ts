@@ -94,7 +94,7 @@ describe('LilypadLogger', () => {
     expect(message).toContain('10n');
   });
 
-  it.each(['components', 'register', 'name', 'then', 'constructor', 'toString'])(
+  it.each(['components', 'register', 'dispose', 'name', 'then', 'constructor', 'toString'])(
     'should reject the reserved log channel "%s"',
     (channel) => {
       expect(() =>
@@ -430,6 +430,54 @@ describe('LilypadLogger', () => {
       })
     ).toBe(logger);
     removeLilypadSingletonInstance(identifier);
+    await logger.dispose();
+  });
+
+  it('should wait for the pending messages when disposed', async () => {
+    let finishWrite!: () => void;
+    mockComponent.write = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishWrite = resolve;
+        })
+    );
+    const logger = LilypadLogger.create<mockType>({
+      components: { info: [mockComponent], error: [] },
+    });
+    logger.info('pending');
+    let disposed = false;
+
+    const disposing = logger.dispose().then(() => {
+      disposed = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mockComponent.write).toHaveBeenCalledTimes(1);
+    expect(disposed).toBe(false);
+
+    finishWrite();
+    await disposing;
+    expect(disposed).toBe(true);
+  });
+
+  it('should release its singleton when disposed, so that create builds a new one', async () => {
+    const options = {
+      singleton: 'LilypadLogger.test-dispose',
+      components: { info: [], error: [] },
+    };
+    const logger = LilypadLogger.create<mockType>(options);
+    expect(LilypadLogger.create<mockType>(options)).toBe(logger);
+
+    await logger.dispose();
+    const next = LilypadLogger.create<mockType>(options);
+
+    expect(next).not.toBe(logger);
+    // A second dispose of the old logger does not remove the new one
+    await logger.dispose();
+    expect(LilypadLogger.create<mockType>(options)).toBe(next);
+    // What `await using` calls at the end of the scope
+    await next[Symbol.asyncDispose]();
+    expect(LilypadLogger.create<mockType>(options)).not.toBe(next);
+    await LilypadLogger.create<mockType>(options).dispose();
   });
 
   describe('serverless support', () => {

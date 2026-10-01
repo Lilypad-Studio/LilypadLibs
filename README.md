@@ -37,6 +37,7 @@ npm install @lilypad-studio/libs
 Requirements:
 
 - Node.js 22.12 or later.
+- TypeScript 5.4 or later, for the type declarations.
 - It is built as ES modules, with type declarations. Node.js 22.12+ also loads them with `require()`, so CommonJS code can use it too.
 - The database modules (`@lilypad-studio/libs/db`) run on Node.js only, since they need TCP connections. The other modules also run in edge runtimes (see [Importing](#importing-the-whole-package-or-one-module)). None of them is meant for browsers.
 - The database modules need PostgreSQL and the [`postgres`](https://github.com/porsager/postgres) driver, an optional peer dependency: install it next to the library (`npm install postgres`) if you use `@lilypad-studio/libs/db`. The other modules do not need it.
@@ -72,7 +73,7 @@ import { LilypadLogger, LilypadConsoleLogger } from '@lilypad-studio/libs/logger
 import { LilypadDbGate, LilypadDbCache } from '@lilypad-studio/libs/db';
 import db from './lilypad.config';
 
-// 1. A logger with the four channels the other modules log on (the default channels)
+// 1. A logger with the four channels the other modules log on (the keys of `components`)
 const logger = LilypadLogger.create({
   name: 'my-app',
   components: {
@@ -173,7 +174,7 @@ const gate = await LilypadDbGate.create({
 - The first call builds the instance. Later calls with the same identifier return that instance and **ignore their own options**. If those options differ from the first ones (connection strings or `listen` channels for a gate, table or TTL for a cache, name or channels for a logger), a warning is logged (`console.warn` for the logger).
 - Identifiers are separate for each class: a `LilypadLogger` and a `LilypadDbGate` can both use `'main'`.
 - Concurrent first calls share one initialization. If it fails, the next call tries again.
-- `gate.close()` and `cache.dispose()` remove the instance from the registry, so the next `create()` builds a new one.
+- `gate.close()`, `cache.dispose()` and `logger.dispose()` remove the instance from the registry, so the next `create()` builds a new one.
 
 This is useful in frameworks with hot module reloading, such as Next.js in development, where module-level variables are created again on every reload but connections should not be.
 
@@ -181,7 +182,7 @@ This is useful in frameworks with hot module reloading, such as Next.js in devel
 
 `LilypadCache`, `LilypadDbCache` and `LilypadDbGate` accept an optional `logger`: any object with some of the methods `error`, `warn`, `info` and `debug` (the type `LilypadLibLogger`). Each method receives the message, then its `LilypadLogMeta`: `{ source, error?, detail? }` (the instance that logs, and the error or the value the message is about). A `LilypadLogger` works, and so does `console`. For pino, which takes the fields first, wrap it: `logger: lilypadPinoLogger(pino())` passes `{ source, err, detail }` then the message, so that pino serializes the error. The levels the logger lacks are skipped, and a logger that throws or rejects never breaks the module. Without a logger, these modules log nothing. That includes errors they handle themselves, such as a failed `bulkSync` or a failed notification callback.
 
-The `source` of the meta is the name of the instance (for a `LilypadDbCache`, its table).
+The `source` of the meta is the `name` of a cache (for a `LilypadDbCache`, its table by default), the `id` of a gate, or the class name before an instance exists.
 
 ### `undefined` and `null` are different
 
@@ -229,8 +230,9 @@ logger.error('Payment failed', new Error('card declined'));
 
 - A channel method takes any number of arguments. Strings are printed as they are. Other values are formatted in a style close to `util.inspect`: an `Error` keeps its message, stack trace, own properties (such as the `code` and `detail` of a database error) and `cause`. Formatting never throws: circular objects, BigInts and getters that throw are printed too.
 - Channel methods return nothing: they never throw, each failing component is reported to `errorLogging`, and a failure of `errorLogging` itself is printed with `console.error`. A failing component does not stop the others. `await logger.flush()` when the messages must be sent before you continue, for example just before `process.exit`.
-- A channel name cannot be the name of a logger property (`components`, `register`, `flush`, `constructor`, `toString`, and so on) or `then`. `create()` throws if it is.
-- Without a type argument, the channels are `'error' | 'warn' | 'info' | 'debug'`, the ones the other modules log on.
+- A channel name cannot be the name of a logger property (`components`, `register`, `flush`, `dispose`, `constructor`, `toString`, and so on) or `then`. `create()` throws if it is.
+- Without a type argument, the channels are the keys of `components` (the components never widen them). With `error`, `warn`, `info` and `debug`, the levels the other modules log on, the logger can be passed to them as their `logger`.
+- `await logger.dispose()` waits for the messages logged so far, as `flush()` does, then removes a singleton logger from the registry, so that the next `create()` with its identifier builds a new one (`await using logger = ...` calls it). The logger holds no resources: its channel methods keep working afterwards.
 
 ### Serverless: background work, flush and context
 
@@ -687,7 +689,7 @@ export const gate = await LilypadDbGate.create({
 | `write(data)` | Applied to the data before every insert and update. Its result replaces the data, so a property it leaves out is not written. Only the `cols` columns of the result are written |
 | `select(row)` | Builds `T` from a database row. It receives the whole row (`SELECT *`, and `RETURNING *` for the writes), and can return `null` to leave the row out of the results             |
 
-- The hooks are typed with the row type of each table: `write: (data: Partial<Member>) => Partial<Member>`, `select: (row: Record<string, unknown>) => Member | null`. A key that is not a table of the config is a type error, and `bindLilypadDbHooks` throws for it.
+- The hooks are typed with the row type of each table: `write: (data: LilypadDbPartialRow<Member>) => LilypadDbPartialRow<Member>` (a `Partial<Member>` whose properties may also be `undefined`, which is not written), `select: (row: Record<string, unknown>) => Member | null`. A key that is not a table of the config is a type error, and `bindLilypadDbHooks` throws for it.
 - `bindLilypadDbHooks` returns a copy of the config (same name, settings and tables) and leaves `db` untouched. There is still one description of each table, in the config file; the copy only adds the functions.
 - A gate created with the bound config applies the hooks to its tables however they are given: `gate.table('members')`, `LilypadDbCache.create({ gate, table: 'members' })`, and also `db.tables.members`, the definition of the original config. The rest of the application can keep importing `lilypad.config`. A gate without a config applies only the hooks of the definitions it is given: pass it `appDb.tables.members`.
 - Binding a bound config again replaces the hooks given, and keeps the others.
@@ -869,15 +871,20 @@ From SQL: `SELECT pg_notify('jobs', '{"jobId": 12}');` or `NOTIFY jobs, '...';`.
 A cache of the rows of a single table of a [config](#database-config). It reads rows through a `LilypadDbGate`, writes through to the database, and updates itself when the table changes elsewhere. It runs on the same engine as `LilypadCache` (TTL, stale values, shared level, fallbacks), but its values always come from the table: it has no `set`, `bulkSet`, `getOrSet` or `bulkSync`, since a value that does not come from the table could otherwise be kept past its TTL as if it did.
 
 ```ts
-// In the config: type Account = { id: number; email: string; plan: string }
+// In the config (lilypad.config.ts)
+type Account = { id: number; email: string; plan: string };
+
 const accounts = defineLilypadTable<Account, 'id'>({
   tableName: 'accounts',
   primaryKey: 'id',
   generatedPrimaryKey: true,
   cols: { id: { type: 'number' }, email: { type: 'string' }, plan: { type: 'string' } },
 });
+```
 
-// In the application
+The application creates the cache:
+
+```ts
 import { LilypadDbCache } from '@lilypad-studio/libs/db';
 
 const accounts = await LilypadDbCache.create({
@@ -1246,7 +1253,7 @@ const cache = getLilypadSingletonInstance('prices', () => new LilypadCache({ ttl
 
 `getLilypadSingletonInstanceAsync` shares one creation between concurrent callers. If the creation fails, it is forgotten, so the next call tries again.
 
-The registry is stored on `globalThis`, so it is shared by the whole process, including copies of the library loaded from different bundles. Use identifiers that are unique across your application. The `create()` methods prefix their identifiers with the class name and a registry version (`LilypadDbGate@1:main-db`), so they never collide with yours, and two copies of the library whose instances are not compatible never share them. To drop one of those singletons, call its `close()`/`dispose()` rather than `removeLilypadSingletonInstance`. `getLilypadSingletonInstance` throws if the identifier is still being created by `getLilypadSingletonInstanceAsync`.
+The registry is stored on `globalThis`, so it is shared by the whole process, including copies of the library loaded from different bundles. Use identifiers that are unique across your application. The `create()` methods prefix their identifiers with the class name and a registry version (`LilypadDbGate@1:main-db`), so they never collide with yours, and two copies of the library whose instances are not compatible never share them. To drop one of those singletons, call its `close()` (gate) or `dispose()` (caches, logger) rather than `removeLilypadSingletonInstance`. `getLilypadSingletonInstance` throws if the identifier is still being created by `getLilypadSingletonInstanceAsync`.
 
 ## Troubleshooting
 
@@ -1296,4 +1303,4 @@ npm run check             # everything the CI checks, except the integration tes
 npx changeset             # describe a change for the changelog (see docs/releasing.md)
 ```
 
-The pre-commit hook formats and lints the staged files (lint-staged), then runs the typecheck and the unit tests; the commit-msg hook requires a [conventional](https://www.conventionalcommits.org) message (`feat:`, `fix:`, `refactor:`, `chore:`...). The CI (`.github/workflows/ci.yml`) runs the checks on Node.js 22, 24 and 26, installs the packed package on Node.js 22.12 (the lowest supported version) to load every entry, and runs the integration tests on PostgreSQL 13, 16 and 18; the release workflow runs it before it publishes. `dist/` is not committed: the release workflow builds and publishes it (see [docs/releasing.md](docs/releasing.md)). See [How @lilypad-studio/libs works](docs/how-it-works.md) for a guided tour of the internals, and [CLAUDE.md](CLAUDE.md) for condensed architecture notes.
+The pre-commit hook formats and lints the staged files (lint-staged), then runs the typecheck and the unit tests; the commit-msg hook requires a [conventional](https://www.conventionalcommits.org) message (`feat:`, `fix:`, `refactor:`, `chore:`...). The CI (`.github/workflows/ci.yml`) runs the checks on Node.js 22, 24 and 26, installs the packed package on Node.js 22.12 (the lowest supported version) to load every entry, and runs the integration tests on PostgreSQL 13, 16 and 18; the release workflow runs it before it publishes. `dist/` is not committed: the release workflow builds and publishes it (see [docs/releasing.md](docs/releasing.md)). See [How @lilypad-studio/libs works](docs/how-it-works.md) for a guided tour of the internals, and [docs/architecture.md](docs/architecture.md) for condensed architecture notes.

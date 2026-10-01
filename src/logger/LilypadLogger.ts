@@ -1,6 +1,7 @@
 import {
   createLilypadSingletonAble,
   type LilypadSingletonAble,
+  type LilypadSingletonRelease,
 } from '@/singleton/LilypadSingleton';
 import {
   type LilypadLoggerComponent,
@@ -18,18 +19,20 @@ import { runInBackground, type LilypadPlatform } from '@/platform/LilypadPlatfor
 import type { LilypadLibLogLevel } from '@/logger/LilypadLibLogger';
 
 /**
- * Options for constructing a {@link LilypadLogger} instance.
+ * The options of {@link LilypadLogger.create}.
  *
- * @template T - A string literal type representing component names.
+ * @template T - The channel names: the keys of `components`.
  *
- * @property {Record<T, LilypadLoggerComponent<T>[]>} components - A record mapping component names to arrays of logger components.
+ * @property {Record<T, LilypadLoggerComponent<T>[]>} components - The components of each channel. Its keys
+ * are the channels of the logger: the components never widen them (`NoInfer`), so that a logger
+ * built from `new LilypadConsoleLogger()` without a type argument has the channels it is given.
  * @property {(error: unknown) => void | Promise<void>} [errorLogging] - Optional callback function to handle logging errors.
  * It is called once for each failing component. If it fails as well, both errors are written to `console.error`.
  * The failures of the messages it logs synchronously on this logger go to `console.error` only, so
  * that a failing component does not loop through it; it must not log on this logger after an `await`.
  */
-export type LilypadLoggerConstructorOptions<T extends string> = {
-  components: Record<T, LilypadLoggerComponent<T>[]>;
+export type LilypadLoggerOptions<T extends string> = {
+  components: Record<T, LilypadLoggerComponent<NoInfer<T>>[]>;
   name?: string | undefined;
   errorLogging?: ((error: unknown) => void | Promise<void>) | undefined;
   /**
@@ -51,6 +54,9 @@ export type LilypadLoggerConstructorOptions<T extends string> = {
    */
   redact?: readonly string[] | false | undefined;
 } & LilypadSingletonAble;
+
+/** @deprecated Renamed {@link LilypadLoggerOptions}: the options go to `create`. */
+export type LilypadLoggerConstructorOptions<T extends string> = LilypadLoggerOptions<T>;
 
 /**
  * A channel method: it logs without being awaited (it never throws, and component errors go to
@@ -104,11 +110,14 @@ export class LilypadLogger<T extends string> {
    */
   #reports: Promise<void>[] | undefined;
 
+  /** Removes the logger from the singleton registry (a no-op if it is not a singleton). */
+  readonly #release: LilypadSingletonRelease;
+
   /**
    * Creates a new LilypadLogger instance or retrieves a singleton instance.
    *
-   * @template T - The log level type, defaults to the levels the other Lilypad modules log on
-   * ('error' | 'warn' | 'info' | 'debug'), so that the logger can be passed to them
+   * @template T - The channels: inferred from the keys of `components` (with the levels the other
+   * Lilypad modules log on, 'error' | 'warn' | 'info' | 'debug', the logger can be passed to them)
    * @param options - Configuration options for the logger, and `singleton`: the identifier of the
    * singleton instance, if one is wanted
    * @returns A LilypadLogger instance typed according to the generic parameter T
@@ -127,12 +136,12 @@ export class LilypadLogger<T extends string> {
    * });
    */
   public static create<T extends string = LilypadLibLogLevel>(
-    options: LilypadLoggerConstructorOptions<T>
+    options: LilypadLoggerOptions<T>
   ): LilypadLoggerType<T> {
     return createLilypadSingletonAble(
       'LilypadLogger',
       options,
-      () => new LilypadLogger<T>(options) as LilypadLoggerType<T>,
+      (release) => new LilypadLogger<T>(options, release) as LilypadLoggerType<T>,
       {
         // No secrets in these options: the signature can stay in clear text
         value: JSON.stringify([options.name, Object.keys(options.components).sort()]),
@@ -144,7 +153,7 @@ export class LilypadLogger<T extends string> {
     );
   }
 
-  private constructor(options: LilypadLoggerConstructorOptions<T>) {
+  private constructor(options: LilypadLoggerOptions<T>, release: LilypadSingletonRelease) {
     // Check that no T can override existing properties. `key in this` also covers inherited ones
     // (e.g. `constructor`, `toString`); fields are listed explicitly because, depending on the
     // compilation target, they may not be defined on the instance yet. `then` would make the logger
@@ -157,6 +166,7 @@ export class LilypadLogger<T extends string> {
     }
 
     this.name = options.name;
+    this.#release = release;
     const redaction =
       options.redact === false
         ? NO_REDACTION
@@ -273,6 +283,21 @@ export class LilypadLogger<T extends string> {
   async flush(): Promise<void> {
     // Promise.all reads the set now: the messages logged meanwhile are not in it
     await Promise.all(this._pending);
+  }
+
+  /**
+   * Waits for the messages logged so far (as `flush` does), then removes the logger from the
+   * singleton registry, so that the next `create` with its `singleton` identifier builds a new
+   * logger. The logger holds no resources: its channel methods keep working afterwards.
+   */
+  async dispose(): Promise<void> {
+    await this.flush();
+    this.#release();
+  }
+
+  /** `await using logger = ...` disposes of the logger at the end of the scope. */
+  [Symbol.asyncDispose](): Promise<void> {
+    return this.dispose();
   }
 }
 

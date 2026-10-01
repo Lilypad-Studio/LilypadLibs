@@ -302,11 +302,11 @@ export const getLogger = () =>
 
 Import the subpaths, not the package root, in edge code:
 
-| Import                                                                                     | Edge runtime                 |
-| ------------------------------------------------------------------------------------------ | ---------------------------- |
-| `@lilypad-studio/libs/logger`, `/cache`, `/flow`, `/serializer`, `/singleton`, `/platform` | Yes                          |
-| `@lilypad-studio/libs/db` (`LilypadDbGate`, `LilypadDbCache`, changelog)                   | No: it needs TCP connections |
-| `@lilypad-studio/libs` (the root)                                                          | Yes: it leaves out `/db`     |
+| Import                                                                                                | Edge runtime                 |
+| ----------------------------------------------------------------------------------------------------- | ---------------------------- |
+| `@lilypad-studio/libs/logger`, `/cache`, `/flow`, `/serializer`, `/singleton`, `/platform`, `/schema` | Yes                          |
+| `@lilypad-studio/libs/db` (`LilypadDbGate`, `LilypadDbCache`, changelog)                              | No: it needs TCP connections |
+| `@lilypad-studio/libs` (the root)                                                                     | Yes: it leaves out `/db`     |
 
 The subpaths also keep the bundles small, since `postgres` is only pulled in by `/db`. `postgres` is an optional peer dependency: install it in the application that uses `/db`.
 

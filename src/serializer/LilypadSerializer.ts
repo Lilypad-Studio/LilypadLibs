@@ -33,7 +33,8 @@ type IsInjective<M extends Record<PropertyKey, PropertyKey>> = {
 type IsBijective<A extends object, B extends object, M extends Record<keyof A, keyof B>> =
   IsSurjective<B, M> extends true ? IsInjective<M> : false;
 
-export type LilypadSerializerConstructorOptions<
+/** The options of the {@link LilypadSerializer} constructor: the mapping of each key of `FROM`. */
+export type LilypadSerializerOptions<
   FROM extends object,
   TO extends object,
   KeyMap extends Record<keyof FROM, keyof TO>,
@@ -48,6 +49,13 @@ export type LilypadSerializerConstructorOptions<
     };
   };
 };
+
+/** @deprecated Renamed {@link LilypadSerializerOptions}, as the options of the other classes. */
+export type LilypadSerializerConstructorOptions<
+  FROM extends object,
+  TO extends object,
+  KeyMap extends Record<keyof FROM, keyof TO>,
+> = LilypadSerializerOptions<FROM, TO, KeyMap>;
 
 /**
  * A generic serializer/deserializer for mapping objects between two shapes (`FROM` and `TO`)
@@ -90,11 +98,11 @@ export class LilypadSerializer<
 > {
   private readonly fields: [
     keyof FROM,
-    LilypadSerializerConstructorOptions<FROM, TO, KeyMap>['serialization'][keyof FROM],
+    LilypadSerializerOptions<FROM, TO, KeyMap>['serialization'][keyof FROM],
   ][];
 
   /** @throws If a key or a `target` is `__proto__`: assigning it would set the prototype instead. */
-  constructor(options: LilypadSerializerConstructorOptions<FROM, TO, KeyMap>) {
+  constructor(options: LilypadSerializerOptions<FROM, TO, KeyMap>) {
     this.fields = Object.entries(options.serialization) as typeof this.fields;
     for (const [fromKey, field] of this.fields) {
       if (fromKey === '__proto__' || field.target === '__proto__') {

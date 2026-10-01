@@ -60,6 +60,7 @@ src/
 ├── internal/
 │   ├── LilypadValidation.ts        checks of numeric options
 │   ├── LilypadDisposedError.ts     thrown by a disposed cache or a closed gate
+│   ├── LilypadTimeout.ts           withLilypadTimeout: the one race of an operation against a timer
 │   └── LilypadBackoff.ts           exponential backoff of retried operations
 ├── logger/
 │   ├── LilypadLibLogger.ts         the minimal logger type + libLog()
@@ -76,7 +77,7 @@ src/
 │   ├── LilypadSharedLevel.ts       the shared level (L2): keys, envelopes, locks
 │   └── LilypadCache.ts             the generic cache: the engine with public writes
 ├── dbCache/                        (Node.js only, entry `db`)
-│   ├── LilypadDbCache.ts           the table cache (≈950 lines)
+│   ├── LilypadDbCache.ts           the table cache (≈1300 lines)
 │   ├── LilypadDbMembers.ts         the keys of the rows of the table, for getAll
 │   ├── LilypadOwnWrites.ts         the writes of this instance, recognized when they come back
 │   ├── LilypadEagerRefresh.ts      the batched re-reads of notified keys
@@ -110,9 +111,9 @@ src/
 Who uses whom (arrows point to what is used):
 
 ```
-LilypadCache ───extends──┐
+LilypadCache ───owns─────┐
                          ├──> LilypadCacheEngine ──uses──> LilypadFlowControl, LilypadSharedLevel,
-LilypadDbCache ─extends──┘                               platform helpers (runInBackground, ...)
+LilypadDbCache ─owns─────┘                               platform helpers (runInBackground, ...)
    │
    ├──uses──> a sync strategy: LilypadListenSync | LilypadChangelogSync | lilypadNoSync
    │             │                   │
@@ -162,7 +163,7 @@ create / new ──> use ──> dispose() / close()
 
 - `LilypadLogger`, `LilypadDbGate` and `LilypadDbCache` have **private constructors**; you get an instance from a static `create()`. That gives the class one place to decide whether to build a new instance or return a registered singleton, and (for the async ones) to do async setup such as starting `LISTEN` before handing out the instance.
 - `LilypadCache`, `LilypadFlowControl` and `LilypadSerializer` use plain `new`: they need no async setup and are not singletons.
-- `dispose()` (caches) and `close()` (gate) release resources and call the `release` function the singleton helper gave them, so that the next `create()` builds a fresh instance. After `dispose()`, every public method of a cache throws, except `dispose()` itself, which can be called again.
+- `dispose()` (caches, logger) and `close()` (gate) release resources and call the `release` function the singleton helper gave them, so that the next `create()` builds a fresh instance. After `dispose()`, every public method of a cache throws, except `dispose()` itself, which can be called again.
 
 ---
 
@@ -249,7 +250,7 @@ The second line covers a subtle case: what if the key has **no entry** at all? T
 
 Three consequences worth remembering:
 
-- **Every code path that reads the source and stores the result must go through `beginRead()`.** That is why `setIfNewer` and `storeFetched` are `private`: subclasses can only reach them through the `LilypadCacheRead` object that `beginRead()` returns (`read.store`, `read.storeFetched`). `LilypadDbCache` uses it for single-row fetches, batched fetches and table loads.
+- **Every code path that reads the source and stores the result must go through `beginRead()`.** That is why `setIfNewer` and `storeFetched` are `private`: the caches that own the engine can only reach them through the `LilypadCacheRead` object that `beginRead()` returns (`read.store`, `read.storeFetched`). `LilypadDbCache` uses it for single-row fetches, batched fetches and table loads.
 - **Expiring an entry takes a new ticket too**. So "invalidate this key" also means "discard any read of this key that is already running", which is exactly what a change notification needs.
 - **Removing an entry never lowers the key's ticket** while a read is in flight: the fence takes over.
 
@@ -300,7 +301,7 @@ From the simplest to the most complex. Each section starts with what the module 
 
 ### 4.1 The singleton registry
 
-[src/singleton/LilypadSingleton.ts](../src/singleton/LilypadSingleton.ts), 172 lines.
+[src/singleton/LilypadSingleton.ts](../src/singleton/LilypadSingleton.ts), 232 lines.
 
 **Purpose.** In Next.js development, modules are re-evaluated on every hot reload, so a module-level `const gate = ...` would open a new connection pool at every save. And an application can end up with two copies of the library in different bundles. A registry stored on `globalThis` survives both.
 
@@ -314,7 +315,7 @@ From the simplest to the most complex. Each section starts with what the module 
 
 ### 4.2 The platform helpers
 
-[src/platform/LilypadPlatform.ts](../src/platform/LilypadPlatform.ts), 143 lines. Section [3.1](#31-never-crash-the-host-background-work-without-unhandled-rejections) covered `runInBackground` and `runAfterResponse`. The other two:
+[src/platform/LilypadPlatform.ts](../src/platform/LilypadPlatform.ts), 181 lines. Section [3.1](#31-never-crash-the-host-background-work-without-unhandled-rejections) covered `runInBackground` and `runAfterResponse`. The other two:
 
 - `sharedStoreOperation`: `Promise.race` between the operation and a timer that rejects after `timeout` ms. Any error, including the timeout, calls `onError` and resolves to `fallback`. The `finally` clears the timer so it does not keep Node.js alive. This is how "the shared store is never required to answer" is implemented: a read that fails looks exactly like a miss.
 - `toTtlSeconds`: the library works in milliseconds, but the Vercel Runtime Cache takes TTLs in seconds. It rounds up, with a minimum of 1 s, so that a short TTL never becomes `0` (which a store could read as "forever"). A value that is not finite gives 1 s too: an early expiry is only a miss.
@@ -334,21 +335,23 @@ There are two different things here, and it helps to keep them apart:
 
 #### LilypadLogger
 
-[LilypadLogger.ts](../src/logger/LilypadLogger.ts), 340 lines.
+[LilypadLogger.ts](../src/logger/LilypadLogger.ts), 365 lines.
 
-**The shape.** You choose channel names (`'error' | 'warn' | 'info' | 'debug'` by default), and each becomes a method: `logger.info(...)`. TypeScript cannot add methods to a class from a type parameter, so the class is `LilypadLogger<T>` and the type you use is `LilypadLoggerType<T> = LilypadLogger<T> & ChannelMethods<T>`; `create()` returns the latter.
+**The shape.** You choose channel names, the keys of `components`, and each becomes a method: `logger.info(...)`. `T` is inferred from those keys only: the components are typed `LilypadLoggerComponent<NoInfer<T>>`, because a `new LilypadConsoleLogger()` is a component of `string`, which would widen the channels to `string` (a logger then unusable as a `LilypadLibLogger`, whose channel methods all compile). TypeScript cannot add methods to a class from a type parameter, so the class is `LilypadLogger<T>` and the type you use is `LilypadLoggerType<T> = LilypadLogger<T> & ChannelMethods<T>`; `create()` returns the latter.
 
 **Construction**:
 
-1. Rejects channel names that would overwrite a property of the logger (line 152). `key in this` catches inherited names such as `constructor` or `toString`; the fields are listed by hand because, depending on the compilation target, class fields may not exist yet at that point of the constructor. `then` is reserved because an object with a `then` method is a "thenable": returning the logger from an `async` function would call it instead of resolving to the logger.
+1. Rejects channel names that would overwrite a property of the logger (line 163). `key in this` catches inherited names such as `constructor` or `toString`; the fields are listed by hand because, depending on the compilation target, class fields may not exist yet at that point of the constructor. `then` is reserved because an object with a `then` method is a "thenable": returning the logger from an `async` function would call it instead of resolving to the logger.
 2. Copies the component arrays (so that `register()` does not mutate the caller's arrays).
-3. For each channel, builds two closures and assigns the second one as a method of the instance (line 245):
+3. For each channel, builds two closures and assigns the second one as a method of the instance (line 255):
    - `send(message, context, fromErrorLogging)` builds a `LilypadLogRecord` (formatted message, raw parts, timestamp, logger name, context, and the name, message and stack of the `Error` parts, read by `lilypadErrorSummary`, which never throws), with the values of the redacted keys (the `redact` option, by default `LILYPAD_DEFAULT_REDACTED_KEYS`) replaced in the message and in a copy of the context. It calls every component's `write()` with `Promise.allSettled`, so that one failing component neither stops the others nor hides their errors, and passes each failure to `reportComponentError` (to `console.error` only for a message logged by `errorLogging`: `fromErrorLogging`). The formatting itself is inside the `try`, because even formatting must never make the promise reject.
-   - `logFn(...message)` (line 233) is the channel method. It reads `context()` **synchronously**, before any `await`, so that an `AsyncLocalStorage` store of the caller's request is still active. It adds the task to `_pending` (for `flush()`), and to `#reports` while `errorLogging` runs synchronously (below), hands it to `runInBackground` (for `platform.background`), and returns nothing.
+   - `logFn(...message)` (line 243) is the channel method. It reads `context()` **synchronously**, before any `await`, so that an `AsyncLocalStorage` store of the caller's request is still active. It adds the task to `_pending` (for `flush()`), and to `#reports` while `errorLogging` runs synchronously (below), hands it to `runInBackground` (for `platform.background`), and returns nothing.
 
 `reportComponentError` tries `errorLogging` (which may be synchronous or async), and falls back to `console.error` if there is none or if it fails too. This is the one place where the library writes to the console on its own, because there is nowhere else left to report. `errorLogging` is wrapped by `report`, which sets `#reports` to a fresh array while it runs synchronously: the messages it logs on the same logger are marked (`fromErrorLogging`, so that a failing component cannot loop through it) and collected, and the report waits for them.
 
 `flush()` is one `await Promise.all(_pending)`, which reads the set when it is called: a message logged later does not hold it, so a steady stream of messages cannot keep it pending forever. The messages `errorLogging` logs synchronously about a failure are still waited for (not those it logs after an `await`), since the message that failed waits for its report, and the report for them.
+
+`dispose()` is `flush()`, then the release function of the singleton helper ([4.1](#41-the-singleton-registry)): the logger holds no connection or timer, so its channel methods keep working after it.
 
 #### Components
 
@@ -397,11 +400,11 @@ return this.singleFlight(id, () =>                               // 2. join, or 
 
 Between the lookup and the registration of the promise there is **no `await`**. That is the whole correctness argument of single-flight: two calls cannot both see "nothing in flight" and both start, because JavaScript runs this block without interruption. It is also why `rateLimit` must stay synchronous.
 
-A consequence the cache relies on: callers who join an execution share **everything** from the first caller, including its timeout and its outcome. The cache's fetches follow the same rule, although they are shared through `LilypadReadFlights` rather than `singleFlight`: the shared fetch only logs a failure and rethrows it, and the per-caller fallback is chosen afterwards, outside the shared fetch (see [4.6](#failures-errorreturn-and-the-cooldown)).
+A consequence the cache relies on: callers who join an execution share **everything** from the first caller, including its timeout and its outcome. The cache's fetches follow the same rule, although they are shared through `LilypadReadFlights` rather than `singleFlight`: the shared fetch only logs a failure and rethrows it, and the per-caller fallback is chosen afterwards, outside the shared fetch (see [4.6](#failures-fallbackresult-and-the-cooldown)).
 
 ### 4.5 LilypadSerializer
 
-[src/serializer/LilypadSerializer.ts](../src/serializer/LilypadSerializer.ts), 129 lines. Unrelated to the rest of the library: it maps objects of shape `FROM` to a compact shape `TO` and back, leaving out values equal to their default.
+[src/serializer/LilypadSerializer.ts](../src/serializer/LilypadSerializer.ts), 154 lines. Unrelated to the rest of the library: it maps objects of shape `FROM` to a compact shape `TO` and back, leaving out values equal to their default.
 
 The runtime is trivial: `serialize` loops over the keys, skips values equal to the default (with `equality`, or `===`), calls the key's `serialize` function and writes the result under the `target` key; `deserialize` does the reverse and fills `undefined` with a `structuredClone` of the default, so that deserialized items never share a default array.
 
@@ -575,7 +578,7 @@ Four levels, each built on the previous one:
 | Method                  | Does                                                                                              | Used by                                                                                                             |
 | ----------------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | `expireNormalized(key)` | Entry: `expirationTime = 0`, new ticket, `invalidatedAt`. No entry but a read in flight: a fence. | everything below                                                                                                    |
-| `expire(key)`           | The above, with a key                                                                             | subclasses                                                                                                          |
+| `expire(key)`           | The above, with a key                                                                             | `markInvalid`                                                                                                       |
 | `markInvalid(key)`      | `expire` + remove from L2                                                                         | `invalidate`; `LilypadDbCache` for changelog changes (and `LilypadCache.invalidate` then forces the next bulk sync) |
 | `invalidate(key)`       | `markInvalid` + a `manual` event to `platform.onInvalidate`                                       | the public API                                                                                                      |
 
@@ -607,7 +610,7 @@ Four levels, each built on the previous one:
 
 ### 4.7 LilypadDbGate
 
-[src/dbGate/LilypadDbGate.ts](../src/dbGate/LilypadDbGate.ts), 706 lines. A thin layer over [postgres.js](https://github.com/porsager/postgres): a client, typed CRUD helpers, and `LISTEN` management.
+[src/dbGate/LilypadDbGate.ts](../src/dbGate/LilypadDbGate.ts), 601 lines. A thin layer over [postgres.js](https://github.com/porsager/postgres): a client, typed CRUD helpers, and `LISTEN` management.
 
 #### The clients
 
@@ -765,7 +768,7 @@ Every problem that the library can fix comes with the SQL that fixes it, generat
 
 ### 4.10 LilypadDbCache
 
-[src/dbCache/LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts), about 950 lines, with its sync strategies in [dbCache/sync/](../src/dbCache/sync/). A cache of one table on the engine of [4.6](#46-the-cache-engine-lilypadcachecore). What it adds:
+[src/dbCache/LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts), about 1300 lines, with its sync strategies in [dbCache/sync/](../src/dbCache/sync/). A cache of one table on the engine of [4.6](#46-the-cache-engine-lilypadcacheengine). What it adds:
 
 1. **Fetching**: `getOrFetch(key)` = the engine's `getOrSetDetailed(key, () => table.selectByPrimaryKey(key))`, where `table = gate.table(schema)`.
 2. **Writing through**: `sqlCreate`/`sqlUpdate`/`sqlDelete` write to the database, then cache the row the database returned.
@@ -944,7 +947,7 @@ Five subtleties:
 
 Sections [4.8](#48-the-changelog) and [4.10](#410-lilypaddbcache) describe the parts one at a time: the SQL and the cursor, the reader, how a change is applied, renewal. This section puts them together. It follows one `LilypadDbCache` created with `sync: { strategy: 'changelog', pollInterval }` through its whole life: what runs in the database, what the instance remembers, when it polls, what it does with what it reads, why it can then trust its memory, and what happens when something goes wrong. The traces [5.1](#51-three-concurrent-getorfetch42-on-a-cold-instance), [5.3](#53-an-update-from-psql-reaches-a-serverless-instance), [5.4](#54-sqlupdate-and-its-echo) and [5.5](#55-the-changelog-query-clause-by-clause) run the same code with concrete values.
 
-The code: [LilypadChangelogSync.ts](../src/dbCache/sync/LilypadChangelogSync.ts) (the strategy, about 150 lines), [LilypadChangelogReader.ts](../src/dbGate/LilypadChangelogReader.ts) (batching), [LilypadChangelog.ts](../src/dbGate/LilypadChangelog.ts) (SQL and the query), and the host methods of [LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts) that the strategy calls.
+The code: [LilypadChangelogSync.ts](../src/dbCache/sync/LilypadChangelogSync.ts) (the strategy, about 210 lines), [LilypadChangelogReader.ts](../src/dbGate/LilypadChangelogReader.ts) (batching), [LilypadChangelog.ts](../src/dbGate/LilypadChangelog.ts) (SQL and the query), and the host methods of [LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts) that the strategy calls.
 
 #### The whole picture
 
@@ -1251,7 +1254,7 @@ Same instance. The application calls `accounts.sqlUpdate({ id: 7, plan: 'team' }
 
 1. `sqlUpdate`: not disposed; `key = 7`; `writing` counts the write of `'7'` in flight, and `startTicket = nextTicket()` = 60.
 2. `table.update` → `prepareWrite`: the `write` hook, if any; primary key present; with `generatedPrimaryKey` the `id` is removed from the data (it only identifies the row); `columns = ['plan']` (only the declared columns that are not `undefined`).
-3. SQL: `UPDATE "accounts" SET "plan" = $1 WHERE "id" = $2 RETURNING "id", "email", "plan", pg_current_xact_id()::text AS "__lilypad_xid"`. `writeResult` strips `__lilypad_xid` and returns `{ row, xid: 9200n }`.
+3. SQL: `UPDATE "public"."accounts" SET "plan" = $1 WHERE "id" = $2 RETURNING "id", "email", "plan", pg_current_xact_id()::text AS "__lilypad_xid"`. `writeResult` strips `__lilypad_xid` and returns `{ row, xid: 9200n }`.
 4. `storeWritten(7, row, 60, 9200n)`: `currentTicket('7')`, the entry's ticket (say 58), is not greater than 60, so nothing interfered. `engine.set(7, row)` → ticket 61, and the row is written to L2. `ownWrites.record('7', 9200n, 61)`.
 5. `emitInvalidation('write', [7])`: `platform.onInvalidate` can call `revalidateTag('lilypad:accounts:7')`.
 
