@@ -224,8 +224,13 @@ export function evaluateLilypadSchema(
           (installedChannel !== false && tableChannels.includes(installedChannel))
         ? installedChannel
         : tableChannels[0]!;
+  // `force`: the fix keeps an installed retention, even below one hour (the pruning check reports it)
   const sqlWith = (prune: LilypadChangelogPruneOptions | false) =>
-    lilypadChangelogSql({ changelogTable: fixChangelog.custom, notifyChannel: fixChannel, prune });
+    lilypadChangelogSql({
+      changelogTable: fixChangelog.custom,
+      notifyChannel: fixChannel,
+      prune: prune && { ...prune, force: true },
+    });
 
   // Reported after the other problems, which the caches need first. Without the pruning check,
   // the fixes keep the installed pruning; with it, they install the suggested one
@@ -438,12 +443,17 @@ export function evaluateLilypadSchema(
 
 /** What a changelog of a compatible older version lacks (see `LILYPAD_CHANGELOG_VERSION`). */
 function outdatedChangelogReason(version: number): string {
-  const beforeVersion7 =
-    'its triggers write the changelog with the privileges of the writing roles, which can then record changes of their own that every cache trusts';
+  const longName =
+    'a changelog table whose name is 62 characters or longer (schema included) breaks its functions and indexes';
+  // The placeholders appeared in version 7
+  const beforeVersion8 = `a changelog table whose name contains a placeholder of its SQL (\`__lilypad_\`) breaks its trigger function, and ${longName}`;
+  const beforeVersion7 = `its triggers write the changelog with the privileges of the writing roles, which can then record changes of their own that every cache trusts, and ${longName}`;
   const beforeVersion6 = `its prune function (\`prune\` option) can be made to run the code of any role with the privileges of its owner, the triggers of a long table name record only TRUNCATE, a name containing \`$\` breaks its SQL, and ${beforeVersion7}`;
   return version < 5
     ? `a statement that changes many rows notifies each of them instead of sending one BULK notification; ${beforeVersion6}`
     : version < 6
       ? beforeVersion6
-      : beforeVersion7;
+      : version < 7
+        ? beforeVersion7
+        : beforeVersion8;
 }

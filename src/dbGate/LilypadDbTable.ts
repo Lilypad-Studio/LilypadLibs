@@ -28,7 +28,9 @@ const XID_COLUMN = '__lilypad_xid';
  * - Only the `cols` keys are selected (unless there is a `select` hook, which gets `*`) and
  *   written: extra properties of the data (e.g. from a request body) are never written.
  * - Rows are mapped with the `select` hook (see `bindLilypadDbHooks`), or by copying the `cols` keys.
- * - Writes return the id of their transaction (`xid`), as the changelog records it.
+ * - Writes return the id of their transaction (`xid`), as the changelog records it. They read it
+ *   as a column named `__lilypad_xid`: a column of the table with that name is missing from the
+ *   rows they return.
  *
  * @example
  * ```typescript
@@ -192,7 +194,7 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
   /**
    * Selects the rows with these primary keys, in one query per batch of 1000 keys (Postgres limits
    * the parameters of a query). Keys without a row are left out of the result, as are the rows the
-   * `select` hook discards.
+   * `select` hook discards; a key given several times is read once.
    *
    * @param options.signal - Stops before the next batch once aborted: the promise then rejects
    * with the reason of the signal.
@@ -204,9 +206,11 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
     this.gate.assertOpen();
     const { signal } = options;
     const typedRows: T[] = [];
-    for (let start = 0; start < primaryKeyValues.length; start += PRIMARY_KEYS_BATCH_SIZE) {
+    // Otherwise a key in two batches would return its row twice
+    const keys = [...new Set(primaryKeyValues)];
+    for (let start = 0; start < keys.length; start += PRIMARY_KEYS_BATCH_SIZE) {
       signal?.throwIfAborted();
-      const batch = primaryKeyValues.slice(start, start + PRIMARY_KEYS_BATCH_SIZE);
+      const batch = keys.slice(start, start + PRIMARY_KEYS_BATCH_SIZE);
       this.mapRows(
         await this.sql`
           SELECT ${this.selectedColumns()} FROM ${this.tableName}

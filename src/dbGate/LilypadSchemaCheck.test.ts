@@ -176,6 +176,23 @@ describe('evaluateLilypadSchema', () => {
     expect(result.problems[0]!.severity).toBe('warning');
     expect(result.problems[0]!.message).toContain('privileges of the writing roles');
     expect(result.problems[0]!.message).not.toContain('prune function');
+    // The placeholders appeared in version 7, the long names broke before
+    expect(result.problems[0]!.message).not.toContain('__lilypad_');
+    expect(result.problems[0]!.message).toContain('62 characters or longer');
+  });
+
+  it('should warn that a changelog of version 7 breaks with some names', () => {
+    const result = evaluateLilypadSchema(
+      facts({ changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:7' } }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['outdated-changelog']);
+    expect(result.problems[0]!.severity).toBe('warning');
+    expect(result.problems[0]!.message).toContain('(version 7, expected 8)');
+    expect(result.problems[0]!.message).toContain('62 characters or longer');
+    expect(result.problems[0]!.message).toContain('a placeholder of its SQL (`__lilypad_`)');
+    expect(result.problems[0]!.message).not.toContain('privileges of the writing roles');
   });
 
   it('should warn about the roles other than its owner that can write the changelog', () => {
@@ -289,7 +306,7 @@ describe('evaluateLilypadSchema', () => {
       );
 
       expect(fix(result)).toContain('DROP FUNCTION IF EXISTS "lilypad_cache_changes_prune"()');
-      expect(fix(result)).not.toContain('PERFORM __lilypad_prune__()');
+      expect(fix(result)).not.toContain('PERFORM %3$s()');
     });
   });
 
@@ -563,7 +580,9 @@ describe('the pruning of the changelog', () => {
     unpruned(
       {},
       {
-        functionSource: lilypadChangelogSql({ prune: { olderThan, every: 10, batchSize: 500 } }),
+        functionSource: lilypadChangelogSql({
+          prune: { olderThan, every: 10, batchSize: 500, force: true },
+        }),
         hasPruneFunction,
       }
     );
@@ -603,7 +622,7 @@ describe('the pruning of the changelog', () => {
     it('should mention pg_cron when the server has it, but it is not known to run', () => {
       const result = evaluateLilypadSchema(unpruned({ available: true }), changelogOptions);
 
-      expect(result.problems[0]!.fix).toContain('PERFORM __lilypad_prune__()');
+      expect(result.problems[0]!.fix).toContain('PERFORM %3$s()');
       expect(result.problems[0]!.message).toContain('pg_cron is available on this server');
     });
 
@@ -706,7 +725,7 @@ describe('the pruning of the changelog', () => {
         );
 
         expect(codes(result)).toEqual(['missing-changelog', 'no-changelog-pruning']);
-        expect(result.problems[0]!.fix).toContain('PERFORM __lilypad_prune__()');
+        expect(result.problems[0]!.fix).toContain('PERFORM %3$s()');
       });
 
       it('should still accept a pg_cron job found', () => {
@@ -761,7 +780,7 @@ describe('the pruning of the changelog', () => {
 
         expect(codes(result)).toEqual(['missing-changelog', 'no-changelog-pruning']);
         // The changelog is installed without the prune option
-        expect(result.problems[0]!.fix).not.toContain('PERFORM __lilypad_prune__()');
+        expect(result.problems[0]!.fix).not.toContain('PERFORM %3$s()');
         expect(result.problems[1]!.fix).toContain(
           lilypadChangelogPruneScheduleSql({
             olderThan: DAY,
@@ -785,7 +804,7 @@ describe('the pruning of the changelog', () => {
       expect(codes(result)).toEqual(['missing-changelog', 'no-changelog-pruning']);
       // One SQL does both: the report shows it once
       expect(result.problems[0]!.fix).toBe(result.problems[1]!.fix);
-      expect(result.problems[0]!.fix).toContain('PERFORM __lilypad_prune__()');
+      expect(result.problems[0]!.fix).toContain('PERFORM %3$s()');
     });
 
     it('should recommend a retention far longer than the one the caches need', () => {

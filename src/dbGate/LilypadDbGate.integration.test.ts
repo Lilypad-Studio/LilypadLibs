@@ -190,6 +190,14 @@ describe('LilypadDbGate (integration)', () => {
       expect(await gate.table(usersSchema).selectByPrimaryKeys([])).toEqual([]);
     });
 
+    it('should return once the row of a key given in two batches of primary keys', async () => {
+      await admin`INSERT INTO users (name) VALUES ('Ada')`;
+
+      const rows = await gate.table(usersSchema).selectByPrimaryKeys([...Array(1000).fill(1), 1]);
+
+      expect(rows.map((row) => row.name)).toEqual(['Ada']);
+    });
+
     it('should stop selecting the batches of primary keys once its signal is aborted', async () => {
       const signal = AbortSignal.abort(new Error('timed out'));
 
@@ -833,6 +841,100 @@ describe('LilypadDbGate (integration)', () => {
       }
     });
 
+    describe('a changelog whose name its SQL could mistake', () => {
+      /** Installs `changelogTable` for a new table, records an insert, and reads it back. */
+      const recordInto = async (
+        changelogTable: string,
+        prune: { olderThan: number; every: number } | false
+      ) => {
+        const table = `odd_items_${Math.random().toString(36).slice(2, 8)}`;
+        await admin.unsafe(`CREATE TABLE ${table} (id int PRIMARY KEY)`);
+        await admin.unsafe(
+          lilypadChangelogSql({ changelogTable, notifyChannel: false, prune }) +
+            lilypadChangelogTriggerSql({ table, primaryKey: 'id', changelogTable })
+        );
+        await admin.unsafe(`INSERT INTO ${table} VALUES (1)`);
+        const { changes } = await readLilypadChanges(gate, {
+          tableName: table,
+          changelogTable,
+          since: { lookback: 60_000 },
+        });
+        return { table, changes: changes.map((change) => change.rowId) };
+      };
+      /** Drops the tables and the functions of the changelog `name`. */
+      const dropChangelog = async (name: string, table: string) => {
+        const functions = await admin`
+          SELECT oid::regprocedure::text AS signature FROM pg_proc
+          WHERE proname LIKE ${`${name.slice(0, 20)}%`}
+        `;
+        await admin.unsafe(`
+          DROP TABLE IF EXISTS ${table};
+          DROP TABLE IF EXISTS "${name}";
+          ${functions.map(({ signature }) => `DROP FUNCTION ${signature as string};`).join('\n')}
+        `);
+      };
+
+      it.each([
+        ['x__lilypad_changelog__', false],
+        ['x__lilypad_changelog_literal__', false],
+        ['x__lilypad_prune__', { olderThan: 60 * 60_000, every: 1 }],
+      ] as const)(
+        'should record into the changelog %s, which contains a placeholder of its SQL',
+        async (changelogTable, prune) => {
+          let table = '';
+          try {
+            const recorded = await recordInto(changelogTable, prune);
+            table = recorded.table;
+
+            expect(recorded.changes).toEqual(['1']);
+          } finally {
+            await dropChangelog(changelogTable, table || 'no_table');
+          }
+        }
+      );
+
+      it.each([false, { olderThan: 60 * 60_000, every: 1 }] as const)(
+        'should install a changelog of 62 characters, whose names PostgreSQL would truncate into one (prune: %o)',
+        async (prune) => {
+          const changelogTable = `long_${'c'.repeat(57)}`;
+          let table = '';
+          try {
+            // What version 7 left: one index, under the name PostgreSQL truncated both to
+            await admin.unsafe(lilypadChangelogSql({ changelogTable, notifyChannel: false }));
+            await admin.unsafe(`
+              DO $$ DECLARE i text; BEGIN
+                FOR i IN SELECT indexname FROM pg_indexes
+                  WHERE tablename = '${changelogTable}' AND indexname NOT LIKE '%_pkey'
+                LOOP EXECUTE format('DROP INDEX %I', i); END LOOP;
+              END $$;
+              CREATE INDEX "${changelogTable}_table_xid_idx" ON "${changelogTable}" (table_name, xid);
+            `);
+
+            const recorded = await recordInto(changelogTable, prune);
+            table = recorded.table;
+
+            expect(recorded.changes).toEqual(['1']);
+            const [indexes] = await admin`
+              SELECT count(*)::int AS count FROM pg_indexes WHERE tablename = ${changelogTable}
+            `;
+            // The primary key, (table_name, xid) and (changed_at): the truncated one is gone
+            expect(indexes!.count).toBe(3);
+            const [truncated] = await admin`
+              SELECT count(*)::int AS count FROM pg_indexes WHERE indexname = ${changelogTable.slice(0, 62) + '_'}
+            `;
+            expect(truncated!.count).toBe(0);
+            const result = await checkLilypadSchema(gate, {
+              tables: [{ table, primaryKey: 'id' }],
+              changelog: { table: changelogTable, checkPruning: false },
+            });
+            expect(result.problems).toEqual([]);
+          } finally {
+            await dropChangelog(changelogTable, table || 'no_table');
+          }
+        }
+      );
+    });
+
     it('should delete the rows older than the retention', async () => {
       await admin`INSERT INTO users (name) VALUES ('Ada')`;
 
@@ -1085,7 +1187,7 @@ describe('LilypadDbGate (integration)', () => {
             lilypadChangelogSql({
               changelogTable: changes,
               notifyChannel: false,
-              prune: { olderThan: 30 * 60_000 },
+              prune: { olderThan: 30 * 60_000, force: true },
             })
           );
 

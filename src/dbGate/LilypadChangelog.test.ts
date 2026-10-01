@@ -14,7 +14,7 @@ describe('lilypadChangelogSql prune option', () => {
   it('should not prune by default, and drop the prune function of an earlier installation', () => {
     const sql = lilypadChangelogSql();
 
-    expect(sql).not.toContain('PERFORM __lilypad_prune__()');
+    expect(sql).not.toContain('PERFORM %3$s()');
     expect(sql).toContain('DROP FUNCTION IF EXISTS "lilypad_cache_changes_prune"();');
     expect(installedLilypadChangelogPrune(sql)).toBe(false);
   });
@@ -29,18 +29,20 @@ describe('lilypadChangelogSql prune option', () => {
     expect(sql).toContain('SECURITY DEFINER');
     expect(sql).not.toContain('DROP FUNCTION');
     // The TRUNCATE and statement branches, qualified by the DO block that creates the function
-    expect(sql.match(/PERFORM __lilypad_prune__\(\);/g)).toHaveLength(2);
-    expect(sql).toContain(`'__lilypad_prune__', prune)`);
+    expect(sql.match(/PERFORM %3\$s\(\);/g)).toHaveLength(2);
+    expect(sql).toContain(', changelog, quote_literal(changelog), prune)');
     expect(sql).toContain('IF random() * 20 < 1 AND');
   });
 
   it('should record its options in the trigger function, for the schema check', () => {
     const prune = { olderThan: 1_500, every: 3, batchSize: 50 };
 
-    expect(installedLilypadChangelogPrune(lilypadChangelogSql({ prune }))).toEqual(prune);
     expect(
-      installedLilypadChangelogPrune(lilypadChangelogSql({ prune: { olderThan: 60_000 } }))
-    ).toEqual({ olderThan: 60_000, every: 20, batchSize: 1000 });
+      installedLilypadChangelogPrune(lilypadChangelogSql({ prune: { ...prune, force: true } }))
+    ).toEqual(prune);
+    expect(
+      installedLilypadChangelogPrune(lilypadChangelogSql({ prune: { olderThan: 3_600_000 } }))
+    ).toEqual({ olderThan: 3_600_000, every: 20, batchSize: 1000 });
   });
 
   it('should search pg_temp last, so that a temporary table cannot stand for the changelog', () => {
@@ -60,13 +62,17 @@ describe('lilypadChangelogSql prune option', () => {
         `'CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS %L LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp'`
       );
       expect(sql).toContain(`WHERE c.oid = '"lilypad_cache_changes"'::regclass`);
-      expect(sql).toContain('INSERT INTO __lilypad_changelog__ (');
-      expect(sql).toContain(`'__lilypad_changelog_literal__', quote_literal(changelog)`);
+      // The placeholders of the changelog are the arguments of one format()
+      expect(sql).toContain('INSERT INTO %1$s (');
+      // The % of the body, escaped for that format()
+      expect(sql).toContain('to_jsonb(n.%%1$I)');
+      expect(sql).toContain(', changelog, quote_literal(changelog)');
+      expect(sql).not.toContain('__lilypad_');
       expect(sql).not.toContain('INSERT INTO "lilypad_cache_changes"');
       expect(sql).toContain(`IS 'lilypad-changelog:${LILYPAD_CHANGELOG_VERSION}'`);
     }
     expect(pruned).toContain(`WHERE p.oid = '"lilypad_cache_changes_prune"()'::regprocedure`);
-    expect(plain).not.toContain('__lilypad_prune__');
+    expect(plain).not.toContain('%3$s');
   });
 
   it('should refuse a channel that contains a placeholder of the trigger function', () => {
@@ -95,7 +101,7 @@ describe('lilypadChangelogSql prune option', () => {
   it('should name the prune function after the changelog table', () => {
     const sql = lilypadChangelogSql({
       changelogTable: 'archive.changes',
-      prune: { olderThan: 60_000 },
+      prune: { olderThan: 3_600_000 },
     });
 
     expect(sql).toContain(`WHERE p.oid = '"archive_changes_prune"()'::regprocedure`);
@@ -248,8 +254,8 @@ describe('lilypadChangelogSql dollar quotes', () => {
 
     expect(sql).toContain('DO $lilypad_$');
     expect(sql).toContain('format($body$');
-    // The names of the tables are placeholders in the body of the trigger function
-    expect(sql).toContain('replace(replace(replace($$');
+    // The names of the tables are arguments of the format() of the body of the trigger function
+    expect(sql).toContain('format($$');
     expect(sql).toContain('EXECUTE format($record$');
     expect(sql).toContain('EXECUTE format($notify_$');
   });
@@ -258,8 +264,107 @@ describe('lilypadChangelogSql dollar quotes', () => {
     const sql = lilypadChangelogSql();
 
     expect(sql).toContain('DO $lilypad$');
-    expect(sql).toContain('replace(replace($$');
+    expect(sql).toContain('format($$');
     expect(sql).toContain('EXECUTE format($record$');
     expect(sql).toContain('EXECUTE format($notify$');
+  });
+});
+
+describe('lilypadChangelogSql names of a long changelog table', () => {
+  const objectNames = (sql: string) => ({
+    functions: [...sql.matchAll(/'"([^"]+)"'(?:, format|,\n)/g)].map((match) => match[1]!),
+    indexes: [...sql.matchAll(/CREATE INDEX IF NOT EXISTS "([^"]+)"/g)].map((match) => match[1]!),
+  });
+
+  it('should give distinct names of at most 63 bytes to its functions and indexes from 62 characters', () => {
+    const changelogTable = 'c'.repeat(62);
+    const { functions, indexes } = objectNames(
+      lilypadChangelogSql({ changelogTable, prune: { olderThan: 86_400_000 } })
+    );
+
+    expect(functions).toHaveLength(2);
+    expect(indexes).toHaveLength(2);
+    for (const names of [functions, indexes]) {
+      expect(new Set(names).size).toBe(2);
+      for (const name of names) {
+        expect(name.length).toBeLessThanOrEqual(63);
+      }
+    }
+    // The trigger SQL and the schema check name the same function
+    expect(
+      lilypadChangelogTriggerSql({ table: 'items', primaryKey: 'id', changelogTable })
+    ).toContain(`EXECUTE FUNCTION "${functions[1]!}"('id')`);
+  });
+
+  it('should drop the one index that earlier versions created under the truncated name', () => {
+    const changelogTable = 'c'.repeat(62);
+    const sql = lilypadChangelogSql({ changelogTable });
+    const { indexes } = objectNames(sql);
+
+    expect(sql).toContain(`DROP INDEX IF EXISTS "${'c'.repeat(62)}_";`);
+    expect(indexes).not.toContain(`${'c'.repeat(62)}_`);
+    // In the schema of the changelog
+    expect(lilypadChangelogSql({ changelogTable: `archive.${'c'.repeat(54)}` })).toContain(
+      `DROP INDEX IF EXISTS "archive"."archive_${'c'.repeat(54)}_";`
+    );
+    expect(lilypadChangelogSql({ changelogTable: 'c'.repeat(61) })).not.toContain('DROP INDEX');
+  });
+
+  it('should name the pg_cron job after the whole changelog name, as earlier versions did', () => {
+    const changelogTable = 'c'.repeat(62);
+
+    expect(lilypadChangelogPruneScheduleSql({ olderThan: 86_400_000, changelogTable })).toContain(
+      `cron.schedule('${changelogTable}_prune'`
+    );
+  });
+
+  it('should keep the names that PostgreSQL truncates distinctly, as earlier versions installed them', () => {
+    const changelogTable = 'c'.repeat(61);
+    const sql = lilypadChangelogSql({ changelogTable, prune: { olderThan: 86_400_000 } });
+
+    expect(sql).toContain(`'"${changelogTable}_record"'`);
+    expect(sql).toContain(`'"${changelogTable}_prune"'`);
+    expect(sql).toContain(`CREATE INDEX IF NOT EXISTS "${changelogTable}_changed_at_idx"`);
+  });
+});
+
+describe('lilypadChangelogSql notification channel', () => {
+  it.each([['a'.repeat(64)], ['é'.repeat(32)], ['']])(
+    'should reject the channel %j, on which pg_notify fails every write',
+    (notifyChannel) => {
+      expect(() => lilypadChangelogSql({ notifyChannel })).toThrow(
+        'lilypadChangelogSql: the channel'
+      );
+    }
+  );
+
+  it('should accept a channel of 63 bytes', () => {
+    expect(lilypadChangelogSql({ notifyChannel: 'a'.repeat(63) })).toContain(
+      `pg_notify('${'a'.repeat(63)}'`
+    );
+  });
+});
+
+describe('the retention of the changelog SQL', () => {
+  it('should reject a prune retention below one hour, unless forced', () => {
+    // Seconds instead of milliseconds: 86 seconds
+    expect(() => lilypadChangelogSql({ prune: { olderThan: 86_400 } })).toThrow(
+      'prune.olderThan is 86400 ms, less than one hour'
+    );
+    expect(lilypadChangelogSql({ prune: { olderThan: 86_400, force: true } })).toContain(
+      'olderThan=86400 '
+    );
+    expect(lilypadChangelogSql({ prune: { olderThan: 3_600_000 } })).toContain(
+      'olderThan=3600000 '
+    );
+  });
+
+  it('should reject a scheduled retention below one hour, unless forced', () => {
+    expect(() => lilypadChangelogPruneScheduleSql({ olderThan: 86_400 })).toThrow(
+      'lilypadChangelogPruneScheduleSql: olderThan is 86400 ms, less than one hour'
+    );
+    expect(lilypadChangelogPruneScheduleSql({ olderThan: 86_400, force: true })).toContain(
+      'make_interval(secs => 86.4)'
+    );
   });
 });
