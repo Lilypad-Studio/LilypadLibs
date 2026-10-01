@@ -3,6 +3,7 @@ import { basename, dirname, extname, isAbsolute, relative, resolve } from 'node:
 import { parseArgs } from 'node:util';
 import { lilypadDbConfigTemplate } from '@/cli/lilypadDbConfigTemplate';
 import { LILYPAD_DEFAULT_DB_CONFIG_NAME } from '@/dbConfig/LilypadDbConfigDefaults';
+import { isLilypadDbConfigName } from '@/dbConfig/LilypadDbConfigValidation';
 import { lilypadDbConfigFileNames } from '@/dbGate/loadLilypadDbConfig';
 
 const LILYPAD_INIT_USAGE = `Usage: lilypad-doctor init [options]
@@ -18,7 +19,6 @@ Options:
 
 Exit code: 0 when the file is created, 2 otherwise (invalid arguments, a file of the config exists).`;
 
-const CONFIG_NAME = /^[A-Za-z0-9_-]+$/;
 const EXTENSIONS = new Set(['.ts', '.mts', '.mjs', '.js']);
 /** `lilypad.config.<ext>` or `lilypad.<name>.config.<ext>`: the name a path gives its config. */
 const CONFIG_FILE = /^lilypad\.(?:([A-Za-z0-9_-]+)\.)?config\.(?:ts|mts|mjs|js)$/;
@@ -51,7 +51,7 @@ export function lilypadInitTarget(
   exists: (path: string) => boolean
 ): LilypadInitTarget {
   const reference = config ?? LILYPAD_DEFAULT_DB_CONFIG_NAME;
-  if (CONFIG_NAME.test(reference)) {
+  if (isLilypadDbConfigName(reference)) {
     const candidates = lilypadDbConfigFileNames(reference).map((file) => resolve(cwd, file));
     return {
       path: candidates[0]!,

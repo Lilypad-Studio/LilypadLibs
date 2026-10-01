@@ -72,8 +72,7 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
         if (host.isDisposed()) {
           return;
         }
-        host.applyBulkChange();
-        host.emitInvalidation('notification', [], { wholeCache: true });
+        this.applyTableChange();
         if (this.applyChanges) {
           this.listenTrustedSince = Date.now();
         }
@@ -137,8 +136,7 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
       } else if (payload.op === 'TRUNCATE') {
         host.emitInvalidation('notification', host.applyTruncate('eager'), { wholeCache: true });
       } else if (payload.op === 'BULK') {
-        host.applyBulkChange();
-        host.emitInvalidation('notification', [], { wholeCache: true });
+        this.applyTableChange();
       } else {
         const key = await host.applyChange(payload.op, payload.id!, 'eager', parseXid(payload.xid));
         host.emitInvalidation('notification', [key]);

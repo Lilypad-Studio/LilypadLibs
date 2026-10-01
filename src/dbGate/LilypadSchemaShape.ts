@@ -209,18 +209,25 @@ export function lilypadCreateTableSql(
   return statements.join('\n');
 }
 
-/** The problems of the foreign keys of a table that does not exist yet: each one is missing. */
-export function lilypadMissingTableForeignKeys(
+function missingForeignKey(
   table: string,
-  shape: LilypadSchemaTableShape
-): LilypadSchemaProblem[] {
-  return shape.foreignKeys.map((foreignKey) => ({
+  foreignKey: LilypadDbResolvedForeignKey
+): LilypadSchemaProblem {
+  return {
     code: 'missing-foreign-key',
     severity: 'error',
     table,
     message: `The foreign key ${describeForeignKey(foreignKey)} of "${table}" does not exist.`,
     fix: foreignKeySql(table, foreignKey),
-  }));
+  };
+}
+
+/** The problems of the foreign keys of a table that does not exist yet: each one is missing. */
+export function lilypadMissingTableForeignKeys(
+  table: string,
+  shape: LilypadSchemaTableShape
+): LilypadSchemaProblem[] {
+  return shape.foreignKeys.map((foreignKey) => missingForeignKey(table, foreignKey));
 }
 
 /**
@@ -417,13 +424,7 @@ export function evaluateLilypadTableShape(
       matchesForeignKey(constraint, foreignKey)
     );
     if (!installed) {
-      deferred.push({
-        code: 'missing-foreign-key',
-        severity: 'error',
-        table,
-        message: `The foreign key ${describeForeignKey(foreignKey)} of "${table}" does not exist.`,
-        fix: foreignKeySql(table, foreignKey),
-      });
+      deferred.push(missingForeignKey(table, foreignKey));
       continue;
     }
     matchedConstraints.add(installed);

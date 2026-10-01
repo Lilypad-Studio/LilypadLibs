@@ -113,6 +113,14 @@ const SYNC_OPTIONS: Readonly<Record<LilypadDbTableSync['strategy'], ReadonlySet<
   none: optionsOf<SyncOf<'none'>>({ strategy: true }),
 };
 
+/**
+ * Whether a string is a config name (letters, digits, `_` and `-`): the loader and
+ * `lilypad-doctor init` take a `--config` that is one for a name, anything else for a path.
+ */
+export function isLilypadDbConfigName(value: string): boolean {
+  return CONFIG_NAME.test(value);
+}
+
 function fail(message: string): never {
   throw new Error(`${OWNER}: ${message}`);
 }
@@ -423,7 +431,7 @@ export function validateLilypadDbConfigInput(input: ConfigInput): void {
   assertOptions(input, CONFIG_OPTIONS, '');
   if (
     input.name !== undefined &&
-    (typeof input.name !== 'string' || !CONFIG_NAME.test(input.name))
+    (typeof input.name !== 'string' || !isLilypadDbConfigName(input.name))
   ) {
     fail(
       `name must contain only letters, digits, "_" and "-" (got ${JSON.stringify(input.name)}).`

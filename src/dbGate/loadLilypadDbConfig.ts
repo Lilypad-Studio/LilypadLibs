@@ -3,10 +3,10 @@ import { isAbsolute, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { isLilypadDbConfig, type LilypadDbConfig } from '@/dbConfig/LilypadDbConfig';
 import { LILYPAD_DEFAULT_DB_CONFIG_NAME } from '@/dbConfig/LilypadDbConfigDefaults';
+import { isLilypadDbConfigName } from '@/dbConfig/LilypadDbConfigValidation';
 
 /** The extensions of the config files. */
 const EXTENSIONS = ['ts', 'mts', 'mjs', 'js'];
-const CONFIG_NAME = /^[A-Za-z0-9_-]+$/;
 
 /**
  * The file names of a config: `lilypad.config.<ext>` for the default one, `lilypad.<name>.config.<ext>`
@@ -27,7 +27,7 @@ export function lilypadDbConfigFileNames(name: string): string[] {
  */
 export function findLilypadDbConfig(config: string | undefined, cwd: string): string {
   const reference = config ?? LILYPAD_DEFAULT_DB_CONFIG_NAME;
-  if (!CONFIG_NAME.test(reference)) {
+  if (!isLilypadDbConfigName(reference)) {
     const path = isAbsolute(reference) ? reference : resolve(cwd, reference);
     if (!existsSync(path)) {
       throw new Error(`The config file ${path} does not exist.`);
@@ -112,7 +112,7 @@ ${lilypadConfigLoadHint(error)}`,
     );
   }
   const expected = options.config ?? LILYPAD_DEFAULT_DB_CONFIG_NAME;
-  if (CONFIG_NAME.test(expected) && config.name !== expected) {
+  if (isLilypadDbConfigName(expected) && config.name !== expected) {
     throw new Error(
       `The config ${path} is named "${config.name}", but it was looked for as "${expected}": set name: '${expected}' in defineLilypadDb, or rename the file.`
     );
