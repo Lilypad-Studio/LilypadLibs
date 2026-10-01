@@ -964,6 +964,64 @@ describe('LilypadDbGate (integration)', () => {
         }
       });
 
+      it('refuses a trigger without its transition tables, so a temporary view cannot run as the owner', async () => {
+        // A role granted EXECUTE on the record function (as a migration role may be) attaches it,
+        // without REFERENCING, to a table of its own: the names of the transition tables would
+        // resolve to a temporary view of its session, whose function would run as the owner
+        await admin.unsafe(`
+          CREATE ROLE lilypad_trigger_maker;
+          GRANT CREATE ON SCHEMA public TO lilypad_trigger_maker;
+          GRANT EXECUTE ON FUNCTION lilypad_cache_changes_record() TO lilypad_trigger_maker;
+          SET ROLE lilypad_trigger_maker;
+          CREATE TABLE no_transition (id int PRIMARY KEY);
+          CREATE FUNCTION no_transition_escalate() RETURNS int LANGUAGE plpgsql AS $$
+            BEGIN
+              -- Only a superuser may do this: it works only if the function runs as the owner
+              ALTER ROLE lilypad_trigger_maker SUPERUSER;
+              RETURN 1;
+            END $$;
+          CREATE TRIGGER no_transition_insert AFTER INSERT ON no_transition
+            FOR EACH STATEMENT EXECUTE FUNCTION lilypad_cache_changes_record('id');
+          RESET ROLE;
+        `);
+        try {
+          const wrote = await admin
+            .begin(async (tx) => {
+              await tx`SET LOCAL ROLE lilypad_trigger_maker`;
+              await tx`CREATE TEMP VIEW lilypad_new AS SELECT no_transition_escalate() AS id`;
+              await tx`INSERT INTO no_transition VALUES (1)`;
+            })
+            .then(
+              () => 'written',
+              (error: unknown) => (error as Error).message
+            );
+
+          expect(wrote).toContain('does not declare its transition tables');
+          const [role] = await admin`
+            SELECT rolsuper FROM pg_roles WHERE rolname = 'lilypad_trigger_maker'
+          `;
+          expect(role!.rolsuper).toBe(false);
+          const [recorded] = await admin`
+            SELECT count(*)::int AS count FROM lilypad_cache_changes WHERE table_name = 'no_transition'
+          `;
+          expect(recorded!.count).toBe(0);
+
+          // The triggers the library installs declare them: their writes are still recorded
+          await admin`INSERT INTO users (name) VALUES ('Ada')`;
+          await admin`UPDATE users SET role = 'admin' WHERE id = 1`;
+          await admin`DELETE FROM users WHERE id = 1`;
+          expect(
+            (
+              await readLilypadChanges(gate, { tableName: 'users', since: { lookback: 60_000 } })
+            ).changes.map(({ op, rowId }) => `${op}:${rowId}`)
+          ).toEqual(['INSERT:1', 'UPDATE:1', 'DELETE:1']);
+        } finally {
+          await admin.unsafe(
+            'DROP OWNED BY lilypad_trigger_maker CASCADE; DROP ROLE lilypad_trigger_maker;'
+          );
+        }
+      });
+
       it('refuses a key column renamed after the triggers (fail closed)', async () => {
         await admin.unsafe(`CREATE TABLE renamed_key (id int PRIMARY KEY, name text)`);
         try {
@@ -1760,6 +1818,26 @@ describe('LilypadDbGate (integration)', () => {
       }
     });
 
+    it('should upgrade a changelog of version 9 with its fix, which refuses triggers without transition tables', async () => {
+      await admin`COMMENT ON FUNCTION lilypad_cache_changes_record() IS 'lilypad-changelog:9'`;
+      const options = { tables: [{ table: 'users', primaryKey: 'id' }] };
+      const result = await check(options);
+
+      expect(codes(result)).toEqual(['outdated-changelog']);
+      expect(result.problems[0]!.message).toContain(
+        `(version 9, expected ${LILYPAD_CHANGELOG_VERSION})`
+      );
+      await admin.unsafe(formatLilypadSchemaFixSql(result.problems));
+
+      expect((await check(options)).ok).toBe(true);
+      const [installed] = await admin`
+        SELECT prosrc, obj_description(oid, 'pg_proc') AS comment FROM pg_proc
+        WHERE oid = 'lilypad_cache_changes_record()'::regprocedure
+      `;
+      expect(installed!.comment).toBe(`lilypad-changelog:${LILYPAD_CHANGELOG_VERSION}`);
+      expect(installed!.prosrc).toContain('does not declare its transition tables');
+    });
+
     it('should not downgrade a changelog installed by a newer version', async () => {
       await admin.unsafe(`CREATE TABLE newer_items (id int PRIMARY KEY)`);
       await admin.unsafe(
@@ -1780,7 +1858,7 @@ describe('LilypadDbGate (integration)', () => {
 
     it('should withhold the changelog fixes while a table outside the config has a key the triggers refuse', async () => {
       // Another config (or service) shares the changelog: its tables have the changelog triggers,
-      // and keys that version 9 refuses (every write of them fails once it is installed)
+      // and keys that the current version refuses (every write of them fails once it is installed)
       await admin.unsafe(`
         CREATE ROLE outside_app;
         GRANT CREATE ON SCHEMA public TO outside_app;
@@ -1818,7 +1896,7 @@ describe('LilypadDbGate (integration)', () => {
         const outdated = result.problems.find((problem) => problem.code === 'outdated-changelog');
         expect(outdated?.fix).toBeUndefined();
         expect(outdated?.message).toContain('"public.outside_items"');
-        // Installing version 9 is withheld: it would fail every write of these tables
+        // Installing the current version is withheld: it would fail every write of these tables
         expect(formatLilypadSchemaFixSql(result.problems)).not.toContain('CREATE OR REPLACE');
         await expect(admin`INSERT INTO outside_items VALUES ('a')`).rejects.toThrow('unsafe type');
 

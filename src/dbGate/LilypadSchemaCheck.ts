@@ -103,6 +103,11 @@ export function formatLilypadSchemaFixSql(problems: LilypadSchemaProblem[]): str
 
 /** The changelog version whose trigger function runs as its owner (`SECURITY DEFINER`). */
 const CHANGELOG_OWNER_VERSION = 7;
+/**
+ * The changelog version whose trigger function refuses a missing key column or a key of an unsafe
+ * type (`lilypadSafeKeyTypeSql`): from it on, the writes of such a table fail already.
+ */
+const CHANGELOG_KEY_GUARD_VERSION = 9;
 
 // pg_trigger.tgtype bits
 const TRIGGER_TYPE_ROW = 1;
@@ -549,7 +554,7 @@ export function evaluateLilypadSchema(
               true,
               installedVersion
             )
-          : `${column === null ? `The changelog triggers of ${outside} name no key column` : `The key column "${column}" that the changelog triggers of ${outside} record does not exist (renamed or dropped?)`}: the changelog triggers cannot record it, and every write of the table fails${installedVersion !== undefined && installedVersion < LILYPAD_CHANGELOG_VERSION ? ` once version ${LILYPAD_CHANGELOG_VERSION} is installed` : ''}. Reinstall its triggers with its primary key (lilypadChangelogTriggerSql), or drop them.`,
+          : `${column === null ? `The changelog triggers of ${outside} name no key column` : `The key column "${column}" that the changelog triggers of ${outside} record does not exist (renamed or dropped?)`}: the changelog triggers cannot record it, and every write of the table fails${installedVersion !== undefined && installedVersion < CHANGELOG_KEY_GUARD_VERSION ? ` once version ${LILYPAD_CHANGELOG_VERSION} is installed` : ''}. Reinstall its triggers with its primary key (lilypadChangelogTriggerSql), or drop them.`,
     });
   }
 
@@ -605,7 +610,7 @@ function unsupportedKeyMessage(
 ): string {
   const unsafe = `its type, output function or a json cast function is not owned by a superuser, or it is a user-defined composite, range or multirange type, or an array or domain over one`;
   const safeTypes = `a built-in type (integer, bigint, uuid, text...), a type of a superuser-installed extension (e.g. citext), or a domain over one`;
-  return installedVersion === undefined || installedVersion >= LILYPAD_CHANGELOG_VERSION
+  return installedVersion === undefined || installedVersion >= CHANGELOG_KEY_GUARD_VERSION
     ? `${key} has the type ${type}, which the changelog triggers cannot convert as their owner (${unsafe}), so the writes of the table fail${hasChangelogTriggers ? '' : ' once its changelog triggers are installed'}. Use ${safeTypes}.`
     : // An installed function of an older version converts it (as the writer before version 7, as
       // the owner since): the triggers of the current version would refuse it

@@ -334,7 +334,7 @@ describe('evaluateLilypadSchema', () => {
     expect(problem.message).toContain(`before installing version ${LILYPAD_CHANGELOG_VERSION}`);
   });
 
-  it('should tell an install older than version 7 to change the key before version 9', () => {
+  it('should tell an install older than version 7 to change the key before the current version', () => {
     const result = evaluateLilypadSchema(
       facts({
         changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:5' },
@@ -356,6 +356,39 @@ describe('evaluateLilypadSchema', () => {
     expect(problem.message).toContain(`before installing version ${LILYPAD_CHANGELOG_VERSION}`);
     // Before version 7, the trigger function ran with the privileges of the writing role
     expect(problem.message).not.toContain("changelog owner's privileges");
+  });
+
+  it('should say that the writes fail already on an outdated install that refuses the key (version 9)', () => {
+    // Version 9 introduced the key guard: an install of it already fails the writes of the table
+    const result = evaluateLilypadSchema(
+      facts({
+        changelog: {
+          ...facts().changelog,
+          functionComment: 'lilypad-changelog:9',
+          blockedTables: [{ table: 'public.other', column: 'id', type: null }],
+        },
+        tables: [
+          {
+            schema: 'public',
+            triggers: [...changelogStatements, changelogTruncate],
+            keyUserType: 'item_status',
+          },
+        ],
+      }),
+      changelogOptions
+    );
+
+    const keyProblem = result.problems.find((p) => p.code === 'unsupported-key-type')!;
+    expect(keyProblem.message).toContain('so the writes of the table fail. Use');
+    expect(keyProblem.message).not.toContain('once version');
+    expect(keyProblem.message).not.toContain("changelog owner's privileges");
+    const outside = result.problems.find((p) => p.code === 'missing-column')!;
+    expect(outside.message).toContain('every write of the table fails. Reinstall');
+    // The outdated install is reported, and its fix withheld until the keys are changed
+    const outdated = result.problems.find((p) => p.code === 'outdated-changelog')!;
+    expect(outdated.message).toContain(`(version 9, expected ${LILYPAD_CHANGELOG_VERSION}).`);
+    expect(outdated.fix).toBeUndefined();
+    expect(formatLilypadSchemaFixSql(result.problems)).toBe('');
   });
 
   it('should not claim that an older install converts the key of a table it has no trigger on', () => {

@@ -18,7 +18,7 @@ import { assertNumberOption } from '@/internal/LilypadValidation';
  * The function carries it in its comment (`lilypad-changelog:<version>`), so that
  * `checkLilypadSchema` can tell an installation made by an older version of the library.
  */
-export const LILYPAD_CHANGELOG_VERSION = 9;
+export const LILYPAD_CHANGELOG_VERSION = 10;
 export const LILYPAD_CHANGELOG_VERSION_PREFIX = 'lilypad-changelog:';
 
 /**
@@ -556,6 +556,19 @@ BEGIN${
     -- goes on (a failing write would be worse), and the schema check reports the trigger
     RAISE WARNING 'lilypad: the row trigger % on %.% is outdated, run lilypadChangelogTriggerSql', TG_NAME, TG_TABLE_SCHEMA, TG_TABLE_NAME;
     RETURN NULL;
+  END IF;
+
+  -- The transition tables are read below by their unqualified names. A statement trigger created
+  -- without them (no REFERENCING, or other names) would make those names resolve to pg_temp: a
+  -- temporary table or view of the writing session, which this function would read, and whose
+  -- functions it would run, as its owner. Fail closed: refuse unless the firing trigger declares them
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_trigger t
+    WHERE t.tgrelid = TG_RELID AND t.tgname = TG_NAME
+      AND (TG_OP = 'INSERT' OR t.tgoldtable = '${oldRows}')
+      AND (TG_OP = 'DELETE' OR t.tgnewtable = '${newRows}')
+  ) THEN
+    RAISE EXCEPTION 'lilypad: the changelog cannot record %.% because the trigger % does not declare its transition tables (${oldRows}, ${newRows}): reinstall the triggers with lilypadChangelogTriggerSql.', TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_NAME;
   END IF;
 
   -- The key column is read below with to_jsonb (and compared with it in the UPDATE branch), which
