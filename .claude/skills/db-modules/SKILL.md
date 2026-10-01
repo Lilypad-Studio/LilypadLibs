@@ -28,8 +28,9 @@ Read the matching section of `docs/architecture.md` (and `docs/how-it-works.md` 
 
 ## Changing the changelog SQL
 
-- Bump `LILYPAD_CHANGELOG_VERSION` in `src/dbGate/LilypadChangelog.ts` (written into the function COMMENT with `LILYPAD_CHANGELOG_VERSION_PREFIX`; `lilypad-doctor` compares it).
-- Raise `LILYPAD_CHANGELOG_MIN_COMPATIBLE_VERSION` when an install of an older version no longer works with the new code (the schema check then reports an error instead of a warning).
+- Bump `LILYPAD_CHANGELOG_VERSION` in `src/dbGate/LilypadChangelog.ts` (written into the function COMMENT with `LILYPAD_CHANGELOG_VERSION_PREFIX`; `lilypad-doctor` compares it: an older install is the error `outdated-changelog`, a newer one the warning `newer-changelog`, which withholds the changelog fixes). Only for a change of what the SQL installs: a statement that only upgrades an older install needs no bump.
+- Append to the SQL the idempotent statements that upgrade an install of the previous version (`IF EXISTS`/`IF NOT EXISTS`, `DROP` of renamed objects): keep the existing ones, so any older install still upgrades in one run.
+- Keep it readable by the previous version of the library: services of both versions share the database during a rollout (the newest one migrates it first, with `lilypad-doctor --sql`). Add columns and payload fields, never remove or rename one the reader or `parseLilypadNotification` of the previous version needs.
 - Update `LilypadChangelog.test.ts` and `LilypadSchemaCheck.test.ts`, then run `npm run test:integration` (Docker).
 - The changeset tells users to reinstall the changelog SQL (an `#### Upgrading` row).
 

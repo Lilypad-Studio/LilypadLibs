@@ -10,7 +10,7 @@ import { assertNumberOption } from '@/internal/LilypadValidation';
  * The changelog records every change of the cached tables in a table, so that each instance can
  * read the changes made since its last check with one query. It needs no long-lived connection
  * (unlike `LISTEN/NOTIFY`), so it suits serverless platforms, and it also catches the changes made
- * by other programs. It needs PostgreSQL 13 or later (`xid8`).
+ * by other programs. It needs PostgreSQL 16 or later, the oldest version the library supports.
  */
 
 /**
@@ -86,13 +86,6 @@ export function lilypadSafeKeyTypeSql(startOid: string): string {
     LEFT JOIN pg_catalog.pg_roles oown ON oown.oid = op.proowner
   ), false)`;
 }
-/**
- * The oldest version that the caches still read correctly: an older installation is an error of
- * the schema check, a newer one that is not the current version only a warning (version 4 notifies
- * every row of a large statement, instead of one `BULK` notification).
- */
-export const LILYPAD_CHANGELOG_MIN_COMPATIBLE_VERSION = 4;
-
 /** Above this number of rows changed by one statement, the trigger sends one `BULK` notification. */
 export const LILYPAD_DEFAULT_NOTIFY_BULK_THRESHOLD = 1000;
 

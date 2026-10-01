@@ -73,7 +73,7 @@
     "prepare": "husky"
   },
   "peerDependencies": {
-    "postgres": "^3.4.7"
+    "postgres": "^3.4.9"
   },
   "peerDependenciesMeta": {
     "postgres": {

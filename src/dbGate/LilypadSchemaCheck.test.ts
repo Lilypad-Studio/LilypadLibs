@@ -113,7 +113,7 @@ describe('evaluateLilypadSchema', () => {
   });
 
   it('should report an unsupported version', () => {
-    expect(codes(evaluateLilypadSchema(facts({ version: 120000 }), changelogOptions))).toContain(
+    expect(codes(evaluateLilypadSchema(facts({ version: 150000 }), changelogOptions))).toContain(
       'unsupported-version'
     );
   });
@@ -210,6 +210,29 @@ describe('evaluateLilypadSchema', () => {
       }
     });
 
+    it('should withhold the notify fixes of a listen-only config too', () => {
+      const result = evaluateLilypadSchema(
+        facts({ changelog: newer, tables: [{ schema: 'public', triggers: [] }] }),
+        listenOptions
+      );
+
+      expect(codes(result)).toEqual(['newer-changelog', 'missing-notify-trigger']);
+      expect(result.problems[1]!.fix).toBeUndefined();
+      expect(formatLilypadSchemaFixSql(result.problems)).toBe('');
+    });
+
+    it('should still report a changelog table that lost its schema column', () => {
+      const result = evaluateLilypadSchema(
+        facts({ changelog: { ...newer, hasSchemaColumn: false } }),
+        changelogOptions
+      );
+
+      expect(codes(result)).toEqual(['newer-changelog', 'outdated-changelog']);
+      expect(result.problems[1]!.message).toContain('has no table_schema column');
+      expect(result.problems[1]!.fix).toBeUndefined();
+      expect(result.ok).toBe(false);
+    });
+
     it('should give both reasons when a key also blocks the fixes', () => {
       const result = evaluateLilypadSchema(
         facts({
@@ -227,17 +250,25 @@ describe('evaluateLilypadSchema', () => {
     });
   });
 
-  it('should only warn about a changelog of version 4, which the caches still read', () => {
-    const result = evaluateLilypadSchema(
-      facts({ changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:4' } }),
-      changelogOptions
-    );
+  it.each([4, 6, 7, LILYPAD_CHANGELOG_VERSION - 1])(
+    'should report a changelog of version %i as an error, with the SQL of this version',
+    (version) => {
+      const result = evaluateLilypadSchema(
+        facts({
+          changelog: { ...facts().changelog, functionComment: `lilypad-changelog:${version}` },
+        }),
+        changelogOptions
+      );
 
-    expect(codes(result)).toEqual(['outdated-changelog']);
-    expect(result.problems[0]!.severity).toBe('warning');
-    expect(result.problems[0]!.message).toContain('BULK');
-    expect(result.ok).toBe(true);
-  });
+      expect(codes(result)).toEqual(['outdated-changelog']);
+      expect(result.problems[0]!.severity).toBe('error');
+      expect(result.problems[0]!.message).toContain(
+        `(version ${version}, expected ${LILYPAD_CHANGELOG_VERSION}).`
+      );
+      expect(result.problems[0]!.fix).toBe(lilypadChangelogSql({ notifyChannel: false }));
+      expect(result.ok).toBe(false);
+    }
+  );
 
   it.each(['lilypad-changelog:abc', 'lilypad-changelog:6.5', 'my own function'])(
     'should take a changelog whose comment is %j for the oldest version',
@@ -252,55 +283,6 @@ describe('evaluateLilypadSchema', () => {
       expect(result.ok).toBe(false);
     }
   );
-
-  it('should warn that the writing roles can write a changelog of version 6', () => {
-    const result = evaluateLilypadSchema(
-      facts({ changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:6' } }),
-      changelogOptions
-    );
-
-    expect(codes(result)).toEqual(['outdated-changelog']);
-    expect(result.problems[0]!.severity).toBe('warning');
-    expect(result.problems[0]!.message).toContain('privileges of the writing roles');
-    expect(result.problems[0]!.message).not.toContain('prune function');
-    // The placeholders appeared in version 7, the long names broke before
-    expect(result.problems[0]!.message).not.toContain('__lilypad_');
-    expect(result.problems[0]!.message).toContain('62 characters or longer');
-  });
-
-  it('should warn that a changelog of version 7 breaks with some names', () => {
-    const result = evaluateLilypadSchema(
-      facts({ changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:7' } }),
-      changelogOptions
-    );
-
-    expect(codes(result)).toEqual(['outdated-changelog']);
-    expect(result.problems[0]!.severity).toBe('warning');
-    expect(result.problems[0]!.message).toContain(
-      `(version 7, expected ${LILYPAD_CHANGELOG_VERSION})`
-    );
-    expect(result.problems[0]!.message).toContain('62 characters or longer');
-    expect(result.problems[0]!.message).toContain('a placeholder of its SQL (`__lilypad_`)');
-    expect(result.problems[0]!.message).toContain('json cast function a non-superuser owns');
-    expect(result.problems[0]!.message).not.toContain('privileges of the writing roles');
-  });
-
-  it('should warn that a changelog of version 8 converts a user-defined key as the owner', () => {
-    const result = evaluateLilypadSchema(
-      facts({ changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:8' } }),
-      changelogOptions
-    );
-
-    expect(codes(result)).toEqual(['outdated-changelog']);
-    expect(result.problems[0]!.severity).toBe('warning');
-    expect(result.problems[0]!.message).toContain(
-      `(version 8, expected ${LILYPAD_CHANGELOG_VERSION})`
-    );
-    expect(result.problems[0]!.message).toContain('json cast function a non-superuser owns');
-    // Version 8 already handled these
-    expect(result.problems[0]!.message).not.toContain('62 characters or longer');
-    expect(result.problems[0]!.message).not.toContain('__lilypad_');
-  });
 
   it('should report a primary key of a user-defined type that the changelog cannot record', () => {
     const result = evaluateLilypadSchema(
@@ -701,18 +683,6 @@ describe('evaluateLilypadSchema', () => {
     expect(sql.indexOf('TRUNCATE ON "lilypad_cache_changes" FROM app;')).toBeGreaterThan(
       sql.indexOf('SECURITY DEFINER SET search_path')
     );
-  });
-
-  it('should warn about the prune function of a changelog of version 5', () => {
-    const result = evaluateLilypadSchema(
-      facts({ changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:5' } }),
-      changelogOptions
-    );
-
-    expect(codes(result)).toEqual(['outdated-changelog']);
-    expect(result.problems[0]!.severity).toBe('warning');
-    expect(result.problems[0]!.message).toContain('prune function');
-    expect(result.problems[0]!.message).not.toContain('BULK');
   });
 
   describe('notifications of the changelog fix', () => {
