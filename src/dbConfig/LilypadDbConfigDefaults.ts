@@ -2,6 +2,11 @@
 
 export const LILYPAD_DEFAULT_CHANGELOG_TABLE = 'lilypad_cache_changes';
 export const LILYPAD_DEFAULT_NOTIFY_CHANNEL = 'cache_events';
+/**
+ * The prefix of the placeholders of the changelog SQL, which a notification channel may not contain:
+ * the channel is written into the body of the trigger function, where it would be replaced.
+ */
+export const LILYPAD_RESERVED_CHANNEL_PART = '__lilypad_';
 /** The name of the config of `lilypad.config.*`: the others are `lilypad.<name>.config.*`. */
 export const LILYPAD_DEFAULT_DB_CONFIG_NAME = 'default';
 export const LILYPAD_DEFAULT_DB_SCHEMA = 'public';

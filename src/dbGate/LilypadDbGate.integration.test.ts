@@ -898,6 +898,23 @@ describe('LilypadDbGate (integration)', () => {
         }
       );
 
+      it.each([
+        { table: 'kt_int', safe: true },
+        { table: 'kt_enum_t', safe: false },
+      ])(
+        '$table checked as a listen table: the key type is reported iff unsafe (safe=$safe)',
+        async ({ table, safe }) => {
+          // The changelog triggers notify it too: its writes go through the same key-type guard
+          const result = await checkLilypadSchema(gate, {
+            tables: [{ table, primaryKey: 'id' }],
+            changelog: false,
+            notifyChannel: 'cache_events',
+          });
+
+          expect(result.problems.some((p) => p.code === 'unsupported-key-type')).toBe(!safe);
+        }
+      );
+
       it('refuses an escalation attempt, so it cannot run the owner of the changelog', async () => {
         // A role that owns its own cached table and gives its key a cast that runs its own code
         await admin.unsafe(`

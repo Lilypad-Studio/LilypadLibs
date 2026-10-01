@@ -257,7 +257,265 @@ describe('evaluateLilypadSchema', () => {
     expect(problem.severity).toBe('error');
     expect(problem.message).toContain('version 8');
     expect(problem.message).toContain("changelog owner's privileges");
-    expect(problem.message).not.toContain('the writes of the table fail');
+    expect(problem.message).toContain(
+      `once version ${LILYPAD_CHANGELOG_VERSION} is installed, every write of the table fails`
+    );
+    expect(problem.message).toContain(`before installing version ${LILYPAD_CHANGELOG_VERSION}`);
+  });
+
+  it('should tell an install older than version 7 to change the key before version 9', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:5' },
+        tables: [
+          {
+            schema: 'public',
+            triggers: [...changelogStatements, changelogTruncate],
+            keyUserType: 'item_status',
+          },
+        ],
+      }),
+      changelogOptions
+    );
+
+    const problem = result.problems.find((p) => p.code === 'unsupported-key-type')!;
+    expect(problem.message).toContain(
+      `once version ${LILYPAD_CHANGELOG_VERSION} is installed, every write of the table fails`
+    );
+    expect(problem.message).toContain(`before installing version ${LILYPAD_CHANGELOG_VERSION}`);
+    // Before version 7, the trigger function ran with the privileges of the writing role
+    expect(problem.message).not.toContain("changelog owner's privileges");
+  });
+
+  it('should not claim that an older install converts the key of a table it has no trigger on', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:8' },
+        tables: [{ schema: 'public', triggers: [], keyUserType: 'item_status' }],
+      }),
+      listenOptions
+    );
+
+    const problem = result.problems.find((p) => p.code === 'unsupported-key-type')!;
+    expect(problem.message).toContain(`once version ${LILYPAD_CHANGELOG_VERSION} is installed`);
+    expect(problem.message).not.toContain("changelog owner's privileges");
+  });
+
+  describe('a key that the changelog triggers refuse', () => {
+    const withheld =
+      'withheld until the primary key of "items" is changed (see unsupported-key-type / missing-column); run the check again then.';
+    const notifying = (trigger: LilypadTriggerInfo) => ({
+      ...trigger,
+      source: notifySource('cache_events'),
+    });
+    /** `items` recorded by the changelog triggers, `orders` without any trigger. */
+    const twoTables = (
+      items: Partial<LilypadSchemaFacts['tables'][0]>,
+      changelog: Partial<LilypadSchemaFacts['changelog']> = {},
+      triggers = [...changelogStatements, changelogTruncate]
+    ) =>
+      facts({
+        changelog: { ...facts().changelog, ...changelog },
+        tables: [
+          { schema: 'public', triggers, ...items },
+          { schema: 'public', triggers: [] },
+        ],
+      });
+    const twoTableOptions = (options: LilypadSchemaCheckOptions) => ({
+      ...options,
+      tables: [...options.tables, { table: 'orders', primaryKey: 'id' }],
+    });
+    const outdated = { functionComment: 'lilypad-changelog:5', writers: 'app' };
+
+    it('should withhold the changelog SQL, its triggers and the REVOKE of an older install', () => {
+      const result = evaluateLilypadSchema(
+        twoTables({ keyUserType: 'item_status' }, outdated),
+        twoTableOptions(changelogOptions)
+      );
+
+      expect(codes(result)).toEqual([
+        'outdated-changelog',
+        'writable-changelog',
+        'unsupported-key-type',
+        'missing-changelog-trigger',
+      ]);
+      expect(result.ok).toBe(false);
+      expect(formatLilypadSchemaFixSql(result.problems)).toBe('');
+      for (const problem of [result.problems[0]!, result.problems[1]!, result.problems[3]!]) {
+        expect(problem.fix).toBeUndefined();
+        expect(problem.message).toContain(`Its fix is ${withheld}`);
+      }
+    });
+
+    it('should keep the fixes of a config without such a key', () => {
+      const result = evaluateLilypadSchema(
+        twoTables({}, outdated),
+        twoTableOptions(changelogOptions)
+      );
+
+      expect(codes(result)).toEqual([
+        'outdated-changelog',
+        'writable-changelog',
+        'missing-changelog-trigger',
+      ]);
+      const sql = formatLilypadSchemaFixSql(result.problems);
+      expect(sql).toContain('REVOKE INSERT, UPDATE, DELETE, TRUNCATE');
+      expect(sql).toContain(lilypadChangelogSql({ notifyChannel: false }));
+      expect(sql).toContain(lilypadChangelogTriggerSql({ table: 'orders', primaryKey: 'id' }));
+      expect(result.problems.every((p) => !p.message.includes('withheld'))).toBe(true);
+    });
+
+    it('should withhold the notify fixes of a listen-only config', () => {
+      const result = evaluateLilypadSchema(
+        twoTables(
+          { keyUserType: 'item_status' },
+          {},
+          [...changelogStatements, changelogTruncate].map(notifying)
+        ),
+        twoTableOptions(listenOptions)
+      );
+
+      expect(codes(result)).toEqual(['unsupported-key-type', 'missing-notify-trigger']);
+      expect(result.problems[1]!.table).toBe('orders');
+      expect(result.problems[1]!.fix).toBeUndefined();
+      expect(result.problems[1]!.message).toContain(`Its fix is ${withheld}`);
+      expect(formatLilypadSchemaFixSql(result.problems)).toBe('');
+    });
+
+    it('should withhold the notify fix that would give the changelog triggers to the table', () => {
+      const result = evaluateLilypadSchema(
+        facts({ tables: [{ schema: 'public', triggers: [], keyUserType: 'item_status' }] }),
+        listenOptions
+      );
+
+      expect(codes(result)).toEqual(['unsupported-key-type', 'missing-notify-trigger']);
+      expect(result.problems[0]!.message).toContain(
+        'the writes of the table fail once its changelog triggers are installed'
+      );
+      expect(result.problems[1]!.fix).toBeUndefined();
+    });
+
+    it('should withhold the trigger fixes of every table when the changelog table was dropped', () => {
+      const result = evaluateLilypadSchema(
+        twoTables({ keyColumnMissing: true }, { hasTable: false }),
+        twoTableOptions(changelogOptions)
+      );
+
+      expect(codes(result)).toEqual([
+        'missing-changelog',
+        'missing-column',
+        'missing-changelog-trigger',
+      ]);
+      expect(result.problems[2]!.table).toBe('orders');
+      expect(formatLilypadSchemaFixSql(result.problems)).toBe('');
+    });
+
+    it('should still create a missing table, without its changelog triggers', () => {
+      const shape: LilypadSchemaTableShape = {
+        cols: { id: { pgType: 'integer' } },
+        unique: [],
+        foreignKeys: [],
+        indexes: [],
+        checks: [],
+        strict: false,
+      };
+      const result = evaluateLilypadSchema(
+        facts({
+          tables: [
+            {
+              schema: 'public',
+              triggers: [...changelogStatements, changelogTruncate],
+              keyUserType: 'item_status',
+            },
+            { schema: null, triggers: [] },
+          ],
+        }),
+        { tables: [...changelogOptions.tables, { table: 'orders', primaryKey: 'id', shape }] }
+      );
+
+      const missing = result.problems.find((p) => p.code === 'missing-table')!;
+      expect(missing.fix).toContain('CREATE TABLE');
+      expect(missing.fix).not.toContain('CREATE TRIGGER');
+      expect(missing.message).toContain(`The changelog triggers of its fix are ${withheld}`);
+    });
+
+    it('should withhold the pruning that installs or schedules against the changelog', () => {
+      const result = evaluateLilypadSchema(
+        facts({
+          cron: { available: false, installed: false, database: null, jobs: null },
+          tables: [
+            {
+              schema: 'public',
+              triggers: [...changelogStatements, changelogTruncate],
+              keyUserType: 'item_status',
+            },
+          ],
+        }),
+        changelogOptions
+      );
+
+      const pruning = result.problems.find((p) => p.code === 'no-changelog-pruning')!;
+      expect(pruning.fix).toBeUndefined();
+      expect(pruning.message).toContain(`Its fix is ${withheld}`);
+      expect(result.problems.every((p) => p.fix !== '')).toBe(true);
+    });
+
+    it('should report the key of a table recorded by the changelog triggers that notify it', () => {
+      const result = evaluateLilypadSchema(
+        facts({
+          tables: [
+            {
+              schema: 'public',
+              triggers: [...changelogStatements, changelogTruncate].map(notifying),
+              keyUserType: 'item_status',
+            },
+          ],
+        }),
+        listenOptions
+      );
+
+      expect(codes(result)).toEqual(['unsupported-key-type']);
+      expect(result.problems[0]!.message).toContain('the writes of the table fail.');
+    });
+
+    it('should report a missing key column that the changelog triggers notifying it read', () => {
+      const result = evaluateLilypadSchema(
+        facts({
+          tables: [
+            {
+              schema: 'public',
+              triggers: [...changelogStatements, changelogTruncate].map(notifying),
+              keyColumnMissing: true,
+            },
+          ],
+        }),
+        listenOptions
+      );
+
+      expect(codes(result)).toEqual(['missing-column']);
+    });
+
+    it('should not report the key of a table notified by triggers of its own', () => {
+      const ownNotifiers: LilypadTriggerInfo[] = [
+        { changelog: false, args: [], type: ROW_TRIGGER, enabled: true, source: '' },
+        { changelog: false, args: [], type: TRUNCATE_TRIGGER, enabled: true, source: '' },
+      ].map(notifying);
+      const result = evaluateLilypadSchema(
+        facts({
+          tables: [
+            {
+              schema: 'public',
+              triggers: ownNotifiers,
+              keyUserType: 'item_status',
+              keyColumnMissing: true,
+            },
+          ],
+        }),
+        listenOptions
+      );
+
+      expect(result.ok).toBe(true);
+    });
   });
 
   it('should report a primary key column that does not exist (changelog-only table)', () => {

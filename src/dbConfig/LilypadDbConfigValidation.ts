@@ -3,7 +3,10 @@ import type {
   LilypadDbTableInputBase,
   LilypadDbTableSync,
 } from '@/dbConfig/LilypadDbConfig';
-import { LILYPAD_DEFAULT_DB_SCHEMA } from '@/dbConfig/LilypadDbConfigDefaults';
+import {
+  LILYPAD_DEFAULT_DB_SCHEMA,
+  LILYPAD_RESERVED_CHANNEL_PART,
+} from '@/dbConfig/LilypadDbConfigDefaults';
 import type {
   LilypadDbCheck,
   LilypadDbColumn,
@@ -448,6 +451,12 @@ export function validateLilypadDbConfigInput(input: ConfigInput): void {
     // postgres.js keeps its channels in a plain object
     if (Object.hasOwn(Object.prototype, input.notifyChannel)) {
       fail(`notifyChannel cannot be "${input.notifyChannel}".`);
+    }
+    // lilypadChangelogSql refuses it, so lilypad-doctor could not write the SQL of the triggers
+    if (input.notifyChannel.includes(LILYPAD_RESERVED_CHANNEL_PART)) {
+      fail(
+        `notifyChannel cannot contain "${LILYPAD_RESERVED_CHANNEL_PART}", which the changelog SQL reserves (got "${input.notifyChannel}").`
+      );
     }
   }
   if (input.changelog !== undefined) {

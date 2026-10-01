@@ -1,6 +1,7 @@
 import {
   LILYPAD_DEFAULT_CHANGELOG_TABLE,
   LILYPAD_DEFAULT_NOTIFY_CHANNEL,
+  LILYPAD_RESERVED_CHANNEL_PART,
 } from '@/dbConfig/LilypadDbConfigDefaults';
 import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
 import { assertNumberOption } from '@/internal/LilypadValidation';
@@ -419,9 +420,11 @@ export function lilypadChangelogSql(options: LilypadChangelogSqlOptions = {}): s
   const channel = options.notifyChannel ?? LILYPAD_DEFAULT_NOTIFY_CHANNEL;
   if (channel !== false) {
     assertLilypadChannel('lilypadChangelogSql', channel);
-    if (channel.includes('__lilypad_')) {
+    if (channel.includes(LILYPAD_RESERVED_CHANNEL_PART)) {
       // It would be taken for a placeholder of the trigger function
-      throw new Error(`lilypadChangelogSql: the notifyChannel "${channel}" contains "__lilypad_".`);
+      throw new Error(
+        `lilypadChangelogSql: the notifyChannel "${channel}" contains "${LILYPAD_RESERVED_CHANNEL_PART}".`
+      );
     }
   }
   const prune = resolvePruneOptions('lilypadChangelogSql', options.prune);

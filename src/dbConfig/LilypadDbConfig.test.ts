@@ -406,6 +406,11 @@ describe('defineLilypadDb', () => {
       'notifyChannel cannot be "constructor"',
     ],
     [
+      'a channel that the changelog SQL reserves',
+      { notifyChannel: 'app__lilypad_events' },
+      'notifyChannel cannot contain "__lilypad_"',
+    ],
+    [
       'a changelog table with two dots',
       { changelog: { table: 'a.b.c' } },
       'changelog.table must be "table" or "schema.table"',

@@ -110,8 +110,10 @@ export type LilypadSchemaProblemCode =
    * function is not, a user-defined (non-built-in) composite, range or multirange type, or an
    * array or domain over one. Converting it
    * would run a non-superuser's code with the changelog owner's privileges, so the trigger refuses
-   * it and the writes of the table fail. Use a built-in type, a superuser-owned extension type
-   * (e.g. `citext`), or a domain over one.
+   * it and the writes of the table fail. Reported for a `changelog` table, and for a `listen` table
+   * that the changelog triggers notify (or that the fix of its notifications gives them). Use a
+   * built-in type, a superuser-owned extension type (e.g. `citext`), or a domain over one, before
+   * installing the changelog SQL of the current version.
    */
   | 'unsupported-key-type'
   /**
