@@ -140,6 +140,93 @@ describe('evaluateLilypadSchema', () => {
     expect(result.ok).toBe(false);
   });
 
+  describe('a changelog installed by a newer version', () => {
+    const newer = {
+      ...facts().changelog,
+      functionComment: `lilypad-changelog:${LILYPAD_CHANGELOG_VERSION + 1}`,
+    };
+
+    it('should only warn, the caches still read it', () => {
+      const result = evaluateLilypadSchema(facts({ changelog: newer }), changelogOptions);
+
+      expect(codes(result)).toEqual(['newer-changelog']);
+      expect(result.problems[0]!.severity).toBe('warning');
+      expect(result.problems[0]!.message).toContain(
+        `(version ${LILYPAD_CHANGELOG_VERSION + 1}, this one knows ${LILYPAD_CHANGELOG_VERSION}): upgrade @lilypad-studio/libs`
+      );
+      expect(result.ok).toBe(true);
+    });
+
+    it('should withhold every fix that would install the older SQL of this version', () => {
+      const shape: LilypadSchemaTableShape = {
+        cols: { id: { pgType: 'integer' } },
+        unique: [],
+        foreignKeys: [],
+        indexes: [],
+        checks: [],
+        strict: false,
+      };
+      const result = evaluateLilypadSchema(
+        facts({
+          changelog: { ...newer, writers: 'app' },
+          cron: { available: false, installed: false, database: null, jobs: null },
+          tables: [
+            { schema: 'public', triggers: [] },
+            { schema: null, triggers: [] },
+          ],
+        }),
+        {
+          tables: [
+            { table: 'items', primaryKey: 'id' },
+            { table: 'orders', primaryKey: 'id', shape, notifyChannel: 'cache_events' },
+          ],
+        }
+      );
+
+      expect(codes(result)).toEqual([
+        'newer-changelog',
+        'writable-changelog',
+        'missing-changelog-trigger',
+        'missing-table',
+        'no-changelog-pruning',
+      ]);
+      const withheld =
+        'withheld until the library is upgraded (see newer-changelog); run the check again then.';
+      const sql = formatLilypadSchemaFixSql(result.problems);
+      expect(sql).not.toContain('lilypad-changelog:');
+      expect(sql).not.toContain('CREATE TRIGGER');
+      expect(sql).not.toContain('REVOKE');
+      const missing = result.problems.find((p) => p.code === 'missing-table')!;
+      expect(missing.fix).toContain('CREATE TABLE');
+      expect(missing.message).toContain(`The changelog triggers of its fix are ${withheld}`);
+      for (const code of [
+        'writable-changelog',
+        'missing-changelog-trigger',
+        'no-changelog-pruning',
+      ]) {
+        const problem = result.problems.find((p) => p.code === code)!;
+        expect(problem.fix).toBeUndefined();
+        expect(problem.message).toContain(`Its fix is ${withheld}`);
+      }
+    });
+
+    it('should give both reasons when a key also blocks the fixes', () => {
+      const result = evaluateLilypadSchema(
+        facts({
+          changelog: newer,
+          tables: [{ schema: 'public', triggers: [], keyUserType: 'item_status' }],
+        }),
+        changelogOptions
+      );
+
+      const trigger = result.problems.find((p) => p.code === 'missing-changelog-trigger')!;
+      expect(trigger.fix).toBeUndefined();
+      expect(trigger.message).toContain(
+        'withheld until the primary key of "items" is changed (see unsupported-key-type / missing-column) and the library is upgraded (see newer-changelog); run the check again then.'
+      );
+    });
+  });
+
   it('should only warn about a changelog of version 4, which the caches still read', () => {
     const result = evaluateLilypadSchema(
       facts({ changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:4' } }),

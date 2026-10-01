@@ -211,6 +211,12 @@ export function evaluateLilypadSchema(
   const installedChannel = installedNotifyChannel(facts.changelog.functionSource);
   // The version of the installed trigger function, or `undefined` if it does not exist
   const installedVersion = installedChangelogVersion(facts.changelog);
+  // Installed by a newer version of the library: the fixes of this one would install its older SQL
+  // over it, under the services of the newer version that share the database
+  const newerInstall =
+    changelog !== undefined &&
+    installedVersion !== undefined &&
+    installedVersion > LILYPAD_CHANGELOG_VERSION;
   const problems: LilypadSchemaProblem[] = [];
 
   if (facts.version < 130000) {
@@ -294,7 +300,16 @@ export function evaluateLilypadSchema(
     }
     // A comment of another origin, or edited by hand: the oldest version
     const version = installedVersion ?? 1;
-    if ((hasTable && !hasSchemaColumn) || (hasFunction && version < LILYPAD_CHANGELOG_VERSION)) {
+    if (newerInstall) {
+      problems.push({
+        code: 'newer-changelog',
+        severity: 'warning',
+        message: `The changelog "${changelog.table}" was installed by a newer version of the library (version ${version}, this one knows ${LILYPAD_CHANGELOG_VERSION}): upgrade @lilypad-studio/libs. The caches of this version still read it.`,
+      });
+    } else if (
+      (hasTable && !hasSchemaColumn) ||
+      (hasFunction && version < LILYPAD_CHANGELOG_VERSION)
+    ) {
       const compatible =
         (!hasTable || hasSchemaColumn) && version >= LILYPAD_CHANGELOG_MIN_COMPATIBLE_VERSION;
       problems.push(
@@ -525,12 +540,23 @@ export function evaluateLilypadSchema(
   });
 
   problems.push(...deferred, ...pruning.problems);
-  if (blockedTables.length === 0) {
+  // Every fix of the changelog, its triggers and its privileges is withheld while a table blocks
+  // them (any of them could make the triggers refuse its key, and fail its writes), or while a newer
+  // version installed the changelog (they would install the older SQL of this one)
+  const withholdReasons: string[] = [];
+  if (blockedTables.length > 0) {
+    const blockedBy = blockedTables.map((table) => `"${table}"`).join(', ');
+    withholdReasons.push(
+      `the primary key of ${blockedBy} is changed (see unsupported-key-type / missing-column)`
+    );
+  }
+  if (newerInstall) {
+    withholdReasons.push('the library is upgraded (see newer-changelog)');
+  }
+  if (withholdReasons.length === 0) {
     return { ok: !problems.some((problem) => problem.severity === 'error'), problems, tables };
   }
-  // Every fix of the changelog, its triggers and its privileges is withheld: any of them could make
-  // the triggers refuse the key of a blocked table, and fail its writes
-  const blockedBy = blockedTables.map((table) => `"${table}"`).join(', ');
+  const until = withholdReasons.join(' and ');
   const withheld = problems.map((problem): LilypadSchemaProblem => {
     if (!changelogFixes.has(problem)) {
       return problem;
@@ -539,7 +565,7 @@ export function evaluateLilypadSchema(
     const { fix: _fix, fixDatabase: _fixDatabase, ...rest } = problem;
     return {
       ...rest,
-      message: `${problem.message} ${kept === undefined ? 'Its fix is' : 'The changelog triggers of its fix are'} withheld until the primary key of ${blockedBy} is changed (see unsupported-key-type / missing-column); run the check again then.`,
+      message: `${problem.message} ${kept === undefined ? 'Its fix is' : 'The changelog triggers of its fix are'} withheld until ${until}; run the check again then.`,
       ...(kept !== undefined && { fix: kept }),
     };
   });
