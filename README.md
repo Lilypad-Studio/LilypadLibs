@@ -473,7 +473,7 @@ const products = new LilypadCache<string, Product>({
 - `set`, `bulkSet`, `delete` and `invalidate` also write to or remove from the shared level, and so do the fetches of `getOrSet`. `clear`, `dispose`, `bulkSync` and the fallback values after an error act on the instance only.
 - The shared level is never required: a failure or a timeout counts as a missing entry, and is logged as a warning.
 - **`codec`**: without it, values are stored as they are, which suits JSON-compatible values only (a `Date` comes back as a string). `encode(value)` converts a value for the store; `decode(raw)` converts it back, and returns `null` to reject an entry that does not have the expected shape. Either one may throw (e.g. a schema `parse`): a value that cannot be encoded is not shared, an entry that cannot be decoded is ignored, and the read or the fetch goes on as usual.
-- **`refreshLockTtl`**: while an instance refreshes a stale key, it holds a lock in the store for this long, and the other instances do not refresh that key. Set it to the longest duration of a fetch. It is a soft lock: rarely, two instances still refresh together.
+- **`refreshLockTtl`**: while an instance refreshes a stale key, it holds a lock in the store for this long, and the other instances do not refresh that key. Set it to the longest duration of a fetch. The lock is read again when the refresh starts (after the response, with `platform.afterResponse`). It is a soft lock: rarely, two instances still refresh together.
 - **`checkBeforeWrite`**: by default a write replaces the shared value. With `true`, each write first reads the shared entry, and leaves it alone when another instance fetched it later. It costs one more round-trip per write, and the check is soft (read and write are not atomic).
 - An invalidated key never adopts a shared copy produced before the invalidation, even if its removal from the shared level failed. A copy stamped in the future (an instance whose clock is ahead) is ignored until its time comes.
 - Whoever can write the shared store decides what the caches serve, as with the database: a `codec` checks the shape of the values, not where they come from. Give the caches a store (or a namespace) of their own.
@@ -499,10 +499,10 @@ const some = products.getMany(['p1', 'p2']); // synchronous: the fresh values of
 ```
 
 - A load replaces the whole content of the cache. Protected keys (see below) are kept, but marked as expired. Values written while the load was running are kept, since they are newer than its data.
-- A load happens again only after `bulkSync.ttl` (at most the cache TTL, since the loaded values expire then), after `invalidate()` or `invalidateBulkSync()` (also when called while a load is running), after `clear()`, after `maxEntries` evicted an entry, or once an entry written with a shorter TTL expires.
+- A load happens again only after `bulkSync.ttl` (at most the cache TTL, since the loaded values expire then), after `invalidate()` or `invalidateBulkSync()` (also when called while a load is running), after `clear()` or the `delete()` of a cached key, after `maxEntries` evicted an entry, or once an entry written with a shorter TTL (or while a load was running) expires.
+- Concurrent calls share one load, unless something forced a new one since it started (`invalidate()`, `delete()`, ...): a later call then starts another load, which may run while the older one ends.
 - `bulkSync()` resolves to `true` when the cache is synced, `false` when the load failed, `bulkSync.fn` returned no data, or there is no `bulkSync.fn`. A failed load is logged and **not thrown**, unless you call `bulkSync({ throwOnError: true })`: the cache keeps its current content, and the next call tries again. A load that times out writes nothing.
 - `bulkSync.fn` receives an `AbortSignal`, aborted on timeout.
-- Concurrent calls share one load.
 - Pass `{ sync: false }` to `getAll` to read without reloading (the same as `entries()`).
 - Loads fill the memory of this instance only, not the shared level.
 

@@ -5,10 +5,12 @@ import {
   type LilypadCacheKey,
   type LilypadCacheOptions,
   type LilypadCachePeek,
+  type LilypadCacheRead,
   type LilypadCacheResult,
   type LilypadCacheSyncFn,
   type LilypadCacheValueFn,
 } from '@/cache/LilypadCacheTypes';
+import { LilypadReadFlights } from '@/cache/LilypadReadFlights';
 import { LilypadFlowControl } from '@/flow/LilypadFlowControl';
 import { LilypadDisposedError } from '@/internal/LilypadDisposedError';
 import { assertNumberOption } from '@/internal/LilypadValidation';
@@ -16,6 +18,8 @@ import { assertNumberOption } from '@/internal/LilypadValidation';
 export * from '@/cache/LilypadCacheTypes';
 
 const DEFAULT_BULK_SYNC_TIMEOUT = 30_000;
+/** The key of the bulk syncs in `bulkSyncs`. */
+const BULK_SYNC_KEY = 'bulkSync';
 
 /**
  * A generic in-memory cache with time-to-live (TTL) support, error fallback, and protection for
@@ -70,6 +74,10 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
   private bulkSyncExpirationTime = 0;
   /** Ticket of the last bulk sync invalidation, which a bulk sync started earlier must not undo. */
   private bulkSyncInvalidationTicket = 0;
+  /** The bulk syncs in flight: a call joins the last one, if it started after that ticket. */
+  private bulkSyncs = new LilypadReadFlights<boolean>();
+  /** The bulk syncs waiting for their data, during which every key counts as read. */
+  private bulkSyncsReading = 0;
 
   /** @throws If an option is not valid. */
   constructor(options: LilypadCacheOptions<K, V> = {}) {
@@ -84,6 +92,7 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
         }
       },
       onEntriesIncomplete: () => this.forceNextBulkSync(),
+      hasReadInFlight: () => this.bulkSyncsReading > 0,
     });
     this.bulkSyncFn = bulkSync?.fn;
     this.bulkSyncTtl = bulkSync?.ttl ?? this.engine.defaultTtl;
@@ -220,7 +229,9 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
   /**
    * Synchronizes the cache in bulk with `bulkSync.fn`.
    *
-   * Concurrent calls share one sync. Errors are logged; unless `throwOnError` is set they are not
+   * Concurrent calls share one sync, unless a change forced a new one since it started (e.g.
+   * `invalidate`, `delete`, `invalidateBulkSync`): a later call then starts another sync, which
+   * may run while the older one ends. Errors are logged; unless `throwOnError` is set they are not
    * rethrown: the cache keeps its current content, and the next call retries the sync.
    * Bulk syncs fill the memory of this instance only, not the shared level.
    *
@@ -237,15 +248,13 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
       }
       return false;
     }
+    if (Date.now() < this.bulkSyncExpirationTime) {
+      return true;
+    }
     try {
-      return await this.bulkSyncFlowControl.singleFlight('LilypadCache-bulkSync', () =>
-        this.bulkSyncFlowControl
-          .executeWithTimeout((signal) => this.runBulkSync(bulkSyncFn, signal))
-          .catch((error: unknown) => {
-            this.engine.log('error', 'Error during bulk sync:', error);
-            throw error;
-          })
-      );
+      // A sync started before the last forced one may miss that change: it is not joined
+      return await (this.bulkSyncs.join(BULK_SYNC_KEY, this.bulkSyncInvalidationTicket) ??
+        this.startBulkSync(bulkSyncFn));
     } catch (error) {
       if (options.throwOnError) {
         throw error;
@@ -254,15 +263,43 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
     }
   }
 
+  /** Starts a bulk sync, which the calls join until the next one is forced. */
+  private startBulkSync(bulkSyncFn: LilypadCacheSyncFn<K, V>): Promise<boolean> {
+    const read = this.engine.beginRead();
+    const syncing = this.bulkSyncFlowControl
+      .executeWithTimeout((signal) => this.runBulkSync(bulkSyncFn, read, signal))
+      .catch((error: unknown) => {
+        this.engine.log('error', 'Error during bulk sync:', error);
+        throw error;
+      });
+    // Registered before the callers get the promise: it is forgotten before they continue
+    this.bulkSyncs.start([BULK_SYNC_KEY], read.ticket, syncing);
+    return syncing;
+  }
+
   private async runBulkSync(
     bulkSyncFn: LilypadCacheSyncFn<K, V>,
+    read: LilypadCacheRead<K, V>,
     signal: AbortSignal
   ): Promise<boolean> {
-    if (Date.now() < this.bulkSyncExpirationTime) {
-      return true;
+    // Until the data arrives (or the timeout), every key counts as read: a key without an entry
+    // expired meanwhile keeps a fence, which discards the value the sync read before the change
+    let reading = true;
+    const stopReading = () => {
+      if (reading) {
+        reading = false;
+        this.bulkSyncsReading--;
+      }
+    };
+    this.bulkSyncsReading++;
+    signal.addEventListener('abort', stopReading);
+    let data: [K, LilypadCachedValueType<V>][];
+    try {
+      data = await bulkSyncFn(signal);
+    } finally {
+      stopReading();
+      signal.removeEventListener('abort', stopReading);
     }
-    const read = this.engine.beginRead();
-    const data = await bulkSyncFn(signal);
     if (signal.aborted) {
       // Timed out: the caller already got an error, and a newer sync may be running
       return false;
@@ -271,15 +308,23 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
       this.engine.log('warn', 'Bulk sync function returned no data');
       return false;
     }
-    // Taken before the entries are written, which expire at the earliest `defaultTtl` after it
-    const storedAt = Date.now();
+    // Taken before the entries are written, which expire at the earliest `defaultTtl` after it.
+    // Never beyond the expiration of the entries: `entries()` would then return an incomplete (or
+    // empty) set while the sync still counts as fresh. The entries written while the sync ran are
+    // kept as they are (newer than its data), and may expire first. An invalidated one is left
+    // out: its invalidation forced the next sync already, unless `{ invalidateBulkSync: false }`
+    // asked to leave the key out until then.
+    let freshUntil = Date.now() + Math.min(this.bulkSyncTtl, this.engine.defaultTtl);
+    for (const entry of this.engine.store.values()) {
+      if (entry.ticket > read.ticket && entry.expirationTime !== 0) {
+        freshUntil = Math.min(freshUntil, entry.expirationTime);
+      }
+    }
     this.engine.replaceEntries(read, data);
 
     // An invalidation that happened while the sync was running may not be reflected in its data
     if (this.bulkSyncInvalidationTicket < read.ticket) {
-      // Never beyond the expiration of the entries: `entries()` would then return an incomplete
-      // (or empty) set while the sync still counts as fresh
-      this.bulkSyncExpirationTime = storedAt + Math.min(this.bulkSyncTtl, this.engine.defaultTtl);
+      this.bulkSyncExpirationTime = freshUntil;
     }
     return true;
   }
@@ -342,8 +387,8 @@ export class LilypadCache<K extends LilypadCacheKey, V> {
   }
 
   /**
-   * Deletes the key from the cache, and from the shared level. To cache the key as "does not
-   * exist" instead, write `null`.
+   * Deletes the key from the cache, and from the shared level. The deletion of a fresh entry also
+   * forces the next bulk sync. To cache the key as "does not exist" instead, write `null`.
    *
    * @param options.force - If true, also deletes a protected key.
    * @returns `false` if the key is protected and was left untouched.

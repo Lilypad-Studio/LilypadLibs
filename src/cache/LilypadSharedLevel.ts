@@ -265,11 +265,26 @@ export class LilypadSharedLevel<V> {
     );
   }
 
-  /** @returns The lock owner id, or undefined when no lock is configured. */
-  async acquireLock(normalizedKey: string): Promise<string | undefined> {
+  /**
+   * Takes the refresh lock of a key, unless another instance holds it. The lock is read again
+   * here, since the refresh may start long after the read that scheduled it (after the response);
+   * the read and the write are still not atomic.
+   *
+   * @returns The lock owner id (also when the write failed: the refresh goes on), `null` if
+   * another instance holds the lock, or `undefined` when no lock is configured.
+   */
+  async acquireLock(normalizedKey: string): Promise<string | null | undefined> {
     const lockTtl = this.options.refreshLockTtl;
     if (lockTtl === undefined) {
       return undefined;
+    }
+    const current = await this.operation(
+      `read of the lock of "${normalizedKey}"`,
+      (store) => store.get(this.lockKey(normalizedKey)),
+      null
+    );
+    if (typeof current === 'string') {
+      return null;
     }
     const owner = globalThis.crypto.randomUUID();
     await this.operation(

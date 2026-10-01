@@ -258,7 +258,7 @@ Three consequences worth remembering:
 An entry expires when `Date.now() >= entry.expirationTime` (`isLilypadEntryStale`, [LilypadCacheEngine.ts](../src/cache/LilypadCacheEngine.ts)). Invalidation does not remove the entry: it sets `expirationTime` to `0` and records `invalidatedAt`. One value encodes several rules at once:
 
 - The entry is expired, so `get` returns `undefined` and `getOrSet` fetches again.
-- It is **never served stale**: the stale window test is `now < expirationTime + staleWindow`, which is false for `0 + window`.
+- It is **never served stale**: the stale window test is `now < staleUntil(entry, staleWindow)`, which is `0` for an expiration time of `0`, whatever the window (`0 + window` alone would pass with a window longer than the time since the epoch).
 - It **keeps its value**, which remains available to `onError: { fallback: 'stale' }` if the next fetch fails.
 - `LilypadDbCache.renew` refuses to extend it ([LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts)).
 - `invalidatedAt` lets `adoptShared` refuse copies from the shared level that were produced before the invalidation ([LilypadCacheEngine.ts](../src/cache/LilypadCacheEngine.ts)).
@@ -276,7 +276,7 @@ Inside the engine, you will see pairs of methods such as `delete`/`removeEntry` 
 | What                    | Identifier                                                      | Where                                                        |
 | ----------------------- | --------------------------------------------------------------- | ------------------------------------------------------------ |
 | `getOrSet` fetches      | each key, if the fetch started after the last change of the key | `LilypadCacheEngine.fetches` (`LilypadReadFlights`)          |
-| bulk syncs              | `LilypadCache-bulkSync`                                         | a second `LilypadFlowControl`                                |
+| bulk syncs              | the cache, if the sync started after the last forced one        | `LilypadCache.bulkSyncs` (`LilypadReadFlights`)              |
 | async singletons        | the registry key                                                | the promise stored in the registry                           |
 | `LISTEN` on a channel   | the channel                                                     | `ChannelListener.ready`                                      |
 | batched row fetches     | each key, if the query started after the last change of the key | `LilypadDbCache.rowFetches` (`LilypadReadFlights`)           |
@@ -415,22 +415,24 @@ The `@ts-expect-error` tests in `LilypadSerializer.test.ts` check these types; t
 
 ### 4.6 The cache engine: LilypadCacheEngine
 
-[src/cache/LilypadCacheEngine.ts](../src/cache/LilypadCacheEngine.ts), about 1180 lines, with its types in [LilypadCacheTypes.ts](../src/cache/LilypadCacheTypes.ts) and the shared level in [LilypadSharedLevel.ts](../src/cache/LilypadSharedLevel.ts). This is the heart of the library. Read [3.4](#34-tickets-ordering-asynchronous-writes) and [3.5](#35-expirationtime-0-means-invalidated) first.
+[src/cache/LilypadCacheEngine.ts](../src/cache/LilypadCacheEngine.ts), about 1260 lines, with its types in [LilypadCacheTypes.ts](../src/cache/LilypadCacheTypes.ts) and the shared level in [LilypadSharedLevel.ts](../src/cache/LilypadSharedLevel.ts). This is the heart of the library. Read [3.4](#34-tickets-ordering-asynchronous-writes) and [3.5](#35-expirationtime-0-means-invalidated) first.
 
-[LilypadCache.ts](../src/cache/LilypadCache.ts) is the public face of the engine: each method checks that the cache is not disposed (a `LilypadDisposedError` otherwise) and calls the engine. It also owns the **bulk sync** (`bulkSync`, `getAll`, `invalidateBulkSync`), which `LilypadDbCache` does not need: it follows the engine through the hooks `onValueStored` (an entry that expires before the sync forces the next one) and `onEntriesIncomplete` (evictions, `clear`, `expireEverything`).
+[LilypadCache.ts](../src/cache/LilypadCache.ts) is the public face of the engine: each method checks that the cache is not disposed (a `LilypadDisposedError` otherwise) and calls the engine. It also owns the **bulk sync** (`bulkSync`, `getAll`, `invalidateBulkSync`), which `LilypadDbCache` does not need: it follows the engine through the hooks `onValueStored` (an entry that expires before the sync forces the next one), `onEntriesIncomplete` (evictions, `clear`, the `delete` of a fresh entry, `expireEverything`) and `hasReadInFlight` (every key, while a sync waits for its data).
 
 #### What the engine holds
 
 The fields fall into four groups:
 
-| Group      | Fields                                                                           | Role                                                                                       |
-| ---------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| Data       | `store: Map<string, entry>`, `protectedKeys`                                     | The entries, by normalized key; keys that `delete`/`clear`/eviction skip                   |
-| Ordering   | `lastTicket`, `ticketFloor`, `fences`, `bulkSyncInvalidationTicket`              | See [3.4](#34-tickets-ordering-asynchronous-writes)                                        |
-| Resilience | `failures`, `refreshing`, `sharedNotBefore`                                      | Cooldown after a failed fetch, background refreshes in progress, oldest acceptable L2 copy |
-| Machinery  | `flowControl`, `bulkSyncFlowControl`, `shared`, `platform`, `logger`, `disposed` | Single-flight + timeouts for fetches and for bulk syncs; the shared level                  |
+| Group      | Fields                                                    | Role                                                                                       |
+| ---------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Data       | `store: Map<string, entry>`, `protectedKeys`              | The entries, by normalized key; keys that `delete`/`clear`/eviction skip                   |
+| Ordering   | `lastTicket`, `ticketFloor`, `fences`                     | See [3.4](#34-tickets-ordering-asynchronous-writes)                                        |
+| Resilience | `failures`, `refreshing`, `sharedNotBefore`               | Cooldown after a failed fetch, background refreshes in progress, oldest acceptable L2 copy |
+| Machinery  | `flowControl`, `shared`, `platform`, `logger`, `disposed` | The timeout of the fetches; the shared level                                               |
 
-An entry ([`LilypadCacheEntry`, LilypadCacheTypes.ts:144](../src/cache/LilypadCacheTypes.ts)) is:
+`LilypadCache` holds the fields of the bulk sync: `bulkSyncExpirationTime`, `bulkSyncInvalidationTicket` (see [3.4](#34-tickets-ordering-asynchronous-writes)), `bulkSyncs` (the syncs in flight), `bulkSyncsReading` (the syncs waiting for their data) and `bulkSyncFlowControl` (their timeout).
+
+An entry ([`LilypadCacheEntry`, LilypadCacheTypes.ts:150](../src/cache/LilypadCacheTypes.ts)) is:
 
 ```ts
 {
@@ -440,13 +442,13 @@ An entry ([`LilypadCacheEntry`, LilypadCacheTypes.ts:144](../src/cache/LilypadCa
   fetchedAt,      // when the value was produced (for L2 copies: when *some* instance fetched it)
   ticket,         // ordering, see 3.4
   origin,         // 'source' (fetch or write) | 'fallback' (fallbackResult) | 'shared' (adopted from L2)
-  invalidatedAt?, // set by expire()
+  invalidatedAt?, // set by expire(), kept by the next entries of the key for a while
 }
 ```
 
 `origin` is used in three places: `freshHit` reports a `fallback` as `refreshFailed`; `LilypadDbCache` only renews `source` entries, and ignores `fallback` entries when tracking the table's rows.
 
-The constructor validates every numeric option, resolves the shared level (throwing if there is no store or no `name`), creates the two flow controls (5 s timeout for fetches, 30 s for bulk syncs, no retries, no rate limit), and starts the cleanup interval if asked, calling `unref()` so that the timer does not keep Node.js alive.
+The constructor validates every numeric option, resolves the shared level (throwing if there is no store or no `name`), creates its flow control (5 s timeout for fetches, no retries, no rate limit; `LilypadCache` creates the one of its bulk syncs, 30 s), and starts the cleanup interval if asked, calling `unref()` so that the timer does not keep Node.js alive.
 
 #### The write path
 
@@ -469,7 +471,7 @@ Four details:
 
 - **The disposed check.** A fetch that was in flight when `dispose()` was called will still complete and try to store its value. The `disposed` flag makes `writeEntry` a no-op, and since the shared level is written only for an entry that was stored (`set`, `storeFetched`), a disposed cache writes nothing to L2 either.
 - **LRU with a `Set`.** With `maxEntries`, `evictionOrder` holds the keys that can be evicted (not protected), least recently used first: a JavaScript `Set` iterates in insertion order, and deleting and re-adding a key moves it to the end. `markUsed()` does that on writes and reads. `evictOverflow()` removes the first keys of `evictionOrder` until the size fits, through `dropEntry` so that a read in flight keeps its fence. Protected keys stay out of it (`addProtectedKeys` removes them, `removeProtectedKeys` puts them back), so an eviction never scans them. Loops that write while iterating still iterate a **copy** of the store (`[...this.store]`).
-- **Bulk sync consistency.** `entries()` returns "everything in the cache" and trusts it to be the whole source while the bulk sync is fresh. So anything that makes an entry disappear or expire early while the sync is fresh must invalidate the sync: an entry written with a shorter TTL (here), an eviction, `clear()`.
+- **Bulk sync consistency.** `entries()` returns "everything in the cache" and trusts it to be the whole source while the bulk sync is fresh. So anything that makes an entry disappear or expire early while the sync is fresh must invalidate the sync: an entry written with a shorter TTL (here), an eviction, `clear()`, the `delete` of a fresh entry. The entries written while a sync runs are kept as they are, so the sync is not fresh beyond the first of them to expire.
 - **One removal path.** `delete`, `clear`, `purgeExpired`, the bulk sync and `get(key, { removeExpired })` all remove through `removeEntry`, which checks the protected keys and calls `dropEntry`.
 
 `set` = `writeLocal` (new ticket, origin `source`) + `writeShared` (L2 in the background). `LilypadDbCache` calls it for its own writes. `writeLocal` alone is used for fallbacks, which must not be shared with other instances.
@@ -536,18 +538,18 @@ When the fetch fails, the shared promise rejects for every caller who joined it.
 
 A fallback is stored with `writeLocal(..., ttl, 'fallback', fetchedAt)`: in this instance only, for `onError.ttl` or the cache's `errorTtl`, and tagged so that `freshHit` reports it with `refreshFailed: true`. When the fallback **is** the stale value, it keeps the stale entry's `fetchedAt`: it is not a newer value, and dating it from now would make `adoptShared` refuse, once the fallback expires, a fresher copy that another instance put in the shared level meanwhile. A value computed by the function is dated from now.
 
-The **failure cooldown** keeps a source that is down from being hammered by every request. `recordFailure` stores the failure time in `failures`, and in L2 (the `f` key of the key) so other instances see it. `inCooldown` is true for `failureCooldown` ms after it. During the cooldown `getOrSetDetailed` skips the fetch and goes straight to `fallbackResult` with a `LilypadCacheCooldownError`, unless a fetch is already in flight (joining it costs nothing). Once the cooldown ends, `freshHit` refreshes a cached fallback in the background, otherwise the fallback would hide the source's recovery until it expired.
+The **failure cooldown** keeps a source that is down from being hammered by every request. `recordFailure` stores the failure time in `failures`, and in L2 (the `f` key of the key) so other instances see it. `inCooldown` is true for `failureCooldown` ms after it. A failure time in the future (the wall clock stepped back since the failure) counts as now, as a remote one does: otherwise the cooldown would last as long as the step. During the cooldown `getOrSetDetailed` skips the fetch and goes straight to `fallbackResult` with a `LilypadCacheCooldownError`, unless a fetch is already in flight (joining it costs nothing). Once the cooldown ends, `freshHit` refreshes a cached fallback in the background, otherwise the fallback would hide the source's recovery until it expired.
 
 #### Stale-while-revalidate
 
-When an entry has expired but less than `staleWhileRevalidate` ago, `getOrSetDetailed` returns it immediately with status `STALE`, and calls `refreshInBackground`. The refresh is skipped when:
+When an entry has expired but less than `staleWhileRevalidate` ago (and was not invalidated), `getOrSetDetailed` returns it immediately with status `STALE`, and calls `refreshInBackground`. The refresh is skipped when:
 
 - another instance holds the L2 refresh lock (`remote.locked`);
 - this instance scheduled a refresh of the key less than 60 s ago (`refreshing` map, on `performance.now()` so that a step back of the wall clock does not extend it; after 60 s it is assumed the platform dropped it);
 - a fetch of the key is already in flight;
 - the key is in its failure cooldown.
 
-Otherwise it records the key in `refreshing` and hands the work to `runAfterResponse`: take the L2 lock (if configured), run `fetchAndStore`, then clean up in `finally`. The lock is a random owner id stored under the `l` key with a TTL. It is released only if it still holds _our_ owner id, because it may have expired and been taken by another instance meanwhile. It is a soft lock: read and write are separate operations, so two instances can occasionally both refresh, which is harmless.
+Otherwise it records the key in `refreshing` and hands the work to `runAfterResponse`: take the L2 lock (if configured), run `fetchAndStore` unless another instance holds the lock or the cache was disposed meanwhile, then clean up in `finally`. The lock is a random owner id stored under the `l` key with a TTL. `acquireLock` reads it again first (`null`: held by another instance): the work may run long after the read that scheduled it (after the response), and every instance that served the stale value meanwhile would otherwise refresh too. It is released only if it still holds _our_ owner id, because it may have expired and been taken by another instance meanwhile. It is a soft lock: read and write are separate operations, so two instances can occasionally both refresh, which is harmless.
 
 #### The shared level (L2)
 
@@ -559,7 +561,7 @@ Everything about the store itself is in `LilypadSharedLevel` ([LilypadSharedLeve
 - **Reading**: `read` reads the value, the failure marker and the lock in parallel, each bounded by the timeout (fallback `null`).
 - **Adopting**: `adoptShared` ([LilypadCacheEngine.ts](../src/cache/LilypadCacheEngine.ts)) copies a remote entry into L1 only if all of these hold:
   1. it is newer than the local entry (`fetchedAt`);
-  2. it was produced after the local entry was invalidated (`invalidatedAt`): an L2 delete may have failed, or another instance may have written an old copy back. A key without an entry keeps that time in `invalidatedMissing` (set by `deleteShared`, or when an invalidated entry is purged), for the default lifetime of an L2 copy (a copy kept longer, by a per-call TTL or stale window or by another instance with a longer TTL, is not covered). Beyond 10,000 of them (e.g. a flood of notifications), they are replaced with `rejectSharedBefore` of the latest: every older copy is refused, in constant memory;
+  2. it was produced after the local entry was invalidated (`invalidatedAt`): an L2 delete may have failed, or another instance may have written an old copy back. The entries written after an invalidation keep its time too, while an L2 copy of that time may live: a value written to this instance only (a bulk sync, a load) does not replace that copy. A key without an entry keeps that time in `invalidatedMissing` (set by `deleteShared`, or when an entry carrying it is removed), for the default lifetime of an L2 copy (a copy kept longer, by a per-call TTL or stale window or by another instance with a longer TTL, is not covered). Beyond 10,000 of them (e.g. a flood of notifications), they are replaced with `rejectSharedBefore` of the latest: every older copy is refused, in constant memory;
   3. it was produced after `sharedNotBefore` (raised by a `TRUNCATE`, see [4.10](#applying-a-change));
   4. no local write started after the L2 read began (ticket check).
 - **Writing**: `writeShared` ([LilypadCacheEngine.ts](../src/cache/LilypadCacheEngine.ts)) computes the L2 lifetime as `expirationTime + staleWhileRevalidate - now` (so other instances can serve it stale too), and `LilypadSharedLevel.write` skips expired entries and writes in the background. With `checkBeforeWrite`, it first reads the L2 entry and leaves it alone if it was fetched later.
@@ -585,19 +587,19 @@ Four levels, each built on the previous one:
 
 #### Bulk sync
 
-`LilypadCache.bulkSync()` loads everything from `bulkSync.fn` and replaces the content of the cache. Without a function it resolves to `false` at once (or rejects with `throwOnError`), with no query and no log. It runs in its own flow control (single-flight on `LilypadCache-bulkSync`, 30 s timeout) and resolves to a boolean instead of throwing, unless `throwOnError`.
+`LilypadCache.bulkSync()` loads everything from `bulkSync.fn` and replaces the content of the cache. Without a function it resolves to `false` at once (or rejects with `throwOnError`), with no query and no log. Still fresh (`now < bulkSyncExpirationTime`)? It resolves to `true` without loading. Otherwise it joins the sync in flight (`bulkSyncs`, a `LilypadReadFlights`), but only one that started after the last `forceNextBulkSync()` (its ticket above `bulkSyncInvalidationTicket`), as `getOrSet` joins a fetch: a sync started before an invalidation may miss it. Else `startBulkSync` takes the read (`beginRead()`) and starts one, bounded by its own flow control (30 s timeout). It resolves to a boolean instead of throwing, unless `throwOnError`.
 
 `runBulkSync`, step by step:
 
-1. Still fresh (`now < bulkSyncExpirationTime`)? Return `true` without loading.
-2. `beginRead()`, then `await bulkSyncFn(signal)`. Timed out (`signal.aborted`)? Store nothing.
+1. Count the sync as reading (`bulkSyncsReading`, which the `hasReadInFlight` hook reads) until its data arrives or it times out: a key without an entry expired meanwhile then gets a fence, which discards the value read before the change.
+2. `await bulkSyncFn(signal)`. Timed out (`signal.aborted`)? Store nothing.
 3. Build `incoming`, keyed by normalized key.
 4. For each **local** entry (on a copy of the store): keep it if it was written after the sync started (`entry.ticket > read.ticket`, newer than the sync's data) or if it is about to be overwritten; otherwise remove it, and if it is protected, expire it instead.
 5. `read.store(key, value)` for each incoming entry: `setIfNewer`, so entries written during the sync still win.
-6. Raise `ticketFloor` to the sync's ticket (line 875): a read of a missing key that started before the sync is older than the sync's knowledge that the key does not exist.
-7. Mark the sync fresh, **unless** an invalidation happened while it was running (`bulkSyncInvalidationTicket >= read.ticket`): its data may predate that invalidation. Freshness never lasts longer than `ttl`, since the entries it loaded expire then.
+6. Raise `ticketFloor` to the sync's ticket (in `replaceEntries`): a read of a missing key that started before the sync is older than the sync's knowledge that the key does not exist.
+7. Mark the sync fresh, **unless** an invalidation happened while it was running (`bulkSyncInvalidationTicket >= read.ticket`): its data may predate that invalidation. Freshness never lasts longer than `ttl`, since the entries it loaded expire then, nor beyond the expiration of the entries written while it ran (taken before step 4), which it kept.
 
-`forceNextBulkSync()` ([line 887](../src/cache/LilypadCacheEngine.ts), public as `invalidateBulkSync()` on `LilypadCache`) resets the expiration **and** records a ticket. Setting `bulkSyncExpirationTime = 0` alone would not be enough: a sync already running would set it again at step 7.
+`forceNextBulkSync()` ([LilypadCache.ts](../src/cache/LilypadCache.ts), public as `invalidateBulkSync()` on `LilypadCache`) resets the expiration **and** records a ticket. Setting `bulkSyncExpirationTime = 0` alone would not be enough: a sync already running would set it again at step 7, and the next call would join it.
 
 #### dispose
 
@@ -1213,12 +1215,12 @@ Without `dropEntry`'s fence, the key would have no entry and no fence at this po
 
 **(d) A bulk sync completes while a fetch of a missing key runs.**
 
-| Step                                     | Code                           | Ticket     |
-| ---------------------------------------- | ------------------------------ | ---------- |
-| `getOrSet('d', slowFn)` starts           |                                | read = 11  |
-| `bulkSync()` starts                      | `beginRead()` in `runBulkSync` | sync = 12  |
-| The sync's data has no `d`; it completes | `ticketFloor = 12`             | floor = 12 |
-| `slowFn` resolves with an old `d`        | `11 <= max(12, …)`             | discarded  |
+| Step                                     | Code                             | Ticket     |
+| ---------------------------------------- | -------------------------------- | ---------- |
+| `getOrSet('d', slowFn)` starts           |                                  | read = 11  |
+| `bulkSync()` starts                      | `beginRead()` in `startBulkSync` | sync = 12  |
+| The sync's data has no `d`; it completes | `ticketFloor = 12`               | floor = 12 |
+| `slowFn` resolves with an old `d`        | `11 <= max(12, …)`               | discarded  |
 
 ### 5.3 An `UPDATE` from `psql` reaches a serverless instance
 
@@ -1236,7 +1238,7 @@ Setup: an instance holds `accounts` row `7` (fresh from a fetch 30 s ago, ticket
    - the entry exists → held → `members.add` → `markInvalid(7)`: `expireNormalized` rewrites the entry with `expirationTime: 0`, ticket 55, `invalidatedAt: now`; `deleteShared(7)` removes the `v` key of `7` from L2 in the background; the next bulk sync is forced.
    - Back in `apply`: the own writes covered by the new cursor are forgotten; cursor stored; a `changelog` event with the tag `lilypad:accounts:7`.
 4. `renew('7')`: `expirationTime === 0`, so no renewal.
-5. `getOrSetDetailed`: the L1 entry is expired. L2: suppose another instance, which has not polled yet, writes its old copy back just now. `adoptShared` refuses it: `remote.fetchedAt < current.invalidatedAt`. Stale window: `0 + swr < now`, so not served stale. Fetch: `SELECT ... WHERE id = 7` returns `plan = 'pro'`, stored with a ticket greater than 55.
+5. `getOrSetDetailed`: the L1 entry is expired. L2: suppose another instance, which has not polled yet, writes its old copy back just now. `adoptShared` refuses it: `remote.fetchedAt < current.invalidatedAt`. Stale window: `staleUntil` is `0` for an invalidated entry, so not served stale. Fetch: `SELECT ... WHERE id = 7` returns `plan = 'pro'`, stored with a ticket greater than 55.
 
 The change reached the instance within `pollInterval`, with one changelog query (shared with every other cached table of the gate) and one row query. The next poll asks for `xid >= 9121 OR xid = ANY({9120})`: change 551 is not returned again.
 
