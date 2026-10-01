@@ -136,6 +136,42 @@ describe('defineLilypadDb', () => {
     });
   });
 
+  it('should resolve a name of the config in another schema to its only table of that name', () => {
+    const { tables } = defineLilypadDb({
+      tables: {
+        archived: { tableName: 'archive.orgs', primaryKey: 'code', cols: { code: {} } },
+        members: {
+          tableName: 'members',
+          primaryKey: 'id',
+          cols: { id: {}, orgCode: { references: { table: 'orgs' } } },
+        },
+      },
+    });
+
+    expect(tables.members.foreignKeys[0]!.references).toEqual({
+      table: 'archive.orgs',
+      columns: ['code'],
+    });
+  });
+
+  it('should reject a name that several schemas share, none of them the default one', () => {
+    expect(() =>
+      defineLilypadDb({
+        tables: {
+          archived: { tableName: 'archive.orgs', primaryKey: 'id', cols: { id: {} } },
+          audited: { tableName: 'audit.orgs', primaryKey: 'code', cols: { code: {} } },
+          members: {
+            tableName: 'members',
+            primaryKey: 'id',
+            cols: { id: {}, orgId: { references: { table: 'orgs' } } },
+          },
+        },
+      })
+    ).toThrow(
+      'defineLilypadDb: the table "members" (column "orgId") references "orgs", which is a table of several schemas (archive.orgs, audit.orgs): qualify it.'
+    );
+  });
+
   it('should take the schema from a qualified name or from schemaName', () => {
     const { tables } = defineLilypadDb({
       tables: {
@@ -260,6 +296,42 @@ describe('defineLilypadDb', () => {
       cols: { ...table.cols, iso: { pgType: 'timestamptz' } },
     });
 
+    // The spellings of PostgreSQL that the types know without a `type`
+    const spellings = defineLilypadTable<
+      {
+        id: number;
+        amount: string;
+        price: string;
+        flag: string;
+        code: string;
+        padded: string;
+        sizes: number[];
+        counts: number[];
+        grid: number[];
+      },
+      'id'
+    >({
+      tableName: 'spellings',
+      primaryKey: 'id',
+      cols: {
+        id: { pgType: 'int4' },
+        amount: { pgType: 'numeric(10)' },
+        price: { pgType: 'dec(10,2)' },
+        flag: { pgType: 'bit' },
+        code: { pgType: 'char varying(10)' },
+        padded: { pgType: 'bpchar' },
+        sizes: { pgType: 'int[3]' },
+        counts: { pgType: 'integer array' },
+        grid: { pgType: 'int array[4]' },
+      },
+    });
+    defineLilypadTable<{ id: number; price: number }, 'id'>({
+      tableName: 'prices',
+      primaryKey: 'id',
+      // @ts-expect-error: postgres.js returns a numeric as a string
+      cols: { id: { pgType: 'int4' }, price: { pgType: 'dec(10,2)' } },
+    });
+
     defineLilypadTable<{ id: number; note?: string }, 'id'>({
       tableName: 'notes',
       primaryKey: 'id',
@@ -268,6 +340,16 @@ describe('defineLilypadDb', () => {
     });
 
     expect(defineLilypadDb({ tables: { table } }).tables.table.cols.id.type).toBe('number');
+    expect(defineLilypadDb({ tables: { spellings } }).tables.spellings.cols).toMatchObject({
+      amount: { type: 'string' },
+      price: { type: 'string' },
+      flag: { type: 'string' },
+      code: { type: 'string' },
+      padded: { type: 'string' },
+      sizes: { type: 'array' },
+      counts: { type: 'array' },
+      grid: { type: 'array' },
+    });
   });
 
   it('should freeze the definitions, with copies of what they take from the input', () => {
@@ -322,6 +404,11 @@ describe('defineLilypadDb', () => {
       'a channel that postgres.js cannot listen to',
       { notifyChannel: 'constructor' },
       'notifyChannel cannot be "constructor"',
+    ],
+    [
+      'a changelog table with two dots',
+      { changelog: { table: 'a.b.c' } },
+      'changelog.table must be "table" or "schema.table"',
     ],
   ])('should reject %s', (_case, config, message) => {
     expect(() => defineLilypadDb({ ...config, tables: { orgs } })).toThrow(message);
@@ -480,10 +567,46 @@ describe('defineLilypadDb', () => {
       'references.column must not contain a dot',
     ],
     ['an empty column name', { cols: { '': {} } }, 'tables.orgs.cols. must be a non-empty string'],
+    [
+      'a type that does not fit a pgType spelled dec',
+      { cols: { id: { type: 'number', pgType: 'dec(10,2)' } } },
+      'cols.id.type "number" does not fit its pgType "dec(10,2)"',
+    ],
+    [
+      'a type that does not fit an array spelled with ARRAY',
+      { cols: { id: { type: 'string', pgType: 'text ARRAY' } } },
+      'cols.id.type "string" does not fit its pgType "text ARRAY"',
+    ],
+    ['columns given as a list', { cols: [{}] as never }, 'cols must describe at least one column'],
+    [
+      'a column that is not an object',
+      { cols: { id: null as never } },
+      'cols.id must be an object',
+    ],
+    ['a column given as a list', { cols: { id: [] as never } }, 'cols.id must be an object'],
+    [
+      'referenced columns that are not a list',
+      { foreignKeys: [{ columns: ['id'], references: { table: 'x', columns: 'id' as never } }] },
+      'foreignKeys[0].references.columns must list column names',
+    ],
+    [
+      'an option of the sync none',
+      { sync: { strategy: 'none', maxAge: 1 } as never },
+      'tables.orgs.sync.maxAge is not an option',
+    ],
   ])('should reject a table with %s', (_case, changes, message) => {
     expect(() =>
       defineLilypadDb({ tables: { orgs: { ...(orgs as LilypadDbTableInputBase), ...changes } } })
     ).toThrow(message);
+  });
+
+  it.each<[string, unknown, string]>([
+    ['tables that are not an object', null, 'defineLilypadDb: tables must be an object'],
+    ['tables given as a list', [orgs], 'defineLilypadDb: tables must be an object'],
+    ['a table that is not an object', { orgs: null }, 'tables.orgs must be a table'],
+    ['a table given as a list', { orgs: [orgs] }, 'tables.orgs must be a table'],
+  ])('should reject %s', (_case, tables, message) => {
+    expect(() => defineLilypadDb({ tables: tables as never })).toThrow(message);
   });
 
   it('should reject two keys for the same table', () => {

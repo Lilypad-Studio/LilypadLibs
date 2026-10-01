@@ -29,6 +29,12 @@ describe('lilypadColumnTypesOfPgType', () => {
     ['float(10)', ['number']],
     ['text[]', ['array']],
     ['user_role[]', ['array']],
+    ['integer ARRAY', ['array']],
+    ['int[3]', ['array']],
+    ['dec(10,2)', ['string', 'bigint']],
+    ['char varying(10)', ['string']],
+    ['bpchar', ['string']],
+    ['bit', ['string']],
   ])('should read %s as %j', (pgType, types) => {
     expect(lilypadColumnTypesOfPgType(pgType)).toEqual(types);
   });
@@ -61,13 +67,27 @@ describe('normalizeLilypadPgType', () => {
     ['timestamp(3) with time zone', 'timestamp(3) with time zone'],
     ['time', 'time without time zone'],
     ['timetz', 'time with time zone'],
-    ['text[][]', 'text[][]'],
+    ['text[][]', 'text[]'],
     ['uuid', 'uuid'],
     ['Public.CITEXT', 'public.citext'],
     ['float', 'double precision'],
     ['float(24)', 'real'],
     ['float(25)', 'double precision'],
     ['FLOAT(10)[]', 'real[]'],
+    // What format_type writes for these spellings (checked on PostgreSQL 16)
+    ['numeric(10)', 'numeric(10,0)'],
+    ['decimal(10)', 'numeric(10,0)'],
+    ['dec(10,2)', 'numeric(10,2)'],
+    ['bit', 'bit(1)'],
+    ['bit[]', 'bit(1)[]'],
+    ['bit varying', 'bit varying'],
+    ['integer ARRAY', 'integer[]'],
+    ['int ARRAY[4]', 'integer[]'],
+    ['int[3]', 'integer[]'],
+    ['integer[3][]', 'integer[]'],
+    ['char varying(10)', 'character varying(10)'],
+    ['bpchar', 'bpchar'],
+    ['bpchar(5)', 'character(5)'],
   ])('should read %s as %s', (declared, expected) => {
     expect(normalizeLilypadPgType(declared)).toBe(expected);
   });

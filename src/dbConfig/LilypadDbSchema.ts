@@ -7,7 +7,9 @@ import type {
 /**
  * The default of a column: `true` when the database has one (whatever it is), or its SQL
  * expression (e.g. `{ sql: 'now()' }`), which `lilypad-doctor` uses in the SQL that fixes the table.
- * The expression is not compared with the installed one.
+ * The expression is not compared with the installed one. A config is trusted code: the expression
+ * is not checked, and goes as it is into the SQL that `lilypad-doctor` prints (the library never
+ * runs that SQL).
  */
 export type LilypadDbColumnDefault = true | { sql: string };
 
@@ -26,7 +28,9 @@ export type LilypadDbColumnName<T> = keyof T & string;
 
 /**
  * The table a foreign key references: `table` or `schema.table`. An unqualified name is the table
- * of the config with this `tableName`, or else a table of the `defaultSchema` of the config.
+ * of the config with this `tableName` in the `defaultSchema` of the config, or else its only table
+ * with this `tableName` (`defineLilypadDb` rejects a name that several schemas share: qualify it),
+ * or else a table of the `defaultSchema` that the config does not describe.
  */
 export type LilypadDbReference = {
   table: string;
@@ -75,7 +79,9 @@ export type LilypadDbIndex<T> = {
 
 /**
  * A `CHECK` constraint, found by its name (its expression is not compared: PostgreSQL rewrites it).
- * With an `expression`, the SQL that fixes the table creates it.
+ * With an `expression`, the SQL that fixes the table creates it. A config is trusted code: the
+ * expression is not checked, and goes as it is into the SQL that `lilypad-doctor` prints (the
+ * library never runs that SQL).
  */
 export type LilypadDbCheck = { name: string; expression?: string | undefined };
 
@@ -141,7 +147,8 @@ export type LilypadDbColumn = {
    * The exact PostgreSQL type (e.g. `uuid`, `int4`, `varchar(64)`, `timestamptz`, `text[]`),
    * compared with the installed one; common aliases are accepted (`int4` is `integer`). Without it,
    * `lilypad-doctor` only checks that the database type fits `type`, and cannot generate the SQL
-   * that creates the column.
+   * that creates the column. A config is trusted code: the type is not checked as SQL, and goes as
+   * it is into the SQL that `lilypad-doctor` prints (the library never runs that SQL).
    */
   pgType?: string | undefined;
   /**

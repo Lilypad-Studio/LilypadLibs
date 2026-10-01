@@ -97,6 +97,12 @@ describe('bindLilypadDbHooks', () => {
     expect(resolveLilypadDbTable('Test', none.tables.events, appDb).hooks?.select).toBe(toEvent);
   });
 
+  it('should leave a table whose hooks are undefined as it is', () => {
+    const none = bindLilypadDbHooks(db, { events: undefined });
+
+    expect(none.tables.events).toBe(db.tables.events);
+  });
+
   it('should type the hooks with the rows of each table', () => {
     const bound = bindLilypadDbHooks(db, {
       // @ts-expect-error: the rows of events have no `name`
@@ -168,6 +174,15 @@ describe('the hooks of a config given to resolveLilypadDbTable', () => {
     expect(resolveLilypadDbTable('Test', other.tables.events, appDb)).toBe(other.tables.events);
     expect(resolveLilypadDbTable('Test', db.tables.orgs, appDb)).toBe(db.tables.orgs);
     expect(resolveLilypadDbTable('Test', db.tables.events, undefined)).toBe(db.tables.events);
+  });
+
+  it('should ignore a table of the same key in a config of the same name, but another table', () => {
+    const moved = defineLilypadDb({
+      name: 'app',
+      tables: { events: { ...(events as LilypadDbTableInputBase), tableName: 'audit.events' } },
+    });
+
+    expect(resolveLilypadDbTable('Test', moved.tables.events, appDb)).toBe(moved.tables.events);
   });
 
   it('should find a table given by key in the bound config', () => {

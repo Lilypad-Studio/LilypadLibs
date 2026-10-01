@@ -2052,7 +2052,7 @@ describe('LilypadDbGate (integration)', () => {
     };
 
     afterEach(async () => {
-      await admin`DROP TABLE IF EXISTS shape_members, shape_teams`;
+      await admin`DROP TABLE IF EXISTS shape_members, shape_teams, shape_spellings`;
     });
 
     it('should create the missing tables with the SQL of the fixes, and find nothing after', async () => {
@@ -2082,6 +2082,38 @@ describe('LilypadDbGate (integration)', () => {
         .insert({ teamId: team!.id, email: 'ada@example.com' } as Member);
       expect(member).toMatchObject({ teamId: team!.id, score: 0, tags: [], managerId: null });
       expect(member!.joinedAt).toBeInstanceOf(Date);
+    });
+
+    it('should find nothing after the fixes for the spellings that format_type writes otherwise', async () => {
+      const spellingsDb = defineLilypadDb({
+        tables: {
+          spellings: {
+            tableName: 'shape_spellings',
+            primaryKey: 'id',
+            cols: {
+              id: { pgType: 'int4' },
+              amount: { pgType: 'numeric(10)' },
+              price: { pgType: 'dec(10,2)' },
+              flag: { pgType: 'bit' },
+              code: { pgType: 'char varying(10)' },
+              padded: { pgType: 'bpchar' },
+              letter: { pgType: 'char' },
+              sizes: { pgType: 'int[3]' },
+              grid: { pgType: 'int ARRAY[4]' },
+              matrix: { pgType: 'text[][]' },
+            },
+            sync: { strategy: 'none' },
+          },
+        },
+      });
+      const checkSpellings = () => checkLilypadSchema(gate, lilypadSchemaCheckOptions(spellingsDb));
+
+      const missing = await checkSpellings();
+      expect(codes(missing)).toEqual(['public.shape_spellings:missing-table']);
+
+      await applyFixes(missing);
+
+      expect((await checkSpellings()).problems).toEqual([]);
     });
 
     it('should report the columns, keys, foreign keys, indexes and checks that differ', async () => {

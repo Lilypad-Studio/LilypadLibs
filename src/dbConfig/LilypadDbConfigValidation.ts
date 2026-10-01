@@ -159,8 +159,13 @@ function assertOptionalIdentifier(value: unknown, what: string): void {
   }
 }
 
+/** An object that is not an array (an array would give its items the keys `0`, `1`...). */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 function assertObject(value: unknown, what: string): asserts value is Record<string, unknown> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+  if (!isPlainObject(value)) {
     fail(`${what} must be an object.`);
   }
 }
@@ -271,7 +276,7 @@ function assertReference(
 
 function assertColumn(name: string, column: unknown, what: string): void {
   assertIdentifier(name, what);
-  if (typeof column !== 'object' || column === null) {
+  if (!isPlainObject(column)) {
     fail(`${what} must be an object (e.g. { type: 'string' }).`);
   }
   assertOptions(column, COLUMN_OPTIONS, what);
@@ -360,10 +365,10 @@ function assertNoHooks(key: string, table: Record<string, unknown>): void {
 
 function assertTable(key: string, table: unknown, defaultSchema: string): string {
   const what = `tables.${key}`;
-  if (typeof table !== 'object' || table === null) {
+  if (!isPlainObject(table)) {
     fail(`${what} must be a table (see defineLilypadTable).`);
   }
-  assertNoHooks(key, table as Record<string, unknown>);
+  assertNoHooks(key, table);
   assertOptions(table, TABLE_OPTIONS, what);
   const input = table as LilypadDbTableInputBase;
   assertTableName(input.tableName, `${what}.tableName`);
@@ -375,7 +380,7 @@ function assertTable(key: string, table: unknown, defaultSchema: string): string
     }
   }
   const cols = input.cols as Record<string, unknown> | undefined;
-  if (typeof cols !== 'object' || cols === null || Object.keys(cols).length === 0) {
+  if (!isPlainObject(cols) || Object.keys(cols).length === 0) {
     fail(`${what}.cols must describe at least one column.`);
   }
   for (const [name, column] of Object.entries(cols)) {
@@ -455,7 +460,7 @@ export function validateLilypadDbConfigInput(input: ConfigInput): void {
     assertNumberOption(OWNER, 'changelog.minRetention', input.changelog.minRetention, 'positive');
   }
   assertBoolean(input.strict, 'strict');
-  if (typeof input.tables !== 'object' || input.tables === null) {
+  if (!isPlainObject(input.tables)) {
     fail('tables must be an object: { <key>: <table> }.');
   }
   const defaultSchema = input.defaultSchema ?? LILYPAD_DEFAULT_DB_SCHEMA;
