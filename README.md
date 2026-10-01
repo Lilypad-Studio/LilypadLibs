@@ -243,7 +243,7 @@ const logger = LilypadLogger.create<Channels>({
   context: () => requestContext.getStore(),
 });
 
-await logger.flush(); // waits for every message being sent, e.g. at the end of a script
+await logger.flush(); // waits for the messages logged so far, e.g. at the end of a script
 ```
 
 On a serverless platform an instance can be suspended as soon as the response is sent: without `platform`, a message still being sent at that moment (for example to Discord) can be lost.

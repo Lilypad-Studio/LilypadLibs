@@ -9,9 +9,9 @@ import {
 import {
   formatLogValue,
   LILYPAD_DEFAULT_REDACTED_KEYS,
+  lilypadErrorSummary,
   lilypadRedaction,
   NO_REDACTION,
-  redactUrlPasswords,
   toLogJson,
 } from '@/logger/formatLogValue';
 import { runInBackground, type LilypadPlatform } from '@/platform/LilypadPlatform';
@@ -98,8 +98,11 @@ export class LilypadLogger<T extends string> {
   /** The messages still being sent, awaited by `flush`. */
   private _pending = new Set<Promise<void>>();
 
-  /** Above 0 while `errorLogging` runs synchronously: the messages it logs are marked. */
-  private _reporting = 0;
+  /**
+   * While `errorLogging` runs synchronously: the messages it logs, which are marked (their own
+   * failures go to `console.error` only) and awaited by the report.
+   */
+  #reports: Promise<void>[] | undefined;
 
   /**
    * Creates a new LilypadLogger instance or retrieves a singleton instance.
@@ -146,15 +149,7 @@ export class LilypadLogger<T extends string> {
     // (e.g. `constructor`, `toString`); fields are listed explicitly because, depending on the
     // compilation target, they may not be defined on the instance yet. `then` would make the logger
     // a thenable: returning it from an async function would call it instead of resolving to it.
-    const reservedKeys = new Set([
-      'components',
-      'register',
-      'flush',
-      'name',
-      '_pending',
-      '_reporting',
-      'then',
-    ]);
+    const reservedKeys = new Set(['components', 'register', 'flush', 'name', '_pending', 'then']);
     for (const key of Object.keys(options.components)) {
       if (reservedKeys.has(key) || key in this) {
         throw new Error(`Logger type "${key}" is reserved and cannot be used as a log channel.`);
@@ -179,12 +174,24 @@ export class LilypadLogger<T extends string> {
     const { errorLogging } = options;
     const report =
       errorLogging &&
-      ((error: unknown): void | Promise<void> => {
-        this._reporting++;
+      (async (error: unknown): Promise<void> => {
+        const reports: Promise<void>[] = [];
+        const outer = this.#reports;
+        this.#reports = reports;
+        let outcome: Promise<unknown>;
         try {
-          return errorLogging(error);
+          // Runs synchronously: an async function runs until its first `await`
+          outcome = Promise.resolve(errorLogging(error));
+        } catch (failure) {
+          outcome = Promise.reject(failure);
         } finally {
-          this._reporting--;
+          this.#reports = outer;
+        }
+        // The report includes the messages it logged, so that `flush()` waits for them too.
+        // allSettled handles `outcome` at once: its rejection is never left unhandled
+        const [settled] = await Promise.allSettled([outcome, ...reports]);
+        if (settled?.status === 'rejected') {
+          throw settled.reason;
         }
       });
 
@@ -225,7 +232,9 @@ export class LilypadLogger<T extends string> {
 
       const logFn = (...message: unknown[]): void => {
         // The context is read synchronously, while the caller's async context is still active
-        const task = send(message, readContext(options.context), this._reporting > 0);
+        const reports = this.#reports;
+        const task = send(message, readContext(options.context), reports !== undefined);
+        reports?.push(task);
         this._pending.add(task);
         void task.finally(() => this._pending.delete(task));
         // `task` never rejects: the error handler is only required by runInBackground
@@ -256,13 +265,14 @@ export class LilypadLogger<T extends string> {
   }
 
   /**
-   * Resolves once every message logged so far has been sent (or has failed and been reported).
+   * Resolves once every message logged so far has been sent (or has failed and been reported, with
+   * the messages `errorLogging` logged synchronously about it). The messages logged after the call
+   * are not waited for, so that a steady stream of messages cannot keep it pending.
    * Useful before the process exits, or at the end of a serverless request without `platform`.
    */
   async flush(): Promise<void> {
-    while (this._pending.size > 0) {
-      await Promise.all(this._pending);
-    }
+    // Promise.all reads the set now: the messages logged meanwhile are not in it
+    await Promise.all(this._pending);
   }
 }
 
@@ -276,17 +286,16 @@ function readContext(
   }
 }
 
-/** The Error objects among the parts of a message, redacted like the message. */
+/**
+ * The Error objects among the parts of a message, redacted like the message. An error whose fields
+ * cannot be read must not lose the message: see `lilypadErrorSummary`.
+ */
 function logErrors(parts: unknown[], redaction: ReadonlySet<string>): LilypadLogRecord['errors'] {
   const errors = parts.filter((part): part is Error => part instanceof Error);
   if (errors.length === 0) {
     return undefined;
   }
-  return errors.map((error) => ({
-    name: error.name,
-    message: redactUrlPasswords(error.message, redaction),
-    stack: error.stack === undefined ? undefined : redactUrlPasswords(error.stack, redaction),
-  }));
+  return errors.map((error) => lilypadErrorSummary(error, redaction));
 }
 
 /**

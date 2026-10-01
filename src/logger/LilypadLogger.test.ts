@@ -318,6 +318,80 @@ describe('LilypadLogger', () => {
     consoleSpy.mockRestore();
   });
 
+  it('should resolve flush while messages keep arriving', async () => {
+    vi.useFakeTimers();
+    try {
+      mockComponent.write = vi.fn(() => new Promise<void>((resolve) => setTimeout(resolve, 30)));
+      const logger = LilypadLogger.create<mockType>({
+        components: { info: [mockComponent], error: [] },
+      });
+      const stream = setInterval(() => logger.info('tick'), 10);
+      logger.info('before flush');
+
+      let flushed = false;
+      void logger.flush().then(() => (flushed = true));
+      await vi.advanceTimersByTimeAsync(100);
+      clearInterval(stream);
+
+      expect(flushed).toBe(true);
+      await vi.advanceTimersByTimeAsync(100);
+      await logger.flush();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('should wait in flush for the messages errorLogging logs about a failure', async () => {
+    let reported = false;
+    const slow = {
+      write: vi.fn(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        reported = true;
+      }),
+    } as unknown as LilypadLoggerComponent<mockType>;
+    mockComponent.write = vi.fn(async () => {
+      throw new Error('Component error');
+    });
+    const logger: LilypadLoggerType<mockType> = LilypadLogger.create<mockType>({
+      components: { info: [slow], error: [mockComponent] },
+      errorLogging: (error) => {
+        logger.info('Logging failed:', error);
+      },
+    });
+
+    logger.error('first');
+    await logger.flush();
+
+    expect(reported).toBe(true);
+  });
+
+  it('should log a message with an error whose fields cannot be read', async () => {
+    const errorLogging = vi.fn();
+    const logger = LilypadLogger.create<mockType>({
+      components: { info: [], error: [mockComponent] },
+      errorLogging,
+    });
+    const error = new Error('boom');
+    // e.g. a failing Error.prepareStackTrace
+    Object.defineProperty(error, 'stack', {
+      get() {
+        throw new Error('no stack');
+      },
+    });
+    const odd = Object.assign(new Error('odd'), { message: 42 });
+
+    logger.error('failed', error, odd);
+    await logger.flush();
+
+    expect(errorLogging).not.toHaveBeenCalled();
+    const record = vi.mocked(mockComponent.write).mock.calls[0]![0];
+    expect(record.message).toContain('failed Error: boom');
+    expect(record.errors).toEqual([
+      { name: 'Error', message: 'boom', stack: undefined },
+      { name: 'Error', message: '42', stack: odd.stack },
+    ]);
+  });
+
   it('should report the error of every failing component', async () => {
     mockComponent.write = vi.fn(async () => {
       throw new Error('first');

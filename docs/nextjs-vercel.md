@@ -296,7 +296,7 @@ export const getLogger = () =>
 - **`LilypadJsonConsoleLogger`** writes one JSON object per line (`time`, `level`, `logger`, `msg`, your context fields, `errors`). Vercel logs and log drains can filter on these fields.
 - **`context`** runs synchronously when a message is logged, so it sees the `AsyncLocalStorage` of the request. The library does not know where the values come from.
 - **`LilypadDiscordLogger`** batches the messages logged within `minRequestInterval` (1 s) into one Discord message. With `platform`, the function stays alive until the batch is sent. Lower `minRequestInterval` if you prefer shorter lifetimes to fewer requests.
-- **`await logger.flush()`** waits for every message being sent: useful at the end of a script, or where `platform` is not available.
+- **`await logger.flush()`** waits for every message logged before the call: useful at the end of a script, or where `platform` is not available.
 
 ## 7. Edge runtime and middleware
 
