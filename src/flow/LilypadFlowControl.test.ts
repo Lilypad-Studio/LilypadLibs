@@ -866,4 +866,48 @@ describe('LilypadFlowControl edge cases', () => {
   it('should reject invalid options with a RangeError', () => {
     expect(() => new LilypadFlowControl({ rate: -1 })).toThrow(RangeError);
   });
+
+  it.each([Number.NaN, 0, 2 ** 31])(
+    'should reject a per-call timeout of %s before the first attempt, without retrying it',
+    async (timeout) => {
+      const flowControl = new LilypadFlowControl({ retries: 2 });
+      const fn = vi.fn(async () => 'ok');
+      const shouldRetry = vi.fn(() => true);
+
+      await expect(
+        flowControl.executeFn({ functionIdentifier: 'fn', fn, timeout, shouldRetry })
+      ).rejects.toThrow(RangeError);
+      expect(fn).not.toHaveBeenCalled();
+      expect(shouldRetry).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([{ retries: Number.NaN }, { timeout: 0 }])(
+    'should not use the rate limit of the key for a call with the invalid options %o',
+    async (invalid) => {
+      const flowControl = new LilypadFlowControl({ rate: 60_000 });
+      const fn = vi.fn(async () => 'ok');
+
+      await expect(
+        flowControl.executeFn({ functionIdentifier: 'fn', fn, ...invalid })
+      ).rejects.toThrow(RangeError);
+      await expect(flowControl.executeFn({ functionIdentifier: 'fn', fn })).resolves.toBe('ok');
+    }
+  );
+
+  it('should reject a caller with invalid options that would join a call in flight', async () => {
+    const flowControl = new LilypadFlowControl();
+    let finish!: (value: string) => void;
+    const fn = vi.fn(() => new Promise<string>((resolve) => (finish = resolve)));
+    const running = flowControl.executeFn({ functionIdentifier: 'fn', fn });
+
+    await expect(
+      flowControl.executeFn({ functionIdentifier: 'fn', fn, timeout: 0 })
+    ).rejects.toThrow(RangeError);
+    expect(flowControl.isInFlight('fn')).toBe(true);
+    finish('ok');
+
+    await expect(running).resolves.toBe('ok');
+    expect(fn).toHaveBeenCalledOnce();
+  });
 });

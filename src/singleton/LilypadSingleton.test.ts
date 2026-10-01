@@ -241,4 +241,53 @@ describe('LilypadSingleton', () => {
 
     expect(getLilypadSingletonInstance(id, () => ({ value: 3 }))).toBe(replacement);
   });
+
+  it('should leave the registry empty when the release runs while the creation is pending', async () => {
+    const options = { singleton: uniqueId() };
+    const key = lilypadSingletonRegistryKey('A', options.singleton);
+    let release!: () => void;
+    let finish!: () => void;
+    const creating = createLilypadSingletonAbleAsync('A', options, async (r) => {
+      release = r;
+      await new Promise<void>((resolve) => (finish = resolve));
+      return { value: 1 };
+    });
+
+    // e.g. the instance is closed by its own setup before the creation resolves
+    release();
+    finish();
+    const first = await creating;
+
+    expect(first).toEqual({ value: 1 });
+    expect(removeLilypadSingletonInstance(key)).toBe(false);
+    const second = await createLilypadSingletonAbleAsync('A', options, async () => ({ value: 2 }));
+    expect(second).not.toBe(first);
+  });
+
+  it('should report a different signature from a caller joining a pending creation', async () => {
+    const id = uniqueId();
+    const onMismatch = vi.fn();
+    let finish!: () => void;
+    const creating = getLilypadSingletonInstanceAsync(
+      id,
+      () => new Promise<object>((resolve) => (finish = () => resolve({}))),
+      { value: 'a', onMismatch }
+    );
+
+    const joining = getLilypadSingletonInstanceAsync(id, async () => ({}), {
+      value: 'b',
+      onMismatch,
+    });
+    expect(onMismatch).toHaveBeenCalledOnce();
+    finish();
+
+    expect(await joining).toBe(await creating);
+  });
+
+  it('should return an instance created asynchronously to a later synchronous lookup', async () => {
+    const id = uniqueId();
+    const instance = await getLilypadSingletonInstanceAsync(id, async () => ({ value: 1 }));
+
+    expect(getLilypadSingletonInstance(id, () => ({ value: 2 }))).toBe(instance);
+  });
 });

@@ -183,7 +183,7 @@ In Node.js, a promise that rejects with no handler attached terminates the proce
 | `runCallbackSafely(channel, id, cb)`                   | [LilypadDbGate.ts](../src/dbGate/LilypadDbGate.ts)       | `Promise.resolve().then(cb).catch(log)`: catches both sync throws and rejections of listener callbacks    |
 | the logger's channel methods                           | [LilypadLogger.ts](../src/logger/LilypadLogger.ts)       | Never reject: component errors go to `errorLogging`, then to `console.error`                              |
 
-Notice the detail in `runInBackground`: `platform.background` itself may throw (Next.js `after()` throws outside a request). The `try/catch` around it reports that error, but the task **still runs**, only without the "keep the instance alive" guarantee. The same fallback exists in `runAfterResponse`: if `afterResponse` throws, the work is started immediately instead.
+Notice the detail in `runInBackground`: `platform.background` itself may throw (Next.js `after()` throws outside a request). The `try/catch` around it reports that error, but the task **still runs**, only without the "keep the instance alive" guarantee. The same fallback exists in `runAfterResponse`: if `afterResponse` throws, the work is started immediately instead, and only once, even if `afterResponse` had scheduled it before throwing.
 
 ESLint enforces the other half of the rule: `@typescript-eslint/no-floating-promises` is an error, so every promise in the code is either awaited, returned, or explicitly marked with `void` after its errors were handled.
 
@@ -378,7 +378,7 @@ There are two different things here, and it helps to keep them apart:
 
 [src/flow/LilypadFlowControl.ts](../src/flow/LilypadFlowControl.ts). Four independent tools, composed by `executeFn`. The constructor checks its numeric options with `assertNumberOption` (a `NaN` timeout would make every call time out at once). The class is **not generic**: each method takes the type of its own `fn`, so one instance can run executions of different types (the cache runs table loads and key queries through the same bulk flow control).
 
-- **`executeWithTimeout(fn, timeout)`**: creates an `AbortController`, and races `fn(signal)` against a timer. When the timer fires, it aborts the controller **with** the `LilypadTimeoutError` and rejects. JavaScript cannot stop a running promise, so the signal is how `fn` learns it should stop, and how the cache learns that a late result must not be stored (it checks `signal.aborted`).
+- **`executeWithTimeout(fn, timeout)`**: creates an `AbortController`, and races `fn(signal)` against a timer. When the timer fires, it rejects with the `LilypadTimeoutError`, then aborts the controller **with** that error. In that order: the abort listeners run synchronously, and an `fn` that rejects from one with an error of its own would otherwise win the race. JavaScript cannot stop a running promise, so the signal is how `fn` learns it should stop, and how the cache learns that a late result must not be stored (it checks `signal.aborted`).
 - **`executeWithRetries({ executionFn, retries, backOffTime })`**: checks `retries` (a `NaN` would never reach `attempts >= retries`), then runs a `while (true)` loop that returns on success, and on failure either sleeps and retries (default backoff `2^attempt × 100` ms, at most 30 s) or, after the last attempt, rethrows. An invalid `backOffTime` result rejects with the attempt's error as `cause`.
 - **`rateLimit(key)`**: remembers the last execution time per key (on `performance.now()`, a monotonic clock) and throws `LilypadRateLimitError` if the new one comes too soon. The map is pruned when it passes 1000 keys. It is deliberately **synchronous**, see below.
 - **`singleFlight(key, fn)`**: returns the promise of the execution of `key` in flight, or calls `fn` and registers its promise (synchronously), removing it once settled.
@@ -386,6 +386,7 @@ There are two different things here, and it helps to keep them apart:
 `executeFn` chains them in this order:
 
 ```ts
+assertNumberOption(..., timeout); assertNumberOption(..., retries); // 0. invalid options reject first
 if (!this.isInFlight(id)) this.rateLimit(`${consumer}#${id}`); // 1. rate limit a new execution only
 return this.singleFlight(id, () =>                               // 2. join, or start and register
   this.executeWithRetries({                                      // 3. retries around timeouts
@@ -396,7 +397,7 @@ return this.singleFlight(id, () =>                               // 2. join, or 
 
 Between the lookup and the registration of the promise there is **no `await`**. That is the whole correctness argument of single-flight: two calls cannot both see "nothing in flight" and both start, because JavaScript runs this block without interruption. It is also why `rateLimit` must stay synchronous.
 
-A consequence the cache relies on: callers who join an execution share **everything** from the first caller, including its timeout and its outcome. That is why the cache calls `singleFlight` with a function that only logs a failure and rethrows it, and the per-caller fallback is chosen afterwards, outside the flight (see [4.6](#failures-errorreturn-and-the-cooldown)).
+A consequence the cache relies on: callers who join an execution share **everything** from the first caller, including its timeout and its outcome. The cache's fetches follow the same rule, although they are shared through `LilypadReadFlights` rather than `singleFlight`: the shared fetch only logs a failure and rethrows it, and the per-caller fallback is chosen afterwards, outside the shared fetch (see [4.6](#failures-errorreturn-and-the-cooldown)).
 
 ### 4.5 LilypadSerializer
 
@@ -407,7 +408,7 @@ The runtime is trivial: `serialize` loops over the keys, skips values equal to t
 The interesting part is the **types** (lines 1-44). The key mapping `KeyMap` must be a bijection: every `TO` key used once, no two `FROM` keys on the same `TO` key.
 
 - `IsSurjective<B, M>`: `keyof B extends M[keyof M]`, every key of `TO` is some target.
-- `IsInjective<M>`: for each key `K`, the inverse record `InvertRecord<M>[M[K]]` (the union of all keys that map to the same target) must be exactly `K`. The `[X] extends [K]` brackets prevent TypeScript from distributing over the union.
+- `IsInjective<M>`: for each key `K`, the inverse record `InvertRecord<M>[M[K]]` (the union of all keys that map to the same target) must be exactly `K`. The `[X] extends [K]` brackets prevent TypeScript from distributing over the union. A key whose target is itself a union (`'x' | 'y'`) is rejected too (`IsUnion`): its runtime `target` would write only one of them.
 - If the mapping is not a bijection, `target` is typed `never`, so the options object does not compile.
 
 The `@ts-expect-error` tests in `LilypadSerializer.test.ts` check these types; they run under `npm run typecheck`, not under vitest.

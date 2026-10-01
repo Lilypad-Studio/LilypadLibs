@@ -8,12 +8,18 @@ type IsSurjective<
   M extends Record<PropertyKey, PropertyKey>,
 > = keyof B extends M[keyof M] ? true : false;
 
-/** True if no two keys of the mapping have the same target. */
+/** True if T is a union of several types (`boolean` once distributed, hence the `extends false`). */
+type IsUnion<T, U = T> = T extends unknown ? ([U] extends [T] ? false : true) : never;
+
+/** True if no two keys of the mapping have the same target, and each key has a single target. */
 type IsInjective<M extends Record<PropertyKey, PropertyKey>> = {
+  // A union target (`'x' | 'y'`) would claim keys that the runtime `target` never writes.
   // InvertRecord<M>[M[K]] is the union of all the keys mapped to M[K]: it must be K alone
-  [K in keyof M]: M[K] extends keyof InvertRecord<M>
-    ? [InvertRecord<M>[M[K]]] extends [K]
-      ? true
+  [K in keyof M]: IsUnion<M[K]> extends false
+    ? M[K] extends keyof InvertRecord<M>
+      ? [InvertRecord<M>[M[K]]] extends [K]
+        ? true
+        : false
       : false
     : false;
 }[keyof M] extends true

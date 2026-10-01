@@ -118,7 +118,8 @@ export function runInBackground(
  * work. Its errors go to `onError`.
  *
  * @param onPlatformError - Receives the error of `platform.afterResponse` or `platform.background`
- * itself: the work then starts at once. Defaults to ignoring it.
+ * itself: the work then starts at once. It runs once in all, even if the platform scheduled it
+ * before throwing. Defaults to ignoring it.
  */
 export function runAfterResponse(
   platform: LilypadPlatform | undefined,
@@ -126,17 +127,26 @@ export function runAfterResponse(
   onError: (error: unknown) => void,
   onPlatformError: (error: unknown) => void = () => {}
 ): void {
+  // An `afterResponse` may throw after it scheduled the work: the fallback must not run it twice
+  let started = false;
+  const once = (): Promise<unknown> => {
+    if (started) {
+      return Promise.resolve();
+    }
+    started = true;
+    return work();
+  };
   if (platform?.afterResponse) {
     try {
       const handler = safeHandler(onError);
-      platform.afterResponse(() => work().catch(handler));
+      platform.afterResponse(() => once().catch(handler));
       return;
     } catch (error) {
       // e.g. `after` called outside a request scope: fall back to starting the work now
       onPlatformError(error);
     }
   }
-  runInBackground(platform, work(), onError, onPlatformError);
+  runInBackground(platform, once(), onError, onPlatformError);
 }
 
 /**

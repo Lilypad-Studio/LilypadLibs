@@ -38,7 +38,8 @@ export type LilypadExecuteFnOptions<T> = {
   shouldRetry?: ((error: unknown, attempt: number) => boolean) | undefined;
   /**
    * Timeout of each attempt of this execution, in milliseconds; overrides the instance's `timeout`.
-   * Callers that join an in-flight execution share the timeout of the call that started it.
+   * Callers that join an in-flight execution share the timeout of the call that started it: their
+   * own `timeout` and `retries` are ignored, but still checked, and rejected when invalid.
    */
   timeout?: number | undefined;
 };
@@ -287,22 +288,27 @@ export class LilypadFlowControl {
    * @template T - The return type of the function to execute.
    * @returns A promise that resolves with the result of the executed function.
    * @throws {LilypadRateLimitError} If the execution is refused by the rate limit.
+   * @throws If `timeout` or `retries` is not valid: before the rate limit and the first attempt.
    * @throws {LilypadTimeoutError} If the last attempt timed out.
    * @throws The error of the last attempt, once the retries are exhausted.
    */
   executeFn<T>(options: LilypadExecuteFnOptions<T>): Promise<T> {
     const { functionIdentifier, consumerIdentifier } = options;
-    if (!this.isInFlight(functionIdentifier)) {
-      try {
+    try {
+      // Checked before anything else: an invalid timeout would otherwise fail every attempt (and
+      // be retried), and an invalid option would still use the rate limit of the key
+      assertNumberOption('LilypadFlowControl', 'timeout', options.timeout, 'positive-delay');
+      assertNumberOption('LilypadFlowControl', 'retries', options.retries, 'non-negative-integer');
+      if (!this.isInFlight(functionIdentifier)) {
         // Synchronous, see rateLimit
         this.rateLimit(
           consumerIdentifier === undefined
             ? functionIdentifier
             : `${consumerIdentifier}#${functionIdentifier}`
         );
-      } catch (error) {
-        return Promise.reject(error);
       }
+    } catch (error) {
+      return Promise.reject(error);
     }
     return this.singleFlight(functionIdentifier, () =>
       this.executeWithRetries<T>({
