@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { LilypadDbCache, type LilypadDbCacheSyncOverrides } from './LilypadDbCache';
 import type { LilypadDbGate, LilypadDbListener } from '@/dbGate/LilypadDbGate';
 import { LilypadTimeoutError } from '@/flow/LilypadFlowControl';
+import { LilypadDisposedError } from '@/internal/LilypadDisposedError';
 import {
   defineLilypadDb,
   defineLilypadTable,
@@ -1175,6 +1176,32 @@ describe('LilypadDbCache', () => {
       expect(queries().byKey).toBe(2);
     });
 
+    it('should not adopt an older shared copy of a changed row once its row read since is evicted', async () => {
+      const shared = new Map<string, unknown>();
+      const store = {
+        get: async (key: string) => structuredClone(shared.get(key) ?? null),
+        set: async (key: string, value: unknown) => void shared.set(key, structuredClone(value)),
+        // The removal fails (or another instance writes its old copy again)
+        delete: async () => {},
+      };
+      const cache = await createChangelogCache({}, { shared: { store }, maxEntries: 1 });
+      await cache.getOrFetch('1');
+      await vi.advanceTimersByTimeAsync(1000);
+
+      fake.rows.set('1', { id: '1', name: 'ONE' });
+      changelog.read.mockResolvedValueOnce({
+        changes: [{ id: '5', xid: 100n, rowId: '1', op: 'UPDATE' }],
+        cursor: at(101n),
+      });
+      // Applies the change, then reads the row for this instance only (not the shared level)
+      expect(await rowsOf(cache.getManyOrFetch(['1']))).toEqual([{ id: '1', name: 'ONE' }]);
+      await cache.getManyOrFetch(['2']); // evicts '1'
+
+      // The entry read after the change carried its mark: the copy read before it is refused
+      expect(await cache.getOrFetch('1')).toEqual({ id: '1', name: 'ONE' });
+      expect(queries().byKey).toBe(2);
+    });
+
     describe('TRUNCATE', () => {
       it('should empty the table read from the changelog without reloading it', async () => {
         const onInvalidate = vi.fn();
@@ -1833,6 +1860,28 @@ describe('LilypadDbCache', () => {
       expect(fake.mocks.selectAll).toHaveBeenCalledTimes(2);
     });
 
+    it('should not fail getAll for good on a notified id that the database rejects', async () => {
+      fake = createFakeGate(
+        ['1', '2', '3', '4', '5', '6', '7', '8'].map((id) => ({ id, name: `row ${id}` }))
+      );
+      const cache = await createCache({ logger: { error: vi.fn() } });
+      await cache.getAll();
+      // An id no row can have, which the database refuses (e.g. text for an integer key)
+      fake.mocks.selectByPrimaryKeys.mockImplementation(async (keys: string[]) => {
+        if (keys.includes('not-a-key')) {
+          throw new Error('invalid input syntax for type integer: "not-a-key"');
+        }
+        return keys.flatMap((key) => fake.rows.get(String(key)) ?? []);
+      });
+
+      await fake.notify({ table: 'items', id: 'not-a-key', op: 'INSERT' });
+
+      // The fetch of the members fails: the table is loaded instead, which forgets the id
+      expect(await rowsOf(cache.getAll())).toHaveLength(8);
+      expect(await rowsOf(cache.getAll())).toHaveLength(8);
+      expect(fake.mocks.selectAll).toHaveBeenCalledTimes(2);
+    });
+
     it('should ignore notifications with an unknown operation or malformed fields', async () => {
       const logger = { warn: vi.fn() };
       const cache = await createCache({ logger });
@@ -2374,6 +2423,89 @@ describe('LilypadDbCache', () => {
       expect([...(await loading).keys()]).toEqual(expect.arrayContaining(['1', '2']));
     });
 
+    it('should load the table again when a change of the whole table voids its load', async () => {
+      const cache = await createCache();
+      const release = holdNextLoad();
+      const loading = cache.getAll();
+      await vi.advanceTimersByTimeAsync(0);
+
+      // A statement changed many rows while the table was loading: the load may predate it
+      fake.rows.set('3', { id: '3', name: 'three' });
+      await fake.notify({ table: 'items', op: 'BULK' });
+      release();
+
+      expect([...(await loading).keys()].sort()).toEqual(['1', '2', '3']);
+      expect(fake.mocks.selectAll).toHaveBeenCalledTimes(2);
+    });
+
+    it('should return the rows of the second load as read when a change of the whole table voids it too', async () => {
+      const cache = await createCache();
+      const releaseFirst = holdNextLoad();
+      const loading = cache.getAll();
+      await vi.advanceTimersByTimeAsync(0);
+      await fake.notify({ table: 'items', op: 'BULK' });
+      fake.rows.set('3', { id: '3', name: 'three' });
+      const releaseSecond = holdNextLoad();
+
+      releaseFirst();
+      // The second load starts, in the next second of the notification budget
+      await vi.advanceTimersByTimeAsync(1000);
+      await fake.notify({ table: 'items', op: 'BULK' });
+      releaseSecond();
+
+      // It started during the call: its rows are a state of the table since the call started
+      expect([...(await loading).keys()].sort()).toEqual(['1', '2', '3']);
+      expect(fake.mocks.selectAll).toHaveBeenCalledTimes(2);
+    });
+
+    /** A cache of 8 rows, loaded, then told of a row it must fetch by key in the next getAll. */
+    const cacheWithNotedRow = async (options: Record<string, unknown> = {}) => {
+      fake = createFakeGate(
+        ['1', '2', '3', '4', '5', '6', '7', '8'].map((id) => ({ id, name: `row ${id}` }))
+      );
+      const cache = await createCache({ logger: { error: vi.fn() }, ...options });
+      await cache.getAll();
+      await fake.notify({ table: 'items', id: '9', op: 'INSERT' });
+      return cache;
+    };
+
+    it('should not load the table instead when the fetch by key times out', async () => {
+      const cache = await cacheWithNotedRow({ bulkSync: { timeout: 1000 } });
+      fake.mocks.selectByPrimaryKeys.mockReturnValueOnce(new Promise<Item[]>(() => {}));
+
+      // eslint-disable-next-line vitest/valid-expect -- awaited once the fake timers have advanced
+      const assertion = expect(cache.getAll()).rejects.toBeInstanceOf(LilypadTimeoutError);
+      await vi.advanceTimersByTimeAsync(1000);
+      await assertion;
+
+      expect(fake.mocks.selectAll).toHaveBeenCalledOnce();
+    });
+
+    it('should not load the table instead once the gate is closed', async () => {
+      const cache = await cacheWithNotedRow();
+      const closed = new LilypadDisposedError('LilypadDbGate "test"', 'closed');
+      fake.mocks.selectByPrimaryKeys.mockRejectedValueOnce(closed);
+
+      await expect(cache.getAll()).rejects.toBe(closed);
+      expect(fake.mocks.selectAll).toHaveBeenCalledOnce();
+    });
+
+    it('should not load the table again when the fetch after its own load fails', async () => {
+      const cache = await createCache({ logger: { error: vi.fn() } });
+      const release = holdNextLoad();
+      const loading = cache.getAll();
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Noted during the load: fetched by key after it, and that fetch fails
+      await fake.notify({ table: 'items', id: 'not-a-key', op: 'INSERT' });
+      const failure = new Error('invalid input syntax for type integer: "not-a-key"');
+      fake.mocks.selectByPrimaryKeys.mockRejectedValueOnce(failure);
+      release();
+
+      await expect(loading).rejects.toBe(failure);
+      expect(fake.mocks.selectAll).toHaveBeenCalledOnce();
+    });
+
     it('should leave no fence after a load evicted rows beyond maxEntries', async () => {
       fake = createFakeGate(['1', '2', '3', '4', '5'].map((id) => ({ id, name: `row ${id}` })));
       const cache = await createCache({ maxEntries: 2 });
@@ -2498,6 +2630,24 @@ describe('LilypadDbCache', () => {
       await writing;
 
       expect(await cache.getOrFetch('1')).toEqual({ id: '1', name: 'theirs' });
+    });
+
+    it('should not keep an outdated row when its own change is notified before the write returned', async () => {
+      const cache = await createCache();
+      await cache.getOrFetch('1');
+      const finish = hold<{ row: Item; xid: bigint }>(fake.mocks.update);
+      const writing = cache.sqlUpdate({ id: '1', name: 'mine' });
+      await vi.advanceTimersByTimeAsync(0);
+
+      // The notification of the write arrives first: its transaction is not known yet
+      fake.rows.set('1', { id: '1', name: 'mine' });
+      await fake.notify({ table: 'items', id: '1', op: 'UPDATE', xid: '1001' });
+      finish({ row: { id: '1', name: 'mine' }, xid: 1001n });
+      await writing;
+
+      expect(await cache.getOrFetch('1')).toEqual({ id: '1', name: 'mine' });
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(cache.get('1')).toEqual({ id: '1', name: 'mine' });
     });
 
     it('should still cache its row when no change came during the write', async () => {

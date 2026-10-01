@@ -1884,6 +1884,29 @@ describe('LilypadDbGate (integration)', () => {
 
       await cache.dispose();
     });
+
+    it('should not fail getAll for good on a notified id that the primary key cannot hold', async () => {
+      const cache = await LilypadDbCache.create({
+        ttl: 60000,
+        gate,
+        table: usersSchema,
+        logger: createMockLogger(),
+      });
+      try {
+        await admin`INSERT INTO users (name) SELECT 'user ' || n FROM generate_series(1, 8) n`;
+        expect((await cache.getAll()).size).toBe(8);
+
+        // Any role can NOTIFY: an id that is not an integer, which a query by key rejects
+        const forged = JSON.stringify({ table: 'users', id: 'not-a-number', op: 'INSERT' });
+        await admin`SELECT pg_notify('cache_events', ${forged})`;
+        await vi.waitFor(() => expect(cache['members'].keys()).toContain('not-a-number'));
+
+        expect((await cache.getAll()).size).toBe(8);
+        expect(cache['members'].keys()).not.toContain('not-a-number');
+      } finally {
+        await cache.dispose();
+      }
+    });
   });
 
   describe('writes and notifications of large statements', () => {
