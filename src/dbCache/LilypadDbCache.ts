@@ -282,6 +282,11 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
           this.refreshes.has(normalizedKey) ||
           this.eagerRefresh.has(normalizedKey) ||
           this.writesInFlight.has(normalizedKey),
+        // A lookback read removes the shared copies of the changes it reads, within the lookback
+        // only: a copy kept longer (a `ttl` given to `getOrFetch`) would outlive a missed change
+        ...(tableSync.strategy === 'changelog' && {
+          maxSharedAge: () => tableSync.lookback ?? this.defaultLookback(),
+        }),
       }
     );
     this.table = gate.table(definition);
@@ -561,10 +566,18 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
       } finally {
         this.loadsReading--;
       }
+      let withoutKey = 0;
       for (const row of loaded) {
-        const key = row[primaryKey] as LilypadDbKey<V, PK>;
+        const key = row[primaryKey] as LilypadDbKey<V, PK> | null | undefined;
+        if (key === undefined || key === null) {
+          withoutKey++;
+          continue;
+        }
         rows.set(engine.normalizeKey(key), row);
         entries.push([key, row]);
+      }
+      if (withoutKey > 0) {
+        this.warnSelectHook(`${withoutKey} rows loaded have no primary key: they are left out.`);
       }
       // After a timeout the caller already got an error, and a newer load may be running
       if (!signal.aborted && !engine.disposed) {
@@ -692,14 +705,34 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
     const primaryKey = this.definition.primaryKey;
     try {
       return await this.loadFlowControl.executeWithTimeout(async (signal) => {
+        const requested = new Set(keys.map((key) => engine.normalizeKey(key)));
         const rows = new Map<string, V>();
+        let unmatched = 0;
         for (const row of await this.table.selectByPrimaryKeys(keys, { signal })) {
-          rows.set(engine.normalizeKey(row[primaryKey] as LilypadDbKey<V, PK>), row);
+          const normalizedKey = engine.normalizeKey(row[primaryKey] as LilypadDbKey<V, PK>);
+          if (requested.has(normalizedKey)) {
+            rows.set(normalizedKey, row);
+          } else {
+            unmatched++;
+          }
+        }
+        if (unmatched > 0) {
+          this.warnSelectHook(
+            `${unmatched} rows read have none of the primary keys asked for: the keys without a row are expired, not cached as missing.`
+          );
         }
         const values = new Map<string, LilypadCachedValueType<V>>();
         for (const key of keys) {
           const normalizedKey = engine.normalizeKey(key);
           const row = rows.get(normalizedKey) ?? null;
+          // A row whose key the select hook changed may be the row of this key: not cached as
+          // missing, but expired (and removed from the shared level), since it may have changed
+          if (row === null && unmatched > 0) {
+            if (!signal.aborted) {
+              engine.markInvalid(key);
+            }
+            continue;
+          }
           values.set(normalizedKey, row);
           if (!signal.aborted) {
             // The row keeps the key type of the database
@@ -717,6 +750,14 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
       engine.log('error', 'Error fetching rows of the table:', error);
       throw error;
     }
+  }
+
+  /** Logs rows whose primary key does not match the query, e.g. changed by the `select` hook. */
+  private warnSelectHook(problem: string) {
+    this.engine.log(
+      'warn',
+      `Reading "${this.definition.tableName}": ${problem} Does the select hook keep the primary key "${String(this.definition.primaryKey)}"?`
+    );
   }
 
   /**

@@ -162,14 +162,15 @@ export class LilypadDbMembers<K extends LilypadCacheKey> {
 
   /**
    * Whether the rows of the table are known: loaded since the sync became trusted, or, without a
-   * trusted sync, less than `ttl` ago.
+   * trusted sync, less than `ttl` ago. A load made before the sync became trusted again (after a
+   * reconnection, or a gap in the reads of the changelog) may miss the rows inserted in between.
    */
   isLoaded(trustedSince: number | undefined, ttl: number): boolean {
     if (this.loadedAt === undefined) {
       return false;
     }
-    if (trustedSince !== undefined && this.loadedAt >= trustedSince) {
-      return true;
+    if (trustedSince !== undefined) {
+      return this.loadedAt >= trustedSince;
     }
     return Date.now() < this.loadedAt + ttl;
   }

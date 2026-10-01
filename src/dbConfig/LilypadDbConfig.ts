@@ -89,9 +89,10 @@ export type LilypadDbTableChangelogSync = LilypadDbTableTrustedSync & {
   maxGap?: number | undefined;
   /**
    * On the first read, or after `maxGap`, the changes of this many ms are applied, so that
-   * copies in the shared level older than those changes are removed too. It must cover the
-   * lifetime of a shared entry. Defaults to the TTL plus `staleWhileRevalidate`, plus 1 minute:
-   * declare it when that exceeds `maxGap`, so that `lilypad-doctor` checks the retention for it.
+   * copies in the shared level older than those changes are removed too: a row stays in the shared
+   * level for at most this long after it was read (0: never written there). Defaults to the TTL
+   * plus `staleWhileRevalidate`, plus 1 minute: declare it when that exceeds `maxGap`, so that
+   * `lilypad-doctor` checks the retention for it.
    */
   lookback?: number | undefined;
 };

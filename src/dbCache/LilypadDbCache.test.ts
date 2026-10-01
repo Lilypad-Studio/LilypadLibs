@@ -289,6 +289,47 @@ describe('LilypadDbCache', () => {
   });
 
   describe('reads', () => {
+    it('should not cache as missing the keys of rows whose primary key the select hook changed', async () => {
+      const logger = { warn: vi.fn() };
+      const cache = await createCache({ logger });
+      fake.mocks.selectByPrimaryKeys.mockResolvedValueOnce([{ id: 'renamed-1', name: 'one' }]);
+
+      expect(await rowsOf(cache.getManyOrFetch(['1']))).toEqual([]);
+
+      // Not `null`: the row of the key exists
+      expect(cache.peek('1').type).toBe('miss');
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('the keys without a row are expired, not cached as missing'),
+        expect.anything()
+      );
+    });
+
+    it('should expire a notified row whose primary key the select hook changed', async () => {
+      const cache = await createCache({ logger: { warn: vi.fn() } });
+      await cache.getOrFetch('1');
+      fake.mocks.selectByPrimaryKeys.mockResolvedValueOnce([{ id: 'renamed-1', name: 'ONE' }]);
+
+      await fake.notify({ table: 'items', id: '1', op: 'UPDATE' });
+
+      // Not kept fresh with the row read before the change
+      expect(cache.peek('1').type).toBe('expired');
+    });
+
+    it('should leave out the rows loaded without a primary key', async () => {
+      const logger = { warn: vi.fn() };
+      const cache = await createCache({ logger });
+      fake.mocks.selectAll.mockResolvedValueOnce([
+        { id: '1', name: 'one' },
+        { name: 'no key' } as Item,
+      ]);
+
+      expect(await rowsOf(cache.getAll())).toEqual([{ id: '1', name: 'one' }]);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('1 rows loaded have no primary key'),
+        expect.anything()
+      );
+    });
+
     it('should return all rows, excluding the deleted ones', async () => {
       const cache = await createCache();
       await cache.getAll();
@@ -529,6 +570,49 @@ describe('LilypadDbCache', () => {
       expect(cache.peek('1').type).toBe('expired');
       await cache.getAll();
       expect(fake.mocks.selectAll).toHaveBeenCalledTimes(2);
+    });
+
+    it('should load the table again after a LISTEN reconnection, even when it was empty', async () => {
+      fake.rows.clear();
+      const cache = await createCache();
+      expect(await rowsOf(cache.getAll())).toEqual([]);
+      // Inserted while LISTEN was down: its notification is lost
+      fake.rows.set('3', { id: '3', name: 'three' });
+
+      await [...fake.listeners.values()][0]!.onReconnect?.();
+
+      expect(await rowsOf(cache.getAll())).toEqual([{ id: '3', name: 'three' }]);
+    });
+
+    it('should not adopt a shared copy produced before a LISTEN reconnection', async () => {
+      const shared = new Map<string, unknown>();
+      const store = {
+        get: async (key: string) => structuredClone(shared.get(key) ?? null),
+        set: async (key: string, value: unknown) => void shared.set(key, structuredClone(value)),
+        delete: async (key: string) => void shared.delete(key),
+      };
+      const first = await createCache({ shared: { store } });
+      const second = await createCache({ shared: { store } });
+      await first.getOrFetch('1');
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      // Changed while LISTEN was down, for every instance: the shared copy was not removed
+      fake.rows.set('1', { id: '1', name: 'ONE' });
+
+      await [...fake.listeners.values()][0]!.onReconnect?.();
+
+      expect(await second.getOrFetch('1')).toEqual({ id: '1', name: 'ONE' });
+    });
+
+    it('should send a whole-cache event when LISTEN reconnects', async () => {
+      const onInvalidate = vi.fn();
+      await createCache({ platform: { onInvalidate } });
+
+      await [...fake.listeners.values()][0]!.onReconnect?.();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(onInvalidate).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ source: 'notification', keys: [], tags: ['lilypad:items'] })
+      );
     });
 
     it('should keep the key type of cached entries for numeric ids', async () => {
@@ -1001,6 +1085,29 @@ describe('LilypadDbCache', () => {
       ]);
       expect(await rowsOf(cache.getManyOrFetch(new Set(['1', '2'])))).toHaveLength(2);
       expect(queries()).toEqual({ table: 0, byKey: 0, byKeys: [['1', '2']] });
+    });
+
+    it('should not keep a shared copy longer than the lookback, whatever the TTL of the read', async () => {
+      const store = {
+        get: vi.fn(async () => null),
+        set: vi.fn(async (_key: string, _value: unknown, _options?: { ttl?: number }) => {}),
+        delete: vi.fn(async () => {}),
+      };
+      const cache = await createChangelogCache({}, { shared: { store } });
+      const custom = await createChangelogCache(
+        { lookback: 30_000 },
+        { shared: { store }, name: 'custom' }
+      );
+
+      await cache.getOrFetch('1', { ttl: 24 * 60 * 60 * 1000, staleWhileRevalidate: 60_000 });
+      await custom.getOrFetch('1', { ttl: 24 * 60 * 60 * 1000 });
+      await vi.advanceTimersByTimeAsync(0);
+
+      // A lookback read removes the shared copies of the changes it reads, within the lookback only
+      expect(store.set.mock.calls.map(([key, , options]) => [key, options])).toEqual([
+        ['lilypad:2:items:v:1', expect.objectContaining({ ttl: 120 })], // TTL + 1 minute
+        ['lilypad:2:custom:v:1', expect.objectContaining({ ttl: 30 })],
+      ]);
     });
 
     it('should not keep past its TTL a row copied from the shared level', async () => {

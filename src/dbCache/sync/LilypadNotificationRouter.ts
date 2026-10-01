@@ -8,6 +8,16 @@ const MALFORMED_WARNING_INTERVAL = 60_000;
 /** The operations that concern the whole table, not one row: they carry no `id`. */
 const TABLE_OPERATIONS = new Set(['TRUNCATE', 'BULK']);
 
+/** Whether a string has no lone surrogate (`String.prototype.isWellFormed`, not in es2023). */
+function isWellFormed(value: string): boolean {
+  try {
+    encodeURIComponent(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Parses a notification of the `cache_events` channel.
  *
@@ -34,6 +44,11 @@ export function parseLilypadNotification(payload: unknown): LilypadDbNotificatio
     !TABLE_OPERATIONS.has(op) &&
     !((typeof id === 'string' && id !== '') || typeof id === 'number')
   ) {
+    return undefined;
+  }
+  if (typeof id === 'string' && !isWellFormed(id)) {
+    // A lone surrogate (`"\ud800"` in the JSON), which no row can have: the shared keys and the
+    // tags of the invalidation events URI-encode the key, and would fail on it
     return undefined;
   }
   if (

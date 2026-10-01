@@ -57,6 +57,16 @@ describe('LilypadDbMembers', () => {
     expect(members.isLoaded(undefined, 60_000)).toBe(false);
   });
 
+  it('should not count a load made before the sync became trusted again, even within the TTL', () => {
+    const members = new LilypadDbMembers<string>();
+    const loadedAt = Date.now();
+    members.replace(loaded('a'), 1, loadedAt, () => false);
+
+    expect(members.isLoaded(loadedAt, 60_000)).toBe(true);
+    // e.g. a LISTEN reconnection: the rows inserted meanwhile may be missing
+    expect(members.isLoaded(loadedAt + 1, 60_000)).toBe(false);
+  });
+
   it('should track the members while the first load runs, and keep them after it', () => {
     const members = new LilypadDbMembers<string>();
     members.beginLoad();

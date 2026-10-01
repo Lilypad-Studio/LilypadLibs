@@ -36,6 +36,13 @@ describe('parseLilypadNotification', () => {
     expect(parseLilypadNotification('{"table":"t","op":"UPDATE"}')).toBeUndefined();
     expect(parseLilypadNotification('{"table":"t","op":"MERGE","id":"1"}')).toBeUndefined();
   });
+
+  it('should refuse an id with a lone surrogate, which no row can have', () => {
+    const payload = (id: string) => JSON.stringify({ table: 't', op: 'UPDATE', id });
+
+    expect(parseLilypadNotification(payload(String.fromCharCode(0xd800)))).toBeUndefined();
+    expect(parseLilypadNotification(payload(String.fromCharCode(0xd83d, 0xde00)))).toBeDefined();
+  });
 });
 
 describe('LilypadNotificationRouter', () => {

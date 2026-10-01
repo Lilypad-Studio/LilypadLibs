@@ -11,7 +11,7 @@ Make `LilypadChangelogSync` measure `pollInterval` and `maxGap` with `performanc
 ## Context
 
 - Source: finding FND-2 (recommended, confirmed) of the `010-foundations` review, whose fix (commit `ca1e3c3`) moved `LilypadFlowControl.rateLimit` and `LilypadBackoff` to `performance.now()`. The report left this caller open: "`LilypadChangelogSync.beforeRead` compares `Date.now()` with `lastRead` (a wall-clock `readAt`) for `pollInterval`."
-- Location: `src/cache/dbSync/LilypadChangelogSync.ts`, class `LilypadChangelogSync`:
+- Location: `src/dbCache/sync/LilypadChangelogSync.ts`, class `LilypadChangelogSync` (moved from `src/cache/dbSync/` by `55ad0f5`):
   ```ts
   private lastRead = 0;
   ...
@@ -43,11 +43,11 @@ Make `LilypadChangelogSync` measure `pollInterval` and `maxGap` with `performanc
     ```
   - The reader types are internal (not exported by any entry), so this is not a breaking change. `performance.now()` is available in edge runtimes too, but this file is only reached from `db`.
 - Tests: `vi.useFakeTimers()` fakes `performance` in the installed vitest, and `vi.setSystemTime` moves only the wall clock. See the existing tests "should not lock the keys out when the wall clock steps back" (`src/flow/LilypadFlowControl.test.ts`) and "should not postpone the next attempt when the wall clock steps back" (`src/internal/LilypadBackoff.test.ts`).
-- Units involved: `060-db-cache` (`LilypadChangelogSync.ts`) and `050-db-gate` (`LilypadChangelogReader.ts`). Their reviews may have queued a duplicate or changed this code: check first.
+- Units involved: `060-db-cache` (`LilypadChangelogSync.ts`) and `050-db-gate` (`LilypadChangelogReader.ts`). Checked by `review-2026-09-30/900-integration`: their reviews queued no duplicate, and the `lastRead` comparisons above are still on the wall clock at `ee36fe2`.
 
 ## Done when
 
-- A test in `src/cache/dbSync/LilypadChangelogSync.test.ts` (or `src/cache/LilypadDbCache.test.ts`) reads once, steps the wall clock back by 1 h with `vi.setSystemTime`, advances the timers past `pollInterval`, and sees the next read happen. It fails before the fix and passes after.
+- A test in `src/dbCache/sync/LilypadChangelogSync.test.ts` (or `src/dbCache/LilypadDbCache.test.ts`) reads once, steps the wall clock back by 1 h with `vi.setSystemTime`, advances the timers past `pollInterval`, and sees the next read happen. It fails before the fix and passes after.
 - A test steps the wall clock back by 1 h, advances the timers past `maxGap`, and sees the next read use a lookback (and `trustedSince()` return `undefined` before it).
 - A test shows that the first `beforeRead` right after construction, with the fake clock near 0, reads.
 - `npm run check` and `npm run test:integration` pass.

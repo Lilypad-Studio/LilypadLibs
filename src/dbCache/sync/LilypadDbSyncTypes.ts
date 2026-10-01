@@ -95,9 +95,9 @@ export type LilypadDbSyncHost<K extends LilypadCacheKey> = {
   /** Applies a `TRUNCATE` of the table. @returns The keys that were cached. */
   applyTruncate(mode: LilypadDbChangeMode): K[];
   /**
-   * Applies a change of too many rows to follow them one by one: every entry is expired (no query,
-   * no removal from the shared level, whose older copies are ignored), and the next `getAll` loads
-   * the table again.
+   * Applies a change of too many rows to follow them one by one, or changes that may have been
+   * missed (a `LISTEN` reconnection): every entry is expired (no query, no removal from the shared
+   * level, whose older copies are ignored), and the next `getAll` loads the table again.
    */
   applyBulkChange(): void;
   /** Expires every entry: the changes made meanwhile may have been missed. */

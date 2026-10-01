@@ -66,12 +66,14 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
     this.subscriber = {
       table: host.tableName.split('.').pop()!,
       handle: (payload) => this.handleNotification(payload),
-      // Notifications sent while the connection was down are lost: every entry may be stale
+      // Notifications sent while the connection was down are lost: every entry may be stale, the
+      // shared copies too (every instance may have lost them), and rows may have been inserted
       onReconnect: () => {
         if (host.isDisposed()) {
           return;
         }
-        host.expireEverything();
+        host.applyBulkChange();
+        host.emitInvalidation('notification', [], { wholeCache: true });
         if (this.applyChanges) {
           this.listenTrustedSince = Date.now();
         }

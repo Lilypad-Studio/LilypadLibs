@@ -74,6 +74,12 @@ export type LilypadCacheEngineHooks<K extends LilypadCacheKey, V> = {
   onEntriesIncomplete?(): void;
   /** Whether the owner reads the key from the source in another way than `getOrSet`. */
   hasReadInFlight?(normalizedKey: string): boolean;
+  /**
+   * The longest a value may stay in the shared level after it was fetched, in ms, whatever the TTL
+   * and the stale window of the read (e.g. the changelog `lookback` of a `LilypadDbCache`, beyond
+   * which a shared copy outlives the changes that the cache would remove it for).
+   */
+  maxSharedAge?(): number;
 };
 
 /**
@@ -869,10 +875,14 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
    */
   private writeShared(entry: LilypadCacheEntry<K, V>, staleWhileRevalidate = 0) {
     const staleWindow = Math.max(staleWhileRevalidate, this.defaultStaleWhileRevalidate);
+    const keptUntil = Math.min(
+      entry.expirationTime + staleWindow,
+      entry.fetchedAt + (this.hooks.maxSharedAge?.() ?? Infinity)
+    );
     this.shared?.write(
       this.normalizeKey(entry.key),
       { value: entry.value, fetchedAt: entry.fetchedAt, expiresAt: entry.expirationTime },
-      entry.expirationTime + staleWindow - Date.now()
+      keptUntil - Date.now()
     );
   }
 
