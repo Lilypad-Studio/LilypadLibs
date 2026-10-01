@@ -98,6 +98,33 @@ describe('lilypadChangelogSql prune option', () => {
     );
   });
 
+  it('should guard the key type before converting it, after the row-trigger check', () => {
+    const sql = lilypadChangelogSql();
+
+    // The guard raises for an unsafe key type
+    expect(sql).toContain('has an unsafe type');
+    const rowReturn = sql.indexOf("IF TG_LEVEL = 'ROW' THEN");
+    const guard = sql.indexOf('INTO key_type');
+    const firstToJsonb = sql.indexOf('to_jsonb(n.%%1$I)');
+    expect(rowReturn).toBeGreaterThan(-1);
+    expect(guard).toBeGreaterThan(rowReturn);
+    expect(firstToJsonb).toBeGreaterThan(guard);
+    // The catalog relations the guard reads are qualified with pg_catalog
+    for (const relation of [
+      'pg_catalog.pg_attribute',
+      'pg_catalog.pg_type',
+      'pg_catalog.pg_roles',
+      'pg_catalog.pg_cast',
+      'pg_catalog.pg_proc',
+    ]) {
+      expect(sql).toContain(relation);
+    }
+    // Fails closed: a missing key column raises too
+    expect(sql).toContain('does not exist (renamed or dropped?)');
+    // The key name is clipped like %I
+    expect(sql).toContain('TG_ARGV[0]::pg_catalog.name');
+  });
+
   it('should name the prune function after the changelog table', () => {
     const sql = lilypadChangelogSql({
       changelogTable: 'archive.changes',

@@ -206,6 +206,8 @@ export function evaluateLilypadSchema(
   const notifyChannel = options.notifyChannel ?? false;
   const installedPrune = installedLilypadChangelogPrune(facts.changelog.functionSource);
   const installedChannel = installedNotifyChannel(facts.changelog.functionSource);
+  // The version of the installed trigger function, or `undefined` if it does not exist
+  const installedVersion = installedChangelogVersion(facts.changelog);
   const problems: LilypadSchemaProblem[] = [];
 
   if (facts.version < 130000) {
@@ -254,7 +256,7 @@ export function evaluateLilypadSchema(
   // Whether a changelog problem carries it: the fixes of the tables then leave it out
   let changelogFixed = false;
   if (changelog) {
-    const { hasTable, hasSchemaColumn, hasFunction, functionComment } = facts.changelog;
+    const { hasTable, hasSchemaColumn, hasFunction } = facts.changelog;
     if (!hasTable || !hasFunction) {
       problems.push({
         code: 'missing-changelog',
@@ -266,12 +268,8 @@ export function evaluateLilypadSchema(
       });
       changelogFixed = true;
     }
-    const comment = functionComment ?? '';
-    const parsed = comment.startsWith(LILYPAD_CHANGELOG_VERSION_PREFIX)
-      ? Number(comment.slice(LILYPAD_CHANGELOG_VERSION_PREFIX.length))
-      : Number.NaN;
     // A comment of another origin, or edited by hand: the oldest version
-    const version = Number.isInteger(parsed) ? parsed : 1;
+    const version = installedVersion ?? 1;
     if ((hasTable && !hasSchemaColumn) || (hasFunction && version < LILYPAD_CHANGELOG_VERSION)) {
       const compatible =
         (!hasTable || hasSchemaColumn) && version >= LILYPAD_CHANGELOG_MIN_COMPATIBLE_VERSION;
@@ -350,6 +348,35 @@ export function evaluateLilypadSchema(
       const shapeProblems = evaluateLilypadTableShape(table, primaryKey, shape, found);
       problems.push(...shapeProblems.problems);
       deferred.push(...shapeProblems.deferred);
+    }
+
+    // A missing key column (renamed or dropped): the changelog trigger has nothing to record. The
+    // shape check reports it only when the shape describes the key column, so report it here unless
+    // it does (a shape that omits the key column would otherwise hide it).
+    if (
+      needsChangelog &&
+      found.keyColumnMissing &&
+      !(shape && Object.hasOwn(shape.cols, primaryKey))
+    ) {
+      problems.push({
+        code: 'missing-column',
+        severity: 'error',
+        table,
+        message: `The primary key column "${primaryKey}" of "${table}" does not exist (renamed or dropped?): the changelog trigger cannot record it.`,
+      });
+    }
+
+    if (needsChangelog && typeof found.keyUserType === 'string') {
+      const current =
+        installedVersion === undefined || installedVersion >= LILYPAD_CHANGELOG_VERSION;
+      problems.push({
+        code: 'unsupported-key-type',
+        severity: 'error',
+        table,
+        message: current
+          ? `The primary key "${primaryKey}" of "${table}" has the type ${found.keyUserType}, which the changelog triggers cannot convert as their owner (its type, output function or a json cast function is not owned by a superuser, or it is a user-defined composite, range or multirange type, or an array or domain over one), so the writes of the table fail. Use a built-in type (integer, bigint, uuid, text...), a type of a superuser-installed extension (e.g. citext), or a domain over one.`
+          : `The primary key "${primaryKey}" of "${table}" has the type ${found.keyUserType}, which the installed changelog triggers (version ${installedVersion}) convert with the changelog owner's privileges (its type, output function or a json cast function is not owned by a superuser), so a non-superuser may be able to run code as that owner. Reinstall the changelog SQL (lilypadChangelogSql, lilypadChangelogTriggerSql) and change the key to a built-in type (integer, bigint, uuid, text...), a type of a superuser-installed extension (e.g. citext), or a domain over one.`,
+      });
     }
 
     if (needsChangelog) {
@@ -446,19 +473,40 @@ export function evaluateLilypadSchema(
   return { ok: !problems.some((problem) => problem.severity === 'error'), problems, tables };
 }
 
+/**
+ * The version of the installed trigger function, from its comment (`undefined` if it does not
+ * exist). A function without a valid version comment (another origin, or edited by hand) is the
+ * oldest version.
+ */
+function installedChangelogVersion(changelog: LilypadSchemaFacts['changelog']): number | undefined {
+  if (!changelog.hasFunction) {
+    return undefined;
+  }
+  const comment = changelog.functionComment ?? '';
+  const parsed = comment.startsWith(LILYPAD_CHANGELOG_VERSION_PREFIX)
+    ? Number(comment.slice(LILYPAD_CHANGELOG_VERSION_PREFIX.length))
+    : Number.NaN;
+  return Number.isInteger(parsed) ? parsed : 1;
+}
+
 /** What a changelog of a compatible older version lacks (see `LILYPAD_CHANGELOG_VERSION`). */
 function outdatedChangelogReason(version: number): string {
   const longName =
     'a changelog table whose name is 62 characters or longer (schema included) breaks its functions and indexes';
+  // Version 9 refuses a user-defined key type, which earlier versions would convert as the owner
+  const keyType = `a key of a type whose output or json cast function a non-superuser owns can run that role's code as the changelog owner, through the conversion of the key in the trigger function`;
   // The placeholders appeared in version 7
   const beforeVersion8 = `a changelog table whose name contains a placeholder of its SQL (\`__lilypad_\`) breaks its trigger function, and ${longName}`;
   const beforeVersion7 = `its triggers write the changelog with the privileges of the writing roles, which can then record changes of their own that every cache trusts, and ${longName}`;
   const beforeVersion6 = `its prune function (\`prune\` option) can be made to run the code of any role with the privileges of its owner, the triggers of a long table name record only TRUNCATE, a name containing \`$\` breaks its SQL, and ${beforeVersion7}`;
-  return version < 5
-    ? `a statement that changes many rows notifies each of them instead of sending one BULK notification; ${beforeVersion6}`
-    : version < 6
-      ? beforeVersion6
-      : version < 7
-        ? beforeVersion7
-        : beforeVersion8;
+  const beforeVersion9 =
+    version < 5
+      ? `a statement that changes many rows notifies each of them instead of sending one BULK notification; ${beforeVersion6}`
+      : version < 6
+        ? beforeVersion6
+        : version < 7
+          ? beforeVersion7
+          : beforeVersion8;
+  // Every version below 9 also lacks the key-type guard
+  return version < 8 ? `${beforeVersion9}, and ${keyType}` : keyType;
 }

@@ -17,8 +17,74 @@ import { assertNumberOption } from '@/internal/LilypadValidation';
  * The function carries it in its comment (`lilypad-changelog:<version>`), so that
  * `checkLilypadSchema` can tell an installation made by an older version of the library.
  */
-export const LILYPAD_CHANGELOG_VERSION = 8;
+export const LILYPAD_CHANGELOG_VERSION = 9;
 export const LILYPAD_CHANGELOG_VERSION_PREFIX = 'lilypad-changelog:';
+
+/**
+ * PostgreSQL's `FirstNormalObjectId`: types, functions and casts whose OID is below it are built-in
+ * (assigned by `initdb`); the rest are user-defined. Only a superuser can attach a cast to, or an
+ * I/O function of, a built-in type, so a built-in type is trusted.
+ */
+const LILYPAD_FIRST_NORMAL_OBJECT_ID = 16384;
+
+/** The deepest chain of domains/arrays the key-type check walks; beyond it, the key is refused. */
+const KEY_TYPE_MAX_DEPTH = 32;
+
+/**
+ * A SQL boolean expression that is true only when the type `startOid` is safe to convert with
+ * `to_jsonb` while running as the changelog owner. `to_jsonb` of a non-built-in value runs its cast
+ * to `json` if one exists, else its output function, and recurses into the elements of an array and
+ * the fields of a composite; a cast or I/O function a role owns runs that role's code. So a type is
+ * safe only when every node it is built from (resolving domains to their base and arrays to their
+ * element) is either built-in (OID below {@link LILYPAD_FIRST_NORMAL_OBJECT_ID}), or a base or enum
+ * type whose type, output function and every `json`/`jsonb` cast function are owned by a superuser
+ * (or built in). A user-defined (non-built-in) composite, range or multirange type, or a chain
+ * deeper than {@link KEY_TYPE_MAX_DEPTH}, is refused (built-in ones, such as `int4range`, pass). It fails closed: an empty walk is unsafe. The same fragment guards the trigger and the
+ * schema check, so they cannot drift. It reads only `pg_catalog`; `startOid` must be trusted SQL.
+ */
+export function lilypadSafeKeyTypeSql(startOid: string): string {
+  const fno = LILYPAD_FIRST_NORMAL_OBJECT_ID;
+  return `coalesce((
+    WITH RECURSIVE walk(oid, typtype, typbasetype, typelem, typowner, typoutput, depth) AS (
+      SELECT ty.oid, ty.typtype, ty.typbasetype, ty.typelem, ty.typowner, ty.typoutput, 0
+      FROM pg_catalog.pg_type ty WHERE ty.oid = ${startOid}
+      UNION ALL
+      SELECT nt.oid, nt.typtype, nt.typbasetype, nt.typelem, nt.typowner, nt.typoutput, walk.depth + 1
+      FROM walk JOIN pg_catalog.pg_type nt ON nt.oid = CASE
+        WHEN walk.typtype = 'd' THEN walk.typbasetype
+        WHEN walk.typelem <> 0 THEN walk.typelem
+        ELSE NULL END
+      WHERE walk.depth < ${KEY_TYPE_MAX_DEPTH}
+    )
+    SELECT bool_and(
+      -- A domain or a registered array type is passed through (resolved above), not checked itself
+      CASE WHEN node.typtype = 'd'
+            OR (node.typelem <> 0 AND EXISTS (
+                 SELECT 1 FROM pg_catalog.pg_type e
+                 WHERE e.oid = node.typelem AND e.typarray = node.oid))
+        THEN true
+        ELSE node.oid < ${fno}
+          OR (
+            node.typtype IN ('b', 'e')
+            AND coalesce(town.rolsuper, false)
+            AND (node.typoutput < ${fno} OR coalesce(oown.rolsuper, false))
+            AND NOT EXISTS (
+              SELECT 1 FROM pg_catalog.pg_cast cs
+              JOIN pg_catalog.pg_proc cp ON cp.oid = cs.castfunc
+              JOIN pg_catalog.pg_roles cr ON cr.oid = cp.proowner
+              WHERE cs.castsource = node.oid
+                AND cs.casttarget IN ('pg_catalog.json'::regtype, 'pg_catalog.jsonb'::regtype)
+                AND cs.castfunc >= ${fno} AND NOT cr.rolsuper
+            )
+          )
+      END
+    ) AND max(node.depth) < ${KEY_TYPE_MAX_DEPTH}
+    FROM walk AS node
+    LEFT JOIN pg_catalog.pg_roles town ON town.oid = node.typowner
+    LEFT JOIN pg_catalog.pg_proc op ON op.oid = node.typoutput
+    LEFT JOIN pg_catalog.pg_roles oown ON oown.oid = op.proowner
+  ), false)`;
+}
 /**
  * The oldest version that the caches still read correctly: an older installation is an error of
  * the schema check, a newer one that is not the current version only a warning (version 4 notifies
@@ -476,6 +542,7 @@ DO ${recordDoBody(
 DECLARE
   changed text;
   recorded bigint;
+  key_type oid;
 BEGIN${
       prune
         ? `
@@ -495,6 +562,24 @@ BEGIN${
     RETURN NULL;
   END IF;
 
+  -- The key column is read below with to_jsonb (and compared with it in the UPDATE branch), which
+  -- this function runs as its owner. to_jsonb resolves a cast or output function by the value's type,
+  -- not by the search_path, so a key of a type whose cast or I/O function a non-superuser owns would
+  -- run that role's code as the owner. Fail closed: refuse unless the key column exists and its type
+  -- is proven safe (see lilypadSafeKeyTypeSql: a built-in type, or a base/enum type whose type,
+  -- output function and json casts are owned by superusers, resolving domains and arrays). TG_ARGV[0]
+  -- is cast to the name type, so it is clipped to 63 bytes exactly as the parser clips the %I below.
+  SELECT a.atttypid INTO key_type
+  FROM pg_catalog.pg_attribute a
+  WHERE a.attrelid = TG_RELID AND a.attname = TG_ARGV[0]::pg_catalog.name
+    AND a.attnum > 0 AND NOT a.attisdropped;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'lilypad: the changelog cannot record %.% because its primary key column % does not exist (renamed or dropped?): reinstall the triggers with lilypadChangelogTriggerSql.', TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_ARGV[0];
+  END IF;
+  IF NOT (${lilypadSafeKeyTypeSql('key_type')}) THEN
+    RAISE EXCEPTION 'lilypad: the changelog cannot record %.% because its primary key column % has an unsafe type: converting it would run a non-superuser''s code as the changelog owner. Use a built-in key type (integer, bigint, uuid, text...), a type of a superuser-installed extension (e.g. citext), or a domain over one.', TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_ARGV[0];
+  END IF;
+
   -- Every row of the statement in one query, from the transition tables. Only the primary key
   -- column is read, instead of converting whole rows to JSON.
   changed := CASE TG_OP
@@ -505,7 +590,8 @@ BEGIN${
       'SELECT to_jsonb(o.%1$I) #>> ''{}'' AS row_id, ''DELETE'' AS op FROM ${oldRows} o',
       TG_ARGV[0])
     -- An update that changes primary keys also deletes the old keys that no row has any more
-    -- (compared as JSON: the = of a type outside pg_catalog, e.g. citext, is not on the path)
+    -- (compared as JSON: the = of a type outside pg_catalog, e.g. citext, is not on the path; the
+    -- key type is proven safe above, so to_jsonb here runs no code of a non-superuser role)
     ELSE format(
       'SELECT to_jsonb(o.%1$I) #>> ''{}'' AS row_id, ''DELETE'' AS op FROM ${oldRows} o '
       || 'WHERE NOT EXISTS (SELECT 1 FROM ${newRows} n WHERE to_jsonb(n.%1$I) = to_jsonb(o.%1$I)) '

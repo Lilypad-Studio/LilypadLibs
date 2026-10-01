@@ -105,6 +105,16 @@ export type LilypadSchemaProblemCode =
   /** The changelog trigger of the table records another column than the primary key. */
   | 'wrong-trigger-primary-key'
   /**
+   * The primary key column has a type the changelog triggers cannot convert with `to_jsonb` as
+   * their owner: an enum or base type not owned by a superuser, or whose output or json cast
+   * function is not, a user-defined (non-built-in) composite, range or multirange type, or an
+   * array or domain over one. Converting it
+   * would run a non-superuser's code with the changelog owner's privileges, so the trigger refuses
+   * it and the writes of the table fail. Use a built-in type, a superuser-owned extension type
+   * (e.g. `citext`), or a domain over one.
+   */
+  | 'unsupported-key-type'
+  /**
    * `TRUNCATE` of the table is not recorded (or not notified, with `notifyChannel`): it fires no
    * row trigger, so the caches would keep the removed rows.
    */

@@ -18,7 +18,7 @@ import type {
   LilypadTriggerInfo,
 } from './LilypadSchemaFacts';
 import { lilypadCommandDeletesFrom, lilypadPruneCommandRetention } from './LilypadSchemaPruning';
-import type { LilypadSchemaCheckOptions } from './LilypadSchemaTypes';
+import type { LilypadSchemaCheckOptions, LilypadSchemaTableShape } from './LilypadSchemaTypes';
 
 // pg_trigger.tgtype: ROW = 1, INSERT = 4, DELETE = 8, UPDATE = 16, TRUNCATE = 32
 const ROW_TRIGGER = 1 | 4 | 8 | 16;
@@ -189,10 +189,139 @@ describe('evaluateLilypadSchema', () => {
 
     expect(codes(result)).toEqual(['outdated-changelog']);
     expect(result.problems[0]!.severity).toBe('warning');
-    expect(result.problems[0]!.message).toContain('(version 7, expected 8)');
+    expect(result.problems[0]!.message).toContain(
+      `(version 7, expected ${LILYPAD_CHANGELOG_VERSION})`
+    );
     expect(result.problems[0]!.message).toContain('62 characters or longer');
     expect(result.problems[0]!.message).toContain('a placeholder of its SQL (`__lilypad_`)');
+    expect(result.problems[0]!.message).toContain('json cast function a non-superuser owns');
     expect(result.problems[0]!.message).not.toContain('privileges of the writing roles');
+  });
+
+  it('should warn that a changelog of version 8 converts a user-defined key as the owner', () => {
+    const result = evaluateLilypadSchema(
+      facts({ changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:8' } }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['outdated-changelog']);
+    expect(result.problems[0]!.severity).toBe('warning');
+    expect(result.problems[0]!.message).toContain(
+      `(version 8, expected ${LILYPAD_CHANGELOG_VERSION})`
+    );
+    expect(result.problems[0]!.message).toContain('json cast function a non-superuser owns');
+    // Version 8 already handled these
+    expect(result.problems[0]!.message).not.toContain('62 characters or longer');
+    expect(result.problems[0]!.message).not.toContain('__lilypad_');
+  });
+
+  it('should report a primary key of a user-defined type that the changelog cannot record', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        tables: [
+          {
+            schema: 'public',
+            triggers: [...changelogStatements, changelogTruncate],
+            keyUserType: 'item_status',
+          },
+        ],
+      }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toContain('unsupported-key-type');
+    const problem = result.problems.find((p) => p.code === 'unsupported-key-type')!;
+    expect(problem.severity).toBe('error');
+    expect(problem.table).toBe('items');
+    expect(problem.message).toContain('item_status');
+    expect(problem.message).toContain('the writes of the table fail');
+    expect(result.ok).toBe(false);
+  });
+
+  it('should say an older install still converts the key as the owner', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:8' },
+        tables: [
+          {
+            schema: 'public',
+            triggers: [...changelogStatements, changelogTruncate],
+            keyUserType: 'item_status',
+          },
+        ],
+      }),
+      changelogOptions
+    );
+
+    const problem = result.problems.find((p) => p.code === 'unsupported-key-type')!;
+    expect(problem.severity).toBe('error');
+    expect(problem.message).toContain('version 8');
+    expect(problem.message).toContain("changelog owner's privileges");
+    expect(problem.message).not.toContain('the writes of the table fail');
+  });
+
+  it('should report a primary key column that does not exist (changelog-only table)', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        tables: [
+          {
+            schema: 'public',
+            triggers: [...changelogStatements, changelogTruncate],
+            keyColumnMissing: true,
+          },
+        ],
+      }),
+      changelogOptions
+    );
+
+    const problem = result.problems.find((p) => p.code === 'missing-column')!;
+    expect(problem.severity).toBe('error');
+    expect(problem.table).toBe('items');
+    expect(problem.message).toContain('does not exist');
+    expect(result.ok).toBe(false);
+  });
+
+  it('should report a missing key column even when a shape omits it', () => {
+    // A shape whose cols do not describe the key column would otherwise hide it
+    const shapeWithoutKey: LilypadSchemaTableShape = {
+      cols: { other: {} },
+      unique: [],
+      foreignKeys: [],
+      indexes: [],
+      checks: [],
+      strict: false,
+    };
+    const result = evaluateLilypadSchema(
+      facts({
+        tables: [
+          {
+            schema: 'public',
+            triggers: [...changelogStatements, changelogTruncate],
+            keyColumnMissing: true,
+          },
+        ],
+      }),
+      { tables: [{ table: 'items', primaryKey: 'id', shape: shapeWithoutKey }] }
+    );
+
+    expect(codes(result)).toContain('missing-column');
+  });
+
+  it('should not report a built-in primary key type', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        tables: [
+          {
+            schema: 'public',
+            triggers: [...changelogStatements, changelogTruncate],
+            keyUserType: null,
+          },
+        ],
+      }),
+      changelogOptions
+    );
+
+    expect(codes(result)).not.toContain('unsupported-key-type');
   });
 
   it('should warn about the roles other than its owner that can write the changelog', () => {

@@ -790,6 +790,178 @@ describe('LilypadDbGate (integration)', () => {
       });
     });
 
+    describe('the type of the primary key', () => {
+      // A non-superuser role owns the "unsafe" types; the superuser-owned ones and citext are safe.
+      beforeAll(async () => {
+        await admin.unsafe(`
+          CREATE EXTENSION IF NOT EXISTS citext;
+          CREATE ROLE kt_app LOGIN;
+          GRANT CREATE ON SCHEMA public TO kt_app;
+          -- Superuser-owned types (safe)
+          CREATE TYPE kt_su_enum AS ENUM ('a', 'b');
+          -- Superuser-owned enum, but its json cast function is owned by a non-superuser (unsafe)
+          CREATE TYPE kt_badcast AS ENUM ('a', 'b');
+          SET ROLE kt_app;
+          CREATE FUNCTION kt_badcast_json(kt_badcast) RETURNS json LANGUAGE sql IMMUTABLE
+            AS $fn$ SELECT to_json($1::text) $fn$;
+          RESET ROLE;
+          CREATE CAST (kt_badcast AS json) WITH FUNCTION kt_badcast_json(kt_badcast);
+          -- Non-superuser-owned types (unsafe)
+          SET ROLE kt_app;
+          CREATE TYPE kt_enum AS ENUM ('a', 'b');
+          CREATE DOMAIN kt_enum_dom AS kt_enum;
+          CREATE TYPE kt_comp AS (x int);
+          RESET ROLE;
+          -- Domains over built-in types (safe)
+          CREATE DOMAIN kt_userid AS int;
+          CREATE DOMAIN kt_ids AS int[];
+          CREATE TABLE kt_int (id int PRIMARY KEY);
+          CREATE TABLE kt_userid_t (id kt_userid PRIMARY KEY);
+          CREATE TABLE kt_ids_t (id kt_ids PRIMARY KEY);
+          CREATE TABLE kt_citext (id citext PRIMARY KEY);
+          CREATE TABLE kt_citext_arr (id citext[] PRIMARY KEY);
+          CREATE TABLE kt_userid_arr (id kt_userid[] PRIMARY KEY);
+          CREATE TABLE kt_su_enum_t (id kt_su_enum PRIMARY KEY);
+          CREATE TABLE kt_badcast_t (id kt_badcast PRIMARY KEY);
+          CREATE TABLE kt_enum_t (id kt_enum PRIMARY KEY);
+          CREATE TABLE kt_enum_arr (id kt_enum[] PRIMARY KEY);
+          CREATE TABLE kt_enum_dom_t (id kt_enum_dom PRIMARY KEY);
+          CREATE TABLE kt_comp_t (id kt_comp PRIMARY KEY);
+        `);
+        for (const table of [
+          'kt_int',
+          'kt_userid_t',
+          'kt_ids_t',
+          'kt_citext',
+          'kt_citext_arr',
+          'kt_userid_arr',
+          'kt_su_enum_t',
+          'kt_badcast_t',
+          'kt_enum_t',
+          'kt_enum_arr',
+          'kt_enum_dom_t',
+          'kt_comp_t',
+        ]) {
+          await admin.unsafe(lilypadChangelogTriggerSql({ table, primaryKey: 'id' }));
+        }
+      });
+
+      afterAll(async () => {
+        await admin.unsafe(`
+          DROP TABLE IF EXISTS kt_int, kt_userid_t, kt_ids_t, kt_citext, kt_citext_arr,
+            kt_userid_arr, kt_su_enum_t, kt_badcast_t, kt_enum_t, kt_enum_arr, kt_enum_dom_t,
+            kt_comp_t CASCADE;
+        `);
+        await admin.unsafe('DROP OWNED BY kt_app CASCADE; DROP ROLE kt_app;');
+        await admin.unsafe(`
+          DROP TYPE IF EXISTS kt_su_enum, kt_badcast CASCADE;
+          DROP DOMAIN IF EXISTS kt_userid, kt_ids, kt_enum_dom CASCADE;
+        `);
+      });
+
+      // For each key type: the write succeeds exactly when the check reports no unsupported-key-type.
+      it.each([
+        { table: 'kt_int', value: '1', safe: true },
+        { table: 'kt_userid_t', value: '1', safe: true },
+        { table: 'kt_ids_t', value: `'{1,2}'`, safe: true },
+        { table: 'kt_citext', value: `'K'`, safe: true },
+        { table: 'kt_citext_arr', value: `ARRAY['a','b']::citext[]`, safe: true },
+        { table: 'kt_userid_arr', value: `ARRAY[1,2]::kt_userid[]`, safe: true },
+        { table: 'kt_su_enum_t', value: `'a'`, safe: true },
+        { table: 'kt_badcast_t', value: `'a'`, safe: false },
+        { table: 'kt_enum_t', value: `'a'`, safe: false },
+        { table: 'kt_enum_arr', value: `ARRAY['a']::kt_enum[]`, safe: false },
+        { table: 'kt_enum_dom_t', value: "'a'", safe: false },
+        { table: 'kt_comp_t', value: `ROW(1)::kt_comp`, safe: false },
+      ])(
+        '$table: write succeeds iff the check passes (safe=$safe)',
+        async ({ table, value, safe }) => {
+          const wrote = await admin.unsafe(`INSERT INTO ${table} (id) VALUES (${value})`).then(
+            () => true,
+            () => false
+          );
+          const result = await checkLilypadSchema(gate, {
+            tables: [{ table, primaryKey: 'id' }],
+          });
+          const reported = result.problems.some((p) => p.code === 'unsupported-key-type');
+
+          expect(wrote).toBe(safe);
+          expect(reported).toBe(!safe);
+          // The trigger and the schema check agree
+          expect(wrote).toBe(!reported);
+        }
+      );
+
+      it('refuses an escalation attempt, so it cannot run the owner of the changelog', async () => {
+        // A role that owns its own cached table and gives its key a cast that runs its own code
+        await admin.unsafe(`
+          CREATE ROLE lilypad_escalator;
+          GRANT CREATE ON SCHEMA public TO lilypad_escalator;
+          SET ROLE lilypad_escalator;
+          CREATE TYPE escalation AS ENUM ('a', 'b');
+          CREATE FUNCTION escalation_json(escalation) RETURNS json LANGUAGE plpgsql AS $$
+            BEGIN
+              -- Only a superuser may do this: it works only if the function runs as the owner
+              ALTER ROLE lilypad_escalator SUPERUSER;
+              RETURN to_json($1::text);
+            END $$;
+          CREATE CAST (escalation AS json) WITH FUNCTION escalation_json(escalation);
+          CREATE TABLE escalate (id escalation PRIMARY KEY);
+          RESET ROLE;
+        `);
+        try {
+          // The migration attaches the changelog triggers (as the changelog owner)
+          await admin.unsafe(lilypadChangelogTriggerSql({ table: 'escalate', primaryKey: 'id' }));
+
+          const wrote = await admin
+            .begin(async (tx) => {
+              await tx`SET LOCAL ROLE lilypad_escalator`;
+              await tx`INSERT INTO escalate VALUES ('a')`;
+            })
+            .then(
+              () => 'written',
+              (error: unknown) => (error as Error).message
+            );
+
+          expect(wrote).toContain('unsafe type');
+          const [role] = await admin`
+            SELECT rolsuper FROM pg_roles WHERE rolname = 'lilypad_escalator'
+          `;
+          expect(role!.rolsuper).toBe(false);
+        } finally {
+          await admin.unsafe(
+            'DROP OWNED BY lilypad_escalator CASCADE; DROP ROLE lilypad_escalator;'
+          );
+        }
+      });
+
+      it('refuses a key column renamed after the triggers (fail closed)', async () => {
+        await admin.unsafe(`CREATE TABLE renamed_key (id int PRIMARY KEY, name text)`);
+        try {
+          await admin.unsafe(
+            lilypadChangelogTriggerSql({ table: 'renamed_key', primaryKey: 'id' })
+          );
+          await admin.unsafe(`ALTER TABLE renamed_key RENAME COLUMN id TO id2`);
+
+          const wrote = await admin
+            .unsafe(`INSERT INTO renamed_key (id2, name) VALUES (1, 'Ada')`)
+            .then(
+              () => 'written',
+              (error: unknown) => (error as Error).message
+            );
+
+          expect(wrote).toContain('does not exist');
+          const { changes } = await readLilypadChanges(gate, {
+            tableName: 'renamed_key',
+            since: { lookback: 60_000 },
+          });
+          expect(changes).toEqual([]);
+        } finally {
+          await admin.unsafe('DROP TABLE IF EXISTS renamed_key');
+        }
+      });
+    });
+
     it('should ignore a changelog row of a transaction that had not started, which only a forger writes', async () => {
       const { cursor } = await readAll();
       await admin`
