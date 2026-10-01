@@ -1,13 +1,13 @@
 // Loads the installed package the way an application does: every subpath of its `exports` with
-// `import` and with `require()` (Node.js 22.12+ loads ES modules with it), then runs the command.
+// `import` and with `require()` (Node.js 22.12+ loads ES modules with it), then runs the command
+// through its `bin` link, as `npx lilypad-doctor` does (which needs its `#!/usr/bin/env node`).
 // CI runs it on the packed tarball, with the lowest Node.js version of `engines`.
 //
 // Usage: copy it into a project where the package is installed (a copy left in this repository
 // would import the package from the repository itself), then node smoke-test.mjs
-import { execFileSync } from 'node:child_process';
+import { execSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
 
 const name = '@lilypad-studio/libs';
 const require = createRequire(`${process.cwd()}/`);
@@ -32,6 +32,6 @@ for (const subpath of subpaths) {
   console.log(`ok ${specifier} (${Object.keys(imported).length} exports)`);
 }
 
-const command = join(dirname(manifestPath), manifest.bin['lilypad-doctor']);
-const help = execFileSync(process.execPath, [command, '--help'], { encoding: 'utf8' });
+// `--no`: the installed command, never one downloaded from the registry
+const help = execSync('npx --no -- lilypad-doctor --help', { encoding: 'utf8' });
 console.log(`ok lilypad-doctor --help (${help.split('\n')[0]})`);

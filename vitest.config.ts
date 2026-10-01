@@ -25,7 +25,8 @@ const config: ViteUserConfig = defineConfig({
       {
         // The tests of the modules exported by the edge-compatible entries (edge.config.ts), run
         // again in an edge runtime, without the Node.js globals (vitest.edge-setup.ts): they fail
-        // if these modules start relying on Node.js APIs
+        // if these modules start relying on one of those globals. A `node:*` import still loads
+        // here: entries.test.ts, the edge typecheck and the lint catch those
         extends: true,
         test: {
           name: 'edge',

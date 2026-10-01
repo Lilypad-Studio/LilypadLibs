@@ -4,11 +4,11 @@ import { importX } from 'eslint-plugin-import-x';
 import { createTypeScriptImportResolver } from 'eslint-import-resolver-typescript';
 import vitest from '@vitest/eslint-plugin';
 import eslintConfigPrettier from 'eslint-config-prettier/flat';
-import { edgeFolders } from './edge.config.ts';
+import { edgeFolders, nodeOnlyFolders } from './edge.config.ts';
 
-// The modules of the edge-compatible entries (every entry except `db`, and the command), listed in
-// edge.config.ts. The typecheck (tsconfig.edge.json) and entries.test.ts check them too: these
-// rules name the import in the editor
+// The modules of the edge-compatible entries (every entry except `db`), listed in edge.config.ts.
+// The typecheck (tsconfig.edge.json) and entries.test.ts check them too: these rules name the
+// import in the editor
 const edgeModules = [
   'src/index.ts',
   'src/entries/!(db).ts',
@@ -94,9 +94,16 @@ export default defineConfig([
               message: 'The edge-compatible modules must not use Node.js APIs.',
             },
             {
-              group: ['postgres', '@/dbGate/*', '@/cli/*'],
+              group: ['postgres'],
               allowTypeImports: true,
-              message: 'Only the `db` entry may reach postgres.js and the gate.',
+              message: 'Only the `db` entry may reach postgres.js.',
+            },
+            {
+              // The Node.js-only folders (edge.config.ts), by alias (`@/dbGate/...`) or by relative
+              // path (`../dbGate/...`, as the entries import)
+              regex: `^(@/|(\\.{1,2}/)+)(${nodeOnlyFolders.join('|')})(/|$)`,
+              allowTypeImports: true,
+              message: 'Only the `db` entry may reach the Node.js-only modules (edge.config.ts).',
             },
           ],
         },

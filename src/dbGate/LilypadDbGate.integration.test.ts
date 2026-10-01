@@ -481,13 +481,19 @@ describe('LilypadDbGate (integration)', () => {
         listenHeartbeat: 100,
       });
       expect(beatingGate.isListenHealthy()).toBe(false);
+      const beat = vi.spyOn(beatingGate['heartbeat']!, 'beat');
 
       await beatingGate.addListener({
         channel: 'beating_channel',
         callbackId: 'cb',
         callback: vi.fn(),
       });
-      await vi.waitFor(() => expect(beatingGate.isListenHealthy()).toBe(true), { timeout: 2000 });
+      // The heartbeat counts as healthy for 2.5 intervals after it starts: only the heartbeats that
+      // came back through PostgreSQL keep it healthy beyond them
+      await vi.waitFor(() => expect(beat.mock.calls.length).toBeGreaterThanOrEqual(3), {
+        timeout: 2000,
+      });
+      expect(beatingGate.isListenHealthy()).toBe(true);
 
       await beatingGate.removeListener('beating_channel', 'cb');
       expect(beatingGate.isListenHealthy()).toBe(false);

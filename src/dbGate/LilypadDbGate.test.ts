@@ -92,6 +92,24 @@ describe('LilypadDbGate (without database)', () => {
       ).rejects.toThrow('is closed');
       await expect(gate.removeListener('c', 'a')).resolves.toBe(false);
     });
+
+    it('should close the gate it created when a listener of `listen` fails', async () => {
+      const close = vi.spyOn(LilypadDbGate.prototype, 'close');
+      try {
+        await expect(
+          LilypadDbGate.create({
+            connectionString: unreachable,
+            listen: [{ channel: '', callbackId: 'cb', callback: () => {} }],
+          })
+        ).rejects.toThrow('the channel must be a non-empty string');
+
+        // Its connection pools are released: the caller never receives the gate to close it
+        expect(close).toHaveBeenCalledOnce();
+        await expect(close.mock.results[0]!.value).resolves.toBeUndefined();
+      } finally {
+        close.mockRestore();
+      }
+    });
   });
 
   describe('heartbeat', () => {

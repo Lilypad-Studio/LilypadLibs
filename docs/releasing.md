@@ -36,5 +36,6 @@ These steps need an owner of the Lilypad-Studio organization; they cannot be don
 
 ## If a release fails
 
-- The workflow runs again on the next push to `main`. `changeset publish` skips a version that is already on the registry, so it is safe to re-run the job (Actions → Release → Re-run jobs).
+- Re-run the failed job (Actions → Release → Re-run jobs): `changeset publish` skips a version that is already on the registry, so it is safe. Do it before merging another pull request with a changeset: a push to `main` with pending changesets only updates the version pull request and publishes nothing, so the version that failed would be skipped for good by the next one. The same holds when a run is still waiting for the previous one (the `release` concurrency group): a newer push replaces it.
+- The tag `v<version>` and the GitHub release are created only for a version the job publishes. If the publication succeeded but they are missing (the job failed or was cancelled after `npm publish`), a re-run does not create them: push the tag from the version commit (`git tag v<version> <commit> && git push origin v<version>`) and create the release from it (Releases → Draft a new release, with the section of `CHANGELOG.md`).
 - A version cannot be published twice. To withdraw a broken version, publish a fixed one; deleting a version (Package settings → Manage versions) is possible for a private package but breaks the lockfiles that point to it.
