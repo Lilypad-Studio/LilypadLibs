@@ -1534,6 +1534,45 @@ describe('LilypadCache', () => {
     });
   });
 
+  describe('wall clock steps back', () => {
+    const HOUR = 60 * 60 * 1000;
+
+    it('should not stay blocked by a dropped refresh when the wall clock steps back', async () => {
+      const target = new LilypadCache<string, number>({
+        ttl: 1000,
+        staleWhileRevalidate: 3 * HOUR,
+        platform: { afterResponse: () => {} }, // drops the work
+      });
+      await target.getOrSet('k', async () => 1);
+      await vi.advanceTimersByTimeAsync(2 * HOUR);
+      await target.getOrSetDetailed('k', async () => 2); // STALE: schedules the dropped refresh
+      const retried = vi.fn(async () => 3);
+
+      // An NTP correction: the entry is still stale, but the dropped refresh looks scheduled later
+      vi.setSystemTime(Date.now() - HOUR);
+      await vi.advanceTimersByTimeAsync(60_000);
+      // From now on the platform runs the work at once
+      (target['engine'] as unknown as { platform: undefined }).platform = undefined;
+      expect(await target.getOrSetDetailed('k', retried)).toMatchObject({ status: 'STALE' });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(retried).toHaveBeenCalledOnce();
+      await target.dispose();
+    });
+
+    it('should purge on access when the wall clock steps back', async () => {
+      const target = new LilypadCache<string, number>({ ttl: 1000, cleanupOnAccessEvery: 10_000 });
+      vi.setSystemTime(Date.now() - HOUR);
+      target.set('k', 1);
+
+      await vi.advanceTimersByTimeAsync(11_000);
+      target.get('other');
+
+      expect(target['engine'].store.has('k')).toBe(false);
+      await target.dispose();
+    });
+  });
+
   describe('least recently used order', () => {
     it('should not make an invalidated entry the most recently used one', () => {
       const target = new LilypadCache<string, number>({ ttl: 1000, maxEntries: 2 });

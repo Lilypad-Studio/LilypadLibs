@@ -39,7 +39,8 @@ const DEFAULT_FETCH_TIMEOUT = 5000;
 const DEFAULT_SHARED_TIMEOUT = 300;
 /**
  * A background refresh scheduled longer ago than this no longer blocks new ones: it may never
- * have started (e.g. the platform dropped the work scheduled after the response).
+ * have started (e.g. the platform dropped the work scheduled after the response). Measured on the
+ * monotonic clock (`performance.now()`): a step back of the wall clock must not extend it.
  */
 const STUCK_REFRESH_AFTER = 60_000;
 /**
@@ -130,7 +131,8 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
   private shared?: LilypadSharedLevel<V> | undefined;
   private readonly maxEntries?: number | undefined;
   private readonly cleanupOnAccessEvery?: number | undefined;
-  private lastCleanup = Date.now();
+  /** When `cleanupOnAccess` last purged (`performance.now()`). */
+  private lastCleanup = performance.now();
   private readonly tagPrefix: string;
 
   /** Bounds the fetches (`fetchTimeout`). */
@@ -166,7 +168,10 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
 
   /** When the last fetch of each key failed (normalized keys), for `failureCooldown`. */
   private failures = new Map<string, number>();
-  /** Keys whose background refresh is scheduled or running, with the time it was scheduled. */
+  /**
+   * Keys whose background refresh is scheduled or running, with the time it was scheduled
+   * (`performance.now()`).
+   */
   private refreshing = new Map<string, number>();
   /** The size of the bookkeeping maps that triggers their next sweep. */
   private nextBookkeepingSweep = BOOKKEEPING_SWEEP_SIZE;
@@ -794,13 +799,13 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
     const normalizedKey = this.normalizeKey(key);
     if (
       lockedByOtherInstance ||
-      Date.now() - (this.refreshing.get(normalizedKey) ?? -Infinity) < STUCK_REFRESH_AFTER ||
+      performance.now() - (this.refreshing.get(normalizedKey) ?? -Infinity) < STUCK_REFRESH_AFTER ||
       this.isFetchInFlight(key) ||
       this.inCooldown(normalizedKey)
     ) {
       return;
     }
-    const scheduledAt = Date.now();
+    const scheduledAt = performance.now();
     this.refreshing.set(normalizedKey, scheduledAt);
     this.sweepBookkeepingIfLarge();
     runAfterResponse(
@@ -1143,7 +1148,12 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
     this.pruneBookkeeping(now);
   }
 
-  /** Removes the failures, refreshes, fences and invalidations that no longer serve. */
+  /**
+   * Removes the failures, refreshes, fences and invalidations that no longer serve.
+   *
+   * @param now - The wall clock (`Date.now()`), for the failures and invalidations, which are
+   * compared with times of the shared level.
+   */
   private pruneBookkeeping(now: number) {
     for (const [normalizedKey, failedAt] of this.failures) {
       // The failure of a cached key still tells a stale read that its refresh failed
@@ -1152,8 +1162,9 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
       }
     }
     // Refreshes that never started (e.g. work after the response dropped by the platform)
+    const monotonicNow = performance.now();
     for (const [normalizedKey, scheduledAt] of this.refreshing) {
-      if (now - scheduledAt >= STUCK_REFRESH_AFTER) {
+      if (monotonicNow - scheduledAt >= STUCK_REFRESH_AFTER) {
         this.refreshing.delete(normalizedKey);
       }
     }
@@ -1193,7 +1204,7 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
     if (this.cleanupOnAccessEvery === undefined) {
       return;
     }
-    const now = Date.now();
+    const now = performance.now();
     if (now - this.lastCleanup >= this.cleanupOnAccessEvery) {
       this.lastCleanup = now;
       this.purgeExpired();

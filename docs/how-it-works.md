@@ -542,7 +542,7 @@ The **failure cooldown** keeps a source that is down from being hammered by ever
 When an entry has expired but less than `staleWhileRevalidate` ago, `getOrSetDetailed` returns it immediately with status `STALE`, and calls `refreshInBackground`. The refresh is skipped when:
 
 - another instance holds the L2 refresh lock (`remote.locked`);
-- this instance scheduled a refresh of the key less than 60 s ago (`refreshing` map; after 60 s it is assumed the platform dropped it);
+- this instance scheduled a refresh of the key less than 60 s ago (`refreshing` map, on `performance.now()` so that a step back of the wall clock does not extend it; after 60 s it is assumed the platform dropped it);
 - a fetch of the key is already in flight;
 - the key is in its failure cooldown.
 
