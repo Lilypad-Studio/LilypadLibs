@@ -693,7 +693,7 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
     try {
       return await this.loadFlowControl.executeWithTimeout(async (signal) => {
         const rows = new Map<string, V>();
-        for (const row of await this.table.selectByPrimaryKeys(keys)) {
+        for (const row of await this.table.selectByPrimaryKeys(keys, { signal })) {
           rows.set(engine.normalizeKey(row[primaryKey] as LilypadDbKey<V, PK>), row);
         }
         const values = new Map<string, LilypadCachedValueType<V>>();

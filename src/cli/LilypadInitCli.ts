@@ -27,7 +27,8 @@ const CONFIG_FILE = /^lilypad\.(?:([A-Za-z0-9_-]+)\.)?config\.(?:ts|mts|mjs|js)$
 export type LilypadInitDependencies = {
   cwd?: string | undefined;
   exists?: ((path: string) => boolean) | undefined;
-  writeFile?: ((path: string, content: string) => void) | undefined;
+  /** Writes the file; unless `overwrite`, it fails if the path exists (even a dangling link). */
+  writeFile?: ((path: string, content: string, overwrite: boolean) => void) | undefined;
 };
 
 export type LilypadInitTarget = {
@@ -82,7 +83,9 @@ export function runLilypadInitCli(
   {
     cwd = process.cwd(),
     exists = existsSync,
-    writeFile = (path, content) => writeFileSync(path, content),
+    // `wx`: a file created since the check (or a link the check did not follow) is not replaced
+    writeFile = (path, content, overwrite) =>
+      writeFileSync(path, content, { flag: overwrite ? 'w' : 'wx' }),
   }: LilypadInitDependencies = {}
 ): number {
   let values: {
@@ -140,7 +143,7 @@ export function runLilypadInitCli(
     empty: values.empty ?? false,
   });
   try {
-    writeFile(target.path, content);
+    writeFile(target.path, content, target.existing.includes(target.path));
   } catch (error) {
     output.error(
       `lilypad-doctor init: could not write ${shown(target.path)}: ${error instanceof Error ? error.message : String(error)}`

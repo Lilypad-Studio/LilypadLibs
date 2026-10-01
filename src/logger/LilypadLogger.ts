@@ -10,6 +10,8 @@ import {
   formatLogValue,
   LILYPAD_DEFAULT_REDACTED_KEYS,
   lilypadRedaction,
+  NO_REDACTION,
+  redactUrlPasswords,
   toLogJson,
 } from '@/logger/formatLogValue';
 import { runInBackground, type LilypadPlatform } from '@/platform/LilypadPlatform';
@@ -160,9 +162,10 @@ export class LilypadLogger<T extends string> {
     }
 
     this.name = options.name;
-    const redaction = lilypadRedaction(
-      options.redact === false ? [] : (options.redact ?? LILYPAD_DEFAULT_REDACTED_KEYS)
-    );
+    const redaction =
+      options.redact === false
+        ? NO_REDACTION
+        : lilypadRedaction(options.redact ?? LILYPAD_DEFAULT_REDACTED_KEYS);
 
     // Assign initial components
     for (const [type, comps] of Object.entries(options.components) as [
@@ -202,6 +205,7 @@ export class LilypadLogger<T extends string> {
             timestamp: new Date(),
             loggerName: this.name,
             context: toLogContext(context, redaction),
+            errors: logErrors(message, redaction),
           };
           // allSettled: a failing component must neither stop nor hide the errors of the others
           const results = await Promise.allSettled(
@@ -270,6 +274,19 @@ function readContext(
   } catch {
     return undefined;
   }
+}
+
+/** The Error objects among the parts of a message, redacted like the message. */
+function logErrors(parts: unknown[], redaction: ReadonlySet<string>): LilypadLogRecord['errors'] {
+  const errors = parts.filter((part): part is Error => part instanceof Error);
+  if (errors.length === 0) {
+    return undefined;
+  }
+  return errors.map((error) => ({
+    name: error.name,
+    message: redactUrlPasswords(error.message, redaction),
+    stack: error.stack === undefined ? undefined : redactUrlPasswords(error.stack, redaction),
+  }));
 }
 
 /**

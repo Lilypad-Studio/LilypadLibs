@@ -65,6 +65,7 @@ function facts(overrides: Partial<LilypadSchemaFacts> = {}): LilypadSchemaFacts 
       functionSource: null,
       schema: 'public',
       hasPruneFunction: false,
+      writers: null,
       oldestRowAge: 60_000,
       deletedRows: 0,
     },
@@ -83,6 +84,7 @@ const noChangelog: LilypadSchemaFacts['changelog'] = {
   functionSource: null,
   schema: null,
   hasPruneFunction: false,
+  writers: null,
   oldestRowAge: null,
   deletedRows: 0,
 };
@@ -164,6 +166,52 @@ describe('evaluateLilypadSchema', () => {
     }
   );
 
+  it('should warn that the writing roles can write a changelog of version 6', () => {
+    const result = evaluateLilypadSchema(
+      facts({ changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:6' } }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['outdated-changelog']);
+    expect(result.problems[0]!.severity).toBe('warning');
+    expect(result.problems[0]!.message).toContain('privileges of the writing roles');
+    expect(result.problems[0]!.message).not.toContain('prune function');
+  });
+
+  it('should warn about the roles other than its owner that can write the changelog', () => {
+    const result = evaluateLilypadSchema(
+      facts({ changelog: { ...facts().changelog, writers: 'PUBLIC, "app role"' } }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['writable-changelog']);
+    expect(result.ok).toBe(true);
+    expect(result.problems[0]!.message).toContain('(PUBLIC, "app role")');
+    expect(result.problems[0]!.fix).toBe(
+      'REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON "lilypad_cache_changes" FROM PUBLIC, "app role";\n'
+    );
+  });
+
+  it('should revoke the writes of the changelog after installing its current version', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        changelog: {
+          ...facts().changelog,
+          functionComment: 'lilypad-changelog:6',
+          writers: 'app',
+        },
+      }),
+      changelogOptions
+    );
+
+    // Revoked first, the triggers of version 6 would fail the writes of these roles
+    expect(codes(result)).toEqual(['outdated-changelog', 'writable-changelog']);
+    const sql = formatLilypadSchemaFixSql(result.problems);
+    expect(sql.indexOf('TRUNCATE ON "lilypad_cache_changes" FROM app;')).toBeGreaterThan(
+      sql.indexOf('SECURITY DEFINER SET search_path')
+    );
+  });
+
   it('should warn about the prune function of a changelog of version 5', () => {
     const result = evaluateLilypadSchema(
       facts({ changelog: { ...facts().changelog, functionComment: 'lilypad-changelog:5' } }),
@@ -241,7 +289,7 @@ describe('evaluateLilypadSchema', () => {
       );
 
       expect(fix(result)).toContain('DROP FUNCTION IF EXISTS "lilypad_cache_changes_prune"()');
-      expect(fix(result)).not.toContain('PERFORM "lilypad_cache_changes_prune"()');
+      expect(fix(result)).not.toContain('PERFORM __lilypad_prune__()');
     });
   });
 
@@ -555,7 +603,7 @@ describe('the pruning of the changelog', () => {
     it('should mention pg_cron when the server has it, but it is not known to run', () => {
       const result = evaluateLilypadSchema(unpruned({ available: true }), changelogOptions);
 
-      expect(result.problems[0]!.fix).toContain('PERFORM "lilypad_cache_changes_prune"()');
+      expect(result.problems[0]!.fix).toContain('PERFORM __lilypad_prune__()');
       expect(result.problems[0]!.message).toContain('pg_cron is available on this server');
     });
 
@@ -658,7 +706,7 @@ describe('the pruning of the changelog', () => {
         );
 
         expect(codes(result)).toEqual(['missing-changelog', 'no-changelog-pruning']);
-        expect(result.problems[0]!.fix).toContain('PERFORM "lilypad_cache_changes_prune"()');
+        expect(result.problems[0]!.fix).toContain('PERFORM __lilypad_prune__()');
       });
 
       it('should still accept a pg_cron job found', () => {
@@ -713,7 +761,7 @@ describe('the pruning of the changelog', () => {
 
         expect(codes(result)).toEqual(['missing-changelog', 'no-changelog-pruning']);
         // The changelog is installed without the prune option
-        expect(result.problems[0]!.fix).not.toContain('PERFORM "lilypad_cache_changes_prune"()');
+        expect(result.problems[0]!.fix).not.toContain('PERFORM __lilypad_prune__()');
         expect(result.problems[1]!.fix).toContain(
           lilypadChangelogPruneScheduleSql({
             olderThan: DAY,
@@ -737,7 +785,7 @@ describe('the pruning of the changelog', () => {
       expect(codes(result)).toEqual(['missing-changelog', 'no-changelog-pruning']);
       // One SQL does both: the report shows it once
       expect(result.problems[0]!.fix).toBe(result.problems[1]!.fix);
-      expect(result.problems[0]!.fix).toContain('PERFORM "lilypad_cache_changes_prune"()');
+      expect(result.problems[0]!.fix).toContain('PERFORM __lilypad_prune__()');
     });
 
     it('should recommend a retention far longer than the one the caches need', () => {

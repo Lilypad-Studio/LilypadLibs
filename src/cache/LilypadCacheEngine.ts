@@ -47,6 +47,12 @@ const STUCK_REFRESH_AFTER = 60_000;
  * swept without waiting for `purgeExpired`, which may never run.
  */
 const BOOKKEEPING_SWEEP_SIZE = 1000;
+/**
+ * The most invalidations of keys without an entry remembered one by one (e.g. the keys notified by
+ * a flood of notifications, which anyone can send). Beyond, they are replaced with one rejection of
+ * every older shared copy: the same guarantee, in constant memory.
+ */
+const MAX_INVALIDATED_MISSING = 10_000;
 
 /** The options of the engine: those of a cache, without its bulk sync. */
 export type LilypadCacheEngineOptions<K extends LilypadCacheKey, V> = Omit<
@@ -364,6 +370,11 @@ export class LilypadCacheEngine<K extends LilypadCacheKey, V> {
       Math.max(time, this.invalidatedMissing.get(normalizedKey) ?? 0)
     );
     this.sweepBookkeepingIfLarge();
+    if (this.invalidatedMissing.size > MAX_INVALIDATED_MISSING) {
+      // Every shared copy produced before the latest of them: a superset of what they reject
+      this.rejectSharedBefore(Math.max(...this.invalidatedMissing.values()));
+      this.invalidatedMissing.clear();
+    }
   }
 
   /** Removes the least recently used entries beyond `maxEntries`, sparing protected keys. */

@@ -108,6 +108,11 @@ export type LilypadSchemaFacts = {
     schema: string | null;
     /** Whether the function that the `prune` option of the trigger calls exists. */
     hasPruneFunction: boolean;
+    /**
+     * The roles other than its owner that may write the changelog (`INSERT`, `UPDATE`, `DELETE`
+     * or `TRUNCATE`), quoted and separated by commas, `PUBLIC` included: `null` if none.
+     */
+    writers: string | null;
     /** How old the oldest row is, in ms (`null` if the table is empty, missing or unreadable). */
     oldestRowAge: number | null;
     /**
@@ -233,6 +238,23 @@ async function readDatabaseFacts(
         WHERE c.oid = to_regclass(${quotedChangelog}::text)
       ) AS changelog_schema,
       to_regprocedure(${pruneSignature}::text) IS NOT NULL AS has_prune_function,
+      (
+        SELECT string_agg(writer.name, ', ' ORDER BY writer.name) FROM (
+          SELECT DISTINCT CASE WHEN acl.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(r.rolname) END AS name
+          FROM pg_class c
+          -- The grants of the table, and those of its columns (an INSERT of some columns is enough)
+          CROSS JOIN LATERAL (
+            SELECT * FROM aclexplode(c.relacl)
+            UNION ALL
+            SELECT column_acl.* FROM pg_attribute a, aclexplode(a.attacl) AS column_acl
+            WHERE a.attrelid = c.oid
+          ) AS acl
+          LEFT JOIN pg_roles r ON r.oid = acl.grantee
+          WHERE c.oid = to_regclass(${quotedChangelog}::text)
+            AND acl.grantee <> c.relowner
+            AND acl.privilege_type IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
+        ) AS writer
+      ) AS changelog_writers,
       coalesce((
         SELECT n_tup_del FROM pg_stat_user_tables WHERE relid = to_regclass(${quotedChangelog}::text)
       ), 0)::float8 AS deleted_rows,
@@ -289,6 +311,7 @@ async function readDatabaseFacts(
       functionSource: database.function_source as string | null,
       schema: database.changelog_schema as string | null,
       hasPruneFunction: database.has_prune_function as boolean,
+      writers: database.changelog_writers as string | null,
       oldestRowAge,
       deletedRows: database.deleted_rows as number,
     },

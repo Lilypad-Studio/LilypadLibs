@@ -59,6 +59,24 @@ describe('LilypadDbGate (without database)', () => {
     await Promise.all([gate.close(), unbounded.close()]);
   });
 
+  it.each(['connectionString', 'listenerConnectionString'] as const)(
+    'should reject a malformed %s without its password in the error',
+    async (option) => {
+      const malformed = 'postgres://user:s3cr3t@[bad/db';
+      const error: unknown = await LilypadDbGate.create({
+        connectionString: unreachable,
+        [option]: malformed,
+      }).catch((error: unknown) => error);
+
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        `LilypadDbGate: ${option} is not a valid URL (Invalid URL).`
+      );
+      expect(JSON.stringify(error)).not.toContain('s3cr3t');
+      expect((error as Error).cause).toBeUndefined();
+    }
+  );
+
   describe('close', () => {
     it('should return the same promise when called again, and reject later queries', async () => {
       const gate = await LilypadDbGate.create({ connectionString: unreachable });

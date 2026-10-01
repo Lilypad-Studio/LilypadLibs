@@ -8,6 +8,8 @@ Versions and the changelog are driven by [changesets](https://github.com/changes
 2. When changesets reach `main`, the release workflow opens (or updates) the pull request **chore: version packages**: it bumps `version` in `package.json`, writes the section of `CHANGELOG.md`, and deletes the changesets.
 3. Merging that pull request publishes the version: the workflow builds the package (`prepack`, with publint and arethetypeswrong), publishes it to GitHub Packages, and pushes the tag `v<version>` with its GitHub release.
 
+The job holds a token that can push and publish, so no dependency code runs in it before the build: it installs with `npm ci --ignore-scripts` (a dependency that needs its install script to build would have to be listed and rebuilt explicitly), and `actions/checkout` keeps no credentials in `.git/config` (`changesets/action` commits through the GitHub API with its own token).
+
 The pull requests opened by the workflow's own token do not trigger other workflows, so CI does not run on the version pull request: close and reopen it to run CI, or give the workflow the token of a GitHub App (the `github-token` input of `changesets/action`).
 
 ## First release: the setup to complete on GitHub
@@ -30,6 +32,7 @@ These steps need an owner of the Lilypad-Studio organization; they cannot be don
    - **Manage Actions access**: add each repository whose workflows install it (role `Read`).
 6. **Migrate the applications** with [installing.md](installing.md).
 7. Recommended: protect `main` (Settings → Rules → Rulesets) so that pull requests need the `check`, `smoke-test` and `integration` jobs of CI to pass.
+8. **Claim the scope on npmjs.com**: create the free organization `lilypad-studio` there (npmjs.com → Add Organization), and publish nothing to it. Otherwise anyone could publish `@lilypad-studio/libs` on the public registry, and an install without the `@lilypad-studio:registry` line of `.npmrc` (and without a lockfile) would get it.
 
 ## If a release fails
 

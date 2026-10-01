@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -170,6 +170,26 @@ describe('runLilypadInitCli', () => {
     expect(out.error).toHaveBeenCalledWith(
       'lilypad-doctor init: could not write lilypad.config.ts: EACCES: permission denied'
     );
+  });
+
+  it('should not replace a file created after the check, nor one --force was not asked for', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lilypad-init-'));
+    try {
+      const file = join(dir, 'lilypad.config.ts');
+      writeFileSync(file, 'mine');
+      const out = output();
+      // The check does not see the file: e.g. created in between, or a link to a missing file
+      const deps = { cwd: dir, exists: () => false };
+
+      expect(runLilypadInitCli([], out, deps)).toBe(2);
+      expect(readFileSync(file, 'utf8')).toBe('mine');
+      expect(out.error).toHaveBeenCalledWith(expect.stringContaining('EEXIST'));
+
+      expect(runLilypadInitCli(['--force'], output(), { cwd: dir })).toBe(0);
+      expect(readFileSync(file, 'utf8')).not.toBe('mine');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('should be the init command of lilypad-doctor, which needs no database', async () => {

@@ -14,7 +14,7 @@ describe('lilypadChangelogSql prune option', () => {
   it('should not prune by default, and drop the prune function of an earlier installation', () => {
     const sql = lilypadChangelogSql();
 
-    expect(sql).not.toContain('PERFORM "lilypad_cache_changes_prune"()');
+    expect(sql).not.toContain('PERFORM __lilypad_prune__()');
     expect(sql).toContain('DROP FUNCTION IF EXISTS "lilypad_cache_changes_prune"();');
     expect(installedLilypadChangelogPrune(sql)).toBe(false);
   });
@@ -28,8 +28,9 @@ describe('lilypadChangelogSql prune option', () => {
     expect(sql).toContain('LIMIT 1000');
     expect(sql).toContain('SECURITY DEFINER');
     expect(sql).not.toContain('DROP FUNCTION');
-    // The TRUNCATE and statement branches
-    expect(sql.match(/PERFORM "lilypad_cache_changes_prune"\(\);/g)).toHaveLength(2);
+    // The TRUNCATE and statement branches, qualified by the DO block that creates the function
+    expect(sql.match(/PERFORM __lilypad_prune__\(\);/g)).toHaveLength(2);
+    expect(sql).toContain(`'__lilypad_prune__', prune)`);
     expect(sql).toContain('IF random() * 20 < 1 AND');
   });
 
@@ -49,13 +50,55 @@ describe('lilypadChangelogSql prune option', () => {
     expect(sql).not.toContain('FROM CURRENT');
   });
 
+  it('should make the trigger function run as its owner, with the changelog qualified', () => {
+    const plain = lilypadChangelogSql();
+    const pruned = lilypadChangelogSql({ prune: { olderThan: 86_400_000 } });
+
+    for (const sql of [plain, pruned]) {
+      // Only pg_catalog: a schema writable by others could hold a better overload of a function
+      expect(sql).toContain(
+        `'CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS %L LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp'`
+      );
+      expect(sql).toContain(`WHERE c.oid = '"lilypad_cache_changes"'::regclass`);
+      expect(sql).toContain('INSERT INTO __lilypad_changelog__ (');
+      expect(sql).toContain(`'__lilypad_changelog_literal__', quote_literal(changelog)`);
+      expect(sql).not.toContain('INSERT INTO "lilypad_cache_changes"');
+      expect(sql).toContain(`IS 'lilypad-changelog:${LILYPAD_CHANGELOG_VERSION}'`);
+    }
+    expect(pruned).toContain(`WHERE p.oid = '"lilypad_cache_changes_prune"()'::regprocedure`);
+    expect(plain).not.toContain('__lilypad_prune__');
+  });
+
+  it('should refuse a channel that contains a placeholder of the trigger function', () => {
+    expect(() => lilypadChangelogSql({ notifyChannel: 'x__lilypad_prune__' })).toThrow(
+      'contains "__lilypad_"'
+    );
+  });
+
+  it('should leave the writes of the changelog and the functions to the triggers', () => {
+    const plain = lilypadChangelogSql();
+    const pruned = lilypadChangelogSql({ prune: { olderThan: 86_400_000 } });
+
+    for (const sql of [plain, pruned]) {
+      expect(sql).toContain(
+        'REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON "lilypad_cache_changes" FROM PUBLIC;'
+      );
+      expect(sql).toContain(
+        'REVOKE EXECUTE ON FUNCTION "lilypad_cache_changes_record"() FROM PUBLIC;'
+      );
+    }
+    expect(pruned).toContain(
+      'REVOKE EXECUTE ON FUNCTION "lilypad_cache_changes_prune"() FROM PUBLIC;'
+    );
+  });
+
   it('should name the prune function after the changelog table', () => {
     const sql = lilypadChangelogSql({
       changelogTable: 'archive.changes',
       prune: { olderThan: 60_000 },
     });
 
-    expect(sql).toContain('PERFORM "archive_changes_prune"();');
+    expect(sql).toContain(`WHERE p.oid = '"archive_changes_prune"()'::regprocedure`);
     // Qualified with its schema by the migration, in the DO block that creates the function
     expect(sql).toContain(`WHERE c.oid = '"archive"."changes"'::regclass`);
     expect(sql).toContain('DELETE FROM %1$s WHERE id IN');
@@ -205,15 +248,17 @@ describe('lilypadChangelogSql dollar quotes', () => {
 
     expect(sql).toContain('DO $lilypad_$');
     expect(sql).toContain('format($body$');
-    expect(sql).toContain('RETURNS trigger AS $_$');
-    expect(sql).toContain('EXECUTE format($record_$');
+    // The names of the tables are placeholders in the body of the trigger function
+    expect(sql).toContain('replace(replace(replace($$');
+    expect(sql).toContain('EXECUTE format($record$');
     expect(sql).toContain('EXECUTE format($notify_$');
   });
 
   it('should leave the SQL of ordinary names as it is', () => {
     const sql = lilypadChangelogSql();
 
-    expect(sql).toContain('RETURNS trigger AS $$');
+    expect(sql).toContain('DO $lilypad$');
+    expect(sql).toContain('replace(replace($$');
     expect(sql).toContain('EXECUTE format($record$');
     expect(sql).toContain('EXECUTE format($notify$');
   });

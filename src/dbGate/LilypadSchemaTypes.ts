@@ -91,6 +91,12 @@ export type LilypadSchemaProblemCode =
    */
   | 'outdated-changelog'
   /**
+   * A warning: roles other than its owner may write the changelog, and record changes that every
+   * cache trusts (e.g. make a row look deleted). Since version 7, the triggers write it as its
+   * owner: the writing roles need no privilege on it.
+   */
+  | 'writable-changelog'
+  /**
    * The enabled changelog triggers of the table do not record each of INSERT, UPDATE and DELETE:
    * row triggers, or statement triggers with their transition tables.
    */

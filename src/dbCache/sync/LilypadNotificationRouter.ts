@@ -3,6 +3,8 @@ import type { LilypadDbGate, LilypadDbListener } from '@/dbGate/LilypadDbGate';
 import type { LilypadLibLogLevel } from '@/logger/LilypadLibLogger';
 
 const OPERATIONS = new Set(['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'BULK']);
+/** At most one warning about malformed notifications per this many ms (anyone can send them). */
+const MALFORMED_WARNING_INTERVAL = 60_000;
 /** The operations that concern the whole table, not one row: they carry no `id`. */
 const TABLE_OPERATIONS = new Set(['TRUNCATE', 'BULK']);
 
@@ -64,6 +66,8 @@ export class LilypadNotificationRouter {
   private readonly listener: LilypadDbListener;
   /** The registration of the listener on the gate, while at least one cache subscribes. */
   private listening?: Promise<void> | undefined;
+  /** The last warning about a malformed notification (`performance.now()`), and those not logged since. */
+  private malformed = { warnedAt: -Infinity, unlogged: 0 };
 
   constructor(
     private readonly gate: LilypadDbGate,
@@ -121,7 +125,7 @@ export class LilypadNotificationRouter {
     }
     const payload = parseLilypadNotification(raw);
     if (!payload) {
-      subscribers[0]!.log('warn', 'Ignoring a malformed cache_events notification:', raw);
+      this.warnMalformed(subscribers[0]!, raw);
       return;
     }
     await Promise.all(
@@ -134,6 +138,25 @@ export class LilypadNotificationRouter {
             subscriber.log('error', 'Error applying a notification:', error);
           }
         })
+    );
+  }
+
+  /**
+   * Logs a malformed notification, at most once per {@link MALFORMED_WARNING_INTERVAL}: a flood of
+   * them must not flood the logs too. The next warning counts those left out.
+   */
+  private warnMalformed(subscriber: LilypadNotificationSubscriber, raw: unknown) {
+    const now = performance.now();
+    if (now - this.malformed.warnedAt < MALFORMED_WARNING_INTERVAL) {
+      this.malformed.unlogged++;
+      return;
+    }
+    const unlogged = this.malformed.unlogged;
+    this.malformed = { warnedAt: now, unlogged: 0 };
+    subscriber.log(
+      'warn',
+      `Ignoring a malformed ${this.listener.channel} notification${unlogged > 0 ? ` (and ${unlogged} more since the last warning)` : ''}:`,
+      raw
     );
   }
 }

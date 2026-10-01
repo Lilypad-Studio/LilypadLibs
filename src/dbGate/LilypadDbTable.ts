@@ -193,11 +193,19 @@ export class LilypadDbTable<T, PK extends keyof T = keyof T> {
    * Selects the rows with these primary keys, in one query per batch of 1000 keys (Postgres limits
    * the parameters of a query). Keys without a row are left out of the result, as are the rows the
    * `select` hook discards.
+   *
+   * @param options.signal - Stops before the next batch once aborted: the promise then rejects
+   * with the reason of the signal.
    */
-  async selectByPrimaryKeys(primaryKeyValues: T[PK][]): Promise<T[]> {
+  async selectByPrimaryKeys(
+    primaryKeyValues: T[PK][],
+    options: { signal?: AbortSignal | undefined } = {}
+  ): Promise<T[]> {
     this.gate.assertOpen();
+    const { signal } = options;
     const typedRows: T[] = [];
     for (let start = 0; start < primaryKeyValues.length; start += PRIMARY_KEYS_BATCH_SIZE) {
+      signal?.throwIfAborted();
       const batch = primaryKeyValues.slice(start, start + PRIMARY_KEYS_BATCH_SIZE);
       this.mapRows(
         await this.sql`

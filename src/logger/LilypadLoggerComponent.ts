@@ -19,6 +19,11 @@ export type LilypadLogRecord<T extends string = string> = {
    * redacted (see `toLogJson`).
    */
   context?: Record<string, unknown> | undefined;
+  /**
+   * The Error objects among the parts, with the passwords of the URLs of their message and stack
+   * masked, as in `message` (unless the logger's `redact` is `false`).
+   */
+  errors?: { name: string; message: string; stack?: string | undefined }[] | undefined;
 };
 
 /**

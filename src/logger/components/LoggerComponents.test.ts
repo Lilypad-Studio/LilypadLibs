@@ -69,6 +69,13 @@ describe('LilypadDiscordLogger', () => {
     expect(body.allowed_mentions).toEqual({ parse: [] });
   });
 
+  it('should not show its webhook URL when it is logged or serialized', () => {
+    const logger = new LilypadDiscordLogger<'info'>(webhookUrl);
+
+    expect(safeJson(logger)).not.toContain('token');
+    expect(Object.values(logger)).not.toContain(webhookUrl);
+  });
+
   it('should truncate messages to the Discord limit of 2000 characters', async () => {
     const fetchMock = stubFetch();
 
@@ -291,6 +298,19 @@ describe('LilypadJsonConsoleLogger', () => {
       msg: 'Failed Error: boom',
       errors: [{ name: 'Error', message: 'boom', stack: error.stack }],
     });
+  });
+
+  it('should write the errors the logger redacted, not the raw ones of the parts', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const error = new Error('cannot reach postgres://app:s3cr3t@db/app');
+
+    await new LilypadJsonConsoleLogger<'error'>().write({
+      ...record('error', 'Failed'),
+      parts: ['Failed', error],
+      errors: [{ name: 'Error', message: 'cannot reach postgres://app:[Redacted]@db/app' }],
+    });
+
+    expect(log.mock.calls[0]![0]).not.toContain('s3cr3t');
   });
 
   it('should not let context fields override the record fields', async () => {

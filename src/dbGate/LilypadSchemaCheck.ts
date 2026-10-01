@@ -274,6 +274,15 @@ export function evaluateLilypadSchema(
       });
       changelogFixed = true;
     }
+    if (hasTable && facts.changelog.writers !== null) {
+      problems.push({
+        code: 'writable-changelog',
+        severity: 'warning',
+        message: `Roles other than its owner may write the changelog "${changelog.table}" (${facts.changelog.writers}): they can record changes that every cache trusts, such as a row deleted. The triggers of version ${LILYPAD_CHANGELOG_VERSION} write it as its owner, so the writing roles need no privilege on it.`,
+        // After the changelog SQL, when a fix installs it: the triggers of older versions need it
+        fix: `REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ${quoteIdentifier(changelog.table)} FROM ${facts.changelog.writers};\n`,
+      });
+    }
   }
 
   const tables: LilypadSchemaCheckResult['tables'] = [];
@@ -429,9 +438,12 @@ export function evaluateLilypadSchema(
 
 /** What a changelog of a compatible older version lacks (see `LILYPAD_CHANGELOG_VERSION`). */
 function outdatedChangelogReason(version: number): string {
-  const beforeVersion6 =
-    'its prune function (`prune` option) can be made to run the code of any role with the privileges of its owner, the triggers of a long table name record only TRUNCATE, and a name containing `$` breaks its SQL';
+  const beforeVersion7 =
+    'its triggers write the changelog with the privileges of the writing roles, which can then record changes of their own that every cache trusts';
+  const beforeVersion6 = `its prune function (\`prune\` option) can be made to run the code of any role with the privileges of its owner, the triggers of a long table name record only TRUNCATE, a name containing \`$\` breaks its SQL, and ${beforeVersion7}`;
   return version < 5
     ? `a statement that changes many rows notifies each of them instead of sending one BULK notification; ${beforeVersion6}`
-    : beforeVersion6;
+    : version < 6
+      ? beforeVersion6
+      : beforeVersion7;
 }

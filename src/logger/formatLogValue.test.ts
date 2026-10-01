@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatLogValue, lilypadRedaction, toLogJson } from './formatLogValue';
+import { formatLogValue, lilypadRedaction, NO_REDACTION, toLogJson } from './formatLogValue';
 
 describe('formatLogValue', () => {
   it.each([
@@ -173,6 +173,23 @@ describe('toLogJson', () => {
       cause: { message: 'socket closed' },
     });
     expect(json.request).toEqual({ headers: { cookie: '[Redacted]' }, url: '/users' });
+  });
+
+  it('should mask the passwords of URLs in strings, messages and stacks, unless redaction is off', () => {
+    const url = 'postgres://app:s3cr3t@db.internal:5432/app';
+    // e.g. the error of a malformed connection string, which carries it in `input`
+    const error = Object.assign(new Error(`cannot reach ${url}`), { input: url });
+    const values = [url, { url }, error, [`see ${url}, then https://host/path?a=b@c`]];
+
+    for (const value of values) {
+      expect(formatLogValue(value)).not.toContain('s3cr3t');
+      expect(JSON.stringify(toLogJson(value))).not.toContain('s3cr3t');
+    }
+    expect(formatLogValue(url)).toBe('postgres://app:[Redacted]@db.internal:5432/app');
+    expect(formatLogValue(['https://host/path?a=b@c'])).toBe("[ 'https://host/path?a=b@c' ]");
+    // Off only with redaction off, not with an empty list of keys
+    expect(formatLogValue(url, lilypadRedaction([]))).not.toContain('s3cr3t');
+    expect(formatLogValue(url, NO_REDACTION)).toBe(url);
   });
 
   it('should turn what JSON cannot hold into plain values', () => {

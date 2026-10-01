@@ -24,7 +24,9 @@ import {
  */
 export class LilypadJsonConsoleLogger<T extends string> extends LilypadLoggerComponent<T> {
   write(record: LilypadLogRecord<T>): Promise<void> {
-    const errors = record.parts.filter((part): part is Error => part instanceof Error);
+    // Redacted by the logger; a record built elsewhere keeps the raw errors of its parts
+    const errors =
+      record.errors ?? record.parts.filter((part): part is Error => part instanceof Error);
     const line = safeJson({
       ...record.context,
       time: record.timestamp.toISOString(),

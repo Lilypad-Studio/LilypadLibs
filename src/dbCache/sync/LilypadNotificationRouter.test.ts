@@ -77,6 +77,32 @@ describe('LilypadNotificationRouter', () => {
     expect(first.handle).toHaveBeenCalledOnce();
   });
 
+  it('should log the malformed notifications at most once a minute, counting the others', async () => {
+    vi.useFakeTimers();
+    try {
+      const { gate, listeners } = createGate();
+      const router = new LilypadNotificationRouter(gate, 'cache_events');
+      const items = subscriber('items');
+      await router.subscribe(items);
+      const callback = listeners.get('lilypad_notification_router')!.callback;
+
+      for (let index = 0; index < 1000; index++) {
+        await callback('not json');
+      }
+      expect(items.log).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      await callback('still not json');
+      expect(items.log).toHaveBeenLastCalledWith(
+        'warn',
+        'Ignoring a malformed cache_events notification (and 999 more since the last warning):',
+        'still not json'
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('should stop listening with the last subscriber, unless one subscribes again meanwhile', async () => {
     const { gate, mocks } = createGate();
     const router = new LilypadNotificationRouter(gate, 'cache_events');

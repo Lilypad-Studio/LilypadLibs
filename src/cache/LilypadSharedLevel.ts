@@ -181,6 +181,11 @@ export class LilypadSharedLevel<V> {
       return undefined;
     }
     const { fetchedAt, expiresAt } = envelope as LilypadSharedEnvelope;
+    // Not before its time: an entry stamped by a clock ahead of this one (or planted) would pass
+    // every invalidation made before its stamp, whenever it was produced
+    if (fetchedAt > Date.now()) {
+      return undefined;
+    }
     if (envelope.value === null) {
       return { value: null, fetchedAt, expiresAt };
     }
@@ -223,7 +228,12 @@ export class LilypadSharedLevel<V> {
       };
       if (checkBeforeWrite) {
         const current = (await store.get(key)) as Partial<LilypadSharedEnvelope> | null | undefined;
-        if (typeof current?.fetchedAt === 'number' && current.fetchedAt > envelope.fetchedAt) {
+        // A value stamped in the future is not newer: it is ignored (see `decode`)
+        if (
+          typeof current?.fetchedAt === 'number' &&
+          current.fetchedAt > envelope.fetchedAt &&
+          current.fetchedAt <= Date.now()
+        ) {
           return;
         }
       }

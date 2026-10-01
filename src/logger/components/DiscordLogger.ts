@@ -72,7 +72,8 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
  *   dropped, so that memory and the pending `write` promises stay bounded.
  */
 export class LilypadDiscordLogger<T extends string> extends LilypadLoggerComponent<T> {
-  private webhookUrl: string;
+  /** A true private field: the URL is a secret, and never shows up when the logger is logged. */
+  readonly #webhookUrl: string;
   private minRequestInterval: number;
   private rateLimitRetries: number;
   private maxQueueSize: number;
@@ -98,7 +99,7 @@ export class LilypadDiscordLogger<T extends string> extends LilypadLoggerCompone
     );
     assertNumberOption(owner, 'rateLimitRetries', options.rateLimitRetries, 'non-negative-integer');
     assertNumberOption(owner, 'maxQueueSize', options.maxQueueSize, 'positive-integer');
-    this.webhookUrl = webhookUrl;
+    this.#webhookUrl = webhookUrl;
     this.minRequestInterval = options.minRequestInterval ?? 1000;
     this.rateLimitRetries = options.rateLimitRetries ?? 1;
     this.maxQueueSize = options.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE;
@@ -223,7 +224,7 @@ export class LilypadDiscordLogger<T extends string> extends LilypadLoggerCompone
   }
 
   private post(content: string): Promise<Response> {
-    return fetch(this.webhookUrl, {
+    return fetch(this.#webhookUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

@@ -476,6 +476,34 @@ describe('LilypadLogger', () => {
       expect(vi.mocked(mockComponent2.write).mock.calls[0]![0].message).toBe("{ password: 'p' }");
     });
 
+    it('should mask the passwords of URLs, also in the errors of the record, unless redact is false', async () => {
+      const url = 'postgres://app:s3cr3t@db/app';
+      const loggers = [[], false].map((redact, index) =>
+        LilypadLogger.create<mockType>({
+          components: { info: [index === 0 ? mockComponent : mockComponent2], error: [] },
+          redact: redact as string[] | false,
+        })
+      );
+
+      for (const logger of loggers) {
+        logger.info(`connecting to ${url}`, new Error(`cannot reach ${url}`));
+        await logger.flush();
+      }
+
+      const masked = vi.mocked(mockComponent.write).mock.calls[0]![0];
+      expect(JSON.stringify({ ...masked, parts: [] })).not.toContain('s3cr3t');
+      expect(masked.errors).toEqual([
+        {
+          name: 'Error',
+          message: 'cannot reach postgres://app:[Redacted]@db/app',
+          stack: expect.stringContaining('[Redacted]') as unknown,
+        },
+      ]);
+      const raw = vi.mocked(mockComponent2.write).mock.calls[0]![0];
+      expect(raw.message).toContain(url);
+      expect(raw.errors?.[0]?.message).toBe(`cannot reach ${url}`);
+    });
+
     it('should log without context when the context function throws', async () => {
       const logger = LilypadLogger.create<mockType>({
         components: { info: [mockComponent], error: [] },

@@ -168,7 +168,7 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
     this.logger = options.logger;
     this.config = options.config as C;
     const statementTimeout = resolveStatementTimeout(options);
-    this.sql = postgres(options.connectionString, {
+    this.sql = createClient('connectionString', options.connectionString, {
       prepare: false,
       ...toPostgresPoolOptions(options.pool),
       ...(statementTimeout !== undefined && {
@@ -178,7 +178,7 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
     const listenerConnectionString = options.listenerConnectionString;
     if (listenerConnectionString && listenerConnectionString !== options.connectionString) {
       // postgres.js opens its own single, long-lived connection for LISTEN: no pool options needed
-      this.listenerClient = postgres(listenerConnectionString);
+      this.listenerClient = createClient('listenerConnectionString', listenerConnectionString);
     }
     if (options.listenHeartbeat !== false) {
       this.heartbeat = new LilypadListenHeartbeat(
@@ -544,6 +544,25 @@ export class LilypadDbGate<C extends LilypadDbConfig | undefined = LilypadDbConf
       this.listenerClient?.end({ timeout: timeout / 1000 }),
       this.sql.end({ timeout: timeout / 1000 }),
     ]);
+  }
+}
+
+/**
+ * A postgres.js client. postgres.js throws the error of a malformed URL with the whole URL,
+ * password included, in its `input`: it is replaced with an error that holds neither.
+ */
+function createClient(
+  option: string,
+  connectionString: string,
+  options?: postgres.Options<Record<string, postgres.PostgresType>>
+): postgres.Sql {
+  try {
+    return postgres(connectionString, options);
+  } catch (error) {
+    if (error instanceof Error && 'input' in error) {
+      throw new Error(`LilypadDbGate: ${option} is not a valid URL (${error.message}).`);
+    }
+    throw error;
   }
 }
 

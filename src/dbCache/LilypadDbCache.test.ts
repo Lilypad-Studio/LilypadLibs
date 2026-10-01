@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { LilypadDbCache, type LilypadDbCacheSyncOverrides } from './LilypadDbCache';
 import type { LilypadDbGate, LilypadDbListener } from '@/dbGate/LilypadDbGate';
+import { LilypadTimeoutError } from '@/flow/LilypadFlowControl';
 import {
   defineLilypadDb,
   defineLilypadTable,
@@ -41,6 +42,9 @@ const rowsOf = async <T>(rows: Promise<Map<unknown, T>>): Promise<T[]> => [
 
 /** The cursor of a read that saw every transaction below `xmax`. */
 const at = (xmax: bigint, xip: bigint[] = []) => ({ xmax, xip });
+
+/** The options of `selectByPrimaryKeys`: the signal of the timeout of the query. */
+const withSignal = { signal: expect.any(AbortSignal) as unknown };
 
 type Item = { id: string; name: string };
 
@@ -461,7 +465,10 @@ describe('LilypadDbCache', () => {
         fake.notify({ table: 'items', id: '1', op: 'UPDATE' }),
       ]);
 
-      expect(fake.mocks.selectByPrimaryKeys).toHaveBeenCalledExactlyOnceWith(['1', '2']);
+      expect(fake.mocks.selectByPrimaryKeys).toHaveBeenCalledExactlyOnceWith(
+        ['1', '2'],
+        withSignal
+      );
       // Only the reads of getOrFetch
       expect(fake.mocks.selectByPrimaryKey).toHaveBeenCalledTimes(2);
       expect(cache.get('1')).toEqual({ id: '1', name: 'ONE' });
@@ -1376,6 +1383,29 @@ describe('LilypadDbCache', () => {
     });
   });
 
+  it('should stop the batches of getManyOrFetch once it times out', async () => {
+    vi.useFakeTimers();
+    try {
+      const cache = await createCache({ bulkSync: { timeout: 1000 } });
+      // A query that never answers
+      fake.mocks.selectByPrimaryKeys.mockReturnValueOnce(new Promise<Item[]>(() => {}));
+
+      const reading = cache.getManyOrFetch(['1']);
+      // eslint-disable-next-line vitest/valid-expect -- awaited once the fake timers have advanced
+      const assertion = expect(reading).rejects.toBeInstanceOf(LilypadTimeoutError);
+      await vi.advanceTimersByTimeAsync(1000);
+      await assertion;
+
+      const [, options] = fake.mocks.selectByPrimaryKeys.mock.calls[0] as unknown as [
+        string[],
+        { signal: AbortSignal },
+      ];
+      expect(options.signal.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   describe('getManyOrFetch in parallel', () => {
     it('should not mix up key sets that join to the same string', async () => {
       fake = createFakeGate([
@@ -1630,7 +1660,7 @@ describe('LilypadDbCache', () => {
       await fake.notify({ table: 'items', id: '1', op: 'DELETE' });
 
       expect(cache.get('1')).toEqual({ id: '1', name: 'one' });
-      expect(fake.mocks.selectByPrimaryKeys).toHaveBeenCalledWith(['1']);
+      expect(fake.mocks.selectByPrimaryKeys).toHaveBeenCalledWith(['1'], withSignal);
     });
 
     it('should not cache anything for a DELETE notification of a key it does not hold', async () => {
@@ -1662,7 +1692,8 @@ describe('LilypadDbCache', () => {
       await fake.notify({ table: 'items', id: { nested: true }, op: 'UPDATE' });
 
       expect(fake.mocks.selectByPrimaryKey).toHaveBeenCalledOnce();
-      expect(logger.warn).toHaveBeenCalledTimes(3);
+      // One warning a minute at most: anyone can send them
+      expect(logger.warn).toHaveBeenCalledOnce();
     });
   });
 
@@ -1932,6 +1963,94 @@ describe('LilypadDbCache', () => {
       expect(cache.peek('n1001').type).toBe('expired');
       expect(cache.peek('n0').type).toBe('hit');
     });
+
+    it('should apply a flood of notifications as one change of the whole table per second', async () => {
+      const onInvalidate = vi.fn();
+      const store = countingStore();
+      const logger = { warn: vi.fn() };
+      const cache = await createCache({
+        name: 'items',
+        shared: { store },
+        platform: { onInvalidate },
+        logger,
+      });
+      await cache.getOrFetch('1');
+      await vi.advanceTimersByTimeAsync(0);
+      store.delete.mockClear();
+      // Keys this instance does not hold: each one costs a removal from the shared level and an event
+      const flood = (from: number, count: number) =>
+        Promise.all(
+          Array.from({ length: count }, (_, index) =>
+            fake.notify({ table: 'items', id: `forged-${from + index}`, op: 'UPDATE' })
+          )
+        );
+
+      await flood(0, 2000);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(store.delete).toHaveBeenCalledTimes(2000);
+      expect(cache.peek('1').type).toBe('hit');
+
+      await flood(2000, 5000);
+      await vi.advanceTimersByTimeAsync(0);
+      const wholeTable = () =>
+        onInvalidate.mock.calls.filter(
+          ([event]) => (event as { keys: string[] }).keys.length === 0
+        );
+      expect(store.delete).toHaveBeenCalledTimes(2000);
+      expect(wholeTable()).toHaveLength(1);
+      expect(cache.peek('1').type).toBe('expired');
+
+      // The notifications left after the first change of the table: once more, at the end of the second
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(wholeTable()).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(wholeTable()).toHaveLength(2);
+      expect(onInvalidate).toHaveBeenCalledTimes(2002);
+
+      // One warning a minute at most, whatever the length of the flood
+      await flood(7000, 2001);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(logger.warn).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await flood(9001, 2001);
+      expect(logger.warn).toHaveBeenCalledTimes(2);
+      expect(logger.warn).toHaveBeenLastCalledWith(
+        expect.stringContaining('(and in 1 more second since the last warning)'),
+        expect.anything()
+      );
+    });
+
+    it('should apply at most one TRUNCATE or BULK notification at once per second', async () => {
+      const onInvalidate = vi.fn();
+      const cache = await createCache({ platform: { onInvalidate } });
+      await cache.getOrFetch('1');
+
+      for (let index = 0; index < 100; index++) {
+        await fake.notify({ table: 'items', op: index % 2 === 0 ? 'TRUNCATE' : 'BULK' });
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onInvalidate).toHaveBeenCalledOnce();
+
+      await cache.getOrFetch('1');
+      expect(cache.peek('1').type).toBe('hit');
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(onInvalidate).toHaveBeenCalledTimes(2);
+      expect(cache.peek('1').type).toBe('expired');
+      await cache.dispose();
+    });
+
+    it('should not apply the change of the table due after dispose', async () => {
+      const onInvalidate = vi.fn();
+      const cache = await createCache({ platform: { onInvalidate } });
+      await fake.notify({ table: 'items', op: 'BULK' });
+      await fake.notify({ table: 'items', op: 'BULK' });
+
+      await cache.dispose();
+      await vi.advanceTimersByTimeAsync(1000);
+
+      expect(onInvalidate).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    });
   });
 
   describe('disposal and gate sharing', () => {
@@ -2084,7 +2203,10 @@ describe('LilypadDbCache', () => {
 
       // getAll checks the row noted by the notification once, as outside a load
       expect([...(await loading).keys()].sort()).toEqual(['1', '2']);
-      expect(fake.mocks.selectByPrimaryKeys).toHaveBeenCalledExactlyOnceWith(['forged']);
+      expect(fake.mocks.selectByPrimaryKeys).toHaveBeenCalledExactlyOnceWith(
+        ['forged'],
+        withSignal
+      );
     });
 
     it('should return every row of a first load during which many ids were notified', async () => {
@@ -2136,7 +2258,10 @@ describe('LilypadDbCache', () => {
       expect(cache.get('1')).toEqual({ id: '1', name: 'ONE' });
       // The changed rows are fetched by key: the load is not repeated
       expect(fake.mocks.selectAll).toHaveBeenCalledOnce();
-      expect(fake.mocks.selectByPrimaryKeys).toHaveBeenCalledExactlyOnceWith(['1', '2']);
+      expect(fake.mocks.selectByPrimaryKeys).toHaveBeenCalledExactlyOnceWith(
+        ['1', '2'],
+        withSignal
+      );
     });
   });
 
@@ -2268,7 +2393,10 @@ describe('LilypadDbCache', () => {
       ];
       await Promise.all(notified);
 
-      expect(fake.mocks.selectByPrimaryKeys).toHaveBeenCalledExactlyOnceWith(['1', '2']);
+      expect(fake.mocks.selectByPrimaryKeys).toHaveBeenCalledExactlyOnceWith(
+        ['1', '2'],
+        withSignal
+      );
       expect(cache.peek('2').type).toBe('hit');
     });
   });

@@ -188,6 +188,17 @@ describe('LilypadDbGate (integration)', () => {
       expect(await gate.table(usersSchema).selectByPrimaryKeys([])).toEqual([]);
     });
 
+    it('should stop selecting the batches of primary keys once its signal is aborted', async () => {
+      const signal = AbortSignal.abort(new Error('timed out'));
+
+      await expect(gate.table(usersSchema).selectByPrimaryKeys([1, 2], { signal })).rejects.toThrow(
+        'timed out'
+      );
+      await expect(gate.table(usersSchema).selectByPrimaryKeys([], { signal })).resolves.toEqual(
+        []
+      );
+    });
+
     it('should update a row and return it', async () => {
       await gate.table(usersSchema).insert({ name: 'Ada', role: 'dev' });
 
@@ -670,6 +681,157 @@ describe('LilypadDbGate (integration)', () => {
       }
     });
 
+    describe('its privileges', () => {
+      beforeAll(async () => {
+        // A role that can write one cached table, and nothing else
+        await admin.unsafe(`
+          CREATE ROLE lilypad_other;
+          GRANT INSERT ON users TO lilypad_other;
+          GRANT USAGE ON SEQUENCE users_id_seq TO lilypad_other;
+        `);
+      });
+
+      afterAll(async () => {
+        await admin.unsafe('DROP OWNED BY lilypad_other; DROP ROLE lilypad_other;');
+      });
+
+      const asOther = <T>(run: (sql: postgres.TransactionSql) => Promise<T>) =>
+        admin.begin(async (tx) => {
+          await tx`SET LOCAL ROLE lilypad_other`;
+          return run(tx);
+        });
+
+      it('should record the writes of a role that cannot write the changelog itself', async () => {
+        await asOther((tx) => tx`INSERT INTO users (name) VALUES ('Ada')`);
+
+        const forged = await asOther(
+          (tx) => tx`
+            INSERT INTO lilypad_cache_changes (table_schema, table_name, row_id, op)
+            VALUES ('public', 'users', '1', 'DELETE')
+          `
+        ).then(
+          () => 'written',
+          (error: unknown) => (error as Error).message
+        );
+
+        expect(forged).toBe('permission denied for table lilypad_cache_changes');
+        expect((await readAll()).changes.map(({ op, rowId }) => `${op}:${rowId}`)).toEqual([
+          'INSERT:1',
+        ]);
+      });
+
+      it('should record into the changelog, never into a temporary table of the writer', async () => {
+        const connection = await admin.reserve();
+        try {
+          await connection`SET ROLE lilypad_other`;
+          await connection`
+            CREATE TEMP TABLE lilypad_cache_changes (table_schema text, table_name text, row_id text, op text)
+          `;
+          await connection`INSERT INTO users (name) VALUES ('Ada')`;
+
+          const [temporary] = await connection`
+            SELECT count(*)::int AS count FROM pg_temp.lilypad_cache_changes
+          `;
+          expect(temporary!.count).toBe(0);
+        } finally {
+          await connection`DROP TABLE IF EXISTS pg_temp.lilypad_cache_changes`;
+          await connection`RESET ROLE`;
+          connection.release();
+        }
+        expect((await readAll()).changes.map((change) => change.rowId)).toEqual(['1']);
+      });
+
+      it('should not call a function that another role added to a schema of the search_path', async () => {
+        // An overload that matches the primary key better than pg_catalog.to_jsonb(anyelement)
+        await admin.unsafe(`
+          GRANT CREATE ON SCHEMA public TO lilypad_other;
+          SET ROLE lilypad_other;
+          CREATE FUNCTION public.to_jsonb(integer) RETURNS jsonb
+            AS $$ SELECT '"planted"'::jsonb $$ LANGUAGE sql;
+          RESET ROLE;
+        `);
+        try {
+          await admin`INSERT INTO users (name) VALUES ('Ada')`;
+
+          expect((await readAll()).changes.map((change) => change.rowId)).toEqual(['1']);
+        } finally {
+          await admin.unsafe(`
+            DROP FUNCTION public.to_jsonb(integer);
+            REVOKE CREATE ON SCHEMA public FROM lilypad_other;
+          `);
+        }
+      });
+
+      it('should report the roles granted a write of the changelog, and revoke it', async () => {
+        await admin`GRANT DELETE ON lilypad_cache_changes TO lilypad_other`;
+        // A grant of some columns is enough to record a change
+        await admin`GRANT INSERT (table_schema, table_name, row_id, op) ON lilypad_cache_changes TO lilypad_other`;
+        const options: LilypadSchemaCheckOptions = {
+          tables: [{ table: 'users', primaryKey: 'id' }],
+        };
+        const writable = (result: Awaited<ReturnType<typeof checkLilypadSchema>>) =>
+          result.problems.find((problem) => problem.code === 'writable-changelog');
+
+        const problem = writable(await checkLilypadSchema(gate, options));
+        expect(problem).toMatchObject({ severity: 'warning' });
+        expect(problem!.message).toContain('(lilypad_other)');
+        await admin.unsafe(problem!.fix!);
+
+        expect(writable(await checkLilypadSchema(gate, options))).toBeUndefined();
+      });
+    });
+
+    it('should ignore a changelog row of a transaction that had not started, which only a forger writes', async () => {
+      const { cursor } = await readAll();
+      await admin`
+        INSERT INTO lilypad_cache_changes (xid, table_schema, table_name, row_id, op)
+        VALUES ((pg_current_xact_id()::text::bigint + 1000000)::text::xid8, 'public', 'users', '1', 'DELETE')
+      `;
+
+      expect((await readAll()).changes).toEqual([]);
+      const next = await readLilypadChanges(gate, { tableName: 'users', since: { cursor } });
+      expect(next.changes).toEqual([]);
+    });
+
+    it('should record the changes into a changelog of another schema, pruned by the trigger', async () => {
+      await admin.unsafe(`
+        CREATE SCHEMA archive;
+        CREATE TABLE archive.items (id serial PRIMARY KEY, name text NOT NULL);
+      `);
+      try {
+        await admin.unsafe(
+          lilypadChangelogSql({
+            changelogTable: 'archive.changes',
+            notifyChannel: false,
+            prune: { olderThan: 60 * 60_000, every: 1 },
+          })
+        );
+        await admin.unsafe(
+          lilypadChangelogTriggerSql({
+            table: 'archive.items',
+            primaryKey: 'id',
+            changelogTable: 'archive.changes',
+          })
+        );
+
+        // The prune function is in the schema of the migration (public), the changelog in archive
+        await admin`INSERT INTO archive.items (name) VALUES ('Ada')`;
+
+        const { changes } = await readLilypadChanges(gate, {
+          tableName: 'archive.items',
+          changelogTable: 'archive.changes',
+          since: { lookback: 60_000 },
+        });
+        expect(changes.map((change) => change.rowId)).toEqual(['1']);
+      } finally {
+        await admin.unsafe(`
+          DROP SCHEMA archive CASCADE;
+          DROP FUNCTION IF EXISTS archive_changes_record();
+          DROP FUNCTION IF EXISTS archive_changes_prune();
+        `);
+      }
+    });
+
     it('should delete the rows older than the retention', async () => {
       await admin`INSERT INTO users (name) VALUES ('Ada')`;
 
@@ -711,13 +873,11 @@ describe('LilypadDbGate (integration)', () => {
               prune: { olderThan: 60 * 60_000, every: 1, batchSize: 2 },
             })
           );
-          // A role that can write the cached table and record its changes, but not delete them
+          // A role that can write the cached table, with no privilege on the changelog
           await admin.unsafe(`
             CREATE ROLE lilypad_writer;
             GRANT INSERT, UPDATE ON users TO lilypad_writer;
             GRANT USAGE ON SEQUENCE users_id_seq TO lilypad_writer;
-            GRANT INSERT ON lilypad_cache_changes TO lilypad_writer;
-            GRANT USAGE ON SEQUENCE lilypad_cache_changes_id_seq TO lilypad_writer;
           `);
         });
 
@@ -744,11 +904,14 @@ describe('LilypadDbGate (integration)', () => {
           await recordOldChanges(3);
           const connection = await admin.reserve();
           try {
-            // Any role can create a temporary table, and call the function
+            // Any role can create a temporary table; only the trigger runs the function
             await connection`SET ROLE lilypad_writer`;
             await connection`CREATE TEMP TABLE lilypad_cache_changes (id bigint, changed_at timestamptz)`;
             await connection`INSERT INTO lilypad_cache_changes VALUES (1, now() - interval '2 hours')`;
-            await connection`SELECT lilypad_cache_changes_prune()`;
+            await expect(connection`SELECT lilypad_cache_changes_prune()`).rejects.toThrow(
+              'permission denied for function lilypad_cache_changes_prune'
+            );
+            await connection`INSERT INTO users (name) VALUES ('Ada')`;
 
             const [temporary] = await connection`
               SELECT count(*)::int AS count FROM pg_temp.lilypad_cache_changes
@@ -759,7 +922,7 @@ describe('LilypadDbGate (integration)', () => {
             await connection`RESET ROLE`;
             connection.release();
           }
-          expect(await countChanges()).toEqual({ old: 1, recent: 0 });
+          expect(await countChanges()).toEqual({ old: 1, recent: 1 });
         });
 
         it('should not prune in a transaction stricter than READ COMMITTED', async () => {

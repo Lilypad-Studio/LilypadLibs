@@ -17,7 +17,7 @@ import { assertNumberOption } from '@/internal/LilypadValidation';
  * The function carries it in its comment (`lilypad-changelog:<version>`), so that
  * `checkLilypadSchema` can tell an installation made by an older version of the library.
  */
-export const LILYPAD_CHANGELOG_VERSION = 6;
+export const LILYPAD_CHANGELOG_VERSION = 7;
 export const LILYPAD_CHANGELOG_VERSION_PREFIX = 'lilypad-changelog:';
 /**
  * The oldest version that the caches still read correctly: an older installation is an error of
@@ -180,6 +180,14 @@ export type LilypadChangelogPruneOptions = {
   batchSize?: number | undefined;
 };
 
+/**
+ * The placeholders of the body of the trigger function: the changelog table (as an identifier, and
+ * as a literal) and the prune function, which the `DO` block that creates it qualifies.
+ */
+const CHANGELOG_TOKEN = '__lilypad_changelog__';
+const CHANGELOG_LITERAL_TOKEN = '__lilypad_changelog_literal__';
+const PRUNE_TOKEN = '__lilypad_prune__';
+
 /** The comment of the trigger function that records its prune options (read back by the schema check). */
 const PRUNE_MARKER = 'lilypad-prune:';
 
@@ -283,6 +291,10 @@ export function lilypadChangelogSql(options: LilypadChangelogSqlOptions = {}): s
   }
   const table = options.changelogTable ?? LILYPAD_DEFAULT_CHANGELOG_TABLE;
   const channel = options.notifyChannel ?? LILYPAD_DEFAULT_NOTIFY_CHANNEL;
+  if (channel !== false && channel.includes('__lilypad_')) {
+    // It would be taken for a placeholder of the trigger function
+    throw new Error(`lilypadChangelogSql: the notifyChannel "${channel}" contains "__lilypad_".`);
+  }
   const prune = resolvePruneOptions('lilypadChangelogSql', options.prune);
   assertNumberOption(
     'lilypadChangelogSql',
@@ -300,7 +312,7 @@ export function lilypadChangelogSql(options: LilypadChangelogSqlOptions = {}): s
     prune
       ? `
 ${indent}IF random() * ${prune.every} < 1 AND current_setting('transaction_isolation') = 'read committed' THEN
-${indent}  PERFORM ${pruneFunction}();
+${indent}  PERFORM ${PRUNE_TOKEN}();
 ${indent}END IF;`
       : '';
   const notify = (idExpression: string, opExpression: string) =>
@@ -370,19 +382,28 @@ DO ${pruneDoBody(pruneFunction, quotedTable, prune)};
     : ''
 }
 -- Records the changes of the rows of a statement, or a TRUNCATE of the table; the trigger argument
--- is the primary key column.
-CREATE OR REPLACE FUNCTION ${functionName}() RETURNS trigger AS ${dollarQuote(`
+-- is the primary key column. It runs as its owner, so that only the triggers write the changelog:
+-- the writing roles need no privilege on it, and cannot record changes of their own (every cache
+-- trusts the changelog). So its search_path is pg_catalog then pg_temp only, and the changelog and
+-- the prune function are qualified with the schemas this migration resolves them to: a schema
+-- writable by others (public) could otherwise hold an object that stands for one of them, or an
+-- overload of a built-in function that matches better, run with the privileges of the owner.
+DO ${recordDoBody(
+    functionName,
+    quotedTable,
+    prune ? pruneFunction : undefined,
+    `
 DECLARE
   changed text;
   recorded bigint;
 BEGIN${
-    prune
-      ? `
+      prune
+        ? `
   -- ${PRUNE_MARKER} olderThan=${prune.olderThan} every=${prune.every} batchSize=${prune.batchSize}`
-      : ''
-  }
+        : ''
+    }
   IF TG_OP = 'TRUNCATE' THEN
-    INSERT INTO ${quotedTable} (table_schema, table_name, row_id, op)
+    INSERT INTO ${CHANGELOG_TOKEN} (table_schema, table_name, row_id, op)
       VALUES (TG_TABLE_SCHEMA, TG_TABLE_NAME, NULL, 'TRUNCATE');${notify('NULL', `'TRUNCATE'`)}${pruneCall('    ')}
     RETURN NULL;
   END IF;
@@ -404,24 +425,77 @@ BEGIN${
       'SELECT to_jsonb(o.%1$I) #>> ''{}'' AS row_id, ''DELETE'' AS op FROM ${oldRows} o',
       TG_ARGV[0])
     -- An update that changes primary keys also deletes the old keys that no row has any more
+    -- (compared as JSON: the = of a type outside pg_catalog, e.g. citext, is not on the path)
     ELSE format(
       'SELECT to_jsonb(o.%1$I) #>> ''{}'' AS row_id, ''DELETE'' AS op FROM ${oldRows} o '
-      || 'WHERE NOT EXISTS (SELECT 1 FROM ${newRows} n WHERE n.%1$I = o.%1$I) '
+      || 'WHERE NOT EXISTS (SELECT 1 FROM ${newRows} n WHERE to_jsonb(n.%1$I) = to_jsonb(o.%1$I)) '
       || 'UNION ALL SELECT to_jsonb(n.%1$I) #>> ''{}'', ''UPDATE'' FROM ${newRows} n',
       TG_ARGV[0])
   END;
   EXECUTE format(${dollarQuote(
     `
-    INSERT INTO ${escapeFormat(quotedTable)} (table_schema, table_name, row_id, op)
+    INSERT INTO %s (table_schema, table_name, row_id, op)
     SELECT $1, $2, changed.row_id, changed.op FROM (%s) AS changed
   `,
     'record'
-  )}, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;${notifyChanged}${pruneCall('  ')}
+  )}, ${CHANGELOG_LITERAL_TOKEN}, changed) USING TG_TABLE_SCHEMA, TG_TABLE_NAME;${notifyChanged}${pruneCall('  ')}
   RETURN NULL;
 END;
-`)} LANGUAGE plpgsql;
+`
+  )};
 COMMENT ON FUNCTION ${functionName}() IS ${quoteLiteral(`${LILYPAD_CHANGELOG_VERSION_PREFIX}${LILYPAD_CHANGELOG_VERSION}`)};
-${prune ? '' : `DROP FUNCTION IF EXISTS ${pruneFunction}();\n`}`;
+-- Only its owner writes the changelog (a role granted a write explicitly keeps it: lilypad-doctor
+-- reports it), and only the triggers run the functions
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ${quotedTable} FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION ${functionName}() FROM PUBLIC;
+${prune ? `REVOKE EXECUTE ON FUNCTION ${pruneFunction}() FROM PUBLIC;` : `DROP FUNCTION IF EXISTS ${pruneFunction}();`}
+`;
+}
+
+/**
+ * The `DO` block that creates the trigger function from `body`, where it replaces the placeholders
+ * with the changelog table and the prune function qualified with their schemas, known only there.
+ */
+function recordDoBody(
+  functionName: string,
+  quotedTable: string,
+  pruneFunction: string | undefined,
+  body: string
+): string {
+  const qualify = (name: string, query: string) => `
+  ${name} text := (
+    ${query}
+  );`;
+  const pruneReplace = pruneFunction === undefined ? '' : `, ${quoteLiteral(PRUNE_TOKEN)}, prune)`;
+  return dollarQuote(
+    `
+DECLARE${qualify(
+      'changelog',
+      `SELECT format('%I.%I', n.nspname, c.relname)
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.oid = ${quoteLiteral(quotedTable)}::regclass`
+    )}${
+      pruneFunction === undefined
+        ? ''
+        : qualify(
+            'prune',
+            `SELECT format('%I.%I', n.nspname, p.proname)
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.oid = ${quoteLiteral(`${pruneFunction}()`)}::regprocedure`
+          )
+    }
+BEGIN
+  EXECUTE format(
+    'CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS %L LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp',
+    ${quoteLiteral(functionName)},
+    ${pruneFunction === undefined ? '' : 'replace('}replace(replace(${dollarQuote(body)},
+      ${quoteLiteral(CHANGELOG_LITERAL_TOKEN)}, quote_literal(changelog)),
+      ${quoteLiteral(CHANGELOG_TOKEN)}, changelog)${pruneReplace}
+  );
+END
+`,
+    'lilypad'
+  );
 }
 
 export type LilypadChangelogPruneScheduleOptions = {
@@ -633,8 +707,12 @@ export async function readLilypadChangesBatch(
         ${textArrayLiteral(xips)}::text[], ${textArrayLiteral(lookbacks)}::text[]
       ) WITH ORDINALITY AS r(table_ref, since_xmax, since_xip, lookback_secs, ordinality)
     ),
+    -- next_xmax: a row of a transaction the snapshot cannot see yet (xid >= xmax) was not written
+    -- by the triggers of that transaction, but with a forged xid: read again by every later read
+    -- from a cursor, it would be applied at each of them
     targets AS (
-      SELECT requests.*, n.nspname AS schema_name, t.relname AS rel_name
+      SELECT requests.*, n.nspname AS schema_name, t.relname AS rel_name,
+        pg_snapshot_xmax(pg_current_snapshot()) AS next_xmax
       FROM requests
       JOIN pg_class t ON t.oid = to_regclass(requests.table_ref)
       JOIN pg_namespace n ON n.oid = t.relnamespace
@@ -649,12 +727,14 @@ export async function readLilypadChangesBatch(
         AND c.table_name = targets.rel_name
         AND c.table_schema = targets.schema_name
         AND (c.xid >= targets.since_xmax OR c.xid = ANY(targets.since_xip))
+        AND c.xid < targets.next_xmax
       UNION ALL
       SELECT c.id, c.xid, c.row_id, c.op FROM ${changelogTable} c
       WHERE targets.since_xmax IS NULL
         AND c.table_name = targets.rel_name
         AND c.table_schema = targets.schema_name
         AND c.changed_at >= clock_timestamp() - make_interval(secs => targets.lookback_secs)
+        AND c.xid < targets.next_xmax
     ) c ON true
     ORDER BY c.id
   `;

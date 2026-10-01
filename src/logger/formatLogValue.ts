@@ -43,8 +43,19 @@ export function lilypadRedaction(keys: readonly string[]): ReadonlySet<string> {
   return new Set(keys.map(normalizeRedactedKey));
 }
 
+/** The password of a URL (`scheme://user:password@host`), e.g. of a connection string. */
+const URL_PASSWORD = /(\b[a-z][a-z\d+.-]*:\/\/[^\s/?#@:]*:)[^\s/?#]*@/gi;
+
+/** Masks the passwords of the URLs of a string, unless redaction is off ({@link NO_REDACTION}). */
+export function redactUrlPasswords(text: string, redaction: ReadonlySet<string>): string {
+  return redaction !== NO_REDACTION && text.includes('://')
+    ? text.replace(URL_PASSWORD, '$1[Redacted]@')
+    : text;
+}
+
 const DEFAULT_REDACTION = lilypadRedaction(LILYPAD_DEFAULT_REDACTED_KEYS);
-const NO_REDACTION: ReadonlySet<string> = new Set();
+/** Redaction off (`redact: false`): no key, and the passwords of URLs are kept too. */
+export const NO_REDACTION: ReadonlySet<string> = new Set();
 
 function isRedacted(key: unknown, redaction: ReadonlySet<string>): boolean {
   return typeof key === 'string' && redaction.size > 0 && redaction.has(normalizeRedactedKey(key));
@@ -113,7 +124,7 @@ function walk(value: unknown, depth: number, state: WalkState): LogNode {
 function walkValue(value: unknown, depth: number, state: WalkState): LogNode {
   switch (typeof value) {
     case 'string':
-      return { kind: 'string', value };
+      return { kind: 'string', value: redactUrlPasswords(value, state.redaction) };
     case 'bigint':
       return { kind: 'text', text: `${value}n` };
     case 'symbol':
@@ -225,8 +236,9 @@ function walkError(error: Error, depth: number, state: WalkState): LogNode {
     return {
       kind: 'error',
       name: error.name,
-      message: error.message,
-      stack: error.stack,
+      message: redactUrlPasswords(error.message, state.redaction),
+      stack:
+        error.stack === undefined ? undefined : redactUrlPasswords(error.stack, state.redaction),
       properties,
       cause: error.cause !== undefined ? walk(error.cause, depth + 1, state) : undefined,
     };
@@ -388,7 +400,8 @@ function renderJson(node: LogNode): unknown {
 /**
  * Formats a part of a log message, in a style close to `util.inspect` but without Node.js APIs,
  * so that the logger also runs in edge runtimes.
- * - Strings are returned as they are.
+ * - Strings are returned as they are, except the passwords of URLs (`scheme://user:[Redacted]@`),
+ *   masked in every string unless redaction is off ({@link NO_REDACTION}, even with no key).
  * - Errors keep their stack (or name and message), their own properties (e.g. the `code` and
  *   `detail` of a database error) and their `cause`.
  * - It never throws: circular references print as `[Circular]`, BigInts as `10n`, a getter
@@ -405,7 +418,7 @@ export function formatLogValue(
   redaction: ReadonlySet<string> = DEFAULT_REDACTION
 ): string {
   if (typeof value === 'string') {
-    return value;
+    return redactUrlPasswords(value, redaction);
   }
   try {
     const node = walk(value, 0, {
@@ -425,7 +438,8 @@ export function formatLogValue(
 
 /**
  * The JSON-safe copy of a logged value (the context of a record, a JSON log line), with the values
- * of the keys of `redaction` replaced with `[Redacted]` at any depth. It follows `toJSON` as
+ * of the keys of `redaction` replaced with `[Redacted]` at any depth (and the passwords of URLs in
+ * its strings, unless redaction is off). It follows `toJSON` as
  * `JSON.stringify` does, then redacts what it returns; errors become `{ name, message, stack }`
  * with their own properties and their `cause` (and an `AggregateError` its `errors`); BigInts
  * become `10n`; a part that cannot be read becomes `[Unformattable value]`; a reference to an ancestor

@@ -12,6 +12,17 @@ import {
 import type { LilypadCacheKey } from '@/cache/LilypadCacheTypes';
 import { LilypadBackoff } from '@/internal/LilypadBackoff';
 
+/**
+ * The most notifications of its table a cache applies one by one per second. Anyone can send a
+ * notification, and each one costs a removal from the shared level and an invalidation event (a
+ * `TRUNCATE` or a `BULK`, an expiration of every entry): beyond the budget, the notifications of the
+ * second are applied as one change of the whole table (see `overflow`).
+ */
+const NOTIFICATIONS_PER_SECOND = 2000;
+const BUDGET_WINDOW = 1000;
+/** At most one warning about the notifications beyond the budget per this many ms. */
+const OVERFLOW_WARNING_INTERVAL = 60_000;
+
 function parseXid(xid: string | undefined): bigint | undefined {
   return xid !== undefined && /^\d+$/.test(xid) ? BigInt(xid) : undefined;
 }
@@ -34,6 +45,16 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
   private readonly backoff = new LilypadBackoff(() => 1000);
   /** Since when `LISTEN` delivers every change to this instance. */
   private listenTrustedSince?: number | undefined;
+  /**
+   * The notifications applied in the current second (`performance.now()`), and whether a change
+   * of the whole table was: at most one per second is applied at once.
+   */
+  private budget = { start: -Infinity, count: 0, tableWide: false, warned: false };
+  /** The last warning about a second beyond the budget, and the seconds beyond it not logged since. */
+  private overflowWarning = { warnedAt: -Infinity, unlogged: 0 };
+  /** The change of the whole table due at the end of the second, for the notifications beyond it. */
+  private overflowTimer?:
+    (ReturnType<typeof setTimeout> & { unref?: (() => void) | undefined }) | undefined;
 
   constructor(
     private readonly host: LilypadDbSyncHost<K>,
@@ -109,7 +130,9 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
     }
     host.log('debug', `Received a notification on the ${this.options.channel} channel:`, payload);
     if (this.applyChanges) {
-      if (payload.op === 'TRUNCATE') {
+      if (!this.takeBudget(payload.op === 'TRUNCATE' || payload.op === 'BULK')) {
+        this.overflow();
+      } else if (payload.op === 'TRUNCATE') {
         host.emitInvalidation('notification', host.applyTruncate('eager'), { wholeCache: true });
       } else if (payload.op === 'BULK') {
         host.applyBulkChange();
@@ -123,6 +146,78 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
   }
 
   /**
+   * Takes one notification from the budget of this second: `false` once it is spent, or for a
+   * change of the whole table when one was already applied in this second.
+   */
+  private takeBudget(tableWide: boolean): boolean {
+    const now = performance.now();
+    if (now - this.budget.start >= BUDGET_WINDOW) {
+      this.budget = { start: now, count: 0, tableWide: false, warned: false };
+    }
+    if (this.budget.count >= NOTIFICATIONS_PER_SECOND || (tableWide && this.budget.tableWide)) {
+      return false;
+    }
+    this.budget.count++;
+    this.budget.tableWide ||= tableWide;
+    return true;
+  }
+
+  /**
+   * Applies a notification beyond the budget as a change of the whole table: at once if none was
+   * applied in this second, otherwise once at its end, for every notification left until then. The
+   * cost of a flood of notifications is then bounded, whatever their number: a change of every
+   * row, as for a `BULK` notification, without a removal from the shared level per key.
+   */
+  private overflow() {
+    if (this.budget.count >= NOTIFICATIONS_PER_SECOND && !this.budget.warned) {
+      this.budget.warned = true;
+      this.warnOverflow();
+    }
+    if (!this.budget.tableWide) {
+      this.budget.tableWide = true;
+      this.applyTableChange();
+      return;
+    }
+    if (this.overflowTimer) {
+      return;
+    }
+    const remaining = this.budget.start + BUDGET_WINDOW - performance.now();
+    this.overflowTimer = setTimeout(
+      () => {
+        this.overflowTimer = undefined;
+        if (this.host.isDisposed()) {
+          return;
+        }
+        // Counts as the change of the whole table of the next second
+        this.budget = { start: performance.now(), count: 0, tableWide: true, warned: false };
+        this.applyTableChange();
+      },
+      Math.max(0, remaining)
+    );
+    this.overflowTimer.unref?.();
+  }
+
+  /** Logs a second beyond the budget, at most once a minute: a flood must not flood the logs too. */
+  private warnOverflow() {
+    const now = performance.now();
+    if (now - this.overflowWarning.warnedAt < OVERFLOW_WARNING_INTERVAL) {
+      this.overflowWarning.unlogged++;
+      return;
+    }
+    const unlogged = this.overflowWarning.unlogged;
+    this.overflowWarning = { warnedAt: now, unlogged: 0 };
+    this.host.log(
+      'warn',
+      `More than ${NOTIFICATIONS_PER_SECOND} notifications in a second on the ${this.options.channel} channel: the others are applied as a change of the whole table${unlogged > 0 ? ` (and in ${unlogged} more second${unlogged === 1 ? '' : 's'} since the last warning)` : ''}.`
+    );
+  }
+
+  private applyTableChange() {
+    this.host.applyBulkChange();
+    this.host.emitInvalidation('notification', [], { wholeCache: true });
+  }
+
+  /**
    * Whether a notification of the table (the router matched its name) is about the schema of this
    * cache: `schema`, when the trigger sends it, must match.
    */
@@ -132,6 +227,8 @@ export class LilypadListenSync<K extends LilypadCacheKey> implements LilypadDbSy
 
   /** Waits for a `LISTEN` still starting, then unsubscribes. It never rejects. */
   async dispose(): Promise<void> {
+    clearTimeout(this.overflowTimer);
+    this.overflowTimer = undefined;
     await this.listening?.catch(() => {});
     await this.router.unsubscribe(this.subscriber);
   }

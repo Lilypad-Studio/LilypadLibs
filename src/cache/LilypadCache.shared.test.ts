@@ -850,6 +850,87 @@ describe('LilypadCache platform features', () => {
       }
     );
 
+    // Written by an instance whose clock is ahead, or planted in the store
+    const futureCopy = (value: number, ahead: number) => {
+      const stamped = Date.now() + ahead;
+      fake.data.set('lilypad:2:products:v:p1', {
+        value: { lilypad: 2, value, fetchedAt: stamped, expiresAt: stamped + 1000 },
+        expiresAt: Date.now() + 3_600_000,
+      });
+    };
+
+    it('should not adopt a shared copy stamped in the future once the key is invalidated', async () => {
+      futureCopy(1, 600_000);
+      const cache = createInstance<number>();
+      fake.store.delete.mockRejectedValueOnce(new Error('store down'));
+      cache.invalidate('p1');
+      await settle();
+      await vi.advanceTimersByTimeAsync(10);
+
+      await expect(cache.getOrSetDetailed('p1', async () => 2)).resolves.toMatchObject({
+        value: 2,
+        status: 'MISS',
+      });
+    });
+
+    it('should adopt a shared copy stamped in the future once its time has come', async () => {
+      futureCopy(1, 100);
+      const early = createInstance<number>();
+      await expect(early.getOrSetDetailed('p1', async () => 2)).resolves.toMatchObject({
+        status: 'MISS',
+      });
+      futureCopy(1, 100);
+      await vi.advanceTimersByTimeAsync(100);
+
+      await expect(
+        createInstance<number>().getOrSetDetailed('p1', async () => 2)
+      ).resolves.toMatchObject({ value: 1, status: 'L2-HIT' });
+    });
+
+    it('should replace a shared value stamped in the future with checkBeforeWrite', async () => {
+      futureCopy(1, 600_000);
+      const cache = createInstance<number>({
+        shared: { store: fake.store, checkBeforeWrite: true },
+      });
+
+      cache.set('p1', 2);
+      await settle();
+
+      expect(fake.data.get('lilypad:2:products:v:p1')?.value).toMatchObject({ value: 2 });
+    });
+
+    it('should bound the invalidations it remembers, and still refuse the copies they concerned', async () => {
+      const writer = createInstance<number>();
+      writer.set('kept', 1);
+      await settle();
+      await vi.advanceTimersByTimeAsync(10);
+      const cache = createInstance<number>();
+      fake.store.delete.mockRejectedValue(new Error('store down'));
+
+      // e.g. a flood of notifications of keys this instance does not hold
+      for (let index = 0; index <= 10_000; index++) {
+        cache.invalidate(`missing-${index}`);
+      }
+      await settle();
+      fake.store.delete.mockReset();
+
+      const remembered = (cache['engine'] as unknown as { invalidatedMissing: Map<string, number> })
+        .invalidatedMissing;
+      expect(remembered.size).toBeLessThanOrEqual(10_000);
+      // Every copy produced before is refused instead, including the ones of other keys
+      await expect(cache.getOrSetDetailed('kept', async () => 2)).resolves.toMatchObject({
+        value: 2,
+        status: 'MISS',
+      });
+      await vi.advanceTimersByTimeAsync(10);
+      writer.set('later', 3);
+      await settle();
+      await expect(cache.getOrSetDetailed('later', async () => 4)).resolves.toMatchObject({
+        value: 3,
+        status: 'L2-HIT',
+      });
+    });
+
     it('should not adopt the shared copy of an invalidated key once its entry is purged', async () => {
       const cache = createInstance<number>();
       await cache.getOrSet('p1', async () => 1);
