@@ -120,7 +120,8 @@ export function quoteIdentifier(identifier: string): string {
     .join('.');
 }
 
-function quoteLiteral(value: string): string {
+/** Quotes a string literal (with `standard_conforming_strings`, on since PostgreSQL 9.1). */
+export function quoteLiteral(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 

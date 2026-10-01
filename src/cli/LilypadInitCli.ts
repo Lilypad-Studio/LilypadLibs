@@ -63,11 +63,12 @@ export function lilypadInitTarget(
   if (!EXTENSIONS.has(extname(path))) {
     throw new Error(`The config file must end with .ts, .mts, .mjs or .js (got ${reference}).`);
   }
-  const match = CONFIG_FILE.exec(basename(path));
-  const name = match?.[1] ?? LILYPAD_DEFAULT_DB_CONFIG_NAME;
-  // A file named as a config: the loader refuses two files of it in one folder
-  const siblings = match
-    ? lilypadDbConfigFileNames(name).map((file) => resolve(dirname(path), file))
+  const name = CONFIG_FILE.exec(basename(path))?.[1] ?? LILYPAD_DEFAULT_DB_CONFIG_NAME;
+  // A file the loader finds by its name (not `lilypad.default.config.*`, which only a path loads):
+  // it refuses two files of that config in one folder
+  const files = lilypadDbConfigFileNames(name);
+  const siblings = files.includes(basename(path))
+    ? files.map((file) => resolve(dirname(path), file))
     : [path];
   return { path, name, existing: siblings.filter((sibling) => exists(sibling)) };
 }

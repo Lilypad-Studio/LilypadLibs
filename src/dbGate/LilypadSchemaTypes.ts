@@ -67,7 +67,8 @@ export type LilypadSchemaCheckOptions = {
   /**
    * Checks that the tables have a trigger that sends notifications on this channel (the `listen`
    * strategy), unless a table sets its own `notifyChannel`. The trigger may be the changelog trigger
-   * or one of your own: its function must call `pg_notify` with the channel name as a literal.
+   * or one of your own: its function must call `pg_notify` with the channel name as a literal,
+   * spelled exactly as the caches listen to it (case included).
    * Defaults to `false`: not checked.
    *
    * The changelog trigger function notifies on one channel, the same in every fix that installs it:

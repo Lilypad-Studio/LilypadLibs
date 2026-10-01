@@ -554,6 +554,22 @@ describe('evaluateLilypadSchema', () => {
       expect(codes(rejected)).toEqual(['missing-notify-trigger']);
     });
 
+    it('should match the channel with its case, and pg_notify in any case', () => {
+      const triggers = (source: string) => [
+        { ...notifier('cache_events', ROW_TRIGGER), source },
+        { ...notifier('cache_events', TRUNCATE_TRIGGER), source },
+      ];
+      const check = (source: string) =>
+        evaluateLilypadSchema(
+          facts({ tables: [{ schema: 'public', triggers: triggers(source) }] }),
+          listenOptions
+        );
+
+      // LISTEN "cache_events" never receives the notifications of 'Cache_Events'
+      expect(codes(check(notifySource('Cache_Events')))).toEqual(['missing-notify-trigger']);
+      expect(check("BEGIN PERFORM PG_NOTIFY('cache_events', payload); END").ok).toBe(true);
+    });
+
     it('should report a TRUNCATE that is not notified', () => {
       const result = evaluateLilypadSchema(
         facts({
@@ -634,6 +650,17 @@ describe('the pruning of the changelog', () => {
 
       expect(result.problems[0]!.fix).toBe(lilypadChangelogPruneScheduleSql({ olderThan: DAY }));
       expect(result.problems[0]!.message).toContain('the jobs of the other roles are not visible');
+    });
+
+    it('should say that the jobs could not be read, rather than that there is none', () => {
+      const result = evaluateLilypadSchema(
+        unpruned({ available: true, installed: true, database: 'app', jobs: null }),
+        changelogOptions
+      );
+
+      expect(result.problems[0]!.fix).toBe(lilypadChangelogPruneScheduleSql({ olderThan: DAY }));
+      expect(result.problems[0]!.message).toContain('the role of the check cannot read its jobs');
+      expect(result.problems[0]!.message).not.toContain('with no job of this role');
     });
 
     it('should install pg_cron where it runs but is not installed yet', () => {
@@ -992,6 +1019,87 @@ describe('the pruning of the changelog', () => {
       );
     });
 
+    it('should read the retention of the statement of a job that deletes from the changelog', () => {
+      const result = evaluateLilypadSchema(
+        withJob({
+          command:
+            "DELETE FROM sessions WHERE expires_at < now() - interval '30 minutes'; DELETE FROM lilypad_cache_changes WHERE changed_at < now() - interval '7 days'",
+        }),
+        changelogOptions
+      );
+
+      expect(result.problems).toEqual([]);
+    });
+
+    it('should report the short retention of a job that does more, without scheduling it again', () => {
+      const result = evaluateLilypadSchema(
+        withJob({
+          command:
+            "DELETE FROM lilypad_cache_changes WHERE changed_at < now() - interval '30 minutes'; VACUUM lilypad_cache_changes",
+        }),
+        changelogOptions
+      );
+
+      expect(codes(result)).toEqual(['short-changelog-retention']);
+      // Scheduled again, the job would lose its VACUUM
+      expect(result.problems[0]!.fix).toBeUndefined();
+      expect(result.problems[0]!.message).toContain('change its interval there');
+    });
+
+    it('should reschedule a job of the library with a short retention', () => {
+      const result = evaluateLilypadSchema(
+        withJob({
+          command:
+            'DELETE FROM "public"."lilypad_cache_changes" WHERE changed_at < clock_timestamp() - make_interval(secs => 1800);',
+        }),
+        changelogOptions
+      );
+
+      expect(codes(result)).toEqual(['short-changelog-retention']);
+      expect(result.problems[0]!.fix).toContain(
+        "SELECT cron.schedule('lilypad_cache_changes_prune'"
+      );
+    });
+
+    it('should not reschedule a job whose DELETE has another condition', () => {
+      const result = evaluateLilypadSchema(
+        withJob({
+          command:
+            "DELETE FROM lilypad_cache_changes WHERE changed_at < now() - interval '30 minutes' AND table_name = 'users'",
+        }),
+        changelogOptions
+      );
+
+      expect(codes(result)).toEqual(['short-changelog-retention']);
+      // Scheduled again, the job would delete the rows of every table
+      expect(result.problems[0]!.fix).toBeUndefined();
+    });
+
+    it('should not read the retention of a DELETE in a CTE, whose job does more', () => {
+      const result = evaluateLilypadSchema(
+        withJob({
+          command:
+            "WITH gone AS (DELETE FROM lilypad_cache_changes WHERE changed_at < now() - interval '30 minutes' RETURNING *) INSERT INTO archive SELECT * FROM gone",
+        }),
+        changelogOptions
+      );
+
+      expect(result.problems).toEqual([]);
+    });
+
+    it('should not take the job of a changelog of the same name in another schema', () => {
+      const result = evaluateLilypadSchema(
+        withJob({
+          command:
+            "DELETE FROM archive.lilypad_cache_changes WHERE changed_at < now() - interval '30 minutes'",
+        }),
+        changelogOptions
+      );
+
+      // Not a short retention of this changelog, whose fix would take over the other job
+      expect(codes(result)).toEqual(['no-changelog-pruning']);
+    });
+
     it('should accept a job whose retention it cannot read', () => {
       const result = evaluateLilypadSchema(
         withJob({
@@ -1066,12 +1174,49 @@ describe('lilypadPruneCommandRetention', () => {
     // A comment is not the condition
     ["now() - interval '7 days' -- interval '1 minute'", 7 * 86_400_000],
     ["/* interval '1 minute' */ now() - interval '7 days'", 7 * 86_400_000],
+    ["now() - interval '7 days' /* /* nested */ interval '1 minute' */", 7 * 86_400_000],
+    ["now() - interval '7 days';", 7 * 86_400_000],
+    // Two intervals: either may be the retention
+    ["now() - interval '1 year' AND changed_at > now() - interval '1 minute'", undefined],
   ])('should read %s', (condition, expected) => {
     expect(
       lilypadPruneCommandRetention(
-        `DELETE FROM lilypad_cache_changes WHERE changed_at < ${condition}`
+        `DELETE FROM lilypad_cache_changes WHERE changed_at < ${condition}`,
+        'lilypad_cache_changes'
       )
     ).toBe(expected);
+  });
+
+  it.each([
+    [
+      'the DELETE of the changelog among other statements',
+      "DELETE FROM sessions WHERE expires_at < now() - interval '1 minute'; DELETE FROM lilypad_cache_changes WHERE changed_at < now() - interval '7 days'",
+      7 * 86_400_000,
+    ],
+    [
+      'two statements that delete from the changelog',
+      "DELETE FROM lilypad_cache_changes WHERE op = 'TRUNCATE'; DELETE FROM lilypad_cache_changes WHERE changed_at < now() - interval '7 days'",
+      undefined,
+    ],
+    [
+      // The -- of a dollar-quoted string is no comment: two intervals
+      'a dollar-quoted string',
+      "DELETE FROM lilypad_cache_changes WHERE changed_at < now() - interval '7 days' AND note <> $$--$$ OR changed_at < now() - interval '1 minute'",
+      undefined,
+    ],
+    [
+      'a DELETE in a DO block',
+      "DO $$ BEGIN DELETE FROM lilypad_cache_changes WHERE changed_at < now() - interval '1 hour'; END $$",
+      undefined,
+    ],
+    [
+      // The escape string is ' -- ': the rest of the line is not a comment
+      'a condition after an escape string',
+      "DELETE FROM lilypad_cache_changes WHERE op <> E'\\' -- ' AND changed_at < now() - interval '30 minutes'",
+      30 * 60_000,
+    ],
+  ])('should read %s', (_case, command, expected) => {
+    expect(lilypadPruneCommandRetention(command, 'lilypad_cache_changes')).toBe(expected);
   });
 });
 
@@ -1094,6 +1239,25 @@ describe('lilypadCommandDeletesFrom', () => {
     ['DELETE FROM mychanges WHERE true', 'MyChanges', false],
     ['DELETE FROM "MYCHANGES" WHERE true', 'MyChanges', false],
     ['WITH gone AS (DELETE FROM changes RETURNING id) SELECT 1', 'changes', true],
+    // PostgreSQL nests the block comments, and a command left open is not understood
+    ['SELECT 1 /* a /* b */ DELETE FROM lilypad_cache_changes */', 'lilypad_cache_changes', false],
+    ['SELECT 1 /* DELETE FROM lilypad_cache_changes', 'lilypad_cache_changes', false],
+    ["SELECT 'x; DELETE FROM lilypad_cache_changes", 'lilypad_cache_changes', false],
+    // The body of a DO block is code, any other dollar-quoted string a literal
+    ['DO $$ BEGIN DELETE FROM lilypad_cache_changes; END $$', 'lilypad_cache_changes', true],
+    ['DO $body$ BEGIN DELETE FROM a$b; END $body$', 'a$b', true],
+    [
+      'DO LANGUAGE plpgsql $$ BEGIN DELETE FROM lilypad_cache_changes; END $$',
+      'lilypad_cache_changes',
+      true,
+    ],
+    ['SELECT $$DELETE FROM lilypad_cache_changes$$', 'lilypad_cache_changes', false],
+    ['SELECT $$ DELETE FROM lilypad_cache_changes', 'lilypad_cache_changes', false],
+    [
+      "DO $$ BEGIN DELETE FROM lilypad_cache_changes WHERE 'x; END $$",
+      'lilypad_cache_changes',
+      false,
+    ],
   ])('%s (%s): %s', (command, table, expected) => {
     expect(lilypadCommandDeletesFrom(command, table)).toBe(expected);
   });

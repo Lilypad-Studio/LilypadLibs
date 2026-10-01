@@ -2318,6 +2318,33 @@ describe('LilypadDbGate (integration)', () => {
       expect(codes(await check(true))).toEqual(['public.shape_members:undeclared-index']);
     });
 
+    it('should make the database generate the keys of a table that has rows, after them', async () => {
+      await admin`CREATE TABLE shape_spellings (id int PRIMARY KEY, name text)`;
+      await admin`INSERT INTO shape_spellings VALUES (1, 'a'), (2, 'b')`;
+      const generatedDb = defineLilypadDb({
+        tables: {
+          spellings: {
+            tableName: 'shape_spellings',
+            primaryKey: 'id',
+            generatedPrimaryKey: true,
+            cols: { id: { pgType: 'int4' }, name: { pgType: 'text' } },
+            sync: { strategy: 'none' },
+          },
+        },
+      });
+      const checkGenerated = () => checkLilypadSchema(gate, lilypadSchemaCheckOptions(generatedDb));
+
+      const missing = await checkGenerated();
+      expect(codes(missing)).toEqual(['public.shape_spellings:missing-column-default']);
+
+      await applyFixes(missing);
+
+      expect((await checkGenerated()).problems).toEqual([]);
+      // The identity starts after the keys of the rows: the insert does not collide with them
+      const { row } = await gate.table(generatedDb.tables.spellings).insert({ name: 'c' });
+      expect(row).toMatchObject({ id: 3, name: 'c' });
+    });
+
     it('should judge the columns of a domain by its base type, through nested domains', async () => {
       await admin.unsafe(`
         CREATE DOMAIN shape_big_id AS int8 CHECK (VALUE > 0);

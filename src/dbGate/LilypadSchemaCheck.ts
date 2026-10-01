@@ -161,12 +161,18 @@ function escapeRegExp(value: string): string {
 }
 
 /**
+ * A call of `pg_notify` up to its first argument: the name in any case (PostgreSQL folds the
+ * unquoted names), but not the channel that follows, which `LISTEN` matches exactly.
+ */
+const NOTIFY_CALL = String.raw`[Pp][Gg]_[Nn][Oo][Tt][Ii][Ff][Yy]\s*\(\s*`;
+
+/**
  * The channel on which an installed changelog function sends notifications (its first
  * `pg_notify`, in the `TRUNCATE` branch, where the literal is not escaped for `format()`), or
  * `false` if it sends none.
  */
 function installedNotifyChannel(source: string | null): string | false {
-  const match = source ? /pg_notify\s*\(\s*'((?:[^']|'')*)'/i.exec(source) : null;
+  const match = source ? new RegExp(`${NOTIFY_CALL}'((?:[^']|'')*)'`).exec(source) : null;
   return match?.[1] !== undefined ? match[1].replace(/''/g, "'") : false;
 }
 
@@ -384,8 +390,7 @@ export function evaluateLilypadSchema(
 
     if (tableChannel !== false) {
       const notifies = new RegExp(
-        `pg_notify\\s*\\(\\s*'${escapeRegExp(tableChannel.replace(/'/g, "''"))}'`,
-        'i'
+        `${NOTIFY_CALL}'${escapeRegExp(tableChannel.replace(/'/g, "''"))}'`
       );
       // The row events notified by any enabled trigger: they may be split across several triggers.
       // A statement trigger notifies each row only if it is a changelog trigger, and a row trigger
