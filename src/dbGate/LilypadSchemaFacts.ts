@@ -92,6 +92,20 @@ export type LilypadCronJobInfo = {
   database: string | null;
 };
 
+/**
+ * A table that is not in the options (another config or service sharing the changelog, or a table
+ * removed from the config) whose changelog triggers record a key column that is missing, or whose
+ * type the trigger function refuses (the rule of `lilypadSafeKeyTypeSql`).
+ */
+type LilypadBlockedChangelogTable = {
+  /** `schema.table`. */
+  table: string;
+  /** The column its triggers record (their first argument), `null` if they have no argument. */
+  column: string | null;
+  /** The type of that column (`format_type`), `null` if the column does not exist. */
+  type: string | null;
+};
+
 /** What `checkLilypadSchema` reads from the catalogs, before it evaluates it. */
 export type LilypadSchemaFacts = {
   /** `server_version_num`, e.g. `160002`. */
@@ -121,6 +135,12 @@ export type LilypadSchemaFacts = {
      * (`pg_stat_user_tables.n_tup_del`): something prunes it, possibly a job the check cannot see.
      */
     deletedRows: number;
+    /**
+     * The tables outside the options whose enabled changelog triggers read a key that the trigger
+     * function refuses (see {@link LilypadBlockedChangelogTable}): their writes fail once the current
+     * version is installed. Empty without the trigger function.
+     */
+    blockedTables: LilypadBlockedChangelogTable[];
   };
   cron: {
     /** Whether pg_cron can be installed on the server (`pg_available_extensions`). */
@@ -239,6 +259,7 @@ async function readDatabaseFacts(
   const changelog = readChangelogTarget(options);
   const quotedChangelog = quoteIdentifier(changelog.table);
   const pruneSignature = `${quoteIdentifier(pruneFunctionName(changelog.table))}()`;
+  const tableRefs = options.tables.map(({ table }) => quoteIdentifier(table));
 
   // pg_settings leaves out the settings the role may not read, where current_setting() throws
   const [database] = await sql`
@@ -288,7 +309,44 @@ async function readDatabaseFacts(
       obj_description(to_regprocedure(${changelog.functionSignature}::text), 'pg_proc') AS function_comment,
       (
         SELECT prosrc FROM pg_proc WHERE oid = to_regprocedure(${changelog.functionSignature}::text)
-      ) AS function_source
+      ) AS function_source,
+      -- The tables outside the options whose enabled changelog statement triggers on INSERT, UPDATE
+      -- or DELETE (those that read the key: 28 = INSERT | DELETE | UPDATE) record a missing column, or
+      -- one of a type the trigger function refuses (lilypadSafeKeyTypeSql). The recorded column is
+      -- the first argument (tgargs ends each one with a zero byte); none without an argument
+      (
+        SELECT coalesce(json_agg(json_build_object(
+          'table', blocked.table_name, 'column', blocked.key_column, 'type', blocked.key_type
+        ) ORDER BY blocked.table_name, blocked.key_column), '[]'::json)
+        FROM (
+          SELECT DISTINCT
+            n.nspname || '.' || c.relname AS table_name,
+            arg.key_column,
+            CASE WHEN a.attnum IS NOT NULL
+              THEN pg_catalog.format_type(a.atttypid, a.atttypmod) END AS key_type
+          FROM pg_catalog.pg_trigger tr
+          JOIN pg_catalog.pg_class c ON c.oid = tr.tgrelid
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          CROSS JOIN LATERAL (
+            SELECT CASE WHEN tr.tgnargs > 0 THEN pg_catalog.convert_from(
+              substring(tr.tgargs FROM 1 FOR greatest(position(decode('00', 'hex') IN tr.tgargs) - 1, 0)),
+              pg_catalog.getdatabaseencoding()
+            ) END AS key_column
+          ) AS arg
+          LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = tr.tgrelid
+            AND a.attname = arg.key_column::pg_catalog.name AND a.attnum > 0 AND NOT a.attisdropped
+          WHERE tr.tgfoid = to_regprocedure(${changelog.functionSignature}::text)::oid
+            AND NOT tr.tgisinternal
+            AND tr.tgenabled IN ('O', 'A')
+            AND (tr.tgtype & 1) = 0
+            AND (tr.tgtype & 28) <> 0
+            AND NOT EXISTS (
+              SELECT 1 FROM unnest(${textArrayLiteral(tableRefs)}::text[]) AS requested(ref)
+              WHERE to_regclass(requested.ref) = tr.tgrelid
+            )
+            AND (a.attnum IS NULL OR NOT (${sql.unsafe(lilypadSafeKeyTypeSql('a.atttypid'))}))
+        ) AS blocked
+      ) AS blocked_changelog_tables
   `;
   if (!database) {
     throw new Error('Reading the database settings returned no row.');
@@ -327,6 +385,9 @@ async function readDatabaseFacts(
       writers: database.changelog_writers as string | null,
       oldestRowAge,
       deletedRows: database.deleted_rows as number,
+      blockedTables: parseJsonColumn(
+        database.blocked_changelog_tables
+      ) as LilypadBlockedChangelogTable[],
     },
     cron: {
       available: database.cron_available as boolean,

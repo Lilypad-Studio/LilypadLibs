@@ -16,7 +16,7 @@ Read the matching section of `docs/architecture.md` (and `docs/how-it-works.md` 
 
 1. The type: a new member of the `LilypadDbTableSync` union in `src/dbConfig/LilypadDbConfig.ts` (next to `LilypadDbTableListenSync` / `LilypadDbTableChangelogSync`), exported from `src/entries/schema.ts`.
 2. The validation: `assertSync` in `src/dbConfig/LilypadDbConfigValidation.ts` (the `assertOneOf` set of `strategy`, and the checks of its options).
-3. The class: in `src/dbCache/sync/`, implementing `LilypadDbSyncStrategy` (`LilypadDbSyncTypes.ts`); `beforeRead()` is awaited inline by the cache.
+3. The class: in `src/dbCache/sync/`, implementing `LilypadDbSyncStrategy` (`LilypadDbSyncTypes.ts`); `beforeRead()` is awaited inline by the cache, so a query it waits for goes through `host.boundRead` (the gate sets no `statement_timeout` by default: an unbounded wait would hold every read).
 4. The wiring: the `if/else` on `tableSync.strategy` in the constructor of `src/dbCache/LilypadDbCache.ts`, and the overrides of `LilypadDbCacheSyncOverrides` if it takes any.
 5. The check: `lilypadSchemaCheckOptions` in `src/dbGate/LilypadDoctor.ts` (which triggers, channel or changelog the strategy needs from the database).
 6. The init template: the `sync` comment of `src/cli/lilypadDbConfigTemplate.ts`.
@@ -29,6 +29,7 @@ Read the matching section of `docs/architecture.md` (and `docs/how-it-works.md` 
 ## Changing the changelog SQL
 
 - Bump `LILYPAD_CHANGELOG_VERSION` in `src/dbGate/LilypadChangelog.ts` (written into the function COMMENT with `LILYPAD_CHANGELOG_VERSION_PREFIX`; `lilypad-doctor` compares it: an older install is the error `outdated-changelog`, a newer one the warning `newer-changelog`, which withholds the changelog fixes). Only for a change of what the SQL installs: a statement that only upgrades an older install needs no bump.
+- The trigger function runs as its owner: qualify every object its body reads (`pg_catalog.` for the catalogs). The transition tables are the only unqualified names, and only because the function first checks that the firing trigger declares them (see the Changelog notes of `docs/architecture.md`).
 - Append to the SQL the idempotent statements that upgrade an install of the previous version (`IF EXISTS`/`IF NOT EXISTS`, `DROP` of renamed objects): keep the existing ones, so any older install still upgrades in one run.
 - Keep it readable by the previous version of the library: services of both versions share the database during a rollout (the newest one migrates it first, with `lilypad-doctor --sql`). Add columns and payload fields, never remove or rename one the reader or `parseLilypadNotification` of the previous version needs.
 - Update `LilypadChangelog.test.ts` and `LilypadSchemaCheck.test.ts`, then run `npm run test:integration` (Docker).

@@ -118,8 +118,10 @@ export type LilypadSchemaProblemCode =
    * function is not, a user-defined (non-built-in) composite, range or multirange type, or an
    * array or domain over one. Converting it
    * would run a non-superuser's code with the changelog owner's privileges, so the trigger refuses
-   * it and the writes of the table fail. Reported for a `changelog` table, and for a `listen` table
-   * that the changelog triggers notify (or that the fix of its notifications gives them). Use a
+   * it and the writes of the table fail. Reported for a `changelog` table, for a `listen` table
+   * that the changelog triggers notify (or that the fix of its notifications gives them), and for a
+   * table outside the options whose changelog triggers record into the same changelog (its `table`
+   * is then `schema.table`). Use a
    * built-in type, a superuser-owned extension type (e.g. `citext`), or a domain over one, before
    * installing the changelog SQL of the current version.
    */
@@ -151,7 +153,10 @@ export type LilypadSchemaProblemCode =
    * changes without knowing it.
    */
   | 'short-changelog-retention'
-  /** A column of the description does not exist. */
+  /**
+   * A column of the description does not exist, or the primary key column that the changelog
+   * triggers record (of a table outside the options too, named `schema.table`).
+   */
   | 'missing-column'
   /**
    * The type of a column is not its `pgType` (an error), or does not fit its `type` (a warning:

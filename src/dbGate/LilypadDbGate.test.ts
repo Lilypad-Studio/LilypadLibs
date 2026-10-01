@@ -47,16 +47,22 @@ describe('LilypadDbGate (without database)', () => {
     await gate.close();
   });
 
-  it('should bound the queries with a statement timeout of 30 seconds by default', async () => {
+  // A pooler (PgBouncer) refuses the startup parameter: every query would fail
+  it('should send no statement timeout by default, only the one given', async () => {
     const gate = await LilypadDbGate.create({ connectionString: unreachable });
     const unbounded = await LilypadDbGate.create({
       connectionString: unreachable,
       statementTimeout: false,
     });
+    const bounded = await LilypadDbGate.create({
+      connectionString: unreachable,
+      statementTimeout: 10_000,
+    });
 
-    expect(gate.sql.options.connection).toMatchObject({ statement_timeout: 30_000 });
+    expect(gate.sql.options.connection).not.toHaveProperty('statement_timeout');
     expect(unbounded.sql.options.connection).not.toHaveProperty('statement_timeout');
-    await Promise.all([gate.close(), unbounded.close()]);
+    expect(bounded.sql.options.connection).toMatchObject({ statement_timeout: 10_000 });
+    await Promise.all([gate.close(), unbounded.close(), bounded.close()]);
   });
 
   it.each(['connectionString', 'listenerConnectionString'] as const)(

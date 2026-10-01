@@ -132,9 +132,14 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
     return this.chainStartedAt;
   }
 
-  /** Reads the changelog; errors are logged, and the next read waits for a backoff. */
+  /**
+   * Reads the changelog, waiting for it at most `fetchTimeout`: a query stuck on a lock, a full
+   * pool or a dead connection would otherwise hold every read of the caches of the gate. Errors
+   * and timeouts are logged, and the next read waits for a backoff; a read that times out still
+   * applies its changes if it completes.
+   */
   private read(): Promise<void> {
-    return this.reader.read(this.subscriber).catch((error: unknown) => {
+    return this.host.boundRead(this.reader.read(this.subscriber)).catch((error: unknown) => {
       this.backoff.fail();
       this.host.log('error', 'Error reading the changelog:', error);
     });

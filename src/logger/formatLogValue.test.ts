@@ -298,6 +298,21 @@ describe('size bounds', () => {
     expect(formatted).toMatch(/^Uint8Array\(5000000\) \[ 0, 0, .*, … 4999900 more items \]$/);
   });
 
+  it('should mask URL passwords in linear time, even in a crafted string', () => {
+    // Each word of the run used to rescan it up to `://`: about 5 seconds per format
+    const crafted = 'a.'.repeat(50_000) + '://a:' + 'b'.repeat(50_000);
+
+    const start = performance.now();
+    formatLogValue(crafted);
+    formatLogValue(new Error(crafted));
+    toLogJson({ crafted });
+
+    expect(performance.now() - start).toBeLessThan(600);
+    expect(formatLogValue('a.b+c-d.postgres://app:s3cr3t@db/app')).toBe(
+      'a.b+c-d.postgres://app:[Redacted]@db/app'
+    );
+  });
+
   it('should count the entries and properties left out of maps, sets and objects', () => {
     const entries = Array.from({ length: 150 }, (_, index) => [`k${index}`, index] as const);
 

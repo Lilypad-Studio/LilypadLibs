@@ -125,6 +125,23 @@ describe('lilypadChangelogSql prune option', () => {
     expect(sql).toContain('TG_ARGV[0]::pg_catalog.name');
   });
 
+  it('should refuse a trigger that does not declare its transition tables, before reading them', () => {
+    const sql = lilypadChangelogSql();
+
+    // Without them, lilypad_old / lilypad_new would resolve to pg_temp: a temporary object of the
+    // writing session, read (and its functions run) as the owner
+    expect(sql).toContain('FROM pg_catalog.pg_trigger t');
+    expect(sql).toContain('WHERE t.tgrelid = TG_RELID AND t.tgname = TG_NAME');
+    expect(sql).toContain(`AND (TG_OP = 'INSERT' OR t.tgoldtable = 'lilypad_old')`);
+    expect(sql).toContain(`AND (TG_OP = 'DELETE' OR t.tgnewtable = 'lilypad_new')`);
+    expect(sql).toContain('does not declare its transition tables');
+    const rowReturn = sql.indexOf("IF TG_LEVEL = 'ROW' THEN");
+    const check = sql.indexOf('FROM pg_catalog.pg_trigger t');
+    expect(check).toBeGreaterThan(rowReturn);
+    expect(sql.indexOf('INTO key_type')).toBeGreaterThan(check);
+    expect(sql.indexOf('FROM lilypad_new n')).toBeGreaterThan(check);
+  });
+
   it('should name the prune function after the changelog table', () => {
     const sql = lilypadChangelogSql({
       changelogTable: 'archive.changes',

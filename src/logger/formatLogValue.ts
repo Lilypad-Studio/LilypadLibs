@@ -43,8 +43,12 @@ export function lilypadRedaction(keys: readonly string[]): ReadonlySet<string> {
   return new Set(keys.map(normalizeRedactedKey));
 }
 
-/** The password of a URL (`scheme://user:password@host`), e.g. of a connection string. */
-const URL_PASSWORD = /(\b[a-z][a-z\d+.-]*:\/\/[^\s/?#@:]*:)[^\s/?#]*@/gi;
+/**
+ * The password of a URL (`scheme://user:password@host`), e.g. of a connection string. The scheme
+ * is bounded: unbounded, each word of a long `a.a.a…://` run rescanned it to the `://`, which made a
+ * crafted logged value block the event loop for seconds (quadratic backtracking).
+ */
+const URL_PASSWORD = /(\b[a-z][a-z\d+.-]{0,63}:\/\/[^\s/?#@:]*:)[^\s/?#]*@/gi;
 
 /** Masks the passwords of the URLs of a string, unless redaction is off ({@link NO_REDACTION}). */
 function redactUrlPasswords(text: string, redaction: ReadonlySet<string>): string {

@@ -52,7 +52,12 @@ export type LilypadDbGateOptions<
    * `statement_timeout`, at most 2147483647): the server cancels longer queries. A caller that
    * times out (e.g. after the `fetchTimeout` of a cache) does not stop its query: without this
    * bound, slow queries would keep the connections of the pool busy, and the queries behind them
-   * would wait. Defaults to 30 seconds; `false` leaves the setting of the database.
+   * would wait. Not set by default (`false` too): the setting of the database applies.
+   *
+   * It is sent as a startup parameter of each connection, which PgBouncer (and most poolers in
+   * transaction mode) refuse: every query then fails with `unsupported startup parameter`. Pass it
+   * only with a direct connection; behind a pooler, set it on the role instead
+   * (`ALTER ROLE <app_role> SET statement_timeout = '30s'`).
    */
   statementTimeout?: number | false | undefined;
   /**
@@ -110,7 +115,6 @@ function toPostgresPoolOptions(pool: LilypadDbPoolOptions | undefined) {
 type LilypadDbGateOptionsWithSingleton<C extends LilypadDbConfig | undefined> =
   LilypadDbGateOptions<C> & LilypadSingletonAble;
 
-const DEFAULT_STATEMENT_TIMEOUT = 30_000;
 /** How long `close` waits for the queries still running, in ms, by default. */
 const DEFAULT_CLOSE_TIMEOUT = 5_000;
 const DEFAULT_LISTEN_HEARTBEAT = 15_000;
@@ -595,7 +599,6 @@ function assertPoolOptions(pool: LilypadDbPoolOptions | undefined): void {
 }
 
 function resolveStatementTimeout(options: LilypadDbGateOptions): number | undefined {
-  return options.statementTimeout === false
-    ? undefined
-    : (options.statementTimeout ?? DEFAULT_STATEMENT_TIMEOUT);
+  // Never by default: a pooler refuses the startup parameter (see the option)
+  return options.statementTimeout === false ? undefined : options.statementTimeout;
 }
