@@ -926,6 +926,50 @@ describe('LilypadDbCache', () => {
       expect(fake.mocks.selectByPrimaryKey).toHaveBeenCalledTimes(2);
     });
 
+    it('should read on the first read, however soon after the start of the clock', async () => {
+      expect(performance.now()).toBeLessThan(1000);
+      const cache = await createChangelogCache();
+
+      await cache.getOrFetch('1');
+
+      expect(changelog.read).toHaveBeenCalledOnce();
+    });
+
+    it('should keep reading the changelog when the wall clock steps back', async () => {
+      const cache = await createChangelogCache();
+      await cache.getOrFetch('1');
+
+      vi.setSystemTime(Date.now() - 3_600_000);
+      await vi.advanceTimersByTimeAsync(1000);
+      await cache.getOrFetch('1');
+
+      expect(changelog.read).toHaveBeenCalledTimes(2);
+      expect(changelog.read).toHaveBeenLastCalledWith(
+        fake.gate,
+        expect.objectContaining({ since: { cursor: at(100n) } })
+      );
+    });
+
+    it('should stop trusting the cursor after maxGap when the wall clock steps back', async () => {
+      // A pollInterval above maxGap, so that only the gap stops the trust
+      const cache = await createChangelogCache({ pollInterval: 10_000, maxGap: 5000 });
+      await cache.getOrFetch('1');
+      const sync = cache['sync'];
+      expect(sync.trustedSince()).toBeDefined();
+
+      vi.setSystemTime(Date.now() - 3_600_000);
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(sync.trustedSince()).toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(4000);
+      await cache.getOrFetch('1');
+      expect(changelog.read).toHaveBeenCalledTimes(2);
+      expect(changelog.read).toHaveBeenLastCalledWith(
+        fake.gate,
+        expect.objectContaining({ since: { lookback: 120_000 } })
+      );
+    });
+
     it('should not wait for the changelog with poll: background', async () => {
       changelog.read.mockReturnValue(new Promise(() => {}));
       const cache = await createChangelogCache({ poll: 'background' });

@@ -12,13 +12,15 @@ export type LilypadChangelogReadResult = {
   changes: LilypadChange[];
   /** The cursor for the next read. */
   cursor: LilypadChangelogCursor;
-  /** When the read started. */
+  /** When the read started (`Date.now()`), to compare with the wall-clock times of the entries. */
   readAt: number;
+  /** When the read started (`performance.now()`), to measure intervals whatever the wall clock does. */
+  readAtMonotonic: number;
 };
 
 export type LilypadChangelogSubscriber = {
   /** What to read for this subscriber, called when a read starts. */
-  request(readAt: number): LilypadChangesRequest;
+  request(readAtMonotonic: number): LilypadChangesRequest;
   /** Applies the changes read for the request. Its errors are its own: they are ignored here. */
   apply(result: LilypadChangelogReadResult, request: LilypadChangesRequest): Promise<void> | void;
 };
@@ -86,14 +88,18 @@ export class LilypadChangelogReader {
       return;
     }
     const readAt = Date.now();
-    const requests = subscribers.map((subscriber) => subscriber.request(readAt));
+    const readAtMonotonic = performance.now();
+    const requests = subscribers.map((subscriber) => subscriber.request(readAtMonotonic));
     const { changes, cursor } = await readLilypadChangesBatch(this.gate, {
       requests,
       changelogTable: this.changelogTable,
     });
     await Promise.allSettled(
       subscribers.map(async (subscriber, index) =>
-        subscriber.apply({ changes: changes[index] ?? [], cursor, readAt }, requests[index]!)
+        subscriber.apply(
+          { changes: changes[index] ?? [], cursor, readAt, readAtMonotonic },
+          requests[index]!
+        )
       )
     );
   }

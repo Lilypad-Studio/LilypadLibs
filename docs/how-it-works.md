@@ -713,9 +713,9 @@ Each request is either `{ cursor }` (trusted: continue from where I stopped) or 
 
 #### The reader: one query for all the caches of a gate
 
-An application may cache ten tables. Ten caches each polling the changelog would be ten queries per interval. `LilypadChangelogReader` ([LilypadChangelogReader.ts](../src/dbGate/LilypadChangelogReader.ts)) is shared by every cache of a gate that uses the same changelog table (a `WeakMap<gate, Map<table, reader>>`, [line 101](../src/dbGate/LilypadChangelogReader.ts)); the `WeakMap` lets the reader be garbage collected with the gate.
+An application may cache ten tables. Ten caches each polling the changelog would be ten queries per interval. `LilypadChangelogReader` ([LilypadChangelogReader.ts](../src/dbGate/LilypadChangelogReader.ts)) is shared by every cache of a gate that uses the same changelog table (a `WeakMap<gate, Map<table, reader>>`, [line 108](../src/dbGate/LilypadChangelogReader.ts)); the `WeakMap` lets the reader be garbage collected with the gate.
 
-Each cache **subscribes** with two functions: `request(readAt)` (what to read for me: my cursor or a lookback) and `apply(result, request)` (apply what was read). When any cache needs a read, `read(subscriber)`:
+Each cache **subscribes** with two functions: `request(readAtMonotonic)` (what to read for me: my cursor or a lookback) and `apply(result, request)` (apply what was read). When any cache needs a read, `read(subscriber)`:
 
 - no read running: start one that includes **every** current subscriber;
 - a read running that includes this subscriber: share it;
@@ -950,8 +950,9 @@ The code: [LilypadChangelogSync.ts](../src/dbCache/sync/LilypadChangelogSync.ts)
    │ INSERT / UPDATE / DELETE / TRUNCATE                 │                       │
    ▼                                                     ▼                       ▼
  statement triggers <table>_lilypad_<event>        LilypadChangelogSync    LilypadChangelogSync
-   │ same transaction as the write                 cursor, lastRead,       (one per cache)
-   ▼                                               chainStartedAt, backoff
+   │ same transaction as the write                 cursor,                 (one per cache)
+   ▼                                               lastReadMonotonic,
+                                                   chainStartedAt, backoff
  lilypad_cache_changes                                   │ read(subscriber)      │
  (xid, table_schema, table_name,                         └──────────┬────────────┘
   row_id, op, changed_at)                                           ▼
@@ -978,7 +979,7 @@ In the database: one changelog row per changed row (one per statement for `TRUNC
 | State                          | Kept by                | Used for                                                                                                                                             |
 | ------------------------------ | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `cursor`                       | `LilypadChangelogSync` | Where the next read starts: `{ xmax, xip }`, the transactions the last read could not see ([4.8](#the-cursor-the-transactions-a-read-could-not-see)) |
-| `lastRead`                     | `LilypadChangelogSync` | When the last **applied** read started (its `readAt`): when the next poll falls due, and whether the cursor is still within `maxGap`                 |
+| `lastReadMonotonic`            | `LilypadChangelogSync` | When the last **applied** read started (`performance.now()`): when the next poll falls due, and whether the cursor is still within `maxGap`          |
 | `lastApplied`                  | `LilypadChangelogSync` | When the last read was applied (`performance.now()`, at its end): whether the changes committed up to about now are applied, for `trustedSince()`    |
 | `chainStartedAt`               | `LilypadChangelogSync` | Since when the reads form an unbroken chain: what `trustedSince()` returns                                                                           |
 | `backoff`                      | `LilypadChangelogSync` | After a failure, when the next read may run                                                                                                          |
@@ -1000,35 +1001,37 @@ The constructor of `LilypadDbCache` checks the numeric options (`pollInterval` i
 - creates its backoff, with a base of `max(pollInterval, 1 s)`;
 - gets the reader shared by every cache of the gate that uses the same changelog table (`getLilypadChangelogReader`, [LilypadChangelogReader.ts](../src/dbGate/LilypadChangelogReader.ts)), and subscribes with two closures: `request` (what to read for me) and `apply` (apply what was read for me).
 
-`start()` resolves at once. Creating the cache opens no connection, which keeps `next build` away from the database. The initial state is `cursor` undefined, `lastRead = 0`, no chain: the sync is **not trusted**, so nothing is renewed until the first read.
+`start()` resolves at once. Creating the cache opens no connection, which keeps `next build` away from the database. The initial state is `cursor` undefined, `lastReadMonotonic = -Infinity` (not `0`: `performance.now()` starts near 0, so the first read within `pollInterval` of the start would not poll), no chain: the sync is **not trusted**, so nothing is renewed until the first read.
 
 #### Step 2: when a poll happens
 
 `beforeRead()` ([LilypadChangelogSync.ts](../src/dbCache/sync/LilypadChangelogSync.ts)) is called at the start of `getOrFetch`/`getOrFetchDetailed`, `getAll` and `getManyOrFetch`. It is not called by `get` and `peek`, which are synchronous, nor by the writes.
 
 ```
-now - lastRead < pollInterval   → undefined: nothing to wait for
-backoff not ready               → undefined
+now - lastReadMonotonic < pollInterval → undefined: nothing to wait for
+backoff not ready                      → undefined
 otherwise:
-  reading = read()              reader.read(this.subscriber); errors → backoff.fail() + log
-  poll: 'background'            → runInBackground(reading); return undefined
-  poll: 'await' (default)       → return reading: the caller awaits it
+  reading = read()                     reader.read(this.subscriber); errors → backoff.fail() + log
+  poll: 'background'                   → runInBackground(reading); return undefined
+  poll: 'await' (default)              → return reading: the caller awaits it
 ```
 
 A few consequences:
 
 - **Polls ride on reads.** A serverless instance cannot keep a timer, so the changelog is read when a read needs it. `pollInterval` then bounds the age of the data **served by the reads that poll**, and an instance nobody uses sends no query. `get()` and `peek()` never poll ([Caveats](#caveats)).
-- **Concurrent reads share one poll.** `lastRead` moves only once a read has been applied. So while a poll runs, every other read of the cache finds a poll due and calls `read()` again. The reader sees that the running read already includes this subscriber and returns the same promise. A burst of requests on a cold instance costs one changelog query.
+- **Concurrent reads share one poll.** `lastReadMonotonic` moves only once a read has been applied. So while a poll runs, every other read of the cache finds a poll due and calls `read()` again. The reader sees that the running read already includes this subscriber and returns the same promise. A burst of requests on a cold instance costs one changelog query.
 - **`beforeRead` never rejects.** `read()` catches, logs `Error reading the changelog:`, and backs off. A broken changelog degrades freshness; it never fails a user's read.
 - **`pollInterval: 0`** polls before every async read, each poll still shared by the reads that arrive while it runs.
 - With `poll: 'background'`, the read goes through `runInBackground`, so the platform keeps the instance alive until it completes, and the user's read proceeds with the current memory.
 
 #### Step 3: what is read
 
-`reader.read(subscriber)` starts a read, shares the running one, or queues one after it for late subscribers ([4.8](#the-reader-one-query-for-all-the-caches-of-a-gate)). `readAll` ([LilypadChangelogReader.ts](../src/dbGate/LilypadChangelogReader.ts)) takes one `readAt = Date.now()` and asks **every** subscribed cache for its request, not only the one that triggered the read. `request(readAt)` ([LilypadChangelogSync.ts](../src/dbCache/sync/LilypadChangelogSync.ts)) returns one of two things:
+`reader.read(subscriber)` starts a read, shares the running one, or queues one after it for late subscribers ([4.8](#the-reader-one-query-for-all-the-caches-of-a-gate)). `readAll` ([LilypadChangelogReader.ts](../src/dbGate/LilypadChangelogReader.ts)) takes one `readAt = Date.now()` and one `readAtMonotonic = performance.now()`, and asks **every** subscribed cache for its request, not only the one that triggered the read. `request(readAtMonotonic)` ([LilypadChangelogSync.ts](../src/dbCache/sync/LilypadChangelogSync.ts)) returns one of two things:
 
-- `{ cursor }` if the cache has a cursor and `readAt - lastRead <= maxGap`: a **trusted** read, which continues the chain;
+- `{ cursor }` if the cache has a cursor and `readAtMonotonic - lastReadMonotonic <= maxGap`: a **trusted** read, which continues the chain;
 - `{ lookback }` otherwise: an **untrusted** read of the changes of the last `lookback` ms (`sync.lookback`, or by default TTL + `staleWhileRevalidate` + 1 minute, from `defaultLookback` at [LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts)). This happens on the first read, or after a gap longer than `maxGap`.
+
+Two clocks, one per use. The intervals (`pollInterval`, `maxGap`) are measured on `readAtMonotonic`: on the wall clock, a step back (an NTP correction, a resumed virtual machine) would stop the polls until the clock caught up, and keep trusting a chain broken for longer than `maxGap`. `readAt` stays on the wall clock, because `chainStartedAt`, which `trustedSince()` returns, is compared with the `fetchedAt` of the entries.
 
 All the requests go into one `readLilypadChangesBatch` ([LilypadChangelog.ts](../src/dbGate/LilypadChangelog.ts), clause by clause in [5.5](#55-the-changelog-query-clause-by-clause)). It returns the changes of each request, and **one** next cursor taken from the snapshot of that statement, which is valid for every request. Caches in different states share the query: an old cache continuing its cursor and a new one reading a lookback are served by the same statement. Each cache's `apply` then runs under `Promise.allSettled`, so one failing cache does not stop the others.
 
@@ -1040,10 +1043,10 @@ All the requests go into one `readLilypadChangesBatch` ([LilypadChangelog.ts](..
 2. **Untrusted read** (a lookback): `expireEverything()` ([LilypadCacheEngine.ts](../src/cache/LilypadCacheEngine.ts)). Every entry is expired, which means never served stale but still usable as an `onError` fallback. `ticketFloor` is raised, so reads in flight, which may have read rows before changes this instance never saw, store nothing. Then `chainStartedAt = readAt`: a new chain starts.
 3. Apply each change, in the order they were recorded (`ORDER BY id`): `TRUNCATE` → `applyTruncate('lazy')` ([LilypadDbCache.ts](../src/dbCache/LilypadDbCache.ts)), any other operation → `applyChange(op, rowId, 'lazy', xid)`.
 4. `forgetOwnWritesCoveredBy(cursor)`: drop the own writes whose change this read has returned or can no longer return. Transactions still in `xip` are kept.
-5. Store the new `cursor`, set `lastRead = readAt`, reset the backoff.
+5. Store the new `cursor`, set `lastReadMonotonic = readAtMonotonic`, reset the backoff.
 6. `emitInvalidation('changelog', keys, { wholeCache: truncated })`: `platform.onInvalidate` in the background, e.g. to expire tags of a CDN or of the Runtime Cache.
 
-If steps 3 to 6 throw, the error is logged (`Error applying the changelog:`) and the backoff grows. Neither the cursor nor `lastRead` moves, so the next read, after the backoff, returns the same changes again. Applying a change twice is harmless: expiring an entry twice or caching `null` twice changes nothing. The only cost is an own write, already consumed by the first attempt, which is applied as a foreign change and costs one fetch.
+If steps 3 to 6 throw, the error is logged (`Error applying the changelog:`) and the backoff grows. Neither the cursor nor `lastReadMonotonic` moves, so the next read, after the backoff, returns the same changes again. Applying a change twice is harmless: expiring an entry twice or caching `null` twice changes nothing. The only cost is an own write, already consumed by the first attempt, which is applied as a foreign change and costs one fetch.
 
 What each change does, in `lazy` mode. A key is "held" if it has an entry or a read of it is in flight:
 
@@ -1076,7 +1079,7 @@ When no read was applied for `pollInterval` (reads failing, or none triggered), 
 `pollInterval: 5 s`, TTL 60 s, no stale window, so `lookback` is 120 s; `maxGap` and `maxAge` 1 h.
 
 ```
-t = 0       cold start. getOrFetch(7): a poll is due (lastRead = 0).
+t = 0       cold start. getOrFetch(7): a poll is due (no read yet).
             No cursor → lookback read of the last 120 s. The query returns the changes of other
             instances' writes and cursor c1. apply (untrusted): expireEverything (nothing yet),
             chainStartedAt = 0, the changes delete their L2 copies. Then row 7 is fetched.
@@ -1114,13 +1117,13 @@ Why the inequalities:
 
 #### When something goes wrong
 
-| What                                                                                                                   | What happens                                                                                                                                                                                                                                                                                                                                                                    |
-| ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The changelog cannot be read (database down, table missing, no privilege)                                              | The user's read goes on with the current memory. The error is logged and the backoff starts (from `max(pollInterval, 1 s)`, doubling up to 1 min). `lastRead` does not move, so the chain is still trusted, and entries still renewed, until `maxGap` after the last applied read. A changelog that stays broken therefore delays changes by up to `maxGap`, not `pollInterval` |
-| One cache fails to apply its changes                                                                                   | That cache keeps its cursor and backs off; the others, applied under `allSettled`, are unaffected. The same changes come back at its next read                                                                                                                                                                                                                                  |
-| The triggers are missing (the table exists)                                                                            | Every read succeeds and returns nothing for that table: the cache trusts a chain that sees no change. Only `lilypad-doctor` reports it, with the SQL that fixes it                                                                                                                                                                                                              |
-| The triggers are bypassed (`ALTER TABLE ... DISABLE TRIGGER`, `session_replication_role = replica` as in `pg_restore`) | The change is never recorded. Entries are renewed until `maxAge`, which is the only bound                                                                                                                                                                                                                                                                                       |
-| The cache is disposed while a read is in flight                                                                        | `apply` returns at its first line; `dispose` unsubscribes from the reader, which garbage collects with the gate                                                                                                                                                                                                                                                                 |
+| What                                                                                                                   | What happens                                                                                                                                                                                                                                                                                                                                                                             |
+| ---------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The changelog cannot be read (database down, table missing, no privilege)                                              | The user's read goes on with the current memory. The error is logged and the backoff starts (from `max(pollInterval, 1 s)`, doubling up to 1 min). `lastReadMonotonic` does not move, so the chain is still trusted, and entries still renewed, until `maxGap` after the last applied read. A changelog that stays broken therefore delays changes by up to `maxGap`, not `pollInterval` |
+| One cache fails to apply its changes                                                                                   | That cache keeps its cursor and backs off; the others, applied under `allSettled`, are unaffected. The same changes come back at its next read                                                                                                                                                                                                                                           |
+| The triggers are missing (the table exists)                                                                            | Every read succeeds and returns nothing for that table: the cache trusts a chain that sees no change. Only `lilypad-doctor` reports it, with the SQL that fixes it                                                                                                                                                                                                                       |
+| The triggers are bypassed (`ALTER TABLE ... DISABLE TRIGGER`, `session_replication_role = replica` as in `pg_restore`) | The change is never recorded. Entries are renewed until `maxAge`, which is the only bound                                                                                                                                                                                                                                                                                                |
+| The cache is disposed while a read is in flight                                                                        | `apply` returns at its first line; `dispose` unsubscribes from the reader, which garbage collects with the gate                                                                                                                                                                                                                                                                          |
 
 #### Caveats
 
@@ -1151,12 +1154,12 @@ Setup: a `LilypadDbCache` of `users` with `sync: { strategy: 'changelog', pollIn
 
 **A:**
 
-1. `getOrFetch` → `getOrFetchDetailed` ([DbCache 673](../src/dbCache/LilypadDbCache.ts)): `assertNotDisposed()`, then `this.sync.beforeRead()` (line 680) → `LilypadChangelogSync.beforeRead`. `lastRead` is `0`, so a poll is due (line 64). `read()` → `reader.read(subscriber)`: nothing is running, so `start()` includes every subscriber and runs `readAll`.
-2. `readAll` calls `subscriber.request(readAt)` → `request`: no cursor yet, so `{ lookback: ttl + swr + 60 000 }`. Then the batched query runs. A awaits it.
+1. `getOrFetch` → `getOrFetchDetailed` ([DbCache 673](../src/dbCache/LilypadDbCache.ts)): `assertNotDisposed()`, then `this.sync.beforeRead()` (line 680) → `LilypadChangelogSync.beforeRead`. `lastReadMonotonic` is `-Infinity`, so a poll is due. `read()` → `reader.read(subscriber)`: nothing is running, so `start()` includes every subscriber and runs `readAll`.
+2. `readAll` calls `subscriber.request(readAtMonotonic)` → `request`: no cursor yet, so `{ lookback: ttl + swr + 60 000 }`. Then the batched query runs. A awaits it.
 
-**B and C** arrive while A is awaiting. `lastRead` is still `0` (it is set only after the read is applied), so their `beforeRead` also calls `reader.read(subscriber)`. This time `current` exists and includes the subscriber, so they get **the same promise**. One query for three callers.
+**B and C** arrive while A is awaiting. `lastReadMonotonic` is still `-Infinity` (it is set only after the read is applied), so their `beforeRead` also calls `reader.read(subscriber)`. This time `current` exists and includes the subscriber, so they get **the same promise**. One query for three callers.
 
-**The read completes.** `apply(result, trusted = false)`: the request was a lookback, so `expireEverything()` (nothing to expire yet, but `ticketFloor` rises to, say, 3) and the chain of trust starts at `readAt`. The returned changes are applied (keys not held: only L2 deletes and members). Cursor stored, `lastRead = readAt`.
+**The read completes.** `apply(result, trusted = false)`: the request was a lookback, so `expireEverything()` (nothing to expire yet, but `ticketFloor` rises to, say, 3) and the chain of trust starts at `readAt`. The returned changes are applied (keys not held: only L2 deletes and members). Cursor stored, `lastReadMonotonic = readAtMonotonic`.
 
 **A resumes**: `renew('42')` does nothing (no entry). `getOrSetDetailed`: no local entry, no shared level, no stale entry, no cooldown → `fetchAndStore`:
 

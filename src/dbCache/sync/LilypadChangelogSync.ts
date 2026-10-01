@@ -66,7 +66,12 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
   private readonly subscriber: LilypadChangelogSubscriber;
   private readonly unsubscribe: () => void;
   private cursor?: LilypadChangelogCursor | undefined;
-  private lastRead = 0;
+  /**
+   * When the last applied read started (`performance.now()`): the intervals are measured on the
+   * monotonic clock, so that a step back of the wall clock neither stops the reads nor keeps a
+   * broken chain trusted. `-Infinity`, not `0`: `performance.now()` starts near 0.
+   */
+  private lastReadMonotonic = -Infinity;
   /**
    * When the last read was applied (`performance.now()`): from its end, not its start, so that a
    * read awaited just before counts as current whatever its duration.
@@ -83,7 +88,7 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
     this.backoff = new LilypadBackoff(() => Math.max(options.pollInterval, 1000));
     this.reader = getLilypadChangelogReader(host.gate, options.table);
     this.subscriber = {
-      request: (readAt) => this.request(readAt),
+      request: (readAtMonotonic) => this.request(readAtMonotonic),
       apply: (result, request) => this.apply(result, 'cursor' in request.since),
     };
     this.unsubscribe = this.reader.subscribe(this.subscriber);
@@ -98,8 +103,10 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
   }
 
   beforeRead(): Promise<void> | undefined {
-    const now = Date.now();
-    if (now - this.lastRead < this.options.pollInterval || !this.backoff.ready()) {
+    if (
+      performance.now() - this.lastReadMonotonic < this.options.pollInterval ||
+      !this.backoff.ready()
+    ) {
       return undefined;
     }
     const reading = this.read();
@@ -115,7 +122,11 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
     // A read that fails, or that no read triggers (`get` does not read), leaves changes unapplied
     const current =
       performance.now() - this.lastApplied <= (poll === 'background' ? 2 : 1) * pollInterval;
-    if (this.cursor === undefined || Date.now() - this.lastRead > this.maxGap || !current) {
+    if (
+      this.cursor === undefined ||
+      performance.now() - this.lastReadMonotonic > this.maxGap ||
+      !current
+    ) {
       return undefined;
     }
     return this.chainStartedAt;
@@ -130,9 +141,9 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
   }
 
   /** What to read: the changes since the cursor, or a lookback if the chain is broken. */
-  private request(readAt: number): LilypadChangesRequest {
+  private request(readAtMonotonic: number): LilypadChangesRequest {
     const tableName = this.host.tableName;
-    if (this.cursor !== undefined && readAt - this.lastRead <= this.maxGap) {
+    if (this.cursor !== undefined && readAtMonotonic - this.lastReadMonotonic <= this.maxGap) {
       return { tableName, since: { cursor: this.cursor } };
     }
     return { tableName, since: { lookback: this.options.lookback ?? this.host.defaultLookback() } };
@@ -145,7 +156,7 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
    * @param trusted - Whether the read started from the cursor of this cache.
    */
   private async apply(
-    { changes, cursor, readAt }: LilypadChangelogReadResult,
+    { changes, cursor, readAt, readAtMonotonic }: LilypadChangelogReadResult,
     trusted: boolean
   ): Promise<void> {
     const { host } = this;
@@ -180,7 +191,7 @@ export class LilypadChangelogSync<K extends LilypadCacheKey> implements LilypadD
       }
       host.forgetOwnWritesCoveredBy(cursor);
       this.cursor = cursor;
-      this.lastRead = readAt;
+      this.lastReadMonotonic = readAtMonotonic;
       this.lastApplied = performance.now();
       this.backoff.succeed();
       host.emitInvalidation('changelog', [...changedKeys], { wholeCache });
