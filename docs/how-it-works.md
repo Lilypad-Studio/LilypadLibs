@@ -1020,7 +1020,8 @@ The constructor of `LilypadDbCache` checks the numeric options (`pollInterval` i
 now - lastReadMonotonic < pollInterval → undefined: nothing to wait for
 backoff not ready                      → undefined
 otherwise:
-  reading = read()                     reader.read(this.subscriber); errors → backoff.fail() + log
+  reading = read()                     reader.read(this.subscriber), awaited at most fetchTimeout;
+                                       errors and timeouts → backoff.fail() + log
   poll: 'background'                   → runInBackground(reading); return undefined
   poll: 'await' (default)              → return reading: the caller awaits it
 ```
@@ -1029,7 +1030,7 @@ A few consequences:
 
 - **Polls ride on reads.** A serverless instance cannot keep a timer, so the changelog is read when a read needs it. `pollInterval` then bounds the age of the data **served by the reads that poll**, and an instance nobody uses sends no query. `get()` and `peek()` never poll ([Caveats](#caveats)).
 - **Concurrent reads share one poll.** `lastReadMonotonic` moves only once a read has been applied. So while a poll runs, every other read of the cache finds a poll due and calls `read()` again. The reader sees that the running read already includes this subscriber and returns the same promise. A burst of requests on a cold instance costs one changelog query.
-- **`beforeRead` never rejects.** `read()` catches, logs `Error reading the changelog:`, and backs off. A broken changelog degrades freshness; it never fails a user's read.
+- **`beforeRead` never rejects, nor waits longer than `fetchTimeout`.** `read()` bounds the wait with `host.boundRead` (the cache's `fetchTimeout`): nothing else bounds the query, since the gate sets no `statement_timeout` by default, and a query stuck on a lock, a full pool or a dead connection would otherwise hold every read of the caches of the gate, memory hits included. It catches the error or the timeout, logs `Error reading the changelog:`, and backs off. A read that timed out keeps running, and applies its changes if it completes. A broken changelog degrades freshness; it never fails a user's read.
 - **`pollInterval: 0`** polls before every async read, each poll still shared by the reads that arrive while it runs.
 - With `poll: 'background'`, the read goes through `runInBackground`, so the platform keeps the instance alive until it completes, and the user's read proceeds with the current memory.
 

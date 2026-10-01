@@ -16,7 +16,7 @@ Read the matching section of `docs/architecture.md` (and `docs/how-it-works.md` 
 
 1. The type: a new member of the `LilypadDbTableSync` union in `src/dbConfig/LilypadDbConfig.ts` (next to `LilypadDbTableListenSync` / `LilypadDbTableChangelogSync`), exported from `src/entries/schema.ts`.
 2. The validation: `assertSync` in `src/dbConfig/LilypadDbConfigValidation.ts` (the `assertOneOf` set of `strategy`, and the checks of its options).
-3. The class: in `src/dbCache/sync/`, implementing `LilypadDbSyncStrategy` (`LilypadDbSyncTypes.ts`); `beforeRead()` is awaited inline by the cache.
+3. The class: in `src/dbCache/sync/`, implementing `LilypadDbSyncStrategy` (`LilypadDbSyncTypes.ts`); `beforeRead()` is awaited inline by the cache, so a query it waits for goes through `host.boundRead` (the gate sets no `statement_timeout` by default: an unbounded wait would hold every read).
 4. The wiring: the `if/else` on `tableSync.strategy` in the constructor of `src/dbCache/LilypadDbCache.ts`, and the overrides of `LilypadDbCacheSyncOverrides` if it takes any.
 5. The check: `lilypadSchemaCheckOptions` in `src/dbGate/LilypadDoctor.ts` (which triggers, channel or changelog the strategy needs from the database).
 6. The init template: the `sync` comment of `src/cli/lilypadDbConfigTemplate.ts`.

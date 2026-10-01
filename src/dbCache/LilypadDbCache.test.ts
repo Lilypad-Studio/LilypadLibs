@@ -989,6 +989,40 @@ describe('LilypadDbCache', () => {
         error: expect.any(Error),
       });
     });
+
+    it('should wait for a stuck changelog read at most fetchTimeout, and apply it once it completes', async () => {
+      const logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+      const cache = await createChangelogCache({}, { logger, fetchTimeout: 2000 });
+      await cache.getOrFetch('1');
+      fake.rows.set('1', { id: '1', name: 'ONE' });
+      // The next read hangs until released (a lock on the changelog, a full pool, a dead connection)
+      let release!: (result: unknown) => void;
+      changelog.read.mockReturnValueOnce(
+        new Promise((resolve) => {
+          release = resolve;
+        })
+      );
+      await vi.advanceTimersByTimeAsync(1000);
+
+      // eslint-disable-next-line vitest/valid-expect -- awaited once the fake timers have advanced
+      const assertion = expect(cache.getOrFetch('1')).resolves.toEqual({ id: '1', name: 'one' });
+      await vi.advanceTimersByTimeAsync(2000);
+      await assertion;
+      expect(logger.error).toHaveBeenCalledWith('Error reading the changelog:', {
+        source: cache.name,
+        error: expect.any(LilypadTimeoutError),
+      });
+
+      // Within the backoff, a read does not wait for the stuck one
+      await expect(cache.getOrFetch('1')).resolves.toEqual({ id: '1', name: 'one' });
+      expect(changelog.read).toHaveBeenCalledTimes(2);
+
+      // The stuck read completes: its changes are applied
+      release({ changes: [{ id: '5', xid: 100n, rowId: '1', op: 'UPDATE' }], cursor: at(101n) });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cache.get('1')).toBeUndefined();
+      await expect(cache.getOrFetch('1')).resolves.toEqual({ id: '1', name: 'ONE' });
+    });
   });
 
   describe('database traffic', () => {

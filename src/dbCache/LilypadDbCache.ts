@@ -367,6 +367,8 @@ export class LilypadDbCache<V extends object, PK extends keyof V = keyof V> {
       platform: engine.platform,
       log: (level, message, detail) => engine.log(level, message, detail),
       isDisposed: () => engine.disposed,
+      // Nothing else bounds a changelog query: the gate sets no statement_timeout by default
+      boundRead: (promise) => engine.flowControl.executeWithTimeout(() => promise),
       applyChange: (op, id, mode, xid) => this.applyChange(op, id, mode, xid),
       applyTruncate: (mode) => this.applyTruncate(mode),
       applyBulkChange: () => this.forgetTable(false),

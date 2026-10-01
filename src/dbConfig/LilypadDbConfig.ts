@@ -76,9 +76,9 @@ export type LilypadDbTableChangelogSync = LilypadDbTableTrustedSync & {
   /** Minimum time between two reads of the changelog, in ms. Changes are seen within it. */
   pollInterval: number;
   /**
-   * `await` (default): a read that is due waits for the changelog, so it never returns data
-   * older than `pollInterval`. `background`: the read does not wait, and may return data one
-   * interval older.
+   * `await` (default): a read that is due waits for the changelog (at most the `fetchTimeout` of
+   * the cache), so it does not return data older than `pollInterval` unless the read fails.
+   * `background`: the read does not wait, and may return data one interval older.
    */
   poll?: 'await' | 'background' | undefined;
   /**

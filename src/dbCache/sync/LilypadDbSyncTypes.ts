@@ -85,6 +85,11 @@ export type LilypadDbSyncHost<K extends LilypadCacheKey> = {
   readonly platform?: LilypadPlatform | undefined;
   log(level: LilypadLibLogLevel, message: string, detail?: unknown): void;
   isDisposed(): boolean;
+  /**
+   * Bounds how long a read of the cache waits for the sync (the `fetchTimeout` of the cache): the
+   * result rejects with a `LilypadTimeoutError` beyond it, while `promise` goes on.
+   */
+  boundRead<T>(promise: Promise<T>): Promise<T>;
   /** Applies a change of a row made elsewhere. @returns The key of the row. */
   applyChange(
     op: LilypadDbRowChange,
