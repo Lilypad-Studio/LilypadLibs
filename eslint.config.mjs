@@ -4,21 +4,15 @@ import { importX } from 'eslint-plugin-import-x';
 import { createTypeScriptImportResolver } from 'eslint-import-resolver-typescript';
 import vitest from '@vitest/eslint-plugin';
 import eslintConfigPrettier from 'eslint-config-prettier/flat';
+import { edgeFolders } from './edge.config.ts';
 
-// The modules of the edge-compatible entries (every entry except `db`, and the command). The
-// typecheck (tsconfig.edge.json) and entries.test.ts check them too: this rule names the import
-// in the editor
+// The modules of the edge-compatible entries (every entry except `db`, and the command), listed in
+// edge.config.ts. The typecheck (tsconfig.edge.json) and entries.test.ts check them too: these
+// rules name the import in the editor
 const edgeModules = [
   'src/index.ts',
   'src/entries/!(db).ts',
-  'src/cache/**/*.ts',
-  'src/dbConfig/**/*.ts',
-  'src/flow/**/*.ts',
-  'src/internal/**/*.ts',
-  'src/logger/**/*.ts',
-  'src/platform/**/*.ts',
-  'src/serializer/**/*.ts',
-  'src/singleton/**/*.ts',
+  ...edgeFolders.map((folder) => `src/${folder}/**/*.ts`),
 ];
 const nodeOnlyModules = ['**/*.test.ts'];
 
@@ -105,6 +99,16 @@ export default defineConfig([
               message: 'Only the `db` entry may reach postgres.js and the gate.',
             },
           ],
+        },
+      ],
+      // The typecheck resolves `import('postgres')` (postgres.js has its types), and the import
+      // rules ignore dynamic imports: the edge modules import statically only
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: 'ImportExpression',
+          message:
+            'The edge-compatible modules import statically, so that the checks of their imports see every import.',
         },
       ],
     },

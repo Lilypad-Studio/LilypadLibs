@@ -1,4 +1,5 @@
 import { defineConfig, type ViteUserConfig } from 'vitest/config';
+import { edgeFolders } from './edge.config.ts';
 
 const config: ViteUserConfig = defineConfig({
   resolve: {
@@ -17,27 +18,20 @@ const config: ViteUserConfig = defineConfig({
         extends: true,
         test: {
           name: 'unit',
-          include: ['src/**/*.test.ts'],
+          include: ['src/**/*.test.ts', 'scripts/**/*.test.ts'],
           exclude: ['src/**/*.integration.test.ts'],
         },
       },
       {
-        // The tests of the modules exported by the edge-compatible entries, run again in an edge
-        // runtime (no Node.js globals): they fail if these modules start relying on Node.js APIs
+        // The tests of the modules exported by the edge-compatible entries (edge.config.ts), run
+        // again in an edge runtime, without the Node.js globals (vitest.edge-setup.ts): they fail
+        // if these modules start relying on Node.js APIs
         extends: true,
         test: {
           name: 'edge',
           environment: 'edge-runtime',
-          include: [
-            'src/cache/**/*.test.ts',
-            'src/dbConfig/**/*.test.ts',
-            'src/flow/**/*.test.ts',
-            'src/internal/**/*.test.ts',
-            'src/logger/**/*.test.ts',
-            'src/platform/**/*.test.ts',
-            'src/serializer/**/*.test.ts',
-            'src/singleton/**/*.test.ts',
-          ],
+          setupFiles: ['./vitest.edge-setup.ts'],
+          include: edgeFolders.map((folder) => `src/${folder}/**/*.test.ts`),
         },
       },
       {

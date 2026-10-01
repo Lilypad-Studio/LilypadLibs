@@ -57,7 +57,9 @@ export type LilypadDoctorArgs =
 /** Reads the variables of an env file (`--env-file`), replaceable in tests. */
 export type LilypadEnvFileReader = (path: string) => Record<string, string | undefined>;
 
-const readEnvFile: LilypadEnvFileReader = (path) => parseEnv(readFileSync(path, 'utf8'));
+// The types of Node.js 22.12 declare `object`: it holds the variables, as strings
+const readEnvFile: LilypadEnvFileReader = (path) =>
+  parseEnv(readFileSync(path, 'utf8')) as Record<string, string>;
 
 /**
  * The options of the command line, or the help.

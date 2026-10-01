@@ -9,3 +9,6 @@ An entry holds a section per kind of change, as in CHANGELOG.md:
 
 - `#### Upgrading`: a table `| Change | What to do |` for what breaks existing code;
 - `#### Added`, `#### Changed`, `#### Fixed`: bullets.
+
+On release, the sections of all the changesets of a version are merged into one of each kind
+(`scripts/merge-changelog-sections.ts`).

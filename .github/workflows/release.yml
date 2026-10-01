@@ -1,8 +1,8 @@
 name: Release
 
-# On main: while changesets are pending, opens (or updates) the "chore: version packages" pull
-# request; once it is merged, publishes the new version to GitHub Packages, with its git tag and
-# its GitHub release. See docs/releasing.md.
+# On main: runs CI first (ci.yml), then, while changesets are pending, opens (or updates) the
+# "chore: version packages" pull request; once it is merged, publishes the new version to GitHub
+# Packages, with its git tag and its GitHub release. See docs/releasing.md.
 on:
   push:
     branches: [main]
@@ -14,7 +14,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Every check of a pull request, on the commit that will be published: nothing is published
+  # from a commit that fails them
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   release:
+    needs: ci
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -41,6 +49,9 @@ jobs:
         with:
           # `npm publish` builds the package first (prepack), with its checks (publint, attw)
           publish-script: npm run release
+          # `changeset version`, then one section per kind of change in CHANGELOG.md, and the
+          # version in package-lock.json
+          version-script: npm run changeset:version
           commit-message: 'chore: version packages'
           pr-title: 'chore: version packages'
           create-github-releases: true

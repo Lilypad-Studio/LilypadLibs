@@ -9,10 +9,11 @@ updates:
       dev-dependencies:
         dependency-type: development
         update-types: [minor, patch]
-    # @types/node follows the lowest Node.js version of `engines`
+    # @types/node follows the lowest Node.js version of `engines` (22.12): a newer one would let the
+    # code use Node.js APIs that this version lacks
     ignore:
       - dependency-name: '@types/node'
-        update-types: [version-update:semver-major]
+        update-types: [version-update:semver-major, version-update:semver-minor]
   - package-ecosystem: github-actions
     directory: /
     schedule:

@@ -5,12 +5,12 @@ Versions and the changelog are driven by [changesets](https://github.com/changes
 ## Day to day
 
 1. In the pull request of a change that the users of the library should know about, run `npx changeset`: pick the bump and write the entry of the changelog (see [.changeset/README.md](../.changeset/README.md) for its sections). Before 1.0, a breaking change is a `minor` bump. Refactors, tests and tooling need no changeset.
-2. When changesets reach `main`, the release workflow opens (or updates) the pull request **chore: version packages**: it bumps `version` in `package.json`, writes the section of `CHANGELOG.md`, and deletes the changesets.
-3. Merging that pull request publishes the version: the workflow builds the package (`prepack`, with publint and arethetypeswrong), publishes it to GitHub Packages, and pushes the tag `v<version>` with its GitHub release.
+2. On every push to `main`, the release workflow first runs CI (every job of [ci.yml](../.github/workflows/ci.yml): checks, smoke test, integration tests), and stops there if it fails: nothing is published from a commit that fails CI. When changesets are pending, it then opens (or updates) the pull request **chore: version packages** with `npm run changeset:version`: it bumps `version` in `package.json` and `package-lock.json`, writes the section of `CHANGELOG.md`, and deletes the changesets. `changeset version` writes each changeset as it is, so [scripts/merge-changelog-sections.ts](../scripts/merge-changelog-sections.ts) then merges them: one `### Upgrading` table, one `### Added`, `### Changed` and `### Fixed` list for the version.
+3. Merging that pull request publishes the version: once CI passes on the merge, the workflow builds the package (`prepack`, with publint and arethetypeswrong), publishes it to GitHub Packages, and pushes the tag `v<version>` with its GitHub release.
 
 The job holds a token that can push and publish, so no dependency code runs in it before the build: it installs with `npm ci --ignore-scripts` (a dependency that needs its install script to build would have to be listed and rebuilt explicitly), and `actions/checkout` keeps no credentials in `.git/config` (`changesets/action` commits through the GitHub API with its own token).
 
-The pull requests opened by the workflow's own token do not trigger other workflows, so CI does not run on the version pull request: close and reopen it to run CI, or give the workflow the token of a GitHub App (the `github-token` input of `changesets/action`).
+The pull requests opened by the workflow's own token do not trigger other workflows, so CI does not run on the version pull request: close and reopen it to run CI, or give the workflow the token of a GitHub App (the `github-token` input of `changesets/action`). Its merge is checked anyway: the release workflow runs CI before it publishes.
 
 ## First release: the setup to complete on GitHub
 

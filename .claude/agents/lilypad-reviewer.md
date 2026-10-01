@@ -19,7 +19,7 @@ You review changes to `@lilypad-studio/libs`, an internal TypeScript library (ca
    - **Gate**: the main `sql` client keeps `prepare: false`; no postgres.js `.cancel()`.
    - **Configs**: database configs hold no functions (hooks go through `bindLilypadDbHooks`); PostgreSQL type knowledge stays in `src/dbConfig/LilypadPgTypes.ts`.
    - **Versioned formats**: a change to the changelog SQL without a `LILYPAD_CHANGELOG_VERSION` bump, or to the shared L2 entries without a `SHARED_FORMAT_VERSION` bump (see the db-modules checklists).
-   - **Public surface**: a new exported class or type missing from its `src/entries/*.ts`; a new entry missing from `tsdown.config.ts`, `typedoc.json`, `src/entries/entries.test.ts`, `src/index.ts` (edge entries) or the vitest `edge` include; a new edge test folder missing from that include; an exported class without the `Lilypad` prefix; a default export.
+   - **Public surface**: a new exported class or type missing from its `src/entries/*.ts`; a new entry missing from `tsdown.config.ts`, `typedoc.json` or `src/index.ts` (edge entries); a new module folder missing from `edge.config.ts`; an exported class without the `Lilypad` prefix; a default export.
    - **Types**: optional properties declared `name?: T` instead of `name?: T | undefined`; `interface` instead of `type`.
    - **Errors**: a changed message of an existing `Lilypad*Error` (tests and users match them).
    - **Tests**: new behavior without a test; fake-timer tests that await a promise before advancing the timers instead of registering the assertion first.

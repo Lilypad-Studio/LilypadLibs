@@ -1,9 +1,10 @@
 name: CI
 
+# On pull requests, and called by the release workflow on every push to main, before it publishes
+# (see docs/releasing.md)
 on:
-  push:
-    branches: [main]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -74,20 +75,29 @@ jobs:
         working-directory: ${{ runner.temp }}/app
         run: |
           npm init -y > /dev/null
-          npm install --no-audit --no-fund ./lilypad-studio-libs-*.tgz postgres
+          npm install --no-audit --no-fund ./lilypad-studio-libs-*.tgz postgres@3.4.7
           cp "$GITHUB_WORKSPACE/scripts/smoke-test.mjs" .
       - name: Load every entry and run the command
         working-directory: ${{ runner.temp }}/app
         run: node smoke-test.mjs
 
   integration:
-    # The runners have Docker: testcontainers starts PostgreSQL
+    # The runners have Docker: testcontainers starts PostgreSQL. Every Node.js version on the
+    # default image, and the oldest and newest supported PostgreSQL versions on Node.js 24
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        node: [22, 24]
+        node: [22, 24, 26]
+        pg: ['postgres:16-alpine']
+        include:
+          - node: 24
+            pg: 'postgres:13-alpine'
+          - node: 24
+            pg: 'postgres:18-alpine'
+    env:
+      LILYPAD_TEST_PG_IMAGE: ${{ matrix.pg }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0

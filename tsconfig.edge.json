@@ -2,12 +2,13 @@
   // The edge-compatible entries (every entry except `db`, and the command), checked without the
   // types of Node.js: the `webworker` lib declares the web APIs of the edge runtimes (fetch,
   // AbortController, timers, console, crypto, structuredClone) and none of Node.js or of the DOM,
-  // so that a Node.js API used by one of their modules fails the typecheck
+  // so that a Node.js API used by one of their modules fails the typecheck. Every entry file is
+  // listed, so that an entry missing from src/index.ts is checked too
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "lib": ["es2023", "esnext.disposable", "webworker"],
     "types": []
   },
-  "include": [],
-  "files": ["src/index.ts"]
+  "include": ["src/index.ts", "src/entries/*.ts"],
+  "exclude": ["src/entries/db.ts", "src/**/*.test.ts"]
 }

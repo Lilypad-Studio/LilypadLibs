@@ -61,7 +61,9 @@ describe('LilypadDbGate (integration)', () => {
   let gate: LilypadDbGate;
 
   beforeAll(async () => {
-    container = await new PostgreSqlContainer('postgres:16-alpine').start();
+    // CI also runs the suite on the oldest and newest supported versions of PostgreSQL
+    const image = process.env.LILYPAD_TEST_PG_IMAGE ?? 'postgres:16-alpine';
+    container = await new PostgreSqlContainer(image).start();
     admin = postgres(container.getConnectionUri(), { onnotice: () => {} });
     await admin`
       CREATE TABLE users (
@@ -477,8 +479,7 @@ describe('LilypadDbGate (integration)', () => {
         callbackId: 'cb',
         callback: vi.fn(),
       });
-      await new Promise((resolve) => setTimeout(resolve, 400));
-      expect(beatingGate.isListenHealthy()).toBe(true);
+      await vi.waitFor(() => expect(beatingGate.isListenHealthy()).toBe(true), { timeout: 2000 });
 
       await beatingGate.removeListener('beating_channel', 'cb');
       expect(beatingGate.isListenHealthy()).toBe(false);
@@ -1156,13 +1157,14 @@ describe('LilypadDbGate (integration)', () => {
 
         it('should suggest nothing once rows were deleted from the changelog, by a job it cannot see', async () => {
           await recordChange('2 days');
-          const connection = await admin.reserve();
+          // A session of its own, ended at once: a session reports its statistics when it ends,
+          // whatever the version of PostgreSQL (an idle one reports them up to 10 s later on 15+,
+          // and not before its next statement before 15)
+          const deleter = postgres(container.getConnectionUri(), { max: 1 });
           try {
-            await connection.unsafe(`DELETE FROM ${changes}`);
-            // The session flushes its statistics when it goes idle next, instead of up to 10 s later
-            await connection`SELECT pg_stat_force_next_flush()`;
+            await deleter.unsafe(`DELETE FROM ${changes}`);
           } finally {
-            connection.release();
+            await deleter.end();
           }
 
           await vi.waitFor(
