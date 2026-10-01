@@ -68,6 +68,7 @@ function facts(overrides: Partial<LilypadSchemaFacts> = {}): LilypadSchemaFacts 
       writers: null,
       oldestRowAge: 60_000,
       deletedRows: 0,
+      blockedTables: [],
     },
     cron: { available: true, installed: true, database: 'app', jobs: [pruneJob] },
     tables: [{ schema: 'public', triggers: [...changelogStatements, changelogTruncate] }],
@@ -87,6 +88,7 @@ const noChangelog: LilypadSchemaFacts['changelog'] = {
   writers: null,
   oldestRowAge: null,
   deletedRows: 0,
+  blockedTables: [],
 };
 
 const changelogOptions: LilypadSchemaCheckOptions = {
@@ -414,6 +416,63 @@ describe('evaluateLilypadSchema', () => {
         expect(problem.fix).toBeUndefined();
         expect(problem.message).toContain(`Its fix is ${withheld}`);
       }
+    });
+
+    it('should withhold the changelog fixes while a table outside the config has such a key', () => {
+      // Another config shares the changelog: its tables have the triggers of an older install
+      const result = evaluateLilypadSchema(
+        twoTables(
+          {},
+          {
+            ...outdated,
+            blockedTables: [
+              { table: 'public.other', column: 'id', type: 'other_kind' },
+              { table: 'public.renamed', column: 'id', type: null },
+              { table: 'public.no_args', column: null, type: null },
+            ],
+          }
+        ),
+        twoTableOptions(changelogOptions)
+      );
+
+      expect(result.problems.map(({ code, table }) => [code, table])).toEqual([
+        ['outdated-changelog', undefined],
+        ['writable-changelog', undefined],
+        ['missing-changelog-trigger', 'orders'],
+        ['unsupported-key-type', 'public.other'],
+        ['missing-column', 'public.renamed'],
+        ['missing-column', 'public.no_args'],
+      ]);
+      expect(result.ok).toBe(false);
+      expect(formatLilypadSchemaFixSql(result.problems)).toBe('');
+      expect(result.problems[0]!.message).toContain(
+        'withheld until the primary key of "public.other", "public.renamed", "public.no_args" is changed'
+      );
+      expect(result.problems[3]!.message).toContain(
+        `The key column "id" of "public.other" (not in this config`
+      );
+      expect(result.problems[3]!.message).toContain(
+        `once version ${LILYPAD_CHANGELOG_VERSION} is installed, every write of the table fails`
+      );
+      expect(result.problems[4]!.message).toContain('"id" that the changelog triggers of');
+      expect(result.problems[5]!.message).toContain('name no key column');
+    });
+
+    it('should withhold the notify fixes of a listen config too', () => {
+      const result = evaluateLilypadSchema(
+        facts({
+          changelog: {
+            ...facts().changelog,
+            blockedTables: [{ table: 'public.other', column: 'id', type: 'other_kind' }],
+          },
+          tables: [{ schema: 'public', triggers: [] }],
+        }),
+        listenOptions
+      );
+
+      expect(codes(result)).toEqual(['missing-notify-trigger', 'unsupported-key-type']);
+      expect(result.problems[0]!.fix).toBeUndefined();
+      expect(result.problems[1]!.message).toContain('so the writes of the table fail.');
     });
 
     it('should keep the fixes of a config without such a key', () => {

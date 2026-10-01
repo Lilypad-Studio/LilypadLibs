@@ -890,7 +890,10 @@ describe('LilypadDbGate (integration)', () => {
           const result = await checkLilypadSchema(gate, {
             tables: [{ table, primaryKey: 'id' }],
           });
-          const reported = result.problems.some((p) => p.code === 'unsupported-key-type');
+          // The other tables of the suite are outside this config: they are reported apart
+          const reported = result.problems.some(
+            (p) => p.code === 'unsupported-key-type' && p.table === table
+          );
 
           expect(wrote).toBe(safe);
           expect(reported).toBe(!safe);
@@ -912,7 +915,9 @@ describe('LilypadDbGate (integration)', () => {
             notifyChannel: 'cache_events',
           });
 
-          expect(result.problems.some((p) => p.code === 'unsupported-key-type')).toBe(!safe);
+          expect(
+            result.problems.some((p) => p.code === 'unsupported-key-type' && p.table === table)
+          ).toBe(!safe);
         }
       );
 
@@ -1769,6 +1774,74 @@ describe('LilypadDbGate (integration)', () => {
         expect(formatLilypadSchemaFixSql(result.problems)).toBe('');
       } finally {
         await admin`DROP TABLE newer_items`;
+        await admin.unsafe(lilypadChangelogSql({ notifyChannel: false }));
+      }
+    });
+
+    it('should withhold the changelog fixes while a table outside the config has a key the triggers refuse', async () => {
+      // Another config (or service) shares the changelog: its tables have the changelog triggers,
+      // and keys that version 9 refuses (every write of them fails once it is installed)
+      await admin.unsafe(`
+        CREATE ROLE outside_app;
+        GRANT CREATE ON SCHEMA public TO outside_app;
+        SET ROLE outside_app;
+        CREATE TYPE outside_kind AS ENUM ('a', 'b');
+        RESET ROLE;
+        CREATE TABLE outside_items (id outside_kind PRIMARY KEY);
+        CREATE TABLE outside_renamed (id int PRIMARY KEY);
+        CREATE TABLE outside_noargs (id int PRIMARY KEY);
+        CREATE TABLE outside_safe (id int PRIMARY KEY);
+      `);
+      for (const table of ['outside_items', 'outside_renamed', 'outside_safe']) {
+        await admin.unsafe(lilypadChangelogTriggerSql({ table, primaryKey: 'id' }));
+      }
+      await admin.unsafe(`
+        ALTER TABLE outside_renamed RENAME COLUMN id TO id2;
+        CREATE TRIGGER outside_noargs_insert AFTER INSERT ON outside_noargs
+          REFERENCING NEW TABLE AS lilypad_new
+          FOR EACH STATEMENT EXECUTE FUNCTION lilypad_cache_changes_record();
+        COMMENT ON FUNCTION lilypad_cache_changes_record() IS 'lilypad-changelog:8';
+      `);
+      try {
+        const outside = (result: Awaited<ReturnType<typeof checkLilypadSchema>>) =>
+          result.problems
+            .filter((problem) => problem.table?.startsWith('public.outside_'))
+            .map(({ table, code }) => [table, code]);
+        const result = await check({ tables: [users] });
+
+        expect(outside(result)).toEqual([
+          ['public.outside_items', 'unsupported-key-type'],
+          ['public.outside_noargs', 'missing-column'],
+          ['public.outside_renamed', 'missing-column'],
+        ]);
+        expect(result.ok).toBe(false);
+        const outdated = result.problems.find((problem) => problem.code === 'outdated-changelog');
+        expect(outdated?.fix).toBeUndefined();
+        expect(outdated?.message).toContain('"public.outside_items"');
+        // Installing version 9 is withheld: it would fail every write of these tables
+        expect(formatLilypadSchemaFixSql(result.problems)).not.toContain('CREATE OR REPLACE');
+        await expect(admin`INSERT INTO outside_items VALUES ('a')`).rejects.toThrow('unsafe type');
+
+        // A table of the config is reported once, as a table of the config
+        const listed = await check({ tables: [{ table: 'outside_items', primaryKey: 'id' }] });
+        expect(
+          listed.problems
+            .filter((problem) => problem.code === 'unsupported-key-type')
+            .map((problem) => problem.table)
+        ).toEqual(['outside_items']);
+
+        // Without the changelog function, there is nothing to read
+        const facts = await readLilypadSchemaFacts(gate, {
+          tables: [],
+          changelog: { table: 'no_such_changes' },
+        });
+        expect(facts.changelog.blockedTables).toEqual([]);
+      } finally {
+        await admin.unsafe(`
+          DROP TABLE outside_items, outside_renamed, outside_noargs, outside_safe;
+          DROP OWNED BY outside_app CASCADE;
+          DROP ROLE outside_app;
+        `);
         await admin.unsafe(lilypadChangelogSql({ notifyChannel: false }));
       }
     });
