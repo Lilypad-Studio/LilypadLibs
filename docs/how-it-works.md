@@ -610,7 +610,7 @@ Four levels, each built on the previous one:
 
 ### 4.7 LilypadDbGate
 
-[src/dbGate/LilypadDbGate.ts](../src/dbGate/LilypadDbGate.ts), 601 lines. A thin layer over [postgres.js](https://github.com/porsager/postgres): a client, typed CRUD helpers, and `LISTEN` management.
+[src/dbGate/LilypadDbGate.ts](../src/dbGate/LilypadDbGate.ts), 604 lines. A thin layer over [postgres.js](https://github.com/porsager/postgres): a client, typed CRUD helpers, and `LISTEN` management.
 
 #### The clients
 
@@ -620,13 +620,13 @@ The constructor creates the main client:
 this.sql = postgres(options.connectionString, {
   prepare: false, // works behind PgBouncer in transaction mode
   ...toPostgresPoolOptions(options.pool), // ms → seconds, undefined keys removed
-  ...(statementTimeout !== undefined && { connection: { statement_timeout } }), // 30 s by default
+  ...(statementTimeout !== undefined && { connection: { statement_timeout } }), // none by default
 });
 ```
 
-postgres.js connects lazily, on the first query, so creating a gate opens nothing. That is what keeps `next build` from reaching the database. `prepare: false` must stay: transaction-mode poolers route each statement to any backend, where a prepared statement may not exist.
+postgres.js connects lazily, on the first query, so creating a gate opens nothing. That is what keeps `next build` from reaching the database. `prepare: false` must stay: transaction-mode poolers route each statement to any backend, where a prepared statement may not exist. `statement_timeout` is a startup parameter of each connection, which PgBouncer refuses (every query would fail with `unsupported startup parameter`): so it has no default, and behind a pooler the timeout is set on the role (`ALTER ROLE ... SET statement_timeout`).
 
-`LISTEN` belongs to a session, so it cannot go through a pooler that reassigns sessions, and it must not be closed for being idle. postgres.js already handles this: its `listen()` opens **its own** dedicated connection (one per client, with no idle timeout and no maximum lifetime), whatever the pool options. So the gate listens through `this.sql` itself, and creates a second client only when `listenerConnectionString` points elsewhere, typically a direct connection (`listenClient()`, [line 506](../src/dbGate/LilypadDbGate.ts)).
+`LISTEN` belongs to a session, so it cannot go through a pooler that reassigns sessions, and it must not be closed for being idle. postgres.js already handles this: its `listen()` opens **its own** dedicated connection (one per client, with no idle timeout and no maximum lifetime), whatever the pool options. So the gate listens through `this.sql` itself, and creates a second client only when `listenerConnectionString` points elsewhere, typically a direct connection (`listenClient()`, [line 295](../src/dbGate/LilypadDbGate.ts)).
 
 `create()` goes through the singleton helper with a SHA-256 signature of the connection options; `initializeNew` registers the `listen` subscriptions and, if one fails, closes the gate before rethrowing, so that a gate that is never returned does not leak its pools.
 

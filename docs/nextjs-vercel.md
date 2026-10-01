@@ -69,13 +69,13 @@ export const getGate = () =>
     config: appDb, // its tables by key, with their hooks
     connectionString: process.env.DATABASE_URL!, // the POOLED connection string
     pool: lilypadServerlessPool, // { max: 3, idleTimeout: 5 s, connectTimeout: 10 s }
-    statementTimeout: 10_000, // Postgres cancels queries longer than 10 s
+    // No statementTimeout behind a pooler: set it on the role (see below)
   });
 ```
 
 - **Use the pooled connection string** (with Neon, the host that contains `-pooler`). Every instance opens its own pool, and a pooler lets many of them share few database connections. The gate already disables prepared statements (`prepare: false`), which transaction-mode poolers require.
 - **`lilypadServerlessPool`** keeps few connections per instance (`max: 3`) and closes them after 5 idle seconds, so a suspended instance does not hold connections. Raise `max` if a single request runs many queries in parallel.
-- **`statementTimeout`** (default: 30 s) makes Postgres stop queries that take too long, so that slow queries whose callers already gave up do not hold the few connections of the pool. Keep it below the `maxDuration` of your functions.
+- **Bound the queries in Postgres**, so that slow queries whose callers already gave up do not hold the few connections of the pool: run `ALTER ROLE app_user SET statement_timeout = '10s';` once, below the `maxDuration` of your functions. Do not pass `statementTimeout` to the gate with a pooled connection string: it is sent as a startup parameter, which PgBouncer (and most poolers in transaction mode) refuse, so every query would fail with `unsupported startup parameter: statement_timeout`. It has no default.
 - **`config: appDb`**: the gate finds the tables by key (`table: 'users'`) and applies the hooks to them, even to a definition taken from the original config (`db.tables.users`). The config file itself imports only `@lilypad-studio/libs/schema` and types (`import type`): see [Functions applied to the rows](../README.md#functions-applied-to-the-rows-bindlilypaddbhooks).
 - `listenerConnectionString` (a direct, non-pooled connection) is only needed by the `listen` strategy, which is not recommended on Vercel (see section 5).
 
@@ -317,7 +317,7 @@ The subpaths also keep the bundles small, since `postgres` is only pulled in by 
 | All                              | `platform`              | The adapter of section 1                                                                           | Background work survives the end of the request                                  |
 | `LilypadDbGate`                  | `connectionString`      | Pooled                                                                                             | Many instances, few database connections                                         |
 |                                  | `pool`                  | `lilypadServerlessPool`                                                                            | Few connections per instance, closed when idle                                   |
-|                                  | `statementTimeout`      | Below `maxDuration`, e.g. `10_000`                                                                 | Slow queries stop instead of piling up                                           |
+|                                  | `statementTimeout`      | Leave unset; `ALTER ROLE app_user SET statement_timeout = '10s'` instead                           | Slow queries stop; a pooler refuses the startup parameter                        |
 |                                  | `listen`                | Leave empty                                                                                        | `LISTEN` needs a long-lived direct connection                                    |
 | `LilypadCache`, `LilypadDbCache` | `shared`                | `{}` (store from `platform`), with a `codec` for non-JSON values                                   | Cold instances find the values of the others                                     |
 |                                  | `shared.timeout`        | `300`                                                                                              | The shared level never slows a response down much                                |

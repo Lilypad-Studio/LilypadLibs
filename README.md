@@ -745,7 +745,7 @@ const gate = await LilypadDbGate.create({
   // when connectionString goes through PgBouncer in transaction mode
   listenerConnectionString: process.env.DATABASE_DIRECT_URL,
   listen: [], // optional: channels to subscribe to at startup (see below)
-  statementTimeout: 10_000, // optional: Postgres cancels queries longer than this (default: 30 s)
+  statementTimeout: 10_000, // optional, direct connections only: Postgres cancels longer queries (default: none)
   pool: { max: 10, idleTimeout: 30_000 }, // optional: pool size and timeouts, in ms
   listenHeartbeat: 15_000, // optional: how often the LISTEN connection is checked (default: 15 s)
   // logger,
@@ -767,7 +767,7 @@ await gate.close(); // waits up to 5 s for the running queries, then closes both
   | `maxLifetime`    | 30 to 60 min        | Closes connections older than this         |
 
 - On serverless platforms, use `pool: lilypadServerlessPool` (`{ max: 3, idleTimeout: 5_000, connectTimeout: 10_000 }`: few connections per instance, closed quickly when idle) with a pooled connection string. Adjust `max` to the number of queries one instance runs in parallel: `pool: { ...lilypadServerlessPool, max: 5 }`.
-- `statementTimeout` (default: 30 s, at most 2 147 483 647 ms; `false` keeps the setting of the database) is enforced by Postgres on the queries of the pool. A cache that times out (`fetchTimeout`) does not stop its query: this bound frees the connection, instead of leaving slow queries holding the pool while the queries behind them wait.
+- `statementTimeout` (at most 2 147 483 647 ms; not set by default, nor with `false`: the setting of the database applies) is enforced by Postgres on the queries of the pool. A cache that times out (`fetchTimeout`) does not stop its query: this bound frees the connection, instead of leaving slow queries holding the pool while the queries behind them wait. It is sent as a startup parameter of each connection, which PgBouncer and most poolers in transaction mode refuse (every query then fails with `unsupported startup parameter: statement_timeout`): pass it only with a direct connection. Behind a pooler, set it on the role of the application instead: `ALTER ROLE app_user SET statement_timeout = '30s';`.
 - `close({ timeout })` waits at most `timeout` ms (default: 5 s) for the running queries, then closes the connections. It returns the same promise when called again, and the gate then rejects queries and `addListener` (`gate.closed` tells whether it was closed).
 
 ### CRUD helpers
@@ -1270,7 +1270,7 @@ Run [`lilypad-doctor`](#lilypad-doctor-checking-the-database): it reports a miss
 `LISTEN` does not work through a pooler in transaction mode. Set `listenerConnectionString` to a direct connection to Postgres.
 
 **`getOrSet` throws `Operation timed out after ...ms` (a `LilypadTimeoutError`, exported by `/cache`, `/db` and `/flow`).**
-The fetch took longer than `fetchTimeout` (5 s by default). Increase it in the cache options, or use `onError` to return a fallback value. For database fetches, set `statementTimeout` on the gate too, so that Postgres stops the slow queries instead of letting them pile up.
+The fetch took longer than `fetchTimeout` (5 s by default). Increase it in the cache options, or use `onError` to return a fallback value. For database fetches, bound the queries in Postgres too (`statementTimeout` on a direct connection, or `ALTER ROLE ... SET statement_timeout` behind a pooler), so that Postgres stops the slow queries instead of letting them pile up.
 
 **`Rate limit exceeded for ...` (a `LilypadRateLimitError`).**
 A `LilypadFlowControl` with `rate` rejects new executions that come too soon. Catch the error, or use a different `consumerIdentifier` for each caller.
