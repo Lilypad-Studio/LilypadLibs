@@ -75,7 +75,7 @@ jobs:
         working-directory: ${{ runner.temp }}/app
         run: |
           npm init -y > /dev/null
-          npm install --no-audit --no-fund ./lilypad-studio-libs-*.tgz postgres@3.4.7
+          npm install --no-audit --no-fund ./lilypad-studio-libs-*.tgz postgres@3.4.9
           cp "$GITHUB_WORKSPACE/scripts/smoke-test.mjs" .
       - name: Load every entry and run the command
         working-directory: ${{ runner.temp }}/app
@@ -83,7 +83,7 @@ jobs:
 
   integration:
     # The runners have Docker: testcontainers starts PostgreSQL. Every Node.js version on the
-    # default image, and the oldest and newest supported PostgreSQL versions on Node.js 24
+    # default image, the oldest supported PostgreSQL version, and the newest one on Node.js 24
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -92,8 +92,6 @@ jobs:
         node: [22, 24, 26]
         pg: ['postgres:16-alpine']
         include:
-          - node: 24
-            pg: 'postgres:13-alpine'
           - node: 24
             pg: 'postgres:18-alpine'
     env:

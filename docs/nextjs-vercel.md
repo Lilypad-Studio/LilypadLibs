@@ -166,7 +166,7 @@ export default defineLilypadDb({ changelog: { pruning: 'trigger' }, tables: { us
 npx lilypad-doctor --url "$DATABASE_URL_UNPOOLED" --sql > migrations/0042_lilypad.sql
 ```
 
-`lilypadChangelogSql()` and `lilypadChangelogTriggerSql({ table, primaryKey })` return the same SQL, if you prefer to write the migration yourself. It needs PostgreSQL 13 or later.
+`lilypadChangelogSql()` and `lilypadChangelogTriggerSql({ table, primaryKey })` return the same SQL, if you prefer to write the migration yourself. It needs PostgreSQL 16 or later.
 
 - The changelog table (`lilypad_cache_changes`) records the table, the primary key and the operation of every change. An update that changes the primary key is recorded as a delete of the old key and an update of the new one. `lilypadChangelogTriggerSql` also adds a trigger for `TRUNCATE`, which the other triggers do not see.
 - The trigger also sends a `NOTIFY` on `cache_events`, so `listen` and `changelog` can coexist (for example a long-running worker next to the Vercel app). Pass `{ notifyChannel: false }` to skip it.

@@ -8,6 +8,7 @@ import { bindLilypadDbHooks, type LilypadDbTableHooks } from '@/dbConfig/Lilypad
 import { LilypadDbCache } from '@/dbCache/LilypadDbCache';
 import { LilypadDbTable } from './LilypadDbTable';
 import {
+  LILYPAD_CHANGELOG_VERSION,
   lilypadChangelogPruneScheduleSql,
   lilypadChangelogSql,
   lilypadChangelogTriggerSql,
@@ -1750,6 +1751,24 @@ describe('LilypadDbGate (integration)', () => {
         // Installed with notifyChannel: false, so the fix sends no notification either
         expect(result.problems[0]!.fix).not.toContain('pg_notify');
       } finally {
+        await admin.unsafe(lilypadChangelogSql({ notifyChannel: false }));
+      }
+    });
+
+    it('should not downgrade a changelog installed by a newer version', async () => {
+      await admin.unsafe(`CREATE TABLE newer_items (id int PRIMARY KEY)`);
+      await admin.unsafe(
+        `COMMENT ON FUNCTION lilypad_cache_changes_record() IS 'lilypad-changelog:${LILYPAD_CHANGELOG_VERSION + 1}'`
+      );
+      try {
+        const result = await check({ tables: [{ table: 'newer_items', primaryKey: 'id' }] });
+
+        expect(codes(result)).toEqual(['newer-changelog', 'missing-changelog-trigger']);
+        expect(result.problems[0]!.severity).toBe('warning');
+        expect(result.problems[1]!.fix).toBeUndefined();
+        expect(formatLilypadSchemaFixSql(result.problems)).toBe('');
+      } finally {
+        await admin`DROP TABLE newer_items`;
         await admin.unsafe(lilypadChangelogSql({ notifyChannel: false }));
       }
     });

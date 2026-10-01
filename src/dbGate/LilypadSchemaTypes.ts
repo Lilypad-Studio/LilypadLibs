@@ -80,17 +80,25 @@ export type LilypadSchemaCheckOptions = {
 };
 
 export type LilypadSchemaProblemCode =
-  /** PostgreSQL is older than 13: the changelog needs `xid8`. */
+  /** PostgreSQL is older than 16, the oldest version the library supports. */
   | 'unsupported-version'
   /** The cached table does not exist (as seen with the `search_path` of the gate). */
   | 'missing-table'
   /** The changelog table or its trigger function does not exist. */
   | 'missing-changelog'
   /**
-   * The changelog table or its trigger function was installed by an older version of the library:
-   * an error if the caches cannot read it correctly, a warning if it only lacks an improvement.
+   * The changelog table or its trigger function was installed by an older version of the library,
+   * or the table lost its `table_schema` column (always an error): the fix installs the changelog
+   * SQL of this version.
    */
   | 'outdated-changelog'
+  /**
+   * A warning: the changelog trigger function was installed by a newer version of the library. The
+   * caches of this version still read it, but every fix that touches the changelog, its triggers or
+   * its privileges is withheld: it would install the older SQL of this version, under the services
+   * of the newer one that share the database. Upgrade the library.
+   */
+  | 'newer-changelog'
   /**
    * A warning: roles other than its owner may write the changelog, and record changes that every
    * cache trusts (e.g. make a row look deleted). Since version 7, the triggers write it as its

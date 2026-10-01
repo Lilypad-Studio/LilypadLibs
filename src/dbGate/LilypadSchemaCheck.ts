@@ -1,6 +1,5 @@
 import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
 import {
-  LILYPAD_CHANGELOG_MIN_COMPATIBLE_VERSION,
   LILYPAD_CHANGELOG_NEW_ROWS,
   LILYPAD_CHANGELOG_OLD_ROWS,
   LILYPAD_CHANGELOG_VERSION,
@@ -211,13 +210,25 @@ export function evaluateLilypadSchema(
   const installedChannel = installedNotifyChannel(facts.changelog.functionSource);
   // The version of the installed trigger function, or `undefined` if it does not exist
   const installedVersion = installedChangelogVersion(facts.changelog);
+  // Installed by a newer version of the library: the fixes of this one would install its older SQL
+  // over it, under the services of the newer version that share the database. Also without the
+  // changelog strategy: the notify fixes install the changelog SQL too
+  const newerInstall =
+    installedVersion !== undefined && installedVersion > LILYPAD_CHANGELOG_VERSION;
   const problems: LilypadSchemaProblem[] = [];
 
-  if (facts.version < 130000) {
+  if (facts.version < 160000) {
     problems.push({
       code: 'unsupported-version',
       severity: 'error',
-      message: `PostgreSQL ${facts.version} is too old: the changelog needs PostgreSQL 13 or later.`,
+      message: `PostgreSQL ${facts.version} is too old: the library needs PostgreSQL 16 or later.`,
+    });
+  }
+  if (newerInstall) {
+    problems.push({
+      code: 'newer-changelog',
+      severity: 'warning',
+      message: `The changelog "${fixChangelog.table}" was installed by a newer version of the library (version ${installedVersion}, this one knows ${LILYPAD_CHANGELOG_VERSION}): upgrade @lilypad-studio/libs.`,
     });
   }
 
@@ -295,15 +306,15 @@ export function evaluateLilypadSchema(
     // A comment of another origin, or edited by hand: the oldest version
     const version = installedVersion ?? 1;
     if ((hasTable && !hasSchemaColumn) || (hasFunction && version < LILYPAD_CHANGELOG_VERSION)) {
-      const compatible =
-        (!hasTable || hasSchemaColumn) && version >= LILYPAD_CHANGELOG_MIN_COMPATIBLE_VERSION;
       problems.push(
         touchesChangelog({
           code: 'outdated-changelog',
-          severity: compatible ? 'warning' : 'error',
+          severity: 'error',
           message:
-            `The changelog "${changelog.table}" was installed by an older version of the library (version ${version}, expected ${LILYPAD_CHANGELOG_VERSION})` +
-            (compatible ? `: the caches read it, but ${outdatedChangelogReason(version)}.` : '.'),
+            version < LILYPAD_CHANGELOG_VERSION
+              ? `The changelog "${changelog.table}" was installed by an older version of the library (version ${version}, expected ${LILYPAD_CHANGELOG_VERSION}).`
+              : // Dropped by hand: the reader filters on it
+                `The changelog table "${changelog.table}" has no table_schema column: the caches cannot read it.`,
           fix: changelogSql,
         })
       );
@@ -525,12 +536,23 @@ export function evaluateLilypadSchema(
   });
 
   problems.push(...deferred, ...pruning.problems);
-  if (blockedTables.length === 0) {
+  // Every fix of the changelog, its triggers and its privileges is withheld while a table blocks
+  // them (any of them could make the triggers refuse its key, and fail its writes), or while a newer
+  // version installed the changelog (they would install the older SQL of this one)
+  const withholdReasons: string[] = [];
+  if (blockedTables.length > 0) {
+    const blockedBy = blockedTables.map((table) => `"${table}"`).join(', ');
+    withholdReasons.push(
+      `the primary key of ${blockedBy} is changed (see unsupported-key-type / missing-column)`
+    );
+  }
+  if (newerInstall) {
+    withholdReasons.push('the library is upgraded (see newer-changelog)');
+  }
+  if (withholdReasons.length === 0) {
     return { ok: !problems.some((problem) => problem.severity === 'error'), problems, tables };
   }
-  // Every fix of the changelog, its triggers and its privileges is withheld: any of them could make
-  // the triggers refuse the key of a blocked table, and fail its writes
-  const blockedBy = blockedTables.map((table) => `"${table}"`).join(', ');
+  const until = withholdReasons.join(' and ');
   const withheld = problems.map((problem): LilypadSchemaProblem => {
     if (!changelogFixes.has(problem)) {
       return problem;
@@ -539,7 +561,7 @@ export function evaluateLilypadSchema(
     const { fix: _fix, fixDatabase: _fixDatabase, ...rest } = problem;
     return {
       ...rest,
-      message: `${problem.message} ${kept === undefined ? 'Its fix is' : 'The changelog triggers of its fix are'} withheld until the primary key of ${blockedBy} is changed (see unsupported-key-type / missing-column); run the check again then.`,
+      message: `${problem.message} ${kept === undefined ? 'Its fix is' : 'The changelog triggers of its fix are'} withheld until ${until}; run the check again then.`,
       ...(kept !== undefined && { fix: kept }),
     };
   });
@@ -564,26 +586,4 @@ function installedChangelogVersion(changelog: LilypadSchemaFacts['changelog']): 
     ? Number(comment.slice(LILYPAD_CHANGELOG_VERSION_PREFIX.length))
     : Number.NaN;
   return Number.isInteger(parsed) ? parsed : 1;
-}
-
-/** What a changelog of a compatible older version lacks (see `LILYPAD_CHANGELOG_VERSION`). */
-function outdatedChangelogReason(version: number): string {
-  const longName =
-    'a changelog table whose name is 62 characters or longer (schema included) breaks its functions and indexes';
-  // Version 9 refuses a user-defined key type, which earlier versions would convert as the owner
-  const keyType = `a key of a type whose output or json cast function a non-superuser owns can run that role's code as the changelog owner, through the conversion of the key in the trigger function`;
-  // The placeholders appeared in version 7
-  const beforeVersion8 = `a changelog table whose name contains a placeholder of its SQL (\`__lilypad_\`) breaks its trigger function, and ${longName}`;
-  const beforeVersion7 = `its triggers write the changelog with the privileges of the writing roles, which can then record changes of their own that every cache trusts, and ${longName}`;
-  const beforeVersion6 = `its prune function (\`prune\` option) can be made to run the code of any role with the privileges of its owner, the triggers of a long table name record only TRUNCATE, a name containing \`$\` breaks its SQL, and ${beforeVersion7}`;
-  const beforeVersion9 =
-    version < 5
-      ? `a statement that changes many rows notifies each of them instead of sending one BULK notification; ${beforeVersion6}`
-      : version < 6
-        ? beforeVersion6
-        : version < 7
-          ? beforeVersion7
-          : beforeVersion8;
-  // Every version below 9 also lacks the key-type guard
-  return version < 8 ? `${beforeVersion9}, and ${keyType}` : keyType;
 }
