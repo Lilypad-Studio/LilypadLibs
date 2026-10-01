@@ -52,6 +52,7 @@ describe('parseLilypadDoctorArgs', () => {
       help: false,
       json: false,
       sql: true,
+      failOnWarnings: false,
       connectionString: url,
       config: 'analytics',
     });
@@ -62,6 +63,7 @@ describe('parseLilypadDoctorArgs', () => {
       help: false,
       json: false,
       sql: false,
+      failOnWarnings: false,
       connectionString: url,
       config: undefined,
     });
@@ -197,6 +199,40 @@ describe('runLilypadDoctorCli', () => {
     ).resolves.toBe(1);
     expect(out.log).toHaveBeenCalledWith('lilypad-doctor: the database is set up.');
     expect(out.error).toHaveBeenCalledWith('lilypad-doctor: not set up');
+  });
+
+  it('should exit with 1 on warnings with --fail-on-warnings', async () => {
+    const out = output();
+    const warned: LilypadDoctorReport = {
+      ...report(true),
+      problems: [
+        {
+          code: 'missing-index',
+          severity: 'warning',
+          table: 'public.users',
+          message: 'no index',
+          fix: 'CREATE INDEX ON users (id);',
+        },
+      ],
+      text: 'lilypad-doctor: the database is set up, with warnings.',
+    };
+    const run = async () => warned;
+
+    await expect(runLilypadDoctorCli(['--url', url], {}, out, { run, load })).resolves.toBe(0);
+    expect(out.log).toHaveBeenCalledWith(warned.text);
+    await expect(
+      runLilypadDoctorCli(['--url', url, '--fail-on-warnings'], {}, out, { run, load })
+    ).resolves.toBe(1);
+    expect(out.error).toHaveBeenCalledWith(warned.text);
+    await expect(
+      runLilypadDoctorCli(['--url', url, '--fail-on-warnings', '--json'], {}, out, { run, load })
+    ).resolves.toBe(1);
+    await expect(
+      runLilypadDoctorCli(['--url', url, '--fail-on-warnings'], {}, out, {
+        run: async () => report(true),
+        load,
+      })
+    ).resolves.toBe(0);
   });
 
   it('should print the result as JSON with --json', async () => {

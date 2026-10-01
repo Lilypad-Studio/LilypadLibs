@@ -30,12 +30,14 @@ Options:
                         later files win, and the variables already set win over every file
   --sql                 Print only the SQL that fixes the problems (for a migration)
   --json                Print the result as JSON
+  --fail-on-warnings    Exit with 1 on warnings too, not only on errors (e.g. in CI)
   -h, --help            Print this help
 
 A TypeScript config needs Node.js 22.18 or later (or NODE_OPTIONS=--experimental-strip-types).
 
-Exit code: 0 when the database matches the config (warnings may be printed), 1 when it does not,
-2 when the check could not run (invalid arguments, config not found, unreachable database).`;
+Exit code: 0 when the database matches the config (warnings may be printed, unless
+--fail-on-warnings), 1 when it does not (or has warnings, with --fail-on-warnings), 2 when the
+check could not run (invalid arguments, config not found, unreachable database).`;
 
 /** Where the command writes. */
 export type LilypadDoctorOutput = {
@@ -49,6 +51,8 @@ export type LilypadDoctorArgs =
       help: false;
       json: boolean;
       sql: boolean;
+      /** Whether a warning fails the check too (exit code 1). */
+      failOnWarnings: boolean;
       connectionString: string;
       /** The name or path of the config (`undefined`: the default one). */
       config?: string | undefined;
@@ -82,6 +86,7 @@ export function parseLilypadDoctorArgs(
       'env-file': { type: 'string', multiple: true },
       sql: { type: 'boolean' },
       json: { type: 'boolean' },
+      'fail-on-warnings': { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -131,6 +136,7 @@ export function parseLilypadDoctorArgs(
     help: false,
     json: values.json ?? false,
     sql: values.sql ?? false,
+    failOnWarnings: values['fail-on-warnings'] ?? false,
     connectionString,
     config: values.config,
   };
@@ -154,8 +160,9 @@ export type LilypadDoctorCliDependencies = {
  * Runs `lilypad-doctor` with these arguments: `init ...` creates a config file, anything else
  * checks the database.
  *
- * @returns The exit code: 0 without errors (there may be warnings), 1 with errors, 2 when the
- * check could not run (invalid arguments, config not found, unreachable database).
+ * @returns The exit code: 0 without errors (there may be warnings, unless `--fail-on-warnings`),
+ * 1 with errors (or warnings, with `--fail-on-warnings`), 2 when the check could not run (invalid
+ * arguments, config not found, unreachable database).
  */
 export async function runLilypadDoctorCli(
   argv: string[],
@@ -191,18 +198,19 @@ export async function runLilypadDoctorCli(
   }
   try {
     const report = await run({ connectionString: parsed.connectionString, config });
+    const passed = parsed.failOnWarnings ? report.problems.length === 0 : report.ok;
     if (parsed.json) {
       const { text: _text, assertOk: _assertOk, ...result } = report;
       output.log(JSON.stringify(result, null, 2));
     } else if (parsed.sql) {
       const sql = formatLilypadSchemaFixSql(report.problems);
       output.log(sql === '' ? '-- lilypad-doctor: nothing to fix.' : sql);
-    } else if (report.ok) {
+    } else if (passed) {
       output.log(report.text);
     } else {
       output.error(report.text);
     }
-    return report.ok ? 0 : 1;
+    return passed ? 0 : 1;
   } catch (error) {
     output.error(
       `lilypad-doctor: could not check the database: ${error instanceof Error ? error.message : String(error)}`
