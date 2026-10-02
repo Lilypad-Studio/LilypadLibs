@@ -75,7 +75,7 @@ export const getGate = () =>
 
 - **Use the pooled connection string** (with Neon, the host that contains `-pooler`). Every instance opens its own pool, and a pooler lets many of them share few database connections. The gate already disables prepared statements (`prepare: false`), which transaction-mode poolers require.
 - **`lilypadServerlessPool`** keeps few connections per instance (`max: 3`) and closes them after 5 idle seconds, so a suspended instance does not hold connections. Raise `max` if a single request runs many queries in parallel.
-- **Bound the queries in Postgres**, so that slow queries whose callers already gave up do not hold the few connections of the pool: run `ALTER ROLE app_user SET statement_timeout = '10s';` once, below the `maxDuration` of your functions (`lilypad-doctor`, run as `app_user`, warns when it is missing or above `maxStatementTimeout`). Do not pass `statementTimeout` to the gate with a pooled connection string: it is sent as a startup parameter, which PgBouncer (and most poolers in transaction mode) refuse, so every query would fail with `unsupported startup parameter: statement_timeout`. It has no default.
+- **Bound the queries in Postgres**, so that slow queries whose callers already gave up do not hold the few connections of the pool: run `ALTER ROLE app_user SET statement_timeout = '10s';` once, below the `maxDuration` of your functions (`lilypad-doctor` warns when it is missing or above `maxStatementTimeout`, for `appRole` of the config, or the role it connects as). Do not pass `statementTimeout` to the gate with a pooled connection string: it is sent as a startup parameter, which PgBouncer (and most poolers in transaction mode) refuse, so every query would fail with `unsupported startup parameter: statement_timeout`. It has no default.
 - **`config: appDb`**: the gate finds the tables by key (`table: 'users'`) and applies the hooks to them, even to a definition taken from the original config (`db.tables.users`). The config file itself imports only `@lilypad-studio/libs/schema` and types (`import type`): see [Functions applied to the rows](../README.md#functions-applied-to-the-rows-bindlilypaddbhooks).
 - `listenerConnectionString` (a direct, non-pooled connection) is only needed by the `listen` strategy, which is not recommended on Vercel (see section 5).
 
@@ -159,12 +159,19 @@ const users = defineLilypadTable<User, 'id'>({
   sync: { strategy: 'changelog', pollInterval: 5_000 },
 });
 
-export default defineLilypadDb({ changelog: { pruning: 'trigger' }, tables: { users } });
+export default defineLilypadDb({
+  changelog: { pruning: 'trigger' },
+  // The doctor runs with the unpooled URL, often as another role: check the application's
+  appRole: 'app_user',
+  tables: { users },
+});
 ```
 
 ```sh
 npx lilypad-doctor --url "$DATABASE_URL_UNPOOLED" --sql > migrations/0042_lilypad.sql
 ```
+
+**A role for the application.** Neon gives you an owner role (e.g. `neondb_owner`), which can do nearly anything in the database. Connect the application as a role of its own instead: with `appRole: 'app_user'` in the config and no such role yet, the SQL above also creates it, with only what the tables need (see [The role of the application](../README.md#the-role-of-the-application)). Then set its password (`ALTER ROLE app_user PASSWORD '...';` as the owner, outside of the migrations), and put it in the pooled `DATABASE_URL` of the application, keeping the owner in `DATABASE_URL_UNPOOLED` for the migrations and the doctor. If the application prunes the changelog itself (`pruneLilypadChangelog`, below), grant it `DELETE` on the changelog too.
 
 `lilypadChangelogSql()` and `lilypadChangelogTriggerSql({ table, primaryKey })` return the same SQL, if you prefer to write the migration yourself. It needs PostgreSQL 16 or later.
 

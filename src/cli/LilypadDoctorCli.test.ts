@@ -58,6 +58,15 @@ describe('parseLilypadDoctorArgs', () => {
     });
   });
 
+  it('should read the role of the application from --app-role', () => {
+    expect(parseLilypadDoctorArgs(['--url', url, '--app-role', 'app_user'], {})).toMatchObject({
+      appRole: 'app_user',
+    });
+    expect(() => parseLilypadDoctorArgs(['--url', url, '--app-role', ' '], {})).toThrow(
+      '--app-role needs the name of a role.'
+    );
+  });
+
   it('should take the connection string from DATABASE_URL, and the default config', () => {
     expect(parseLilypadDoctorArgs([], { DATABASE_URL: url })).toEqual({
       help: false,
@@ -156,6 +165,16 @@ describe('runLilypadDoctorCli', () => {
     ).resolves.toBe(0);
     expect(load).toHaveBeenCalledWith({ config: 'analytics' });
     expect(run).toHaveBeenCalledWith({ connectionString: url, config });
+  });
+
+  it('should pass --app-role to the check, over the appRole of the config', async () => {
+    const out = output();
+    const run = vi.fn(async () => report(true));
+
+    await expect(
+      runLilypadDoctorCli(['--url', url, '--app-role', 'app_user'], {}, out, { run, load })
+    ).resolves.toBe(0);
+    expect(run).toHaveBeenCalledWith({ connectionString: url, config, appRole: 'app_user' });
   });
 
   it('should read the connection string from the env file given by --env-file', async () => {

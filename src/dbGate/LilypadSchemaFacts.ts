@@ -4,6 +4,7 @@ import {
   lilypadSafeKeyTypeSql,
   pruneFunctionName,
   quoteIdentifier,
+  quoteLiteral,
   textArrayLiteral,
   triggerFunctionName,
 } from '@/dbGate/LilypadChangelog';
@@ -22,6 +23,10 @@ export type LilypadTriggerInfo = {
   type: number;
   /** Whether it fires in normal operation (not disabled, nor `ENABLE REPLICA` only). */
   enabled: boolean;
+  /** Its name (`tgname`). */
+  name?: string | undefined;
+  /** Whether it fires with `session_replication_role = replica` too (`ENABLE ALWAYS`). */
+  always?: boolean | undefined;
   source: string;
   /** The names of its transition tables (`REFERENCING OLD TABLE / NEW TABLE`), if any. */
   oldTable?: string | null | undefined;
@@ -106,23 +111,107 @@ type LilypadBlockedChangelogTable = {
   type: string | null;
 };
 
+/** The settings the check reads for the role of the application. */
+const LILYPAD_ROLE_SETTINGS = [
+  'statement_timeout',
+  'idle_session_timeout',
+  'session_replication_role',
+  'default_transaction_isolation',
+  'default_transaction_read_only',
+] as const;
+
+export type LilypadRoleSettingName = (typeof LILYPAD_ROLE_SETTINGS)[number];
+
+/** A setting of the session of the check (`pg_settings`). */
+export type LilypadSettingInfo = {
+  /** `setting`: in its unit for a duration (ms for the timeouts), e.g. `30000`. */
+  value: string;
+  /**
+   * Where it comes from (`source`): `default`, `configuration file`, `database`, `user`,
+   * `database user`, `client`...
+   */
+  source: string;
+};
+
+/** A row of `pg_db_role_setting` that applies to this database. */
+type LilypadRoleSettingRow = {
+  /** The role, or `null` for every role (`ALTER DATABASE ... SET`, `ALTER ROLE ALL SET`). */
+  role: string | null;
+  /** Whether it applies to this database only (else to every database). */
+  inDatabase: boolean;
+  /** Its `name=value` entries (`setconfig`), the values as they were written, e.g. `30s`. */
+  config: string[];
+};
+
+/** A changelog function (the trigger function, or its prune function). */
+export type LilypadFunctionInfo = {
+  /** The role that owns it, as which it runs (`SECURITY DEFINER`). */
+  owner: string;
+  securityDefiner: boolean;
+  /** Its settings (`proconfig`), e.g. `search_path=pg_catalog, pg_temp`. */
+  config: string[];
+  /** Whether `PUBLIC` may execute it. */
+  publicExecute: boolean;
+  /** The privileges it runs with that its owner lacks, e.g. `INSERT on the changelog`. */
+  ownerLacks: string[];
+};
+
+/** A role other than its owner granted a write of the changelog. */
+type LilypadChangelogWriter = {
+  /** Quoted, or `PUBLIC`. */
+  role: string;
+  /** Among `INSERT`, `UPDATE`, `DELETE` and `TRUNCATE`, on the table or some of its columns. */
+  privileges: string[];
+};
+
+/**
+ * What the role of the application may do with a table, from the columns of its description (every
+ * column of the table without one).
+ */
+export type LilypadTablePrivileges = {
+  /** `USAGE` on the schema of the table. */
+  schemaUsage: boolean;
+  /** The columns it may not `SELECT`. */
+  missingSelect: string[];
+  /** The columns it may not `INSERT` (not the generated primary key). */
+  missingInsert: string[];
+  /** The columns it may not `UPDATE` (not the primary key). */
+  missingUpdate: string[];
+  /** `DELETE` on the table. */
+  delete: boolean;
+  /** The sequences of its serial columns (see {@link LilypadTableFacts.sequences}) it may not use. */
+  missingSequences: string[];
+};
+
 /** What `checkLilypadSchema` reads from the catalogs, before it evaluates it. */
 export type LilypadSchemaFacts = {
   /** `server_version_num`, e.g. `160002`. */
   version: number;
   /** `current_database()`. */
   database: string;
-  /** The session of the check: the role it connects as, and the settings that bound its queries. */
+  /** The session of the check: the role it connects as, and its settings. */
   session: {
     /** `current_user`. */
     role: string;
-    /** `statement_timeout`, in ms (`0`: none); `null` if it cannot be read. */
-    statementTimeout: number | null;
-    /**
-     * Where it comes from (`pg_settings.source`): `default`, `configuration file`, `database`,
-     * `user`, `database user`, `client`...
-     */
-    statementTimeoutSource: string | null;
+    /** The settings of {@link LILYPAD_ROLE_SETTINGS} (absent: the role may not read it). */
+    settings: Partial<Record<LilypadRoleSettingName, LilypadSettingInfo>>;
+  };
+  /** The role of the application: `appRole`, else the role of the session. */
+  appRole: {
+    name: string;
+    exists: boolean;
+    superuser: boolean;
+    bypassRls: boolean;
+    /** `CREATEROLE`. */
+    createRole: boolean;
+  };
+  /** The settings of roles and databases that apply to this database (`pg_db_role_setting`). */
+  roleSettings: LilypadRoleSettingRow[];
+  server: {
+    /** `pg_is_in_recovery()`: a standby. */
+    inRecovery: boolean;
+    /** `pg_notification_queue_usage()`, from 0 to 1. */
+    notifyQueueUsage: number;
   };
   changelog: {
     hasTable: boolean;
@@ -135,11 +224,36 @@ export type LilypadSchemaFacts = {
     schema: string | null;
     /** Whether the function that the `prune` option of the trigger calls exists. */
     hasPruneFunction: boolean;
+    /** The role that owns the changelog table (`null` if it does not exist). */
+    owner: string | null;
     /**
-     * The roles other than its owner that may write the changelog (`INSERT`, `UPDATE`, `DELETE`
-     * or `TRUNCATE`), quoted and separated by commas, `PUBLIC` included: `null` if none.
+     * The roles other than its owner granted a write of the changelog (`INSERT`, `UPDATE`, `DELETE`
+     * or `TRUNCATE`), `PUBLIC` included.
      */
-    writers: string | null;
+    writers: LilypadChangelogWriter[];
+    /**
+     * The roles that may write the changelog through a membership (quoted): members of its owner,
+     * or of `pg_write_all_data`; not the superusers, nor the predefined `pg_*` roles.
+     */
+    memberWriters: string[];
+    /** Row-level security on the changelog (`relrowsecurity`, `relforcerowsecurity`). */
+    rowSecurity: boolean;
+    forceRowSecurity: boolean;
+    /** Whether `row_id` is `NOT NULL` (as before version 3): recording a `TRUNCATE` fails. */
+    rowIdNotNull: boolean;
+    /** Whether a valid, non-partial index starts with `(table_name, xid)`, or with `changed_at`. */
+    hasTableXidIndex: boolean;
+    hasChangedAtIndex: boolean;
+    /** The trigger function and the prune function (`null` if they do not exist). */
+    recordFunction: LilypadFunctionInfo | null;
+    pruneFunction: LilypadFunctionInfo | null;
+    /**
+     * What the role of the application may read of the changelog (`null` if the table or the role
+     * does not exist): whether it has the privileges of its owner (row-level security then does
+     * not apply to it, unless `FORCE`), `USAGE` on its schema, `SELECT` on the columns the caches
+     * read.
+     */
+    appPrivileges: { owner: boolean; schemaUsage: boolean; select: boolean } | null;
     /** How old the oldest row is, in ms (`null` if the table is empty, missing or unreadable). */
     oldestRowAge: number | null;
     /**
@@ -195,6 +309,26 @@ export type LilypadTableFacts = {
   keyUserType?: string | null | undefined;
   /** Whether the primary key column does not exist (renamed or dropped after the triggers). */
   keyColumnMissing?: boolean | undefined;
+  /** A partition (`relispartition`). */
+  isPartition?: boolean | undefined;
+  /** Whether it has partitions or inheritance children (`pg_inherits`). */
+  hasChildren?: boolean | undefined;
+  /** Whether row-level security applies to the role of the application (`null`: unknown). */
+  rowSecurity?: boolean | null | undefined;
+  /** Whether a subscription of logical replication writes it (`null`: unknown). */
+  subscribed?: boolean | null | undefined;
+  /** What the role of the application may do with it (`null`: the role does not exist). */
+  appPrivileges?: LilypadTablePrivileges | null | undefined;
+  /**
+   * Whether the role of the application has the privileges of its owner (`null`: the role does not
+   * exist).
+   */
+  ownedByAppRole?: boolean | null | undefined;
+  /**
+   * The sequences owned by its (described) columns, qualified and quoted: the serial columns, whose
+   * default an insert that leaves them out runs (an identity column needs no privilege).
+   */
+  sequences?: string[] | undefined;
   columns?: LilypadColumnInfo[] | undefined;
   constraints?: LilypadConstraintInfo[] | undefined;
   indexes?: LilypadIndexInfo[] | undefined;
@@ -263,6 +397,48 @@ export function readChangelogTarget(options: LilypadSchemaCheckOptions): Lilypad
   );
 }
 
+/**
+ * The tables of the options for an `unnest(...) AS requested(ref, schema_name, table_name)`: the
+ * quoted name, and the schema ('' when unqualified) and table of a qualified one.
+ */
+function requestedTables(options: LilypadSchemaCheckOptions): string {
+  const parts = options.tables.map(({ table }) => table.split('.'));
+  return `unnest(
+    ${quoteLiteral(textArrayLiteral(options.tables.map(({ table }) => quoteIdentifier(table))))}::text[],
+    ${quoteLiteral(textArrayLiteral(parts.map((part) => (part.length === 2 ? part[0]! : ''))))}::text[],
+    ${quoteLiteral(textArrayLiteral(parts.map((part) => part.at(-1)!)))}::text[]
+  )`;
+}
+
+/**
+ * The oid of a table of the options (`requested`, see {@link requestedTables}): a qualified one
+ * through the catalogs, which any role reads (`to_regclass` throws without `USAGE` on its schema,
+ * which the role of the application, the check's by default, may lack), an unqualified one through
+ * the `search_path` (`to_regclass`, which skips the schemas it may not use).
+ */
+const REQUESTED_TABLE_OID = `CASE WHEN requested.schema_name = '' THEN to_regclass(requested.ref) ELSE (
+  SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace ns ON ns.oid = c.relnamespace
+  WHERE ns.nspname = requested.schema_name AND c.relname = requested.table_name
+) END`;
+
+/**
+ * The sequences owned by the described columns of the table `t` (`seq.oid`, `seq.name`: qualified
+ * and quoted), for a `FROM`: those of the serial columns (`OWNED BY`, an automatic dependency; an
+ * identity column's is internal, and needs no privilege). Read from `pg_depend`:
+ * `pg_get_serial_sequence` throws without `USAGE` on the schema.
+ */
+const OWNED_SEQUENCES = `(
+  SELECT s.oid, s.relkind AS kind, format('%I.%I', sn.nspname, s.relname) AS name
+  FROM pg_catalog.pg_depend dep
+  JOIN pg_catalog.pg_class s ON s.oid = dep.objid AND s.relkind = 'S'
+  JOIN pg_catalog.pg_namespace sn ON sn.oid = s.relnamespace
+  JOIN pg_catalog.pg_attribute sa ON sa.attrelid = dep.refobjid AND sa.attnum = dep.refobjsubid
+  WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+    AND dep.refclassid = 'pg_catalog.pg_class'::regclass
+    AND dep.refobjid = t.oid AND dep.deptype = 'a'
+    AND (described.cols IS NULL OR sa.attname = ANY(described.cols))
+) AS seq`;
+
 async function readDatabaseFacts(
   gate: LilypadDbGate,
   options: LilypadSchemaCheckOptions
@@ -271,18 +447,83 @@ async function readDatabaseFacts(
   const changelog = readChangelogTarget(options);
   const quotedChangelog = quoteIdentifier(changelog.table);
   const pruneSignature = `${quoteIdentifier(pruneFunctionName(changelog.table))}()`;
-  const tableRefs = options.tables.map(({ table }) => quoteIdentifier(table));
 
-  // pg_settings leaves out the settings the role may not read, where current_setting() throws
+  const recordSignature = changelog.functionSignature;
+  const recordNeeds = sql`ARRAY[
+    CASE WHEN NOT has_table_privilege(p.proowner, cl.oid, 'INSERT') THEN 'INSERT on the changelog' END,
+    CASE WHEN NOT has_schema_privilege(p.proowner, cl.relnamespace, 'USAGE')
+      THEN 'USAGE on the schema of the changelog' END,
+    -- Nested CASE: pg_get_serial_sequence() throws for a missing column
+    CASE WHEN EXISTS (
+      SELECT 1 FROM pg_attribute WHERE attrelid = cl.oid AND attname = 'id' AND NOT attisdropped
+    ) THEN CASE WHEN NOT has_sequence_privilege(
+      p.proowner, pg_get_serial_sequence(cl.oid::regclass::text, 'id'), 'USAGE'
+    ) THEN 'USAGE on the sequence of its id column' END END,
+    CASE WHEN NOT has_function_privilege(p.proowner, to_regprocedure(${pruneSignature}::text), 'EXECUTE')
+      THEN 'EXECUTE on the prune function' END
+  ]`;
+  const pruneNeeds = sql`ARRAY[
+    CASE WHEN NOT has_table_privilege(p.proowner, cl.oid, 'SELECT') THEN 'SELECT on the changelog' END,
+    CASE WHEN NOT has_table_privilege(p.proowner, cl.oid, 'UPDATE') THEN 'UPDATE on the changelog' END,
+    CASE WHEN NOT has_table_privilege(p.proowner, cl.oid, 'DELETE') THEN 'DELETE on the changelog' END,
+    CASE WHEN NOT has_schema_privilege(p.proowner, cl.relnamespace, 'USAGE')
+      THEN 'USAGE on the schema of the changelog' END
+  ]`;
+
+  // A changelog function: its owner, its settings, whether PUBLIC may execute it (a NULL proacl
+  // is the default, which grants it), and the privileges it runs with that its owner lacks
+  const functionInfo = (signature: string, needs: typeof recordNeeds) => sql`
+    (
+      SELECT json_build_object(
+        'owner', r.rolname,
+        'securityDefiner', p.prosecdef,
+        'config', coalesce(p.proconfig, '{}'::text[]),
+        'publicExecute', EXISTS (
+          SELECT 1 FROM aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) AS acl
+          WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE'
+        ),
+        'ownerLacks', array_remove(${needs}, NULL)
+      )
+      FROM pg_proc p
+      JOIN pg_roles r ON r.oid = p.proowner
+      LEFT JOIN pg_class cl ON cl.oid = to_regclass(${quotedChangelog}::text)
+      WHERE p.oid = to_regprocedure(${signature}::text)
+    )`;
+  // pg_settings leaves out the settings the role may not read, where current_setting() throws. The
+  // role of the application is resolved to its oid: the has_*_privilege() of an oid that does not
+  // exist return NULL, those of a name throw
   const [database] = await sql`
+    WITH app AS (
+      SELECT r.oid, r.rolname, r.rolsuper, r.rolbypassrls, r.rolcreaterole
+      FROM (SELECT coalesce(${options.appRole ?? null}::text, current_user::text) AS name) AS wanted
+      LEFT JOIN pg_roles r ON r.rolname = wanted.name
+    )
     SELECT
       current_setting('server_version_num')::int AS version,
       current_database() AS database,
       current_user AS role,
-      -- In ms (its unit), as it applies to this session: the server, database and role settings, and
-      -- what the connection sets
-      (SELECT setting::float8 FROM pg_settings WHERE name = 'statement_timeout') AS statement_timeout,
-      (SELECT source FROM pg_settings WHERE name = 'statement_timeout') AS statement_timeout_source,
+      -- As they apply to this session: the server, database and role settings, and what the
+      -- connection sets (durations in ms, their unit)
+      (
+        SELECT json_object_agg(name, json_build_object('value', setting, 'source', source))
+        FROM pg_settings WHERE name = ANY(${textArrayLiteral([...LILYPAD_ROLE_SETTINGS])}::text[])
+      ) AS session_settings,
+      coalesce(${options.appRole ?? null}::text, current_user::text) AS app_role,
+      app.oid IS NOT NULL AS app_role_exists,
+      coalesce(app.rolsuper, false) AS app_role_superuser,
+      coalesce(app.rolbypassrls, false) AS app_role_bypass_rls,
+      coalesce(app.rolcreaterole, false) AS app_role_create_role,
+      (
+        SELECT coalesce(json_agg(json_build_object(
+          'role', r.rolname, 'inDatabase', s.setdatabase <> 0, 'config', s.setconfig
+        ) ORDER BY s.setdatabase DESC, r.rolname), '[]'::json)
+        FROM pg_db_role_setting s
+        LEFT JOIN pg_roles r ON r.oid = s.setrole
+        WHERE s.setdatabase = 0
+          OR s.setdatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+      ) AS role_settings,
+      pg_is_in_recovery() AS in_recovery,
+      pg_notification_queue_usage()::float8 AS notify_queue_usage,
       to_regclass(${quotedChangelog}::text) IS NOT NULL AS has_changelog_table,
       (
         SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -290,8 +531,16 @@ async function readDatabaseFacts(
       ) AS changelog_schema,
       to_regprocedure(${pruneSignature}::text) IS NOT NULL AS has_prune_function,
       (
-        SELECT string_agg(writer.name, ', ' ORDER BY writer.name) FROM (
-          SELECT DISTINCT CASE WHEN acl.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(r.rolname) END AS name
+        SELECT pg_get_userbyid(c.relowner) FROM pg_class c
+        WHERE c.oid = to_regclass(${quotedChangelog}::text)
+      ) AS changelog_owner,
+      (
+        SELECT coalesce(json_agg(json_build_object(
+          'role', writer.name, 'privileges', writer.privileges
+        ) ORDER BY writer.name), '[]'::json) FROM (
+          SELECT
+            CASE WHEN acl.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(r.rolname) END AS name,
+            array_agg(DISTINCT acl.privilege_type ORDER BY acl.privilege_type) AS privileges
           FROM pg_class c
           -- The grants of the table, and those of its columns (an INSERT of some columns is enough)
           CROSS JOIN LATERAL (
@@ -304,8 +553,72 @@ async function readDatabaseFacts(
           WHERE c.oid = to_regclass(${quotedChangelog}::text)
             AND acl.grantee <> c.relowner
             AND acl.privilege_type IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
+          GROUP BY 1
         ) AS writer
       ) AS changelog_writers,
+      -- The roles that write it through a membership: of its owner, or of pg_write_all_data, with
+      -- its privileges (USAGE) or SET ROLE (SET, from PostgreSQL 16; MEMBER before, which counts
+      -- every membership). Not the superusers (trusted), nor the predefined roles
+      (
+        SELECT coalesce(json_agg(quote_ident(r.rolname) ORDER BY r.rolname), '[]'::json)
+        FROM pg_class c, pg_roles r
+        WHERE c.oid = to_regclass(${quotedChangelog}::text)
+          AND r.oid <> c.relowner AND NOT r.rolsuper AND r.rolname !~ '^pg_'
+          AND (
+            pg_has_role(r.oid, c.relowner, 'USAGE')
+            OR pg_has_role(r.oid, 'pg_write_all_data', 'USAGE')
+            OR CASE WHEN current_setting('server_version_num')::int >= 160000
+              THEN pg_has_role(r.oid, c.relowner, 'SET')
+                OR pg_has_role(r.oid, 'pg_write_all_data', 'SET')
+              ELSE pg_has_role(r.oid, c.relowner, 'MEMBER')
+                OR pg_has_role(r.oid, 'pg_write_all_data', 'MEMBER')
+            END
+          )
+      ) AS changelog_member_writers,
+      coalesce((
+        SELECT c.relrowsecurity FROM pg_class c WHERE c.oid = to_regclass(${quotedChangelog}::text)
+      ), false) AS changelog_row_security,
+      coalesce((
+        SELECT c.relforcerowsecurity FROM pg_class c
+        WHERE c.oid = to_regclass(${quotedChangelog}::text)
+      ), false) AS changelog_force_row_security,
+      EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = to_regclass(${quotedChangelog}::text)
+          AND attname = 'row_id' AND attnotnull AND NOT attisdropped
+      ) AS changelog_row_id_not_null,
+      -- An index whose key starts with these columns (int2vector subscripts start at 0)
+      EXISTS (
+        SELECT 1 FROM pg_index ix
+        JOIN pg_attribute a0 ON a0.attrelid = ix.indrelid AND a0.attnum = ix.indkey[0]
+        JOIN pg_attribute a1 ON a1.attrelid = ix.indrelid AND a1.attnum = ix.indkey[1]
+        WHERE ix.indrelid = to_regclass(${quotedChangelog}::text)
+          AND ix.indisvalid AND ix.indpred IS NULL
+          AND a0.attname = 'table_name' AND a1.attname = 'xid'
+      ) AS changelog_table_xid_index,
+      EXISTS (
+        SELECT 1 FROM pg_index ix
+        JOIN pg_attribute a0 ON a0.attrelid = ix.indrelid AND a0.attnum = ix.indkey[0]
+        WHERE ix.indrelid = to_regclass(${quotedChangelog}::text)
+          AND ix.indisvalid AND ix.indpred IS NULL AND a0.attname = 'changed_at'
+      ) AS changelog_changed_at_index,
+      ${functionInfo(recordSignature, recordNeeds)} AS record_function,
+      ${functionInfo(pruneSignature, pruneNeeds)} AS prune_function,
+      -- What the caches read: USAGE on the schema, SELECT on the columns of the reader's query
+      (
+        SELECT json_build_object(
+          'owner', pg_has_role(app.oid, c.relowner, 'USAGE'),
+          'schemaUsage', has_schema_privilege(app.oid, c.relnamespace, 'USAGE'),
+          'select', NOT EXISTS (
+            SELECT 1 FROM pg_attribute a
+            WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+              AND a.attname IN ('id', 'xid', 'table_schema', 'table_name', 'row_id', 'op', 'changed_at')
+              AND NOT has_column_privilege(app.oid, c.oid, a.attnum, 'SELECT')
+          )
+        )
+        FROM pg_class c
+        WHERE c.oid = to_regclass(${quotedChangelog}::text) AND app.oid IS NOT NULL
+      ) AS changelog_app_privileges,
       coalesce((
         SELECT n_tup_del FROM pg_stat_user_tables WHERE relid = to_regclass(${quotedChangelog}::text)
       ), 0)::float8 AS deleted_rows,
@@ -358,12 +671,14 @@ async function readDatabaseFacts(
             AND (tr.tgtype & 1) = 0
             AND (tr.tgtype & 28) <> 0
             AND NOT EXISTS (
-              SELECT 1 FROM unnest(${textArrayLiteral(tableRefs)}::text[]) AS requested(ref)
-              WHERE to_regclass(requested.ref) = tr.tgrelid
+              SELECT 1 FROM ${sql.unsafe(requestedTables(options))}
+                AS requested(ref, schema_name, table_name)
+              WHERE ${sql.unsafe(REQUESTED_TABLE_OID)} = tr.tgrelid
             )
             AND (a.attnum IS NULL OR NOT (${sql.unsafe(lilypadSafeKeyTypeSql('a.atttypid'))}))
         ) AS blocked
       ) AS blocked_changelog_tables
+    FROM app
   `;
   if (!database) {
     throw new Error('Reading the database settings returned no row.');
@@ -393,8 +708,19 @@ async function readDatabaseFacts(
     database: database.database as string,
     session: {
       role: database.role as string,
-      statementTimeout: database.statement_timeout as number | null,
-      statementTimeoutSource: database.statement_timeout_source as string | null,
+      settings: parseJsonColumn(database.session_settings) ?? {},
+    },
+    appRole: {
+      name: database.app_role as string,
+      exists: database.app_role_exists as boolean,
+      superuser: database.app_role_superuser as boolean,
+      bypassRls: database.app_role_bypass_rls as boolean,
+      createRole: database.app_role_create_role as boolean,
+    },
+    roleSettings: parseJsonColumn(database.role_settings) as LilypadRoleSettingRow[],
+    server: {
+      inRecovery: database.in_recovery as boolean,
+      notifyQueueUsage: database.notify_queue_usage as number,
     },
     changelog: {
       hasTable: database.has_changelog_table as boolean,
@@ -404,7 +730,23 @@ async function readDatabaseFacts(
       functionSource: database.function_source as string | null,
       schema: database.changelog_schema as string | null,
       hasPruneFunction: database.has_prune_function as boolean,
-      writers: database.changelog_writers as string | null,
+      owner: database.changelog_owner as string | null,
+      writers: parseJsonColumn(database.changelog_writers) as LilypadChangelogWriter[],
+      memberWriters: parseJsonColumn(database.changelog_member_writers) as string[],
+      rowSecurity: database.changelog_row_security as boolean,
+      forceRowSecurity: database.changelog_force_row_security as boolean,
+      rowIdNotNull: database.changelog_row_id_not_null as boolean,
+      hasTableXidIndex: database.changelog_table_xid_index as boolean,
+      hasChangedAtIndex: database.changelog_changed_at_index as boolean,
+      recordFunction: (parseJsonColumn(database.record_function) ??
+        null) as LilypadFunctionInfo | null,
+      pruneFunction: (parseJsonColumn(database.prune_function) ??
+        null) as LilypadFunctionInfo | null,
+      appPrivileges: (parseJsonColumn(database.changelog_app_privileges) ?? null) as {
+        owner: boolean;
+        schemaUsage: boolean;
+        select: boolean;
+      } | null,
       oldestRowAge,
       deletedRows: database.deleted_rows as number,
       blockedTables: parseJsonColumn(
@@ -432,6 +774,14 @@ async function readTableFacts(
   const changelog = readChangelogTarget(options);
   const tableRefs = options.tables.map(({ table }) => quoteIdentifier(table));
   const primaryKeys = options.tables.map(({ primaryKey }) => primaryKey);
+  // For the privileges: the columns of each table's description (null: every column of the
+  // table), and whether its primary key is generated
+  const described = JSON.stringify(
+    options.tables.map(({ shape }) => ({
+      cols: shape ? Object.keys(shape.cols) : null,
+      generated: shape?.generatedPrimaryKey === true,
+    }))
+  );
   const withShape = options.tables.some((table) => table.shape !== undefined);
   const shapeColumns = withShape
     ? sql`,
@@ -523,6 +873,8 @@ async function readTableFacts(
           'type', tr.tgtype,
           -- 'R' (ENABLE REPLICA) triggers fire only with session_replication_role = replica
           'enabled', tr.tgenabled IN ('O', 'A'),
+          'name', tr.tgname,
+          'always', tr.tgenabled = 'A',
           'source', p.prosrc,
           'oldTable', tr.tgoldtable,
           'newTable', tr.tgnewtable
@@ -534,7 +886,7 @@ async function readTableFacts(
       -- type, so it is clipped to 63 bytes as the trigger's %I is.
       NOT EXISTS (
         SELECT 1 FROM pg_catalog.pg_attribute a
-        WHERE a.attrelid = t.oid AND a.attname = requested.primary_key::pg_catalog.name
+        WHERE a.attrelid = t.oid AND a.attname = keys.primary_key::pg_catalog.name
           AND a.attnum > 0 AND NOT a.attisdropped
       ) AS key_column_missing,
       -- The type of the primary key column when it is not safe to record, i.e. when converting it
@@ -546,15 +898,85 @@ async function readTableFacts(
         SELECT CASE WHEN NOT (${sql.unsafe(lilypadSafeKeyTypeSql('a.atttypid'))})
           THEN pg_catalog.format_type(a.atttypid, a.atttypmod) END
         FROM pg_catalog.pg_attribute a
-        WHERE a.attrelid = t.oid AND a.attname = requested.primary_key::pg_catalog.name
+        WHERE a.attrelid = t.oid AND a.attname = keys.primary_key::pg_catalog.name
           AND a.attnum > 0 AND NOT a.attisdropped
-      ) AS key_user_type
+      ) AS key_user_type,
+      t.relispartition AS is_partition,
+      EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhparent = t.oid) AS has_children,
+      -- Row-level security applies to the role of the application: not a superuser nor BYPASSRLS,
+      -- and not the owner (nor a role with its privileges), unless FORCE (NULL when the role does
+      -- not exist)
+      CASE WHEN app.oid IS NOT NULL THEN
+        t.relrowsecurity AND NOT app.rolsuper AND NOT app.rolbypassrls
+          AND (t.relforcerowsecurity OR NOT pg_has_role(app.oid, t.relowner, 'USAGE'))
+      END AS row_security,
+      CASE WHEN app.oid IS NOT NULL THEN pg_has_role(app.oid, t.relowner, 'USAGE') END
+        AS owned_by_app_role,
+      (
+        SELECT coalesce(json_agg(seq.name ORDER BY seq.name), '[]'::json) FROM ${sql.unsafe(OWNED_SEQUENCES)}
+      ) AS sequences,
+      CASE WHEN app.oid IS NOT NULL THEN (
+        SELECT json_build_object(
+          'schemaUsage', has_schema_privilege(app.oid, t.relnamespace, 'USAGE'),
+          'missingSelect', coalesce(json_agg(a.attname ORDER BY a.attnum)
+            FILTER (WHERE NOT has_column_privilege(app.oid, t.oid, a.attnum, 'SELECT')), '[]'::json),
+          'missingInsert', coalesce(json_agg(a.attname ORDER BY a.attnum) FILTER (
+            WHERE NOT (described.generated AND a.attname = keys.primary_key)
+              AND NOT has_column_privilege(app.oid, t.oid, a.attnum, 'INSERT')
+          ), '[]'::json),
+          'missingUpdate', coalesce(json_agg(a.attname ORDER BY a.attnum) FILTER (
+            WHERE a.attname <> keys.primary_key
+              AND NOT has_column_privilege(app.oid, t.oid, a.attnum, 'UPDATE')
+          ), '[]'::json),
+          'delete', has_table_privilege(app.oid, t.oid, 'DELETE'),
+          'missingSequences', (
+            SELECT coalesce(json_agg(seq.name ORDER BY seq.name), '[]'::json)
+            FROM ${sql.unsafe(OWNED_SEQUENCES)}
+            -- CASE: the planner may test the privilege before the join keeps only sequences
+            -- (a partition depends on its parent the same way), and it throws for another relation
+            WHERE CASE WHEN seq.kind = 'S'
+              THEN NOT has_sequence_privilege(app.oid, seq.oid, 'USAGE') ELSE false END
+          )
+        )
+        FROM pg_attribute a
+        WHERE a.attrelid = t.oid AND a.attnum > 0 AND NOT a.attisdropped
+          AND (described.cols IS NULL OR a.attname = ANY(described.cols))
+      ) END AS app_privileges
       ${shapeColumns}
-    FROM unnest(${textArrayLiteral(tableRefs)}::text[], ${textArrayLiteral(primaryKeys)}::text[])
-      WITH ORDINALITY AS requested(ref, primary_key, position)
-    JOIN pg_class t ON t.oid = to_regclass(requested.ref)
+    FROM ${sql.unsafe(requestedTables(options))}
+      WITH ORDINALITY AS requested(ref, schema_name, table_name, position)
+    JOIN unnest(${textArrayLiteral(primaryKeys)}::text[]) WITH ORDINALITY AS keys(primary_key, position)
+      ON keys.position = requested.position
+    JOIN pg_class t ON t.oid = ${sql.unsafe(REQUESTED_TABLE_OID)}
     JOIN pg_namespace n ON n.oid = t.relnamespace
+    CROSS JOIN LATERAL (
+      SELECT
+        CASE WHEN json_typeof(d -> 'cols') = 'array' THEN ARRAY(
+          SELECT json_array_elements_text(d -> 'cols')
+        )::pg_catalog.name[] END AS cols,
+        (d ->> 'generated')::boolean AS generated
+      -- Sent as text: a parameter of type json would be serialized again by postgres.js
+      FROM (SELECT ${described}::text::json -> (requested.position::int - 1) AS d) AS item
+    ) AS described
+    CROSS JOIN (
+      SELECT r.oid, r.rolsuper, r.rolbypassrls
+      FROM (SELECT coalesce(${options.appRole ?? null}::text, current_user::text) AS name) AS wanted
+      LEFT JOIN pg_roles r ON r.rolname = wanted.name
+    ) AS app
   `;
+  // The tables a subscription of logical replication writes: best effort (pg_subscription_rel)
+  const subscribed: Set<number> | null =
+    found.length === 0
+      ? new Set()
+      : await sql`
+          SELECT requested.position
+          FROM ${sql.unsafe(requestedTables(options))}
+            WITH ORDINALITY AS requested(ref, schema_name, table_name, position)
+          JOIN pg_subscription_rel s ON s.srrelid = ${sql.unsafe(REQUESTED_TABLE_OID)}
+        `.then(
+          (rows) => new Set(rows.map((row) => Number(row.position))),
+          () => null
+        );
   const byPosition = new Map(found.map((row) => [Number(row.position), row]));
   // The schemas of the missing `schema.table`, and which of them exist
   const schemaOf = (table: string) => {
@@ -600,6 +1022,13 @@ async function readTableFacts(
       })),
       keyUserType: (row.key_user_type as string | null | undefined) ?? null,
       keyColumnMissing: (row.key_column_missing as boolean | undefined) ?? false,
+      isPartition: row.is_partition as boolean,
+      hasChildren: row.has_children as boolean,
+      rowSecurity: row.row_security as boolean | null,
+      subscribed: subscribed === null ? null : subscribed.has(index + 1),
+      appPrivileges: (parseJsonColumn(row.app_privileges) ?? null) as LilypadTablePrivileges | null,
+      ownedByAppRole: row.owned_by_app_role as boolean | null,
+      sequences: parseJsonColumn(row.sequences) as string[],
     };
     if (table.shape !== undefined) {
       facts.columns = parseJsonColumn(row.columns) as LilypadColumnInfo[];

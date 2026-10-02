@@ -1,6 +1,4 @@
-import { LILYPAD_DEFAULT_MAX_STATEMENT_TIMEOUT } from '@/dbConfig/LilypadDbConfigDefaults';
 import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
-import { assertNumberOption } from '@/internal/LilypadValidation';
 import {
   LILYPAD_CHANGELOG_NEW_ROWS,
   LILYPAD_CHANGELOG_OLD_ROWS,
@@ -8,6 +6,7 @@ import {
   LILYPAD_CHANGELOG_VERSION_PREFIX,
   installedLilypadChangelogPrune,
   lilypadChangelogSql,
+  pruneFunctionName,
   lilypadChangelogTriggerSql,
   quoteIdentifier,
   type LilypadChangelogPruneOptions,
@@ -15,11 +14,22 @@ import {
 import {
   changelogTarget,
   readChangelogTarget,
+  type LilypadChangelogTarget,
   readLilypadSchemaFacts,
   type LilypadSchemaFacts,
   type LilypadTriggerInfo,
 } from '@/dbGate/LilypadSchemaFacts';
-import { evaluatePruning, formatDuration } from '@/dbGate/LilypadSchemaPruning';
+import { evaluatePruning } from '@/dbGate/LilypadSchemaPruning';
+import {
+  evaluateAppRoleExists,
+  evaluateChangelogAccess,
+  evaluatePrivilegedAppRole,
+  evaluateRoleSettings,
+  evaluateStatementTimeout,
+  evaluateTableAccess,
+  lilypadNewTableGrants,
+  quoteRole,
+} from '@/dbGate/LilypadSchemaRoles';
 import {
   evaluateLilypadTableShape,
   lilypadCreateTableSql,
@@ -101,6 +111,181 @@ export function formatLilypadSchemaFixSql(problems: LilypadSchemaProblem[]): str
     }
   }
   return parts.join('\n');
+}
+
+/** The `search_path` the changelog functions are created with. */
+const FUNCTION_SEARCH_PATH = 'pg_catalog,pg_temp';
+
+/**
+ * The problems of the changelog functions (`changelog-function-owner`,
+ * `unsafe-changelog-function`), of the row-level security of the changelog, and, when the caches
+ * read it (`read`), of its shape (`changelog-shape`). Their fixes touch the changelog.
+ *
+ * @param current - Whether this version of the library installed the changelog: the functions and
+ * the shape of another version are not what this one installs (`outdated-changelog` reports an
+ * older one, whose fix installs them again; `newer-changelog` a newer one).
+ */
+function changelogObjectProblems(
+  facts: LilypadSchemaFacts,
+  target: LilypadChangelogTarget,
+  read: boolean,
+  current: boolean,
+  changelogSql: string
+): LilypadSchemaProblem[] {
+  const problems: LilypadSchemaProblem[] = [];
+  const { changelog } = facts;
+  const functions: [LilypadSchemaFacts['changelog']['recordFunction'], string, string][] = [
+    [changelog.recordFunction, target.functionSignature, 'trigger function'],
+    [
+      changelog.pruneFunction,
+      `${quoteIdentifier(pruneFunctionName(target.table))}()`,
+      'prune function',
+    ],
+  ];
+  for (const [info, signature, kind] of functions) {
+    if (!info || !current) {
+      continue;
+    }
+    const subject = `The changelog ${kind} ${signature}`;
+    // A function that does not run as its owner is reported below
+    if (info.securityDefiner && info.ownerLacks.length > 0) {
+      const giveTo =
+        changelog.owner !== null && changelog.owner !== info.owner ? changelog.owner : undefined;
+      problems.push({
+        code: 'changelog-function-owner',
+        severity: 'error',
+        message:
+          `${subject} runs as its owner "${info.owner}" (SECURITY DEFINER), which lacks ${info.ownerLacks.join(', ')}: ${kind === 'trigger function' ? 'every write of the tables it records fails' : 'the writes that prune the changelog (about one in every) fail'}.` +
+          (giveTo === undefined
+            ? ` Grant them to "${info.owner}".`
+            : ` Give it to the owner of the changelog, "${giveTo}".`),
+        ...(giveTo !== undefined && {
+          fix: `ALTER FUNCTION ${signature} OWNER TO ${quoteRole(giveTo)};\n`,
+        }),
+      });
+    }
+    const searchPath = info.config
+      .find((item) => item.startsWith('search_path='))
+      ?.slice('search_path='.length)
+      .replace(/[\s"]/g, '')
+      .toLowerCase();
+    const unsafe = [
+      ...(info.securityDefiner ? [] : ['is not SECURITY DEFINER']),
+      ...(searchPath === FUNCTION_SEARCH_PATH
+        ? []
+        : [
+            searchPath === undefined
+              ? 'has no search_path setting'
+              : `has the search_path ${searchPath}, not pg_catalog, pg_temp`,
+          ]),
+    ];
+    if (unsafe.length > 0) {
+      problems.push({
+        code: 'unsafe-changelog-function',
+        severity: 'error',
+        message: `${subject} ${unsafe.join(' and ')} (changed by hand?): it must run as its owner, with only pg_catalog then pg_temp on its search_path, or the writes of the cached tables fail, or a role may run its own code as the owner. Install the changelog SQL again.`,
+        fix: changelogSql,
+      });
+    }
+    if (info.publicExecute) {
+      problems.push({
+        code: 'unsafe-changelog-function',
+        severity: 'warning',
+        message: `PUBLIC may execute ${subject.charAt(0).toLowerCase()}${subject.slice(1)}: only the triggers (and the roles of your migrations, granted it by name) need it.`,
+        fix: `REVOKE EXECUTE ON FUNCTION ${signature} FROM PUBLIC;\n`,
+      });
+    }
+  }
+
+  // Without FORCE, it applies to the caches that read the changelog, not to the triggers, which
+  // write it as its owner
+  if (changelog.hasTable && changelog.rowSecurity) {
+    const app = facts.appRole;
+    const exempt =
+      app.exists && (app.superuser || app.bypassRls || changelog.appPrivileges?.owner === true);
+    if (changelog.forceRowSecurity || (read && !exempt)) {
+      problems.push({
+        code: 'row-level-security',
+        severity: 'error',
+        table: target.table,
+        message: `The changelog "${target.table}" has row-level security${changelog.forceRowSecurity ? ' (FORCE, which applies to its owner too: the triggers may fail to record changes)' : ''}: the caches would miss the changes its policies hide from the role "${app.name}".`,
+        fix: `ALTER TABLE ${quoteIdentifier(target.table)} NO FORCE ROW LEVEL SECURITY;\nALTER TABLE ${quoteIdentifier(target.table)} DISABLE ROW LEVEL SECURITY;\n`,
+      });
+    }
+  }
+
+  if (read && current && changelog.hasTable) {
+    if (changelog.rowIdNotNull) {
+      problems.push({
+        code: 'changelog-shape',
+        severity: 'error',
+        table: target.table,
+        message: `The column row_id of the changelog "${target.table}" is NOT NULL: recording a TRUNCATE fails, so every TRUNCATE of a cached table fails.`,
+        fix: changelogSql,
+      });
+    }
+    const missingIndexes = [
+      ...(changelog.hasTableXidIndex ? [] : ['(table_name, xid), for the reads of the caches']),
+      ...(changelog.hasChangedAtIndex
+        ? []
+        : ['(changed_at), for the lookback reads and the pruning']),
+    ];
+    if (missingIndexes.length > 0) {
+      problems.push({
+        code: 'changelog-shape',
+        severity: 'warning',
+        table: target.table,
+        message: `The changelog "${target.table}" has no index on ${missingIndexes.join(', nor on ')}: they scan the whole changelog.`,
+        fix: changelogSql,
+      });
+    }
+  }
+  return problems;
+}
+
+/**
+ * `writable-changelog`: roles other than its owner may write the changelog, by a grant or through a
+ * membership. With `external` pruning, a `DELETE` is expected: `pruneLilypadChangelog` deletes the
+ * old rows as the role that calls it.
+ */
+function writableChangelogProblem(
+  facts: LilypadSchemaFacts,
+  table: string,
+  externalPruning: boolean
+): LilypadSchemaProblem | undefined {
+  const revoked = ['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE'].filter(
+    (privilege) => !(externalPruning && privilege === 'DELETE')
+  );
+  const writers = facts.changelog.writers.flatMap(({ role, privileges }) => {
+    const kept = privileges.filter((privilege) => revoked.includes(privilege));
+    return kept.length === 0 ? [] : [{ role, privileges: kept }];
+  });
+  const members = facts.changelog.memberWriters;
+  if (writers.length === 0 && members.length === 0) {
+    return undefined;
+  }
+  const granted =
+    writers.length === 0
+      ? ''
+      : ` Roles other than its owner may write the changelog "${table}" (${writers
+          .map(({ role, privileges }) => `${role}: ${privileges.join(', ')}`)
+          .join('; ')}).`;
+  const member =
+    members.length === 0
+      ? ''
+      : ` Roles may write the changelog "${table}" as members of its owner or of pg_write_all_data (${members.join(', ')}): revoke these memberships, unless the roles are as trusted as its owner.`;
+  const external = externalPruning
+    ? ' (A DELETE is not reported: the external pruning needs it.)'
+    : '';
+  return {
+    code: 'writable-changelog',
+    severity: 'warning',
+    message: `${(granted + member).trim()} They can record changes that every cache trusts, such as a row deleted. The triggers of version ${LILYPAD_CHANGELOG_VERSION} write it as its owner, so the writing roles need no privilege on it.${external}`,
+    // After the changelog SQL, when a fix installs it: the triggers of older versions need it
+    ...(writers.length > 0 && {
+      fix: `REVOKE ${revoked.join(', ')} ON ${quoteIdentifier(table)} FROM ${writers.map(({ role }) => role).join(', ')};\n`,
+    }),
+  };
 }
 
 /** The changelog version whose trigger function runs as its owner (`SECURITY DEFINER`). */
@@ -232,6 +417,7 @@ export function evaluateLilypadSchema(
       message: `PostgreSQL ${facts.version} is too old: the library needs PostgreSQL 16 or later.`,
     });
   }
+  problems.push(...evaluateAppRoleExists(facts, options, changelog?.table));
   if (newerInstall) {
     problems.push({
       code: 'newer-changelog',
@@ -328,16 +514,29 @@ export function evaluateLilypadSchema(
       );
       changelogFixed = true;
     }
-    if (hasTable && facts.changelog.writers !== null) {
-      problems.push(
-        touchesChangelog({
-          code: 'writable-changelog',
-          severity: 'warning',
-          message: `Roles other than its owner may write the changelog "${changelog.table}" (${facts.changelog.writers}): they can record changes that every cache trusts, such as a row deleted. The triggers of version ${LILYPAD_CHANGELOG_VERSION} write it as its owner, so the writing roles need no privilege on it.`,
-          // After the changelog SQL, when a fix installs it: the triggers of older versions need it
-          fix: `REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ${quoteIdentifier(changelog.table)} FROM ${facts.changelog.writers};\n`,
-        })
+    if (hasTable) {
+      const writable = writableChangelogProblem(
+        facts,
+        changelog.table,
+        options.changelog !== false && options.changelog?.pruning === 'external'
       );
+      if (writable) {
+        problems.push(touchesChangelog(writable));
+      }
+    }
+  }
+
+  // The changelog functions and table, when a table needs them: their owner, their security and,
+  // when the caches read it, the shape of the changelog
+  if (changelog !== undefined || tableChannels.length > 0) {
+    for (const problem of changelogObjectProblems(
+      facts,
+      fixChangelog,
+      changelog !== undefined,
+      installedVersion === LILYPAD_CHANGELOG_VERSION,
+      changelogSql
+    )) {
+      problems.push(touchesChangelog(problem));
     }
   }
 
@@ -367,11 +566,21 @@ export function evaluateLilypadSchema(
         needsChangelog || notifyFixable
           ? (notifyFixable && !changelogFixed ? changelogSql : '') + triggerSql
           : '';
+      // With the grants of the role of the application, which may be created by the same fixes
       const createFix =
         createTable &&
         (missingSchema !== undefined
           ? `CREATE SCHEMA IF NOT EXISTS ${quoteIdentifier(missingSchema)};\n`
-          : '') + createTable;
+          : '') +
+          createTable +
+          lilypadNewTableGrants(
+            facts,
+            options,
+            table,
+            primaryKey,
+            shape,
+            table.includes('.') ? table.split('.')[0] : undefined
+          );
       const missingTable: LilypadSchemaProblem = {
         code: 'missing-table',
         severity: 'error',
@@ -391,6 +600,7 @@ export function evaluateLilypadSchema(
     }
     tables.push({ table, schema: found.schema });
     const triggers = found.triggers;
+    problems.push(...evaluateTableAccess(facts, table, found, shape !== undefined, shape?.access));
 
     if (shape && found.columns) {
       const shapeProblems = evaluateLilypadTableShape(table, primaryKey, shape, found);
@@ -490,6 +700,58 @@ export function evaluateLilypadSchema(
       });
     }
 
+    // The statement triggers of a partition fire only for the statements that name it
+    if (found.isPartition === true && recordsKey) {
+      problems.push({
+        code: 'partition-table',
+        severity: 'warning',
+        table,
+        message: `"${table}" is a partition: its changelog triggers fire only for the statements that name it, not for the writes made through its partitioned table, so the caches miss these. Cache the partitioned table instead, or always write to the partition itself.`,
+      });
+    }
+    if (found.hasChildren === true && (needsChangelog || tableChannel !== false)) {
+      problems.push({
+        code: 'child-tables',
+        severity: 'warning',
+        table,
+        message: `"${table}" has partitions or inheritance children: its triggers do not fire for the writes made directly to them, so the caches miss these changes. Write through "${table}" itself.`,
+      });
+    }
+    if (found.subscribed === true && (needsChangelog || tableChannel !== false)) {
+      // The triggers the caches rely on: those of the changelog, and those that notify
+      const relied = triggers.filter(
+        (trigger) =>
+          trigger.enabled &&
+          (trigger.changelog === true ||
+            (tableChannel !== false &&
+              new RegExp(`${NOTIFY_CALL}'${escapeRegExp(tableChannel.replace(/'/g, "''"))}'`).test(
+                trigger.source
+              )))
+      );
+      const notAlways = relied.filter((trigger) => trigger.always !== true);
+      if (relied.length === 0 || notAlways.length > 0) {
+        const fix = notAlways
+          .flatMap(({ name }) =>
+            name === undefined
+              ? []
+              : [
+                  `ALTER TABLE ${quoteIdentifier(table)} ENABLE ALWAYS TRIGGER ${quoteRole(name)};\n`,
+                ]
+          )
+          .join('');
+        // Enabled ALWAYS, the triggers would also refuse a blocked key on every replicated write
+        problems.push(
+          touchesChangelog({
+            code: 'replicated-table',
+            severity: 'warning',
+            table,
+            message: `A subscription of logical replication writes "${table}": it applies the changes with session_replication_role = replica, so the triggers fire only if enabled ALWAYS, and the caches miss these changes.`,
+            ...(fix !== '' && { fix }),
+          })
+        );
+      }
+    }
+
     if (needsChangelog) {
       const fix = triggerSql;
       // The events may be split across several triggers (one statement trigger per event)
@@ -561,7 +823,26 @@ export function evaluateLilypadSchema(
     });
   }
 
-  problems.push(...deferred, ...pruning.problems, ...evaluateStatementTimeout(facts, options));
+  const needs = {
+    triggers: options.tables.some(
+      (requirement) =>
+        (changelog !== undefined && requirement.changelog !== false) ||
+        (requirement.notifyChannel ?? notifyChannel) !== false
+    ),
+    listens: tableChannels.length > 0,
+    notifies: tableChannels.length > 0 || installedChannel !== false,
+    triggerPruning: changelog !== undefined && pruning.prune !== false,
+  };
+  problems.push(
+    ...deferred,
+    ...(changelog !== undefined && facts.changelog.hasTable
+      ? evaluateChangelogAccess(facts, changelog.table)
+      : []),
+    ...pruning.problems,
+    ...evaluateRoleSettings(facts, needs),
+    ...evaluatePrivilegedAppRole(facts, options),
+    ...evaluateStatementTimeout(facts, options)
+  );
   // Every fix of the changelog, its triggers and its privileges is withheld while a table blocks
   // them (any of them could make the triggers refuse its key, and fail its writes), or while a newer
   // version installed the changelog (they would install the older SQL of this one)
@@ -596,54 +877,6 @@ export function evaluateLilypadSchema(
     problems: withheld,
     tables,
   };
-}
-
-/** Where a setting comes from, for a message (`pg_settings.source`). */
-const SETTING_SOURCES: Record<string, string> = {
-  default: 'the default of PostgreSQL',
-  'configuration file': 'the configuration of the server',
-  database: 'the database',
-  user: 'the role',
-  'database user': 'the role in this database',
-  client: 'the connection',
-};
-
-/**
- * `long-statement-timeout`: the `statement_timeout` of the session of the check is off, or longer
- * than `maxStatementTimeout`. No fix: the role of the check may not be the role of the application
- * (e.g. a migration role, whose long statements a timeout would cancel).
- */
-function evaluateStatementTimeout(
-  facts: LilypadSchemaFacts,
-  options: LilypadSchemaCheckOptions
-): LilypadSchemaProblem[] {
-  const max = options.maxStatementTimeout ?? LILYPAD_DEFAULT_MAX_STATEMENT_TIMEOUT;
-  if (max === false) {
-    return [];
-  }
-  assertNumberOption('checkLilypadSchema', 'maxStatementTimeout', max, 'positive-delay');
-  const { role, statementTimeout, statementTimeoutSource: source } = facts.session;
-  if (statementTimeout === null || (statementTimeout > 0 && statementTimeout <= max)) {
-    return [];
-  }
-  const from = source === null ? '' : `, from ${SETTING_SOURCES[source] ?? `the ${source}`}`;
-  const found =
-    statementTimeout === 0
-      ? `has no statement_timeout (0${from})`
-      : `has a statement_timeout of ${formatDuration(statementTimeout)} (${statementTimeout} ms${from}), longer than ${formatDuration(max)} (maxStatementTimeout)`;
-  // Within maxStatementTimeout, or the suggested setting would be reported too
-  const suggested = Math.min(30_000, max);
-  const setting = suggested % 1000 === 0 ? `${suggested / 1000}s` : `${suggested}ms`;
-  return [
-    {
-      code: 'long-statement-timeout',
-      severity: 'warning',
-      message:
-        `The role "${role}" that the check connects as ${found}: a query stuck on a lock or a dead connection holds its connection of the pool, and its caller, for as long as it lasts (the gate sets no timeout by default, and the caches stop waiting, not their queries).` +
-        ` If the application connects as this role, bound its queries: ALTER ROLE ${quoteIdentifier(role)} SET statement_timeout = '${setting}'; (behind a pooler, the role the pooler connects as).` +
-        ' If it connects as another role (check that one), or bounds its queries with the statementTimeout of its gate, set maxStatementTimeout: false in the config (or in the options of checkLilypadSchema).',
-    },
-  ];
 }
 
 /**

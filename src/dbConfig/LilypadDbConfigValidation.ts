@@ -45,6 +45,7 @@ const CONFIG_OPTIONS = optionsOf<ConfigInput>({
   changelog: true,
   strict: true,
   maxStatementTimeout: true,
+  appRole: true,
   tables: true,
 });
 const CHANGELOG_OPTIONS = optionsOf<NonNullable<ConfigInput['changelog']>>({
@@ -64,7 +65,9 @@ const TABLE_OPTIONS = optionsOf<LilypadDbTableInputBase>({
   checks: true,
   sync: true,
   strict: true,
+  access: true,
 });
+const TABLE_ACCESS = new Set<string>(['read', 'write']);
 const COLUMN_OPTIONS = optionsOf<LilypadDbColumn>({
   type: true,
   pgType: true,
@@ -395,6 +398,7 @@ function assertTable(key: string, table: unknown, defaultSchema: string): string
   }
   assertBoolean(input.generatedPrimaryKey, `${what}.generatedPrimaryKey`);
   assertBoolean(input.strict, `${what}.strict`);
+  assertOneOf(input.access, TABLE_ACCESS, `${what}.access`);
   assertEntries(input.unique, UNIQUE_OPTIONS, `${what}.unique`).forEach((uniqueKey, index) => {
     assertOptionalIdentifier(uniqueKey.name, `${what}.unique[${index}].name`);
     assertColumns(uniqueKey.columns, cols, `${what}.unique[${index}].columns`);
@@ -473,6 +477,11 @@ export function validateLilypadDbConfigInput(input: ConfigInput): void {
   if (input.maxStatementTimeout !== false) {
     // statement_timeout holds at most 2^31 - 1 ms, as a timer does
     assertNumberOption(OWNER, 'maxStatementTimeout', input.maxStatementTimeout, 'positive-delay');
+  }
+  // A role name, never split: it may contain a dot
+  if (input.appRole !== undefined) {
+    assertName(input.appRole, 'appRole');
+    assertLength(input.appRole, 'appRole');
   }
   if (!isPlainObject(input.tables)) {
     fail('tables must be an object: { <key>: <table> }.');
