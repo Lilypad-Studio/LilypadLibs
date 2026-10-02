@@ -4,6 +4,7 @@ import {
   lilypadSafeKeyTypeSql,
   pruneFunctionName,
   quoteIdentifier,
+  quoteLiteral,
   textArrayLiteral,
   triggerFunctionName,
 } from '@/dbGate/LilypadChangelog';
@@ -248,9 +249,11 @@ export type LilypadSchemaFacts = {
     pruneFunction: LilypadFunctionInfo | null;
     /**
      * What the role of the application may read of the changelog (`null` if the table or the role
-     * does not exist): `USAGE` on its schema, `SELECT` on the columns the caches read.
+     * does not exist): whether it has the privileges of its owner (row-level security then does
+     * not apply to it, unless `FORCE`), `USAGE` on its schema, `SELECT` on the columns the caches
+     * read.
      */
-    appPrivileges: { schemaUsage: boolean; select: boolean } | null;
+    appPrivileges: { owner: boolean; schemaUsage: boolean; select: boolean } | null;
     /** How old the oldest row is, in ms (`null` if the table is empty, missing or unreadable). */
     oldestRowAge: number | null;
     /**
@@ -384,6 +387,30 @@ export function readChangelogTarget(options: LilypadSchemaCheckOptions): Lilypad
   );
 }
 
+/**
+ * The tables of the options for an `unnest(...) AS requested(ref, schema_name, table_name)`: the
+ * quoted name, and the schema ('' when unqualified) and table of a qualified one.
+ */
+function requestedTables(options: LilypadSchemaCheckOptions): string {
+  const parts = options.tables.map(({ table }) => table.split('.'));
+  return `unnest(
+    ${quoteLiteral(textArrayLiteral(options.tables.map(({ table }) => quoteIdentifier(table))))}::text[],
+    ${quoteLiteral(textArrayLiteral(parts.map((part) => (part.length === 2 ? part[0]! : ''))))}::text[],
+    ${quoteLiteral(textArrayLiteral(parts.map((part) => part.at(-1)!)))}::text[]
+  )`;
+}
+
+/**
+ * The oid of a table of the options (`requested`, see {@link requestedTables}): a qualified one
+ * through the catalogs, which any role reads (`to_regclass` throws without `USAGE` on its schema,
+ * which the role of the application, the check's by default, may lack), an unqualified one through
+ * the `search_path` (`to_regclass`, which skips the schemas it may not use).
+ */
+const REQUESTED_TABLE_OID = `CASE WHEN requested.schema_name = '' THEN to_regclass(requested.ref) ELSE (
+  SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace ns ON ns.oid = c.relnamespace
+  WHERE ns.nspname = requested.schema_name AND c.relname = requested.table_name
+) END`;
+
 async function readDatabaseFacts(
   gate: LilypadDbGate,
   options: LilypadSchemaCheckOptions
@@ -392,7 +419,6 @@ async function readDatabaseFacts(
   const changelog = readChangelogTarget(options);
   const quotedChangelog = quoteIdentifier(changelog.table);
   const pruneSignature = `${quoteIdentifier(pruneFunctionName(changelog.table))}()`;
-  const tableRefs = options.tables.map(({ table }) => quoteIdentifier(table));
 
   const recordSignature = changelog.functionSignature;
   const recordNeeds = sql`ARRAY[
@@ -501,17 +527,23 @@ async function readDatabaseFacts(
           GROUP BY 1
         ) AS writer
       ) AS changelog_writers,
-      -- The roles that write it through a membership: of its owner, or of pg_write_all_data
-      -- (MEMBER: with its privileges, or SET ROLE). Not the superusers (trusted), nor the
-      -- predefined roles
+      -- The roles that write it through a membership: of its owner, or of pg_write_all_data, with
+      -- its privileges (USAGE) or SET ROLE (SET, from PostgreSQL 16; MEMBER before, which counts
+      -- every membership). Not the superusers (trusted), nor the predefined roles
       (
         SELECT coalesce(json_agg(quote_ident(r.rolname) ORDER BY r.rolname), '[]'::json)
         FROM pg_class c, pg_roles r
         WHERE c.oid = to_regclass(${quotedChangelog}::text)
           AND r.oid <> c.relowner AND NOT r.rolsuper AND r.rolname !~ '^pg_'
           AND (
-            pg_has_role(r.oid, c.relowner, 'MEMBER')
-            OR pg_has_role(r.oid, 'pg_write_all_data', 'MEMBER')
+            pg_has_role(r.oid, c.relowner, 'USAGE')
+            OR pg_has_role(r.oid, 'pg_write_all_data', 'USAGE')
+            OR CASE WHEN current_setting('server_version_num')::int >= 160000
+              THEN pg_has_role(r.oid, c.relowner, 'SET')
+                OR pg_has_role(r.oid, 'pg_write_all_data', 'SET')
+              ELSE pg_has_role(r.oid, c.relowner, 'MEMBER')
+                OR pg_has_role(r.oid, 'pg_write_all_data', 'MEMBER')
+            END
           )
       ) AS changelog_member_writers,
       coalesce((
@@ -546,6 +578,7 @@ async function readDatabaseFacts(
       -- What the caches read: USAGE on the schema, SELECT on the columns of the reader's query
       (
         SELECT json_build_object(
+          'owner', pg_has_role(app.oid, c.relowner, 'USAGE'),
           'schemaUsage', has_schema_privilege(app.oid, c.relnamespace, 'USAGE'),
           'select', NOT EXISTS (
             SELECT 1 FROM pg_attribute a
@@ -609,8 +642,9 @@ async function readDatabaseFacts(
             AND (tr.tgtype & 1) = 0
             AND (tr.tgtype & 28) <> 0
             AND NOT EXISTS (
-              SELECT 1 FROM unnest(${textArrayLiteral(tableRefs)}::text[]) AS requested(ref)
-              WHERE to_regclass(requested.ref) = tr.tgrelid
+              SELECT 1 FROM ${sql.unsafe(requestedTables(options))}
+                AS requested(ref, schema_name, table_name)
+              WHERE ${sql.unsafe(REQUESTED_TABLE_OID)} = tr.tgrelid
             )
             AND (a.attnum IS NULL OR NOT (${sql.unsafe(lilypadSafeKeyTypeSql('a.atttypid'))}))
         ) AS blocked
@@ -679,6 +713,7 @@ async function readDatabaseFacts(
       pruneFunction: (parseJsonColumn(database.prune_function) ??
         null) as LilypadFunctionInfo | null,
       appPrivileges: (parseJsonColumn(database.changelog_app_privileges) ?? null) as {
+        owner: boolean;
         schemaUsage: boolean;
         select: boolean;
       } | null,
@@ -821,7 +856,7 @@ async function readTableFacts(
       -- type, so it is clipped to 63 bytes as the trigger's %I is.
       NOT EXISTS (
         SELECT 1 FROM pg_catalog.pg_attribute a
-        WHERE a.attrelid = t.oid AND a.attname = requested.primary_key::pg_catalog.name
+        WHERE a.attrelid = t.oid AND a.attname = keys.primary_key::pg_catalog.name
           AND a.attnum > 0 AND NOT a.attisdropped
       ) AS key_column_missing,
       -- The type of the primary key column when it is not safe to record, i.e. when converting it
@@ -833,16 +868,17 @@ async function readTableFacts(
         SELECT CASE WHEN NOT (${sql.unsafe(lilypadSafeKeyTypeSql('a.atttypid'))})
           THEN pg_catalog.format_type(a.atttypid, a.atttypmod) END
         FROM pg_catalog.pg_attribute a
-        WHERE a.attrelid = t.oid AND a.attname = requested.primary_key::pg_catalog.name
+        WHERE a.attrelid = t.oid AND a.attname = keys.primary_key::pg_catalog.name
           AND a.attnum > 0 AND NOT a.attisdropped
       ) AS key_user_type,
       t.relispartition AS is_partition,
       EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhparent = t.oid) AS has_children,
       -- Row-level security applies to the role of the application: not a superuser nor BYPASSRLS,
-      -- and not the owner, unless FORCE (NULL when the role does not exist)
+      -- and not the owner (nor a role with its privileges), unless FORCE (NULL when the role does
+      -- not exist)
       CASE WHEN app.oid IS NOT NULL THEN
         t.relrowsecurity AND NOT app.rolsuper AND NOT app.rolbypassrls
-          AND (t.relforcerowsecurity OR t.relowner <> app.oid)
+          AND (t.relforcerowsecurity OR NOT pg_has_role(app.oid, t.relowner, 'USAGE'))
       END AS row_security,
       CASE WHEN app.oid IS NOT NULL THEN (
         SELECT json_build_object(
@@ -853,11 +889,11 @@ async function readTableFacts(
             OR has_any_column_privilege(app.oid, t.oid, 'UPDATE')
             OR has_table_privilege(app.oid, t.oid, 'DELETE'),
           'missingInsert', coalesce(json_agg(a.attname ORDER BY a.attnum) FILTER (
-            WHERE NOT (described.generated AND a.attname = requested.primary_key)
+            WHERE NOT (described.generated AND a.attname = keys.primary_key)
               AND NOT has_column_privilege(app.oid, t.oid, a.attnum, 'INSERT')
           ), '[]'::json),
           'missingUpdate', coalesce(json_agg(a.attname ORDER BY a.attnum) FILTER (
-            WHERE a.attname <> requested.primary_key
+            WHERE a.attname <> keys.primary_key
               AND NOT has_column_privilege(app.oid, t.oid, a.attnum, 'UPDATE')
           ), '[]'::json),
           'delete', has_table_privilege(app.oid, t.oid, 'DELETE'),
@@ -868,7 +904,7 @@ async function readTableFacts(
               SELECT pg_get_serial_sequence(t.oid::regclass::text, k.attname) AS name
               FROM pg_attribute k
               WHERE described.generated AND k.attrelid = t.oid
-                AND k.attname = requested.primary_key::pg_catalog.name
+                AND k.attname = keys.primary_key::pg_catalog.name
                 AND k.attnum > 0 AND NOT k.attisdropped AND k.attidentity = ''
             ) AS seq
             WHERE seq.name IS NOT NULL
@@ -879,9 +915,11 @@ async function readTableFacts(
           AND (described.cols IS NULL OR a.attname = ANY(described.cols))
       ) END AS app_privileges
       ${shapeColumns}
-    FROM unnest(${textArrayLiteral(tableRefs)}::text[], ${textArrayLiteral(primaryKeys)}::text[])
-      WITH ORDINALITY AS requested(ref, primary_key, position)
-    JOIN pg_class t ON t.oid = to_regclass(requested.ref)
+    FROM ${sql.unsafe(requestedTables(options))}
+      WITH ORDINALITY AS requested(ref, schema_name, table_name, position)
+    JOIN unnest(${textArrayLiteral(primaryKeys)}::text[]) WITH ORDINALITY AS keys(primary_key, position)
+      ON keys.position = requested.position
+    JOIN pg_class t ON t.oid = ${sql.unsafe(REQUESTED_TABLE_OID)}
     JOIN pg_namespace n ON n.oid = t.relnamespace
     CROSS JOIN LATERAL (
       SELECT
@@ -903,8 +941,9 @@ async function readTableFacts(
       ? new Set()
       : await sql`
           SELECT requested.position
-          FROM unnest(${textArrayLiteral(tableRefs)}::text[]) WITH ORDINALITY AS requested(ref, position)
-          JOIN pg_subscription_rel s ON s.srrelid = to_regclass(requested.ref)
+          FROM ${sql.unsafe(requestedTables(options))}
+            WITH ORDINALITY AS requested(ref, schema_name, table_name, position)
+          JOIN pg_subscription_rel s ON s.srrelid = ${sql.unsafe(REQUESTED_TABLE_OID)}
         `.then(
           (rows) => new Set(rows.map((row) => Number(row.position))),
           () => null

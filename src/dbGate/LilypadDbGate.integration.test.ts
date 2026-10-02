@@ -2671,6 +2671,39 @@ describe('LilypadDbGate (integration)', () => {
         expect(report.problems.map((problem) => problem.code)).toEqual(['missing-app-role']);
       });
 
+      it('should report a schema the role connecting cannot use, instead of failing', async () => {
+        await withDatabase('role_usage', async (url, sql) => {
+          await sql.unsafe(`
+            CREATE SCHEMA hidden;
+            CREATE TABLE hidden.items (id int PRIMARY KEY);
+            CREATE ROLE role_usage LOGIN PASSWORD 'role_usage';
+            ALTER ROLE role_usage SET statement_timeout = '30s';
+          `);
+          try {
+            const report = await runLilypadDoctor({
+              connectionString: url.replace(/\/\/[^@]+@/, '//role_usage:role_usage@'),
+              config: defineLilypadDb({
+                tables: {
+                  items: {
+                    tableName: 'hidden.items',
+                    primaryKey: 'id',
+                    cols: { id: {} },
+                    sync: { strategy: 'none' },
+                  },
+                },
+              }),
+            });
+
+            expect(report.problems.map(({ code }) => code)).toEqual(['missing-privilege']);
+            expect(report.problems[0]!.message).toContain(
+              'lacks USAGE on the schema "hidden" and SELECT on the columns id of "hidden.items"'
+            );
+          } finally {
+            await sql.unsafe('DROP OWNED BY role_usage; DROP ROLE role_usage;');
+          }
+        });
+      });
+
       it('should report the changelog functions changed by hand, and install them again', async () => {
         await withAppDatabase('role_functions', async (check, sql) => {
           await sql.unsafe('GRANT SELECT ON users, events, lilypad_cache_changes TO role_app');
@@ -2756,36 +2789,48 @@ describe('LilypadDbGate (integration)', () => {
             ${lilypadChangelogSql({ notifyChannel: false })}
             ${lilypadChangelogTriggerSql({ table: 'measures', primaryKey: 'id' })}
           `);
-          const report = await runLilypadDoctor({
-            connectionString: url,
-            config: defineLilypadDb({
-              changelog: { pruning: 'external' },
-              tables: {
-                measures: {
-                  tableName: 'measures',
-                  primaryKey: 'id',
-                  cols: { id: {} },
-                  sync: { strategy: 'changelog', pollInterval: 1000 },
-                },
-                partition: {
-                  tableName: 'measures_2026',
-                  primaryKey: 'id',
-                  cols: { id: {} },
-                  sync: { strategy: 'changelog', pollInterval: 1000 },
-                },
+          const partitionConfig = defineLilypadDb({
+            changelog: { pruning: 'external' },
+            tables: {
+              measures: {
+                tableName: 'measures',
+                primaryKey: 'id',
+                cols: { id: {} },
+                sync: { strategy: 'changelog', pollInterval: 1000 },
               },
-            }),
+              partition: {
+                tableName: 'measures_2026',
+                primaryKey: 'id',
+                cols: { id: {} },
+                sync: { strategy: 'changelog', pollInterval: 1000 },
+              },
+            },
           });
+          const report = await runLilypadDoctor({ connectionString: url, config: partitionConfig });
 
-          const triggers = report.problems.filter(
-            ({ code }) => !['undeclared-required-column', 'wrong-primary-key'].includes(code)
-          );
-          expect(triggers.map(({ code, table }) => `${code} ${table}`)).toEqual([
+          const triggers = (problems: LilypadDoctorReport['problems']) =>
+            problems
+              .filter(
+                ({ code }) => !['undeclared-required-column', 'wrong-primary-key'].includes(code)
+              )
+              .map(({ code, table }) => `${code} ${table}`);
+          expect(triggers(report.problems)).toEqual([
             'child-tables public.measures',
             'partition-table public.measures_2026',
             'missing-changelog-trigger public.measures_2026',
           ]);
-          expect(triggers[2]!.fix).toBeUndefined();
+
+          // A partition may have the statement triggers: the fix installs them
+          await sql.unsafe(
+            formatLilypadSchemaFixSql(
+              report.problems.filter(({ code }) => code === 'missing-changelog-trigger')
+            )
+          );
+          const fixed = await runLilypadDoctor({ connectionString: url, config: partitionConfig });
+          expect(triggers(fixed.problems)).toEqual([
+            'child-tables public.measures',
+            'partition-table public.measures_2026',
+          ]);
         });
       });
     });

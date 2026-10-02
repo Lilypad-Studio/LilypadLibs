@@ -284,8 +284,9 @@ export type LilypadSchemaProblemCode =
    */
   | 'row-level-security'
   /**
-   * The table is a partition: its changelog triggers cannot have transition tables. Cache the
-   * partitioned table instead, whose triggers see the writes made through it.
+   * A warning: the table is a partition. Its changelog triggers (statement triggers) fire only for
+   * the statements that name it, not for the writes made through its partitioned table: cache the
+   * partitioned table instead, or always write to the partition itself.
    */
   | 'partition-table'
   /**

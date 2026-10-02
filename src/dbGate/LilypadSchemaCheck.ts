@@ -118,11 +118,16 @@ const FUNCTION_SEARCH_PATH = 'pg_catalog,pg_temp';
  * The problems of the changelog functions (`changelog-function-owner`,
  * `unsafe-changelog-function`), of the row-level security of the changelog, and, when the caches
  * read it (`read`), of its shape (`changelog-shape`). Their fixes touch the changelog.
+ *
+ * @param current - Whether this version of the library installed the changelog: the functions and
+ * the shape of another version are not what this one installs (`outdated-changelog` reports an
+ * older one, whose fix installs them again; `newer-changelog` a newer one).
  */
 function changelogObjectProblems(
   facts: LilypadSchemaFacts,
   target: LilypadChangelogTarget,
   read: boolean,
+  current: boolean,
   changelogSql: string
 ): LilypadSchemaProblem[] {
   const problems: LilypadSchemaProblem[] = [];
@@ -136,11 +141,12 @@ function changelogObjectProblems(
     ],
   ];
   for (const [info, signature, kind] of functions) {
-    if (!info) {
+    if (!info || !current) {
       continue;
     }
     const subject = `The changelog ${kind} ${signature}`;
-    if (info.ownerLacks.length > 0) {
+    // A function that does not run as its owner is reported below
+    if (info.securityDefiner && info.ownerLacks.length > 0) {
       const giveTo =
         changelog.owner !== null && changelog.owner !== info.owner ? changelog.owner : undefined;
       problems.push({
@@ -189,10 +195,13 @@ function changelogObjectProblems(
     }
   }
 
+  // Without FORCE, it applies to the caches that read the changelog, not to the triggers, which
+  // write it as its owner
   if (changelog.hasTable && changelog.rowSecurity) {
     const app = facts.appRole;
-    const exempt = app.exists && (app.superuser || app.bypassRls || app.name === changelog.owner);
-    if (changelog.forceRowSecurity || !exempt) {
+    const exempt =
+      app.exists && (app.superuser || app.bypassRls || changelog.appPrivileges?.owner === true);
+    if (changelog.forceRowSecurity || (read && !exempt)) {
       problems.push({
         code: 'row-level-security',
         severity: 'error',
@@ -203,7 +212,7 @@ function changelogObjectProblems(
     }
   }
 
-  if (read && changelog.hasTable) {
+  if (read && current && changelog.hasTable) {
     if (changelog.rowIdNotNull) {
       problems.push({
         code: 'changelog-shape',
@@ -522,6 +531,7 @@ export function evaluateLilypadSchema(
       facts,
       fixChangelog,
       changelog !== undefined,
+      installedVersion === LILYPAD_CHANGELOG_VERSION,
       changelogSql
     )) {
       problems.push(touchesChangelog(problem));
@@ -579,8 +589,6 @@ export function evaluateLilypadSchema(
     tables.push({ table, schema: found.schema });
     const triggers = found.triggers;
     problems.push(...evaluateTableAccess(facts, table, found, shape !== undefined));
-    // A partition cannot have the changelog triggers (transition tables): no fix installs them
-    const installable = found.isPartition !== true;
 
     if (shape && found.columns) {
       const shapeProblems = evaluateLilypadTableShape(table, primaryKey, shape, found);
@@ -610,10 +618,7 @@ export function evaluateLilypadSchema(
               : recordedEvents(trigger)),
           0
         );
-      const fix =
-        notifyFixable && installable
-          ? (changelogFixed ? '' : changelogSql) + triggerSql
-          : undefined;
+      const fix = notifyFixable ? (changelogFixed ? '' : changelogSql) + triggerSql : undefined;
       // Without a fix: the changelog function notifies on the channel of other tables
       const ownTrigger = notifyFixable
         ? ''
@@ -683,12 +688,13 @@ export function evaluateLilypadSchema(
       });
     }
 
-    if (found.isPartition === true && (needsChangelog || (notifyFixable && notifyProblem))) {
+    // The statement triggers of a partition fire only for the statements that name it
+    if (found.isPartition === true && recordsKey) {
       problems.push({
         code: 'partition-table',
-        severity: 'error',
+        severity: 'warning',
         table,
-        message: `"${table}" is a partition: its changelog triggers cannot have the transition tables they record from. Cache the partitioned table instead, and write through it.`,
+        message: `"${table}" is a partition: its changelog triggers fire only for the statements that name it, not for the writes made through its partitioned table, so the caches miss these. Cache the partitioned table instead, or always write to the partition itself.`,
       });
     }
     if (found.hasChildren === true && (needsChangelog || tableChannel !== false)) {
@@ -721,18 +727,21 @@ export function evaluateLilypadSchema(
                 ]
           )
           .join('');
-        problems.push({
-          code: 'replicated-table',
-          severity: 'warning',
-          table,
-          message: `A subscription of logical replication writes "${table}": it applies the changes with session_replication_role = replica, so the triggers fire only if enabled ALWAYS, and the caches miss these changes.`,
-          ...(fix !== '' && { fix }),
-        });
+        // Enabled ALWAYS, the triggers would also refuse a blocked key on every replicated write
+        problems.push(
+          touchesChangelog({
+            code: 'replicated-table',
+            severity: 'warning',
+            table,
+            message: `A subscription of logical replication writes "${table}": it applies the changes with session_replication_role = replica, so the triggers fire only if enabled ALWAYS, and the caches miss these changes.`,
+            ...(fix !== '' && { fix }),
+          })
+        );
       }
     }
 
     if (needsChangelog) {
-      const fix = installable ? triggerSql : undefined;
+      const fix = triggerSql;
       // The events may be split across several triggers (one statement trigger per event)
       const working = triggers.filter((trigger) => recordedEvents(trigger) !== 0);
       const recorded = working.reduce((events, trigger) => events | recordedEvents(trigger), 0);

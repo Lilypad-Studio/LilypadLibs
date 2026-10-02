@@ -475,7 +475,11 @@ export function validateLilypadDbConfigInput(input: ConfigInput): void {
     // statement_timeout holds at most 2^31 - 1 ms, as a timer does
     assertNumberOption(OWNER, 'maxStatementTimeout', input.maxStatementTimeout, 'positive-delay');
   }
-  assertOptionalIdentifier(input.appRole, 'appRole');
+  // A role name, never split: it may contain a dot
+  if (input.appRole !== undefined) {
+    assertName(input.appRole, 'appRole');
+    assertLength(input.appRole, 'appRole');
+  }
   if (!isPlainObject(input.tables)) {
     fail('tables must be an object: { <key>: <table> }.');
   }

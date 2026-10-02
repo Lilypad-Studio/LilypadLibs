@@ -755,8 +755,8 @@ WHERE c.oid = ${quoteLiteral(quoteIdentifier(table))}::regclass;
  * earlier, which the trigger function no longer serves. Run it once per table, in a migration (in one transaction, so that no write goes
  * unrecorded), after {@link lilypadChangelogSql}.
  *
- * Transition tables are not supported on the partitions of a partitioned table, nor on tables with
- * inheritance children: attach the triggers to the partitioned table itself.
+ * The statement triggers of a partition (or an inheritance child) fire only for the statements that
+ * name it, not for the writes made through its parent: attach them to the partitioned table itself.
  *
  * @param options.table - The cached table (`table` or `schema.table`).
  * @param options.primaryKey - Its primary key column.

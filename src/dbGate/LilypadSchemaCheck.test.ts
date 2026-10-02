@@ -96,7 +96,7 @@ function facts(overrides: Partial<LilypadSchemaFacts> = {}): LilypadSchemaFacts 
       hasChangedAtIndex: true,
       recordFunction,
       pruneFunction: null,
-      appPrivileges: { schemaUsage: true, select: true },
+      appPrivileges: { owner: false, schemaUsage: true, select: true },
       oldestRowAge: 60_000,
       deletedRows: 0,
       blockedTables: [],
@@ -2358,7 +2358,10 @@ describe('the role of the application', () => {
 
   it('should report a changelog the role cannot read, only when a table reads it', () => {
     const unreadable = facts({
-      changelog: { ...facts().changelog, appPrivileges: { schemaUsage: false, select: false } },
+      changelog: {
+        ...facts().changelog,
+        appPrivileges: { owner: false, schemaUsage: false, select: false },
+      },
     });
 
     const result = evaluateLilypadSchema(unreadable, changelogOptions);
@@ -2390,9 +2393,16 @@ describe('the role of the application', () => {
   });
 
   it('should report row-level security on the changelog, unless only its owner reads it', () => {
-    const secured = (changes: Partial<LilypadSchemaFacts['changelog']>, owner = 'owner') =>
+    const secured = (changes: Partial<LilypadSchemaFacts['changelog']>, owner = false) =>
       evaluateLilypadSchema(
-        facts({ changelog: { ...facts().changelog, rowSecurity: true, owner, ...changes } }),
+        facts({
+          changelog: {
+            ...facts().changelog,
+            rowSecurity: true,
+            appPrivileges: { owner, schemaUsage: true, select: true },
+            ...changes,
+          },
+        }),
         changelogOptions
       );
 
@@ -2403,8 +2413,8 @@ describe('the role of the application', () => {
       'ALTER TABLE "lilypad_cache_changes" NO FORCE ROW LEVEL SECURITY;\nALTER TABLE "lilypad_cache_changes" DISABLE ROW LEVEL SECURITY;\n'
     );
     // The owner of the changelog bypasses it, unless FORCE
-    expect(codes(secured({}, 'app'))).toEqual([]);
-    expect(codes(secured({ forceRowSecurity: true }, 'app'))).toEqual(['row-level-security']);
+    expect(codes(secured({}, true))).toEqual([]);
+    expect(codes(secured({ forceRowSecurity: true }, true))).toEqual(['row-level-security']);
   });
 });
 
@@ -2668,17 +2678,103 @@ describe('the changelog functions and table', () => {
     );
   });
 
-  it('should withhold the fixes of the functions while a newer version installed them', () => {
+  it('should withhold the fixes of the functions while a table blocks the changelog fixes', () => {
     const result = evaluateLilypadSchema(
       withChangelog({
-        functionComment: `lilypad-changelog:${LILYPAD_CHANGELOG_VERSION + 1}`,
         recordFunction: { ...recordFunction, publicExecute: true },
+        blockedTables: [{ table: 'public.other', column: 'id', type: 'other_type' }],
       }),
       changelogOptions
     );
 
-    expect(codes(result)).toEqual(['newer-changelog', 'unsafe-changelog-function']);
-    expect(result.problems[1]!.fix).toBeUndefined();
+    expect(codes(result)).toEqual(['unsafe-changelog-function', 'unsupported-key-type']);
+    expect(result.problems[0]!.fix).toBeUndefined();
+    expect(result.problems[0]!.message).toContain('Its fix is withheld');
+  });
+
+  it('should leave the functions of a newer install to it', () => {
+    const result = evaluateLilypadSchema(
+      withChangelog({
+        functionComment: `lilypad-changelog:${LILYPAD_CHANGELOG_VERSION + 1}`,
+        recordFunction: { ...recordFunction, securityDefiner: false },
+      }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['newer-changelog']);
+  });
+
+  it('should leave the functions and the shape of an older install to outdated-changelog', () => {
+    const result = evaluateLilypadSchema(
+      withChangelog({
+        functionComment: 'lilypad-changelog:6',
+        rowIdNotNull: true,
+        // Version 6 ran as the writer, without a search_path
+        recordFunction: {
+          ...recordFunction,
+          securityDefiner: false,
+          config: [],
+          ownerLacks: ['INSERT on the changelog'],
+        },
+      }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['outdated-changelog']);
+  });
+
+  it('should not report a function owner without the privileges it does not run with', () => {
+    const result = evaluateLilypadSchema(
+      withChangelog({
+        recordFunction: {
+          ...recordFunction,
+          securityDefiner: false,
+          ownerLacks: ['INSERT on the changelog'],
+        },
+      }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['unsafe-changelog-function']);
+  });
+
+  it('should report the row-level security of the changelog only where it applies', () => {
+    const secured = (changes: Partial<LilypadSchemaFacts['changelog']>) =>
+      codes(
+        evaluateLilypadSchema(
+          facts({ changelog: { ...facts().changelog, rowSecurity: true, ...changes } }),
+          changelogOptions
+        )
+      );
+
+    // A member of its owner has its privileges: row-level security does not apply to it
+    expect(secured({ appPrivileges: { owner: true, schemaUsage: true, select: true } })).toEqual(
+      []
+    );
+    // With listen tables only, nothing reads it: the triggers write it as its owner, unless FORCE
+    const listening = {
+      tables: [
+        {
+          schema: 'public',
+          triggers: [
+            { ...changelogRow, changelog: false, source: notifySource('cache_events') },
+            { ...changelogTruncate, changelog: false, source: notifySource('cache_events') },
+          ],
+        },
+      ],
+    };
+    const listenRls = (changes: Partial<LilypadSchemaFacts['changelog']>) =>
+      codes(
+        evaluateLilypadSchema(
+          facts({
+            changelog: { ...facts().changelog, rowSecurity: true, ...changes },
+            ...listening,
+          }),
+          listenOptions
+        )
+      );
+    expect(listenRls({})).toEqual([]);
+    expect(listenRls({ forceRowSecurity: true })).toEqual(['row-level-security']);
   });
 
   it('should report the shape of the changelog the caches read', () => {
@@ -2700,15 +2796,16 @@ describe('the changelog functions and table', () => {
 });
 
 describe('the writes the triggers of a table may not see', () => {
-  it('should report a partition, without the trigger fix that would fail', () => {
+  it('should warn about a partition, whose triggers miss the writes made through its parent', () => {
     const result = evaluateLilypadSchema(
       facts({ tables: [{ schema: 'public', triggers: [], isPartition: true }] }),
       changelogOptions
     );
 
+    // Statement triggers with transition tables are allowed on a partition: the fix installs them
     expect(codes(result)).toEqual(['partition-table', 'missing-changelog-trigger']);
-    expect(result.problems[0]!.severity).toBe('error');
-    expect(result.problems[1]!.fix).toBeUndefined();
+    expect(result.problems[0]!.severity).toBe('warning');
+    expect(result.problems[1]!.fix).toContain('CREATE TRIGGER');
   });
 
   it('should warn about the partitions and children of a table', () => {
