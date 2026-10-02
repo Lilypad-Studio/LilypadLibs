@@ -60,6 +60,7 @@ function exampleTable(typescript: boolean): string[] {
     '  // How LilypadDbCache follows the changes made elsewhere: listen (long-running servers),',
     "  // { strategy: 'changelog', pollInterval: 5_000 } (serverless platforms), or { strategy: 'none' }",
     "  sync: { strategy: 'listen' },",
+    "  // access: 'read', // the application only reads it: its appRole gets no write of it",
     '});',
   ];
 }

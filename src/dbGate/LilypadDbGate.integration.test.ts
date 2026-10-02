@@ -2671,6 +2671,103 @@ describe('LilypadDbGate (integration)', () => {
         expect(report.problems.map((problem) => problem.code)).toEqual(['missing-app-role']);
       });
 
+      it('should create the role of the application, which then runs the library, and keep it working', async () => {
+        await withDatabase('role_create', async (url, sql) => {
+          await sql.unsafe(`
+            CREATE TABLE users (id serial PRIMARY KEY, name text NOT NULL, role text NOT NULL DEFAULT 'user');
+            ${lilypadChangelogSql({ notifyChannel: false })}
+            ${lilypadChangelogTriggerSql({ table: 'users', primaryKey: 'id' })}
+          `);
+          const tables = (changes: Partial<typeof usersInput> = {}) => ({
+            users: {
+              ...usersInput,
+              ...changes,
+              sync: { strategy: 'changelog' as const, pollInterval: 1000 },
+            },
+          });
+          const config = defineLilypadDb({
+            changelog: { pruning: 'external' },
+            appRole: 'gen_app',
+            tables: tables(),
+          });
+          const check = (checked = config) =>
+            runLilypadDoctor({ connectionString: url, config: checked });
+          try {
+            const created = await check();
+            expect(created.problems.map(({ code }) => code)).toEqual(['missing-app-role']);
+            await sql.unsafe(formatLilypadSchemaFixSql(created.problems));
+            await sql.unsafe(`ALTER ROLE gen_app PASSWORD 'gen_app'`);
+            expect((await check()).problems).toEqual([]);
+
+            // The application, connected as the role it created
+            const app = await LilypadDbGate.create({
+              connectionString: url.replace(/\/\/[^@]+@/, '//gen_app:gen_app@'),
+              config,
+            });
+            try {
+              const users = app.table(config.tables.users);
+              const { row } = await users.insert({ name: 'Ada', role: 'user' });
+              const id = row!.id;
+              await users.update({ id, name: 'Ada L.' });
+              expect(await users.selectByPrimaryKey(id)).toMatchObject({ name: 'Ada L.' });
+              await users.delete(id);
+              const { changes } = await readLilypadChanges(app, {
+                tableName: 'users',
+                since: { lookback: 60_000 },
+              });
+              expect(changes.map(({ op }) => op)).toEqual(['INSERT', 'UPDATE', 'DELETE']);
+              // Nothing more: it cannot write the changelog, nor create a table
+              await expect(
+                app.sql`INSERT INTO lilypad_cache_changes (table_name, op) VALUES ('users', 'DELETE')`
+              ).rejects.toThrow('permission denied');
+              await expect(app.sql`CREATE TABLE intruder (id int)`).rejects.toThrow(
+                'permission denied'
+              );
+            } finally {
+              await app.close();
+            }
+
+            // A column added to the table and to the config: the check grants it
+            await sql.unsafe(`ALTER TABLE users ADD COLUMN email text`);
+            // Not in the config yet: only the described columns are checked
+            expect((await check()).problems).toEqual([]);
+            const withEmail = defineLilypadDb({
+              changelog: { pruning: 'external' },
+              appRole: 'gen_app',
+              tables: tables({
+                cols: { ...usersInput.cols, email: { type: 'string', nullable: true } },
+              } as Partial<typeof usersInput>),
+            });
+            const grown = await check(withEmail);
+            expect(grown.problems.map(({ code, severity }) => `${code} ${severity}`)).toEqual([
+              'missing-privilege error',
+              'missing-privilege warning',
+            ]);
+            await sql.unsafe(formatLilypadSchemaFixSql(grown.problems));
+            expect((await check(withEmail)).problems).toEqual([]);
+          } finally {
+            await sql.unsafe('DROP OWNED BY gen_app; DROP ROLE IF EXISTS gen_app;');
+          }
+        });
+      });
+
+      it('should warn with strict about a role of the application that owns the tables', async () => {
+        const report = await runLilypadDoctor({
+          connectionString: container.getConnectionUri(),
+          config: defineLilypadDb({
+            strict: true,
+            maxStatementTimeout: false,
+            tables: { users: usersInput },
+          }),
+        });
+
+        expect(
+          report.problems.find(({ code }) => code === 'privileged-app-role')?.message
+        ).toContain(
+          'is a superuser, may create roles (CREATEROLE), bypasses row-level security (BYPASSRLS), has the privileges of the owner of "public.users"'
+        );
+      });
+
       it('should report a schema the role connecting cannot use, instead of failing', async () => {
         await withDatabase('role_usage', async (url, sql) => {
           await sql.unsafe(`
@@ -3044,8 +3141,12 @@ describe('LilypadDbGate (integration)', () => {
       await admin`ALTER TABLE shape_members DROP COLUMN tenant`;
       await applyFixes(await check());
       expect(codes(await check())).toEqual([]);
-      // With strict, the index of the database that the description lacks
-      expect(codes(await check(true))).toEqual(['public.shape_members:undeclared-index']);
+      // With strict, the index of the database that the description lacks, and the role of the
+      // check (a superuser), which is the application's without appRole
+      expect(codes(await check(true))).toEqual([
+        'public.shape_members:undeclared-index',
+        ':privileged-app-role',
+      ]);
     });
 
     it('should make the database generate the keys of a table that has rows, after them', async () => {

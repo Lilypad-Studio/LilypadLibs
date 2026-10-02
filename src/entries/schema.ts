@@ -20,6 +20,7 @@ export type {
   LilypadDbResolvedIndex,
   LilypadDbResolvedUniqueKey,
   LilypadDbRow,
+  LilypadDbTableAccess,
   LilypadDbTableChangelogSync,
   LilypadDbTableDefinition,
   LilypadDbTableDefinitionBase,

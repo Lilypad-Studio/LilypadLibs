@@ -65,7 +65,9 @@ const TABLE_OPTIONS = optionsOf<LilypadDbTableInputBase>({
   checks: true,
   sync: true,
   strict: true,
+  access: true,
 });
+const TABLE_ACCESS = new Set<string>(['read', 'write']);
 const COLUMN_OPTIONS = optionsOf<LilypadDbColumn>({
   type: true,
   pgType: true,
@@ -396,6 +398,7 @@ function assertTable(key: string, table: unknown, defaultSchema: string): string
   }
   assertBoolean(input.generatedPrimaryKey, `${what}.generatedPrimaryKey`);
   assertBoolean(input.strict, `${what}.strict`);
+  assertOneOf(input.access, TABLE_ACCESS, `${what}.access`);
   assertEntries(input.unique, UNIQUE_OPTIONS, `${what}.unique`).forEach((uniqueKey, index) => {
     assertOptionalIdentifier(uniqueKey.name, `${what}.unique[${index}].name`);
     assertColumns(uniqueKey.columns, cols, `${what}.unique[${index}].columns`);

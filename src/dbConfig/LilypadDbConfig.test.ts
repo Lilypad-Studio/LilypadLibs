@@ -51,6 +51,16 @@ describe('defineLilypadDb', () => {
       defineLilypadDb({ maxStatementTimeout: false, tables: { orgs } }).maxStatementTimeout
     ).toBe(false);
     expect(db.appRole).toBeUndefined();
+    expect(db.tables.orgs.access).toBe('write');
+    expect(
+      defineLilypadDb({ tables: { orgs: { ...orgs, access: 'read' } } }).tables.orgs.access
+    ).toBe('read');
+    expect(() =>
+      defineLilypadDb({
+        // @ts-expect-error -- not an access
+        tables: { orgs: { ...orgs, access: 'readonly' } },
+      })
+    ).toThrow('tables.orgs.access must be one of read, write');
     expect(defineLilypadDb({ appRole: 'app_user', tables: { orgs } }).appRole).toBe('app_user');
     expect(isLilypadDbTableDefinition(db.tables.users)).toBe(true);
     expect(db.tables.orgs).toMatchObject({

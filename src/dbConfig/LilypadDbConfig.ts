@@ -131,7 +131,17 @@ export type LilypadDbTableInput<T, PK extends keyof T = keyof T> = LilypadDbSche
   sync?: LilypadDbTableSync | undefined;
   /** Overrides the `strict` of the config for this table. */
   strict?: boolean | undefined;
+  /**
+   * Whether the application writes the table (`sqlCreate`, `sqlUpdate`, `sqlDelete` of its
+   * `LilypadDbCache`): `read` if it only reads it. `lilypad-doctor` grants the role it creates for
+   * the application (`appRole`) only what it reads, and no longer reports the writes it lacks.
+   * Defaults to `write`.
+   */
+  access?: LilypadDbTableAccess | undefined;
 };
+
+/** Whether the application writes a table (`write`), or only reads it (`read`). */
+export type LilypadDbTableAccess = 'read' | 'write';
 
 /** A unique key, resolved: its columns, including the `unique` columns. */
 export type LilypadDbResolvedUniqueKey = { name?: string | undefined; columns: readonly string[] };
@@ -177,6 +187,8 @@ export type LilypadDbTableDefinitionBase = {
   readonly qualifiedName: string;
   readonly primaryKey: PropertyKey;
   readonly generatedPrimaryKey?: boolean | undefined;
+  /** Whether the application writes the table (`write`, the default), or only reads it. */
+  readonly access?: LilypadDbTableAccess | undefined;
   /** The functions bound to the table by `bindLilypadDbHooks`, if any. */
   readonly hooks?: LilypadDbTableHooksBase | undefined;
   readonly cols: Readonly<Record<string, LilypadDbColumn>>;
@@ -627,6 +639,7 @@ export function defineLilypadDb<Tables extends Record<string, LilypadDbTableInpu
       qualifiedName,
       primaryKey: table.primaryKey,
       generatedPrimaryKey: table.generatedPrimaryKey ?? false,
+      access: table.access ?? 'write',
       cols: resolveColumns(table.cols),
       sync: Object.freeze({ ...(sync ?? { strategy: 'listen' }) }),
       strict: strict ?? input.strict ?? false,

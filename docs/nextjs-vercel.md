@@ -171,6 +171,8 @@ export default defineLilypadDb({
 npx lilypad-doctor --url "$DATABASE_URL_UNPOOLED" --sql > migrations/0042_lilypad.sql
 ```
 
+**A role for the application.** Neon gives you an owner role (e.g. `neondb_owner`), which can do nearly anything in the database. Connect the application as a role of its own instead: with `appRole: 'app_user'` in the config and no such role yet, the SQL above also creates it, with only what the tables need (see [The role of the application](../README.md#the-role-of-the-application)). Then set its password (`ALTER ROLE app_user PASSWORD '...';` as the owner, outside of the migrations), and put it in the pooled `DATABASE_URL` of the application, keeping the owner in `DATABASE_URL_UNPOOLED` for the migrations and the doctor. If the application prunes the changelog itself (`pruneLilypadChangelog`, below), grant it `DELETE` on the changelog too.
+
 `lilypadChangelogSql()` and `lilypadChangelogTriggerSql({ table, primaryKey })` return the same SQL, if you prefer to write the migration yourself. It needs PostgreSQL 16 or later.
 
 - The changelog table (`lilypad_cache_changes`) records the table, the primary key and the operation of every change. An update that changes the primary key is recorded as a delete of the old key and an update of the new one. `lilypadChangelogTriggerSql` also adds a trigger for `TRUNCATE`, which the other triggers do not see.

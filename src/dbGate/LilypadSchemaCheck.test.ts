@@ -75,7 +75,7 @@ function facts(overrides: Partial<LilypadSchemaFacts> = {}): LilypadSchemaFacts 
     version: 160000,
     database: 'app',
     session: appSession,
-    appRole: { name: 'app', exists: true, superuser: false, bypassRls: false },
+    appRole: { name: 'app', exists: true, superuser: false, bypassRls: false, createRole: false },
     roleSettings: [],
     server: { inRecovery: false, notifyQueueUsage: 0 },
     changelog: {
@@ -1816,7 +1816,13 @@ describe('the statement_timeout of the session', () => {
           role: 'App "User"',
           settings: { statement_timeout: { value: '0', source: 'override' } },
         },
-        appRole: { name: 'App "User"', exists: true, superuser: false, bypassRls: false },
+        appRole: {
+          name: 'App "User"',
+          exists: true,
+          superuser: false,
+          bypassRls: false,
+          createRole: false,
+        },
       }),
       changelogOptions
     );
@@ -2029,6 +2035,7 @@ describe('evaluateLilypadSchema with the tables of a config', () => {
       changelogTable: 'lilypad_cache_changes',
       notifyChannel: false,
       maxStatementTimeout: 60_000,
+      strict: false,
     });
     expect(lilypadSchemaCheckOptions(defineLilypadDb({ tables: { orgs: orgs } })).changelog).toBe(
       false
@@ -2294,7 +2301,13 @@ describe('the role of the application', () => {
     const result = evaluateLilypadSchema(
       {
         ...withPrivileges({ schemaUsage: false }),
-        appRole: { name: 'ghost', exists: false, superuser: false, bypassRls: false },
+        appRole: {
+          name: 'ghost',
+          exists: false,
+          superuser: false,
+          bypassRls: false,
+          createRole: false,
+        },
       },
       shaped
     );
@@ -2877,5 +2890,188 @@ describe('the roles that may write the changelog', () => {
       'as members of its owner or of pg_write_all_data ("app", etl)'
     );
     expect(result.problems[0]!.fix).toBeUndefined();
+  });
+});
+
+describe('the role that missing-app-role creates', () => {
+  const shape: LilypadSchemaTableShape = {
+    cols: { id: { pgType: 'integer' }, name: { pgType: 'text' }, removed: { pgType: 'text' } },
+    generatedPrimaryKey: true,
+    unique: [],
+    foreignKeys: [],
+    indexes: [],
+    checks: [],
+    strict: false,
+  };
+  const column = (name: string) => ({
+    name,
+    type: 'text',
+    category: 'S',
+    notNull: false,
+    hasDefault: false,
+    identity: false,
+    generated: false,
+  });
+  /** `app_user` does not exist; `items` has the columns id and name, `missing` does not exist. */
+  const missingRole = (serialSequence: string | null = 'public.items_id_seq') =>
+    facts({
+      appRole: {
+        name: 'app_user',
+        exists: false,
+        superuser: false,
+        bypassRls: false,
+        createRole: false,
+      },
+      tables: [
+        {
+          schema: 'public',
+          triggers: [...changelogStatements, changelogTruncate],
+          columns: [column('id'), column('name')],
+          serialSequence,
+        },
+        { schema: null, triggers: [] },
+      ],
+    });
+  const fixOf = (result: ReturnType<typeof evaluateLilypadSchema>) =>
+    result.problems.find((problem) => problem.code === 'missing-app-role')!.fix;
+  const items = (changes: Partial<LilypadSchemaTableShape> = {}) => ({
+    table: 'items',
+    primaryKey: 'id',
+    shape: { ...shape, ...changes },
+  });
+  const missing = { table: 'missing', primaryKey: 'id' };
+
+  it('should create the role with only what the existing tables need', () => {
+    const result = evaluateLilypadSchema(missingRole(), { tables: [items(), missing] });
+
+    expect(result.problems[0]!.message).toContain(
+      `Set its password outside of the migrations (ALTER ROLE "app_user" PASSWORD '...';`
+    );
+    expect(fixOf(result)).toBe(
+      [
+        'CREATE ROLE "app_user" LOGIN;',
+        `ALTER ROLE "app_user" SET statement_timeout = '30s';`,
+        'GRANT USAGE ON SCHEMA "public" TO "app_user";',
+        'GRANT SELECT ("id", "name") ON "items" TO "app_user";',
+        'GRANT INSERT ("name") ON "items" TO "app_user";',
+        'GRANT UPDATE ("name") ON "items" TO "app_user";',
+        'GRANT DELETE ON "items" TO "app_user";',
+        'GRANT USAGE ON SEQUENCE public.items_id_seq TO "app_user";',
+        'GRANT SELECT ON "lilypad_cache_changes" TO "app_user";',
+        '',
+      ].join('\n')
+    );
+  });
+
+  it('should grant only the reads of a table the application only reads', () => {
+    const fix = fixOf(
+      evaluateLilypadSchema(missingRole(), {
+        tables: [items({ access: 'read' })],
+        changelog: false,
+        notifyChannel: 'cache_events',
+        maxStatementTimeout: false,
+      })
+    );
+
+    expect(fix).toBe(
+      [
+        'CREATE ROLE "app_user" LOGIN;',
+        'GRANT USAGE ON SCHEMA "public" TO "app_user";',
+        'GRANT SELECT ("id", "name") ON "items" TO "app_user";',
+        '',
+      ].join('\n')
+    );
+  });
+
+  it('should grant the whole table without a description, and the INSERT of a key not generated', () => {
+    const fix = fixOf(
+      evaluateLilypadSchema(missingRole(null), {
+        tables: [{ table: 'items', primaryKey: 'id' }],
+        maxStatementTimeout: 10_500,
+      })
+    );
+
+    expect(fix).toContain(`SET statement_timeout = '10500ms';`);
+    expect(fix).toContain('GRANT SELECT ON "items" TO "app_user";\nGRANT INSERT ON "items"');
+    expect(fix).not.toContain('SEQUENCE');
+
+    expect(
+      fixOf(
+        evaluateLilypadSchema(missingRole(), { tables: [items({ generatedPrimaryKey: false })] })
+      )
+    ).toContain('GRANT INSERT ("id", "name") ON "items"');
+  });
+
+  it('should not report the writes of a table the application only reads', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        tables: [
+          {
+            schema: 'public',
+            triggers: [...changelogStatements, changelogTruncate],
+            appPrivileges: {
+              schemaUsage: true,
+              missingSelect: [],
+              canWrite: true,
+              missingInsert: ['name'],
+              missingUpdate: [],
+              delete: false,
+              missingSequence: null,
+            },
+          },
+        ],
+      }),
+      { tables: [{ table: 'items', primaryKey: 'id', shape: { ...shape, access: 'read' } }] }
+    );
+
+    expect(codes(result)).not.toContain('missing-privilege');
+  });
+});
+
+describe('privileged-app-role', () => {
+  const privileged = (
+    appRole: Partial<LilypadSchemaFacts['appRole']>,
+    changes: Partial<LilypadSchemaFacts> = {},
+    strict = true
+  ) =>
+    evaluateLilypadSchema(facts({ appRole: { ...facts().appRole, ...appRole }, ...changes }), {
+      ...changelogOptions,
+      strict,
+    });
+
+  it('should warn, with strict only, about a role with more privileges than the tables need', () => {
+    const result = privileged({ superuser: true, createRole: true });
+
+    expect(codes(result)).toEqual(['privileged-app-role']);
+    expect(result.problems[0]!.severity).toBe('warning');
+    expect(result.problems[0]!.message).toContain(
+      'The role "app" that the check connects as is a superuser, may create roles (CREATEROLE)'
+    );
+    expect(result.problems[0]!.message).toContain('set appRole to a new name');
+    expect(codes(privileged({ superuser: true }, {}, false))).toEqual([]);
+    expect(codes(privileged({}))).toEqual([]);
+  });
+
+  it('should warn about the owner of a cached table or of the changelog', () => {
+    const owner = privileged(
+      {},
+      {
+        tables: [
+          {
+            schema: 'public',
+            triggers: [...changelogStatements, changelogTruncate],
+            ownedByAppRole: true,
+          },
+        ],
+        changelog: {
+          ...facts().changelog,
+          appPrivileges: { owner: true, schemaUsage: true, select: true },
+        },
+      }
+    );
+
+    expect(owner.problems[0]!.message).toContain(
+      'has the privileges of the owner of "items", has the privileges of the owner of the changelog'
+    );
   });
 });

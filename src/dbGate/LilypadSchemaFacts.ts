@@ -204,6 +204,8 @@ export type LilypadSchemaFacts = {
     exists: boolean;
     superuser: boolean;
     bypassRls: boolean;
+    /** `CREATEROLE`. */
+    createRole: boolean;
   };
   /** The settings of roles and databases that apply to this database (`pg_db_role_setting`). */
   roleSettings: LilypadRoleSettingRow[];
@@ -319,6 +321,13 @@ export type LilypadTableFacts = {
   subscribed?: boolean | null | undefined;
   /** What the role of the application may do with it (`null`: the role does not exist). */
   appPrivileges?: LilypadTablePrivileges | null | undefined;
+  /**
+   * Whether the role of the application has the privileges of its owner (`null`: the role does not
+   * exist).
+   */
+  ownedByAppRole?: boolean | null | undefined;
+  /** The sequence of its serial generated primary key (`null`: none, e.g. an identity). */
+  serialSequence?: string | null | undefined;
   columns?: LilypadColumnInfo[] | undefined;
   constraints?: LilypadConstraintInfo[] | undefined;
   indexes?: LilypadIndexInfo[] | undefined;
@@ -466,7 +475,7 @@ async function readDatabaseFacts(
   // exist return NULL, those of a name throw
   const [database] = await sql`
     WITH app AS (
-      SELECT r.oid, r.rolname, r.rolsuper, r.rolbypassrls
+      SELECT r.oid, r.rolname, r.rolsuper, r.rolbypassrls, r.rolcreaterole
       FROM (SELECT coalesce(${options.appRole ?? null}::text, current_user::text) AS name) AS wanted
       LEFT JOIN pg_roles r ON r.rolname = wanted.name
     )
@@ -484,6 +493,7 @@ async function readDatabaseFacts(
       app.oid IS NOT NULL AS app_role_exists,
       coalesce(app.rolsuper, false) AS app_role_superuser,
       coalesce(app.rolbypassrls, false) AS app_role_bypass_rls,
+      coalesce(app.rolcreaterole, false) AS app_role_create_role,
       (
         SELECT coalesce(json_agg(json_build_object(
           'role', r.rolname, 'inDatabase', s.setdatabase <> 0, 'config', s.setconfig
@@ -686,6 +696,7 @@ async function readDatabaseFacts(
       exists: database.app_role_exists as boolean,
       superuser: database.app_role_superuser as boolean,
       bypassRls: database.app_role_bypass_rls as boolean,
+      createRole: database.app_role_create_role as boolean,
     },
     roleSettings: parseJsonColumn(database.role_settings) as LilypadRoleSettingRow[],
     server: {
@@ -880,6 +891,16 @@ async function readTableFacts(
         t.relrowsecurity AND NOT app.rolsuper AND NOT app.rolbypassrls
           AND (t.relforcerowsecurity OR NOT pg_has_role(app.oid, t.relowner, 'USAGE'))
       END AS row_security,
+      CASE WHEN app.oid IS NOT NULL THEN pg_has_role(app.oid, t.relowner, 'USAGE') END
+        AS owned_by_app_role,
+      -- The sequence of a serial generated key (an identity column needs no privilege)
+      (
+        SELECT pg_get_serial_sequence(t.oid::regclass::text, k.attname)
+        FROM pg_attribute k
+        WHERE described.generated AND k.attrelid = t.oid
+          AND k.attname = keys.primary_key::pg_catalog.name
+          AND k.attnum > 0 AND NOT k.attisdropped AND k.attidentity = ''
+      ) AS serial_sequence,
       CASE WHEN app.oid IS NOT NULL THEN (
         SELECT json_build_object(
           'schemaUsage', has_schema_privilege(app.oid, t.relnamespace, 'USAGE'),
@@ -927,7 +948,8 @@ async function readTableFacts(
           SELECT json_array_elements_text(d -> 'cols')
         )::pg_catalog.name[] END AS cols,
         (d ->> 'generated')::boolean AS generated
-      FROM (SELECT ${described}::json -> (requested.position::int - 1) AS d) AS item
+      -- Sent as text: a parameter of type json would be serialized again by postgres.js
+      FROM (SELECT ${described}::text::json -> (requested.position::int - 1) AS d) AS item
     ) AS described
     CROSS JOIN (
       SELECT r.oid, r.rolsuper, r.rolbypassrls
@@ -998,6 +1020,8 @@ async function readTableFacts(
       rowSecurity: row.row_security as boolean | null,
       subscribed: subscribed === null ? null : subscribed.has(index + 1),
       appPrivileges: (parseJsonColumn(row.app_privileges) ?? null) as LilypadTablePrivileges | null,
+      ownedByAppRole: row.owned_by_app_role as boolean | null,
+      serialSequence: row.serial_sequence as string | null,
     };
     if (table.shape !== undefined) {
       facts.columns = parseJsonColumn(row.columns) as LilypadColumnInfo[];

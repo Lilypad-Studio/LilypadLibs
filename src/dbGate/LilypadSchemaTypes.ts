@@ -1,5 +1,6 @@
 import type {
   LilypadChangelogPruning,
+  LilypadDbTableAccess,
   LilypadDbResolvedForeignKey,
   LilypadDbResolvedIndex,
   LilypadDbResolvedUniqueKey,
@@ -86,9 +87,15 @@ export type LilypadSchemaCheckOptions = {
   maxStatementTimeout?: number | false | undefined;
   /**
    * The role the application connects as: the check reads its privileges, its settings and the
-   * row-level security that applies to it. Defaults to the role the check connects as.
+   * row-level security that applies to it. Defaults to the role the check connects as. When it does
+   * not exist, the fix of `missing-app-role` creates it with what the tables need.
    */
   appRole?: string | undefined;
+  /**
+   * Also reports a role of the application with more privileges than the tables need
+   * (`privileged-app-role`). The `strict` of the config.
+   */
+  strict?: boolean | undefined;
 };
 
 export type LilypadSchemaProblemCode =
@@ -213,7 +220,12 @@ export type LilypadSchemaProblemCode =
    * message gives the `ALTER ROLE`.
    */
   | 'long-statement-timeout'
-  /** The `appRole` does not exist: its privileges and settings cannot be checked. */
+  /**
+   * The `appRole` does not exist. The fix creates it (without a password) with only what the tables
+   * need, on the objects that exist: `USAGE` on their schemas, `SELECT` of their described columns,
+   * the writes of `LilypadDbCache` unless `access: 'read'`, `SELECT` on the changelog the caches
+   * read, and the `statement_timeout`.
+   */
   | 'missing-app-role'
   /**
    * The role of the application lacks a privilege the library needs. An error for what it reads:
@@ -300,7 +312,14 @@ export type LilypadSchemaProblemCode =
    * `session_replication_role = replica`: its triggers fire only if enabled `ALWAYS`. The fix
    * enables the changelog and notifying triggers `ALWAYS`.
    */
-  | 'replicated-table';
+  | 'replicated-table'
+  /**
+   * A warning of `strict`: the role of the application has more privileges than the tables need
+   * (a superuser, `CREATEROLE`, `BYPASSRLS`, or the privileges of the owner of a cached table or of
+   * the changelog). Give the application a role of its own: an `appRole` that does not exist gets a
+   * fix that creates it (`missing-app-role`).
+   */
+  | 'privileged-app-role';
 
 /**
  * `error`: the database is not what the config describes (the caches may serve stale data, the
@@ -339,6 +358,8 @@ export type LilypadSchemaCheckResult = {
 export type LilypadSchemaTableShape = {
   cols: Readonly<Record<string, LilypadDbColumn>>;
   generatedPrimaryKey?: boolean | undefined;
+  /** `read`: the application only reads the table, so its role needs no write of it. */
+  access?: LilypadDbTableAccess | undefined;
   unique: readonly LilypadDbResolvedUniqueKey[];
   foreignKeys: readonly LilypadDbResolvedForeignKey[];
   indexes: readonly LilypadDbResolvedIndex[];

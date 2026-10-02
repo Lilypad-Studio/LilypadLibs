@@ -73,6 +73,7 @@ export function lilypadSchemaCheckOptions(config: LilypadDbConfig): LilypadSchem
     // A config of an older copy of the library has none: the default
     maxStatementTimeout: config.maxStatementTimeout,
     appRole: config.appRole,
+    strict: config.strict,
   };
 }
 

@@ -23,6 +23,7 @@ import { evaluatePruning } from '@/dbGate/LilypadSchemaPruning';
 import {
   evaluateAppRoleExists,
   evaluateChangelogAccess,
+  evaluatePrivilegedAppRole,
   evaluateRoleSettings,
   evaluateStatementTimeout,
   evaluateTableAccess,
@@ -415,7 +416,7 @@ export function evaluateLilypadSchema(
       message: `PostgreSQL ${facts.version} is too old: the library needs PostgreSQL 16 or later.`,
     });
   }
-  problems.push(...evaluateAppRoleExists(facts));
+  problems.push(...evaluateAppRoleExists(facts, options, changelog?.table));
   if (newerInstall) {
     problems.push({
       code: 'newer-changelog',
@@ -588,7 +589,7 @@ export function evaluateLilypadSchema(
     }
     tables.push({ table, schema: found.schema });
     const triggers = found.triggers;
-    problems.push(...evaluateTableAccess(facts, table, found, shape !== undefined));
+    problems.push(...evaluateTableAccess(facts, table, found, shape !== undefined, shape?.access));
 
     if (shape && found.columns) {
       const shapeProblems = evaluateLilypadTableShape(table, primaryKey, shape, found);
@@ -828,6 +829,7 @@ export function evaluateLilypadSchema(
       : []),
     ...pruning.problems,
     ...evaluateRoleSettings(facts, needs),
+    ...evaluatePrivilegedAppRole(facts, options),
     ...evaluateStatementTimeout(facts, options)
   );
   // Every fix of the changelog, its triggers and its privileges is withheld while a table blocks
