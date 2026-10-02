@@ -1,6 +1,6 @@
 {
   "name": "@lilypad-studio/libs",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Internal TypeScript utilities of Lilypad Studio: cache, PostgreSQL gateway, logger, flow control, serializer and singletons.",
   "license": "UNLICENSED",
   "author": {
