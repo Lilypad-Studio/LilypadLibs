@@ -1,6 +1,6 @@
 import type { LilypadDbTableAccess } from '@/dbConfig/LilypadDbConfig';
 import { LILYPAD_DEFAULT_MAX_STATEMENT_TIMEOUT } from '@/dbConfig/LilypadDbConfigDefaults';
-import { quoteIdentifier } from '@/dbGate/LilypadChangelog';
+import { dollarQuote, quoteIdentifier, quoteLiteral } from '@/dbGate/LilypadChangelog';
 import type {
   LilypadRoleSettingName,
   LilypadSchemaFacts,
@@ -9,7 +9,11 @@ import type {
   LilypadTablePrivileges,
 } from '@/dbGate/LilypadSchemaFacts';
 import { formatDuration } from '@/dbGate/LilypadSchemaPruning';
-import type { LilypadSchemaCheckOptions, LilypadSchemaProblem } from '@/dbGate/LilypadSchemaTypes';
+import type {
+  LilypadSchemaCheckOptions,
+  LilypadSchemaProblem,
+  LilypadSchemaTableShape,
+} from '@/dbGate/LilypadSchemaTypes';
 import { assertNumberOption } from '@/internal/LilypadValidation';
 
 /**
@@ -182,20 +186,85 @@ export function evaluateAppRoleExists(
     {
       code: 'missing-app-role',
       severity: 'error',
-      message: `The role "${facts.appRole.name}" (appRole) does not exist. Its fix creates it with only what the tables need, on those that exist now: run the check again after the migration, it grants the tables the migration creates. Set its password outside of the migrations (ALTER ROLE ${role} PASSWORD '...'; or the console of your provider), and connect the application as it. If the application connects as another role, set appRole (or --app-role) to that one instead.`,
+      message: `The role "${facts.appRole.name}" (appRole) does not exist. Its fix creates it with only what the tables need (on the tables and the changelog that exist: the fix of a missing table grants it the table it creates, and the next check a changelog created by the same SQL). Set its password outside of the migrations (ALTER ROLE ${role} PASSWORD '...'; or the console of your provider), and connect the application as it. If the application connects as another role, set appRole (or --app-role) to that one instead.`,
       fix: appRoleCreateSql(facts, options, changelogTable),
     },
   ];
 }
 
 /**
- * The SQL that creates the role of the application with only what the tables of the options need:
- * `USAGE` on their schemas, `SELECT` of their described columns (of the whole table without a
- * description), and, unless their `access` is `read`, the writes of `LilypadDbCache` (`INSERT` and
- * `UPDATE` of the described columns, `DELETE`, `USAGE` on the sequence of a serial generated key);
- * `SELECT` on the changelog the caches read, and the `statement_timeout`. Only on the objects that
- * exist: the next check grants the others (`missing-privilege`). No password: the migrations are
- * committed.
+ * The `GRANT`s of a cached table to the role of the application: `SELECT` of the columns (the whole
+ * table: `null`), and, unless its `access` is `read`, the writes of `LilypadDbCache`: `INSERT` (not
+ * of a generated key) and `UPDATE` (not of the key) of the columns, `DELETE`, and `USAGE` on the
+ * sequences of its serial columns, whose default an insert that leaves them out runs.
+ */
+function tableGrants(
+  role: string,
+  table: string,
+  primaryKey: string,
+  shape: LilypadSchemaTableShape | undefined,
+  columns: string[] | null,
+  sequences: string[]
+): string[] {
+  const except = (excluded: boolean) =>
+    columns === null ? null : columns.filter((name) => !(excluded && name === primaryKey));
+  const nonEmpty = (list: string[] | null) => list === null || list.length > 0;
+  const grants: string[] = [];
+  if (nonEmpty(columns)) {
+    grants.push(grantSql('SELECT', table, columns, role));
+  }
+  if (shape?.access === 'read') {
+    return grants;
+  }
+  const insert = except(shape?.generatedPrimaryKey === true);
+  const update = except(true);
+  if (nonEmpty(insert)) {
+    grants.push(grantSql('INSERT', table, insert, role));
+  }
+  if (nonEmpty(update)) {
+    grants.push(grantSql('UPDATE', table, update, role));
+  }
+  grants.push(grantSql('DELETE', table, null, role));
+  for (const sequence of sequences) {
+    grants.push(`GRANT USAGE ON SEQUENCE ${sequence} TO ${role};\n`);
+  }
+  return grants;
+}
+
+/**
+ * The `GRANT`s of a table that a fix creates (`missing-table`), to an `appRole` other than the role
+ * of the check (which creates it, and owns it): appended to that fix, so that the role created in
+ * the same migration (`missing-app-role`, earlier in the fixes) may use the table at once. The
+ * created table has the described columns, and no sequence (a generated key is an identity or a
+ * `uuid` default).
+ *
+ * @param schema - The schema of the table (`undefined`: unqualified, resolved by the `search_path`).
+ */
+export function lilypadNewTableGrants(
+  facts: LilypadSchemaFacts,
+  options: LilypadSchemaCheckOptions,
+  table: string,
+  primaryKey: string,
+  shape: LilypadSchemaTableShape,
+  schema: string | undefined
+): string {
+  if (options.appRole === undefined || isSessionRole(facts)) {
+    return '';
+  }
+  const role = quoteRole(facts.appRole.name);
+  return [
+    ...(schema === undefined ? [] : [`GRANT USAGE ON SCHEMA ${quoteRole(schema)} TO ${role};\n`]),
+    ...tableGrants(role, table, primaryKey, shape, Object.keys(shape.cols), []),
+  ].join('');
+}
+
+/**
+ * The SQL that creates the role of the application, if it does not exist yet (roles are shared by
+ * the databases of a server, where the migration may run again), with only what the tables of the
+ * options need: `USAGE` on their schemas, the {@link tableGrants} of their described columns that
+ * exist (of the whole table without a description), `SELECT` on the changelog the caches read, and
+ * the `statement_timeout`. Only on the objects that exist: the fixes of the missing tables grant
+ * theirs ({@link lilypadNewTableGrants}). No password: the migrations are committed.
  */
 function appRoleCreateSql(
   facts: LilypadSchemaFacts,
@@ -203,7 +272,14 @@ function appRoleCreateSql(
   changelogTable: string | undefined
 ): string {
   const role = quoteRole(facts.appRole.name);
-  const lines = [`CREATE ROLE ${role} LOGIN;\n`];
+  const create = `
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = ${quoteLiteral(facts.appRole.name)}) THEN
+    CREATE ROLE ${role} LOGIN;
+  END IF;
+END
+`;
+  const lines = [`DO ${dollarQuote(create)};\n`];
   const max = options.maxStatementTimeout ?? LILYPAD_DEFAULT_MAX_STATEMENT_TIMEOUT;
   if (max !== false) {
     lines.push(`ALTER ROLE ${role} SET statement_timeout = '${suggestedStatementTimeout(max)}';\n`);
@@ -223,27 +299,7 @@ function appRoleCreateSql(
           (found.columns ?? []).some((column) => column.name === name)
         )
       : null;
-    const except = (excluded: boolean) =>
-      columns === null ? null : columns.filter((name) => !(excluded && name === primaryKey));
-    const nonEmpty = (list: string[] | null) => list === null || list.length > 0;
-    if (nonEmpty(columns)) {
-      grants.push(grantSql('SELECT', table, columns, role));
-    }
-    if (shape?.access === 'read') {
-      return;
-    }
-    const insert = except(shape?.generatedPrimaryKey === true);
-    const update = except(true);
-    if (nonEmpty(insert)) {
-      grants.push(grantSql('INSERT', table, insert, role));
-    }
-    if (nonEmpty(update)) {
-      grants.push(grantSql('UPDATE', table, update, role));
-    }
-    grants.push(grantSql('DELETE', table, null, role));
-    if (found.serialSequence) {
-      grants.push(`GRANT USAGE ON SEQUENCE ${found.serialSequence} TO ${role};\n`);
-    }
+    grants.push(...tableGrants(role, table, primaryKey, shape, columns, found.sequences ?? []));
   });
   if (changelogTable !== undefined && facts.changelog.hasTable) {
     if (facts.changelog.schema !== null) {
@@ -362,11 +418,10 @@ function privilegeProblems(
     });
   }
 
-  // Only for a table the application writes (access), and a role that may write it at all: a
-  // read-only role is one by design
+  // Only for a table the application writes (access)
   const writes: string[] = [];
   const writeFixes: string[] = [];
-  if (access === 'write' && privileges.canWrite) {
+  if (access === 'write') {
     if (privileges.missingInsert.length > 0) {
       writes.push(`INSERT of ${privileges.missingInsert.join(', ')}`);
       writeFixes.push(grantSql('INSERT', table, columns(privileges.missingInsert), role));
@@ -379,9 +434,13 @@ function privilegeProblems(
       writes.push('DELETE');
       writeFixes.push(grantSql('DELETE', table, null, role));
     }
-    if (privileges.missingSequence !== null) {
-      writes.push(`USAGE on the sequence ${privileges.missingSequence} of its generated key`);
-      writeFixes.push(`GRANT USAGE ON SEQUENCE ${privileges.missingSequence} TO ${role};\n`);
+    if (privileges.missingSequences.length > 0) {
+      writes.push(
+        `USAGE on the sequences of its serial columns (${privileges.missingSequences.join(', ')})`
+      );
+      for (const sequence of privileges.missingSequences) {
+        writeFixes.push(`GRANT USAGE ON SEQUENCE ${sequence} TO ${role};\n`);
+      }
     }
   }
   if (writes.length > 0) {
@@ -389,7 +448,7 @@ function privilegeProblems(
       code: 'missing-privilege',
       severity: 'warning',
       table,
-      message: `${roleSubject(facts)} may write "${table}", but lacks ${writes.join(', ')}: sqlCreate, sqlUpdate or sqlDelete of its LilypadDbCache fail.`,
+      message: `${roleSubject(facts)} lacks ${writes.join(', ')} of "${table}": sqlCreate, sqlUpdate or sqlDelete of its LilypadDbCache fail. If the application only reads the table, set its access: 'read'.`,
       fix: writeFixes.join(''),
     });
   }

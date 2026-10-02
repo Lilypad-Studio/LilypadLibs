@@ -94,7 +94,7 @@ export function lilypadDbConfigTemplate({
     "  // defaultSchema: 'public', // the schema of the tables whose name is not qualified",
     "  // notifyChannel: 'cache_events', // the channel of the 'listen' tables",
     "  // changelog: { table: 'lilypad_cache_changes', pruning: 'detect' }, // for the 'changelog' tables",
-    '  // strict: false, // true: lilypad-doctor also reports what the database has and the config lacks',
+    '  // strict: false, // true: lilypad-doctor also reports what the database has and the config lacks, and an over-privileged appRole',
     '  // maxStatementTimeout: 60_000, // the longest statement_timeout lilypad-doctor accepts for the app role (false: not checked)',
     "  // appRole: 'app_user', // the role the application connects as (default: the role of lilypad-doctor)",
     empty ? '  tables: {},' : '  tables: { example },',

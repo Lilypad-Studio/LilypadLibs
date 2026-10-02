@@ -2530,14 +2530,17 @@ describe('LilypadDbGate (integration)', () => {
     });
 
     describe('the role of the application', () => {
-      const config = defineLilypadDb({
-        changelog: { pruning: 'external' },
-        appRole: 'role_app',
-        tables: {
-          users: { ...usersInput, sync: { strategy: 'changelog', pollInterval: 1000 } },
-          events: { tableName: 'events', primaryKey: 'id', cols: { id: {} } },
-        },
-      });
+      /** The tables, which the application only reads unless `access` says otherwise. */
+      const roleConfig = (access: 'read' | 'write' = 'read') =>
+        defineLilypadDb({
+          changelog: { pruning: 'external' },
+          appRole: 'role_app',
+          tables: {
+            users: { ...usersInput, access, sync: { strategy: 'changelog', pollInterval: 1000 } },
+            events: { tableName: 'events', primaryKey: 'id', access: 'read', cols: { id: {} } },
+          },
+        });
+      const config = roleConfig();
       const codesOf = (report: LilypadDoctorReport) =>
         report.problems.map((problem) => problem.code);
       const problemOf = (report: LilypadDoctorReport, code: string) =>
@@ -2589,13 +2592,18 @@ describe('LilypadDbGate (integration)', () => {
           await sql.unsafe(formatLilypadSchemaFixSql(first.problems));
           expect((await check()).problems).toEqual([]);
 
-          // A role that may write the table needs every write of the cache
-          await sql.unsafe('GRANT INSERT (name) ON users TO role_app');
-          const writes = await check();
+          // A table the application writes needs every write of the cache, its sequence included
+          const url = container.getConnectionUri().replace(/\/[^/]+$/, '/role_privileges');
+          const checkWrites = () =>
+            runLilypadDoctor({ connectionString: url, config: roleConfig('write') });
+          const writes = await checkWrites();
           expect(codesOf(writes)).toEqual(['missing-privilege']);
           expect(writes.problems[0]!.severity).toBe('warning');
+          expect(writes.problems[0]!.message).toContain(
+            'USAGE on the sequences of its serial columns (public.users_id_seq)'
+          );
           await sql.unsafe(formatLilypadSchemaFixSql(writes.problems));
-          expect((await check()).problems).toEqual([]);
+          expect((await checkWrites()).problems).toEqual([]);
         });
       });
 
@@ -2654,7 +2662,7 @@ describe('LilypadDbGate (integration)', () => {
             config: defineLilypadDb({
               appRole: 'role_app',
               maxStatementTimeout: false,
-              tables: { users: usersInput },
+              tables: { users: { ...usersInput, access: 'read' } },
             }),
           });
           expect(listen.problems.map((problem) => problem.code)).toEqual(['idle-session-timeout']);
@@ -2751,6 +2759,62 @@ describe('LilypadDbGate (integration)', () => {
         });
       });
 
+      it('should set up an empty database and the role of the application in one run', async () => {
+        await withDatabase('role_first', async (url, sql) => {
+          const config = defineLilypadDb({
+            changelog: { pruning: 'trigger' },
+            appRole: 'first_app',
+            tables: {
+              notes: {
+                tableName: 'app.notes',
+                primaryKey: 'id',
+                generatedPrimaryKey: true,
+                cols: { id: { pgType: 'int8' }, body: { pgType: 'text', nullable: false } },
+                sync: { strategy: 'changelog', pollInterval: 1000 },
+              },
+            },
+          });
+          const check = () => runLilypadDoctor({ connectionString: url, config });
+          try {
+            await sql.unsafe(formatLilypadSchemaFixSql((await check()).problems));
+            // Again: the creation of the role does nothing the second time (another database)
+            await sql.unsafe(`
+              DO $$ BEGIN
+                IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'first_app') THEN
+                  RAISE EXCEPTION 'not created';
+                END IF;
+              END $$;
+              ALTER ROLE first_app PASSWORD 'first_app';
+            `);
+            const changelogGrant = await check();
+            // The changelog was created by the same SQL, after the role: the next run grants it
+            expect(changelogGrant.problems.map(({ code }) => code)).toEqual(['missing-privilege']);
+            await sql.unsafe(formatLilypadSchemaFixSql(changelogGrant.problems));
+            expect((await check()).problems).toEqual([]);
+
+            const app = await LilypadDbGate.create({
+              connectionString: url.replace(/\/\/[^@]+@/, '//first_app:first_app@'),
+              config,
+            });
+            try {
+              const notes = app.table(config.tables.notes);
+              const { row } = await notes.insert({ body: 'hello' });
+              await notes.update({ id: row!.id, body: 'hello again' });
+              await notes.delete(row!.id);
+              const { changes } = await readLilypadChanges(app, {
+                tableName: 'app.notes',
+                since: { lookback: 60_000 },
+              });
+              expect(changes.map(({ op }) => op)).toEqual(['INSERT', 'UPDATE', 'DELETE']);
+            } finally {
+              await app.close();
+            }
+          } finally {
+            await sql.unsafe('DROP OWNED BY first_app; DROP ROLE IF EXISTS first_app;');
+          }
+        });
+      });
+
       it('should warn with strict about a role of the application that owns the tables', async () => {
         const report = await runLilypadDoctor({
           connectionString: container.getConnectionUri(),
@@ -2772,7 +2836,7 @@ describe('LilypadDbGate (integration)', () => {
         await withDatabase('role_usage', async (url, sql) => {
           await sql.unsafe(`
             CREATE SCHEMA hidden;
-            CREATE TABLE hidden.items (id int PRIMARY KEY);
+            CREATE TABLE hidden.items (id serial PRIMARY KEY);
             CREATE ROLE role_usage LOGIN PASSWORD 'role_usage';
             ALTER ROLE role_usage SET statement_timeout = '30s';
           `);
@@ -2784,6 +2848,8 @@ describe('LilypadDbGate (integration)', () => {
                   items: {
                     tableName: 'hidden.items',
                     primaryKey: 'id',
+                    // Its sequence is read from pg_depend: pg_get_serial_sequence needs USAGE
+                    generatedPrimaryKey: true,
                     cols: { id: {} },
                     sync: { strategy: 'none' },
                   },
@@ -2791,9 +2857,15 @@ describe('LilypadDbGate (integration)', () => {
               }),
             });
 
-            expect(report.problems.map(({ code }) => code)).toEqual(['missing-privilege']);
+            expect(report.problems.map(({ code }) => code)).toEqual([
+              'missing-privilege',
+              'missing-privilege',
+            ]);
             expect(report.problems[0]!.message).toContain(
               'lacks USAGE on the schema "hidden" and SELECT on the columns id of "hidden.items"'
+            );
+            expect(report.problems[1]!.message).toContain(
+              'USAGE on the sequences of its serial columns (hidden.items_id_seq)'
             );
           } finally {
             await sql.unsafe('DROP OWNED BY role_usage; DROP ROLE role_usage;');

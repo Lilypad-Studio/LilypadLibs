@@ -2283,11 +2283,10 @@ describe('the role of the application', () => {
           appPrivileges: {
             schemaUsage: true,
             missingSelect: [],
-            canWrite: true,
             missingInsert: [],
             missingUpdate: [],
             delete: true,
-            missingSequence: null,
+            missingSequences: [],
             ...privileges,
           },
         },
@@ -2319,7 +2318,7 @@ describe('the role of the application', () => {
 
   it('should report what the role cannot read of a table, with the GRANT', () => {
     const result = evaluateLilypadSchema(
-      withPrivileges({ schemaUsage: false, missingSelect: ['id', 'name'], canWrite: false }),
+      withPrivileges({ schemaUsage: false, missingSelect: ['id', 'name'] }),
       shaped
     );
 
@@ -2343,12 +2342,12 @@ describe('the role of the application', () => {
     expect(result.problems[0]!.fix).toBe('GRANT SELECT ON "items" TO "app";\n');
   });
 
-  it('should warn about the writes the role lacks, only when it may write the table', () => {
+  it('should warn about the writes the role lacks, unless the application only reads the table', () => {
     const result = evaluateLilypadSchema(
       withPrivileges({
         missingInsert: ['name'],
         delete: false,
-        missingSequence: 'public.items_id_seq',
+        missingSequences: ['public.items_id_seq'],
       }),
       shaped
     );
@@ -2357,15 +2356,19 @@ describe('the role of the application', () => {
     expect(result.ok).toBe(true);
     expect(result.problems[0]!.severity).toBe('warning');
     expect(result.problems[0]!.message).toContain(
-      'lacks INSERT of name, DELETE, USAGE on the sequence public.items_id_seq of its generated key'
+      'lacks INSERT of name, DELETE, USAGE on the sequences of its serial columns (public.items_id_seq) of "items"'
     );
     expect(result.problems[0]!.fix).toBe(
       'GRANT INSERT ("name") ON "items" TO "app";\nGRANT DELETE ON "items" TO "app";\nGRANT USAGE ON SEQUENCE public.items_id_seq TO "app";\n'
     );
 
-    // A read-only role is one by design
+    expect(result.problems[0]!.message).toContain("set its access: 'read'");
     expect(
-      codes(evaluateLilypadSchema(withPrivileges({ canWrite: false, delete: false }), shaped))
+      codes(
+        evaluateLilypadSchema(withPrivileges({ delete: false }), {
+          tables: [{ table: 'items', primaryKey: 'id', shape: { ...shape, access: 'read' } }],
+        })
+      )
     ).toEqual([]);
   });
 
@@ -2913,7 +2916,7 @@ describe('the role that missing-app-role creates', () => {
     generated: false,
   });
   /** `app_user` does not exist; `items` has the columns id and name, `missing` does not exist. */
-  const missingRole = (serialSequence: string | null = 'public.items_id_seq') =>
+  const missingRole = (sequences: string[] = ['public.items_id_seq']) =>
     facts({
       appRole: {
         name: 'app_user',
@@ -2927,7 +2930,7 @@ describe('the role that missing-app-role creates', () => {
           schema: 'public',
           triggers: [...changelogStatements, changelogTruncate],
           columns: [column('id'), column('name')],
-          serialSequence,
+          sequences,
         },
         { schema: null, triggers: [] },
       ],
@@ -2949,7 +2952,13 @@ describe('the role that missing-app-role creates', () => {
     );
     expect(fixOf(result)).toBe(
       [
-        'CREATE ROLE "app_user" LOGIN;',
+        'DO $$',
+        'BEGIN',
+        "  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'app_user') THEN",
+        '    CREATE ROLE "app_user" LOGIN;',
+        '  END IF;',
+        'END',
+        '$$;',
         `ALTER ROLE "app_user" SET statement_timeout = '30s';`,
         'GRANT USAGE ON SCHEMA "public" TO "app_user";',
         'GRANT SELECT ("id", "name") ON "items" TO "app_user";',
@@ -2973,9 +2982,8 @@ describe('the role that missing-app-role creates', () => {
       })
     );
 
-    expect(fix).toBe(
+    expect(fix!.slice(fix!.indexOf('$$;\n') + 4)).toBe(
       [
-        'CREATE ROLE "app_user" LOGIN;',
         'GRANT USAGE ON SCHEMA "public" TO "app_user";',
         'GRANT SELECT ("id", "name") ON "items" TO "app_user";',
         '',
@@ -2985,7 +2993,7 @@ describe('the role that missing-app-role creates', () => {
 
   it('should grant the whole table without a description, and the INSERT of a key not generated', () => {
     const fix = fixOf(
-      evaluateLilypadSchema(missingRole(null), {
+      evaluateLilypadSchema(missingRole([]), {
         tables: [{ table: 'items', primaryKey: 'id' }],
         maxStatementTimeout: 10_500,
       })
@@ -3002,6 +3010,40 @@ describe('the role that missing-app-role creates', () => {
     ).toContain('GRANT INSERT ("id", "name") ON "items"');
   });
 
+  it('should grant the role of the application a table that a fix creates, after creating both', () => {
+    const plans = {
+      table: 'public.plans',
+      primaryKey: 'id',
+      shape: { ...shape, cols: { id: { pgType: 'integer' }, name: { pgType: 'text' } } },
+    };
+    const result = evaluateLilypadSchema(missingRole(), {
+      tables: [items(), plans],
+      appRole: 'app_user',
+    });
+    const created = result.problems.find((problem) => problem.code === 'missing-table')!.fix!;
+
+    expect(created).toContain(
+      [
+        'GRANT USAGE ON SCHEMA "public" TO "app_user";',
+        'GRANT SELECT ("id", "name") ON "public"."plans" TO "app_user";',
+        'GRANT INSERT ("name") ON "public"."plans" TO "app_user";',
+        'GRANT UPDATE ("name") ON "public"."plans" TO "app_user";',
+        'GRANT DELETE ON "public"."plans" TO "app_user";',
+      ].join('\n')
+    );
+    const sql = formatLilypadSchemaFixSql(result.problems);
+    expect(sql.indexOf('CREATE ROLE')).toBeLessThan(sql.indexOf('CREATE TABLE "public"."plans"'));
+    expect(sql.indexOf('CREATE TABLE "public"."plans"')).toBeLessThan(
+      sql.indexOf('ON "public"."plans" TO')
+    );
+
+    // The role of the check creates the table, and owns it
+    const own = evaluateLilypadSchema(missingRole(), { tables: [items(), plans] });
+    expect(own.problems.find((problem) => problem.code === 'missing-table')!.fix).not.toContain(
+      'GRANT'
+    );
+  });
+
   it('should not report the writes of a table the application only reads', () => {
     const result = evaluateLilypadSchema(
       facts({
@@ -3012,11 +3054,10 @@ describe('the role that missing-app-role creates', () => {
             appPrivileges: {
               schemaUsage: true,
               missingSelect: [],
-              canWrite: true,
               missingInsert: ['name'],
               missingUpdate: [],
               delete: false,
-              missingSequence: null,
+              missingSequences: [],
             },
           },
         ],

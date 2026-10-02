@@ -231,9 +231,8 @@ export type LilypadSchemaProblemCode =
    * The role of the application lacks a privilege the library needs. An error for what it reads:
    * `USAGE` on the schema of a table or of the changelog, `SELECT` on the described columns of a
    * table, `SELECT` on the changelog (the `changelog` strategy). A warning for what the writes of
-   * `LilypadDbCache` need (`INSERT`, `UPDATE`, `DELETE`, `USAGE` on the sequence of a serial
-   * generated key), reported only when the role may write the table at all (a read-only role is not
-   * reported). The fix is the `GRANT`.
+   * `LilypadDbCache` need (`INSERT`, `UPDATE`, `DELETE`, `USAGE` on the sequences of the serial
+   * columns), unless the table's `access` is `read`. The fix is the `GRANT`.
    */
   | 'missing-privilege'
   /**

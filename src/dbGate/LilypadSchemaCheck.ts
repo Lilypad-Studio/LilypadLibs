@@ -27,6 +27,7 @@ import {
   evaluateRoleSettings,
   evaluateStatementTimeout,
   evaluateTableAccess,
+  lilypadNewTableGrants,
   quoteRole,
 } from '@/dbGate/LilypadSchemaRoles';
 import {
@@ -565,11 +566,21 @@ export function evaluateLilypadSchema(
         needsChangelog || notifyFixable
           ? (notifyFixable && !changelogFixed ? changelogSql : '') + triggerSql
           : '';
+      // With the grants of the role of the application, which may be created by the same fixes
       const createFix =
         createTable &&
         (missingSchema !== undefined
           ? `CREATE SCHEMA IF NOT EXISTS ${quoteIdentifier(missingSchema)};\n`
-          : '') + createTable;
+          : '') +
+          createTable +
+          lilypadNewTableGrants(
+            facts,
+            options,
+            table,
+            primaryKey,
+            shape,
+            table.includes('.') ? table.split('.')[0] : undefined
+          );
       const missingTable: LilypadSchemaProblem = {
         code: 'missing-table',
         severity: 'error',

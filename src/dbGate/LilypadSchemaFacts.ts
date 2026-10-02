@@ -173,16 +173,14 @@ export type LilypadTablePrivileges = {
   schemaUsage: boolean;
   /** The columns it may not `SELECT`. */
   missingSelect: string[];
-  /** Whether it may write the table at all (`INSERT` or `UPDATE` of a column, or `DELETE`). */
-  canWrite: boolean;
   /** The columns it may not `INSERT` (not the generated primary key). */
   missingInsert: string[];
   /** The columns it may not `UPDATE` (not the primary key). */
   missingUpdate: string[];
   /** `DELETE` on the table. */
   delete: boolean;
-  /** The sequence of a serial generated primary key it may not use (`null`: none, or allowed). */
-  missingSequence: string | null;
+  /** The sequences of its serial columns (see {@link LilypadTableFacts.sequences}) it may not use. */
+  missingSequences: string[];
 };
 
 /** What `checkLilypadSchema` reads from the catalogs, before it evaluates it. */
@@ -326,8 +324,11 @@ export type LilypadTableFacts = {
    * exist).
    */
   ownedByAppRole?: boolean | null | undefined;
-  /** The sequence of its serial generated primary key (`null`: none, e.g. an identity). */
-  serialSequence?: string | null | undefined;
+  /**
+   * The sequences owned by its (described) columns, qualified and quoted: the serial columns, whose
+   * default an insert that leaves them out runs (an identity column needs no privilege).
+   */
+  sequences?: string[] | undefined;
   columns?: LilypadColumnInfo[] | undefined;
   constraints?: LilypadConstraintInfo[] | undefined;
   indexes?: LilypadIndexInfo[] | undefined;
@@ -419,6 +420,24 @@ const REQUESTED_TABLE_OID = `CASE WHEN requested.schema_name = '' THEN to_regcla
   SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace ns ON ns.oid = c.relnamespace
   WHERE ns.nspname = requested.schema_name AND c.relname = requested.table_name
 ) END`;
+
+/**
+ * The sequences owned by the described columns of the table `t` (`seq.oid`, `seq.name`: qualified
+ * and quoted), for a `FROM`: those of the serial columns (`OWNED BY`, an automatic dependency; an
+ * identity column's is internal, and needs no privilege). Read from `pg_depend`:
+ * `pg_get_serial_sequence` throws without `USAGE` on the schema.
+ */
+const OWNED_SEQUENCES = `(
+  SELECT s.oid, s.relkind AS kind, format('%I.%I', sn.nspname, s.relname) AS name
+  FROM pg_catalog.pg_depend dep
+  JOIN pg_catalog.pg_class s ON s.oid = dep.objid AND s.relkind = 'S'
+  JOIN pg_catalog.pg_namespace sn ON sn.oid = s.relnamespace
+  JOIN pg_catalog.pg_attribute sa ON sa.attrelid = dep.refobjid AND sa.attnum = dep.refobjsubid
+  WHERE dep.classid = 'pg_catalog.pg_class'::regclass
+    AND dep.refclassid = 'pg_catalog.pg_class'::regclass
+    AND dep.refobjid = t.oid AND dep.deptype = 'a'
+    AND (described.cols IS NULL OR sa.attname = ANY(described.cols))
+) AS seq`;
 
 async function readDatabaseFacts(
   gate: LilypadDbGate,
@@ -893,22 +912,14 @@ async function readTableFacts(
       END AS row_security,
       CASE WHEN app.oid IS NOT NULL THEN pg_has_role(app.oid, t.relowner, 'USAGE') END
         AS owned_by_app_role,
-      -- The sequence of a serial generated key (an identity column needs no privilege)
       (
-        SELECT pg_get_serial_sequence(t.oid::regclass::text, k.attname)
-        FROM pg_attribute k
-        WHERE described.generated AND k.attrelid = t.oid
-          AND k.attname = keys.primary_key::pg_catalog.name
-          AND k.attnum > 0 AND NOT k.attisdropped AND k.attidentity = ''
-      ) AS serial_sequence,
+        SELECT coalesce(json_agg(seq.name ORDER BY seq.name), '[]'::json) FROM ${sql.unsafe(OWNED_SEQUENCES)}
+      ) AS sequences,
       CASE WHEN app.oid IS NOT NULL THEN (
         SELECT json_build_object(
           'schemaUsage', has_schema_privilege(app.oid, t.relnamespace, 'USAGE'),
           'missingSelect', coalesce(json_agg(a.attname ORDER BY a.attnum)
             FILTER (WHERE NOT has_column_privilege(app.oid, t.oid, a.attnum, 'SELECT')), '[]'::json),
-          'canWrite', has_any_column_privilege(app.oid, t.oid, 'INSERT')
-            OR has_any_column_privilege(app.oid, t.oid, 'UPDATE')
-            OR has_table_privilege(app.oid, t.oid, 'DELETE'),
           'missingInsert', coalesce(json_agg(a.attname ORDER BY a.attnum) FILTER (
             WHERE NOT (described.generated AND a.attname = keys.primary_key)
               AND NOT has_column_privilege(app.oid, t.oid, a.attnum, 'INSERT')
@@ -918,17 +929,13 @@ async function readTableFacts(
               AND NOT has_column_privilege(app.oid, t.oid, a.attnum, 'UPDATE')
           ), '[]'::json),
           'delete', has_table_privilege(app.oid, t.oid, 'DELETE'),
-          -- The sequence of a serial generated key (an identity column needs no privilege)
-          'missingSequence', (
-            SELECT CASE WHEN NOT has_sequence_privilege(app.oid, seq.name, 'USAGE') THEN seq.name END
-            FROM (
-              SELECT pg_get_serial_sequence(t.oid::regclass::text, k.attname) AS name
-              FROM pg_attribute k
-              WHERE described.generated AND k.attrelid = t.oid
-                AND k.attname = keys.primary_key::pg_catalog.name
-                AND k.attnum > 0 AND NOT k.attisdropped AND k.attidentity = ''
-            ) AS seq
-            WHERE seq.name IS NOT NULL
+          'missingSequences', (
+            SELECT coalesce(json_agg(seq.name ORDER BY seq.name), '[]'::json)
+            FROM ${sql.unsafe(OWNED_SEQUENCES)}
+            -- CASE: the planner may test the privilege before the join keeps only sequences
+            -- (a partition depends on its parent the same way), and it throws for another relation
+            WHERE CASE WHEN seq.kind = 'S'
+              THEN NOT has_sequence_privilege(app.oid, seq.oid, 'USAGE') ELSE false END
           )
         )
         FROM pg_attribute a
@@ -1021,7 +1028,7 @@ async function readTableFacts(
       subscribed: subscribed === null ? null : subscribed.has(index + 1),
       appPrivileges: (parseJsonColumn(row.app_privileges) ?? null) as LilypadTablePrivileges | null,
       ownedByAppRole: row.owned_by_app_role as boolean | null,
-      serialSequence: row.serial_sequence as string | null,
+      sequences: parseJsonColumn(row.sequences) as string[],
     };
     if (table.shape !== undefined) {
       facts.columns = parseJsonColumn(row.columns) as LilypadColumnInfo[];

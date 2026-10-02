@@ -162,7 +162,7 @@ function changelogObjectName(prefix: string, suffix: string): string {
  * Dollar-quotes a body with a tag that it does not contain: the names of a config may contain `$`.
  * The tag is lengthened with `_` until it is unique.
  */
-function dollarQuote(body: string, tag = ''): string {
+export function dollarQuote(body: string, tag = ''): string {
   let delimiter = `$${tag}$`;
   // Also when the end of the body and the delimiter form one (`...$` followed by `$$`)
   while (`${body}${delimiter}`.indexOf(delimiter) !== body.length) {
