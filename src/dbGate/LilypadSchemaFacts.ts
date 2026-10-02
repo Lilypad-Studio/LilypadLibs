@@ -111,7 +111,7 @@ type LilypadBlockedChangelogTable = {
 };
 
 /** The settings the check reads for the role of the application. */
-export const LILYPAD_ROLE_SETTINGS = [
+const LILYPAD_ROLE_SETTINGS = [
   'statement_timeout',
   'idle_session_timeout',
   'session_replication_role',
@@ -133,7 +133,7 @@ export type LilypadSettingInfo = {
 };
 
 /** A row of `pg_db_role_setting` that applies to this database. */
-export type LilypadRoleSettingRow = {
+type LilypadRoleSettingRow = {
   /** The role, or `null` for every role (`ALTER DATABASE ... SET`, `ALTER ROLE ALL SET`). */
   role: string | null;
   /** Whether it applies to this database only (else to every database). */
@@ -156,7 +156,7 @@ export type LilypadFunctionInfo = {
 };
 
 /** A role other than its owner granted a write of the changelog. */
-export type LilypadChangelogWriter = {
+type LilypadChangelogWriter = {
   /** Quoted, or `PUBLIC`. */
   role: string;
   /** Among `INSERT`, `UPDATE`, `DELETE` and `TRUNCATE`, on the table or some of its columns. */
