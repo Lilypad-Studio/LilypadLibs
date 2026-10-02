@@ -112,6 +112,18 @@ export type LilypadSchemaFacts = {
   version: number;
   /** `current_database()`. */
   database: string;
+  /** The session of the check: the role it connects as, and the settings that bound its queries. */
+  session: {
+    /** `current_user`. */
+    role: string;
+    /** `statement_timeout`, in ms (`0`: none); `null` if it cannot be read. */
+    statementTimeout: number | null;
+    /**
+     * Where it comes from (`pg_settings.source`): `default`, `configuration file`, `database`,
+     * `user`, `database user`, `client`...
+     */
+    statementTimeoutSource: string | null;
+  };
   changelog: {
     hasTable: boolean;
     hasSchemaColumn: boolean;
@@ -266,6 +278,11 @@ async function readDatabaseFacts(
     SELECT
       current_setting('server_version_num')::int AS version,
       current_database() AS database,
+      current_user AS role,
+      -- In ms (its unit), as it applies to this session: the server, database and role settings, and
+      -- what the connection sets
+      (SELECT setting::float8 FROM pg_settings WHERE name = 'statement_timeout') AS statement_timeout,
+      (SELECT source FROM pg_settings WHERE name = 'statement_timeout') AS statement_timeout_source,
       to_regclass(${quotedChangelog}::text) IS NOT NULL AS has_changelog_table,
       (
         SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -374,6 +391,11 @@ async function readDatabaseFacts(
   return {
     version: database.version as number,
     database: database.database as string,
+    session: {
+      role: database.role as string,
+      statementTimeout: database.statement_timeout as number | null,
+      statementTimeoutSource: database.statement_timeout_source as string | null,
+    },
     changelog: {
       hasTable: database.has_changelog_table as boolean,
       hasSchemaColumn: database.has_schema_column as boolean,

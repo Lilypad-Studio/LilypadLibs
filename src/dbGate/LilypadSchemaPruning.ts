@@ -29,7 +29,7 @@ const DEFAULT_MIN_RETENTION = HOUR;
 const UNPRUNED_MARGIN = 7 * DAY;
 
 /** A duration for a message, e.g. `36 hours`, `2.5 days`. */
-function formatDuration(ms: number): string {
+export function formatDuration(ms: number): string {
   const units: [number, string][] = [
     [DAY, 'day'],
     [HOUR, 'hour'],

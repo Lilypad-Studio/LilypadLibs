@@ -77,6 +77,13 @@ export type LilypadSchemaCheckOptions = {
    * A table that needs yet another channel gets no fix: it needs a notifying trigger of its own.
    */
   notifyChannel?: string | false | undefined;
+  /**
+   * The longest `statement_timeout` accepted for the session of the check, in ms: none (`0`) or a
+   * longer one is the warning `long-statement-timeout`. The check reads it for the role it connects
+   * as (and the connection: on the gate of the application, the `statementTimeout` of the gate).
+   * `false` skips it. Defaults to 1 minute.
+   */
+  maxStatementTimeout?: number | false | undefined;
 };
 
 export type LilypadSchemaProblemCode =
@@ -192,7 +199,14 @@ export type LilypadSchemaProblemCode =
   /** A warning of `strict`: a unique key, foreign key or check is not in the description. */
   | 'undeclared-constraint'
   /** A warning of `strict`: an index is not in the description. */
-  | 'undeclared-index';
+  | 'undeclared-index'
+  /**
+   * A warning: the session of the check has no `statement_timeout` (`0`), or one longer than
+   * `maxStatementTimeout`. Nothing then bounds a query stuck on a lock or a dead connection: it holds
+   * its connection of the pool, and its caller, for as long as it lasts. It has no fix (the role of
+   * the check may not be the role of the application): the message gives the `ALTER ROLE`.
+   */
+  | 'long-statement-timeout';
 
 /**
  * `error`: the database is not what the config describes (the caches may serve stale data, the

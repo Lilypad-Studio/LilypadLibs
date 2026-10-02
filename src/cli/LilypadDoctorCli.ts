@@ -17,8 +17,8 @@ init creates a config file to start from (see lilypad-doctor init --help).
 
 Without a command, it checks the database against a config (see defineLilypadDb): the tables,
 their columns, keys, foreign keys, indexes and checks, the triggers of the sync strategies, the
-changelog and how it is pruned. It only reads the catalogs, and prints the SQL that fixes what it
-finds.
+changelog and how it is pruned, and the statement_timeout of the role it connects as. It only reads
+the catalogs, and prints the SQL that fixes what it finds.
 
 Options:
   --config <name|path>  The config: a name finds lilypad.<name>.config.{ts,mts,mjs,js} in the

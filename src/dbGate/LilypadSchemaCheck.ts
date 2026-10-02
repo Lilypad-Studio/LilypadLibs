@@ -1,4 +1,6 @@
+import { LILYPAD_DEFAULT_MAX_STATEMENT_TIMEOUT } from '@/dbConfig/LilypadDbConfigDefaults';
 import type { LilypadDbGate } from '@/dbGate/LilypadDbGate';
+import { assertNumberOption } from '@/internal/LilypadValidation';
 import {
   LILYPAD_CHANGELOG_NEW_ROWS,
   LILYPAD_CHANGELOG_OLD_ROWS,
@@ -17,7 +19,7 @@ import {
   type LilypadSchemaFacts,
   type LilypadTriggerInfo,
 } from '@/dbGate/LilypadSchemaFacts';
-import { evaluatePruning } from '@/dbGate/LilypadSchemaPruning';
+import { evaluatePruning, formatDuration } from '@/dbGate/LilypadSchemaPruning';
 import {
   evaluateLilypadTableShape,
   lilypadCreateTableSql,
@@ -186,7 +188,8 @@ function installedNotifyChannel(source: string | null): string | false {
 /**
  * Checks that the database has what `LilypadDbCache` needs to learn about changes: the changelog
  * table, its trigger function and a trigger on each cached table, or a trigger that sends
- * notifications. It only reads the catalogs: it changes nothing.
+ * notifications; and the `statement_timeout` of the role it connects as (see
+ * `maxStatementTimeout`). It only reads the catalogs: it changes nothing.
  *
  * @returns The problems found, each with a message and, when the library can generate it, the SQL
  * that fixes it (`ok` is true when there is none).
@@ -558,7 +561,7 @@ export function evaluateLilypadSchema(
     });
   }
 
-  problems.push(...deferred, ...pruning.problems);
+  problems.push(...deferred, ...pruning.problems, ...evaluateStatementTimeout(facts, options));
   // Every fix of the changelog, its triggers and its privileges is withheld while a table blocks
   // them (any of them could make the triggers refuse its key, and fail its writes), or while a newer
   // version installed the changelog (they would install the older SQL of this one)
@@ -593,6 +596,54 @@ export function evaluateLilypadSchema(
     problems: withheld,
     tables,
   };
+}
+
+/** Where a setting comes from, for a message (`pg_settings.source`). */
+const SETTING_SOURCES: Record<string, string> = {
+  default: 'the default of PostgreSQL',
+  'configuration file': 'the configuration of the server',
+  database: 'the database',
+  user: 'the role',
+  'database user': 'the role in this database',
+  client: 'the connection',
+};
+
+/**
+ * `long-statement-timeout`: the `statement_timeout` of the session of the check is off, or longer
+ * than `maxStatementTimeout`. No fix: the role of the check may not be the role of the application
+ * (e.g. a migration role, whose long statements a timeout would cancel).
+ */
+function evaluateStatementTimeout(
+  facts: LilypadSchemaFacts,
+  options: LilypadSchemaCheckOptions
+): LilypadSchemaProblem[] {
+  const max = options.maxStatementTimeout ?? LILYPAD_DEFAULT_MAX_STATEMENT_TIMEOUT;
+  if (max === false) {
+    return [];
+  }
+  assertNumberOption('checkLilypadSchema', 'maxStatementTimeout', max, 'positive-delay');
+  const { role, statementTimeout, statementTimeoutSource: source } = facts.session;
+  if (statementTimeout === null || (statementTimeout > 0 && statementTimeout <= max)) {
+    return [];
+  }
+  const from = source === null ? '' : `, from ${SETTING_SOURCES[source] ?? `the ${source}`}`;
+  const found =
+    statementTimeout === 0
+      ? `has no statement_timeout (0${from})`
+      : `has a statement_timeout of ${formatDuration(statementTimeout)} (${statementTimeout} ms${from}), longer than ${formatDuration(max)} (maxStatementTimeout)`;
+  // Within maxStatementTimeout, or the suggested setting would be reported too
+  const suggested = Math.min(30_000, max);
+  const setting = suggested % 1000 === 0 ? `${suggested / 1000}s` : `${suggested}ms`;
+  return [
+    {
+      code: 'long-statement-timeout',
+      severity: 'warning',
+      message:
+        `The role "${role}" that the check connects as ${found}: a query stuck on a lock or a dead connection holds its connection of the pool, and its caller, for as long as it lasts (the gate sets no timeout by default, and the caches stop waiting, not their queries).` +
+        ` If the application connects as this role, bound its queries: ALTER ROLE ${quoteIdentifier(role)} SET statement_timeout = '${setting}'; (behind a pooler, the role the pooler connects as).` +
+        ' If it connects as another role (check that one), or bounds its queries with the statementTimeout of its gate, set maxStatementTimeout: false in the config (or in the options of checkLilypadSchema).',
+    },
+  ];
 }
 
 /**

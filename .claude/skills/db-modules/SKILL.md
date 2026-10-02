@@ -40,4 +40,4 @@ Read the matching section of `docs/architecture.md` (and `docs/how-it-works.md` 
 - Bump `SHARED_FORMAT_VERSION` in `src/cache/LilypadSharedLevel.ts`: it builds the `lilypad:<v>:` keys and the `{ lilypad: <v> }` envelope, so the instances of two versions never read each other's entries.
 - Update the key literals (`lilypad:2:`) in `src/cache/LilypadCache.shared.test.ts` and `src/dbCache/LilypadDbCache.test.ts`.
 
-<!-- verified against code: 2026-10-01 -->
+<!-- verified against code: 2026-10-02 -->

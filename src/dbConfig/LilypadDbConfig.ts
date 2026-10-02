@@ -11,6 +11,7 @@ import {
   LILYPAD_DEFAULT_DB_CONFIG_NAME,
   LILYPAD_DEFAULT_DB_SCHEMA,
   LILYPAD_DEFAULT_MAX_GAP,
+  LILYPAD_DEFAULT_MAX_STATEMENT_TIMEOUT,
   LILYPAD_DEFAULT_NOTIFY_CHANNEL,
 } from '@/dbConfig/LilypadDbConfigDefaults';
 import { validateLilypadDbConfigInput } from '@/dbConfig/LilypadDbConfigValidation';
@@ -278,6 +279,14 @@ export type LilypadDbConfigInput<Tables extends Record<string, LilypadDbTableInp
    * foreign keys, unique keys and indexes. Defaults to false.
    */
   strict?: boolean | undefined;
+  /**
+   * The longest `statement_timeout` that `lilypad-doctor` accepts for the role it connects as, in
+   * ms: a longer one, or none (`0`), is a warning. Without it, a query stuck on a lock or a dead
+   * connection holds its connection of the pool, and its caller, for as long as it lasts (the gate
+   * sets no timeout by default). `false` skips the check, e.g. when the doctor connects as another
+   * role than the application. Defaults to 1 minute.
+   */
+  maxStatementTimeout?: number | false | undefined;
   /** The tables, by key: `db.tables.<key>`. */
   tables: Tables;
 };
@@ -299,6 +308,7 @@ export type LilypadDbConfig<
     readonly minRetention: number;
   };
   readonly strict: boolean;
+  readonly maxStatementTimeout: number | false;
   readonly tables: Tables;
 };
 
@@ -635,6 +645,7 @@ export function defineLilypadDb<Tables extends Record<string, LilypadDbTableInpu
       minRetention: input.changelog?.minRetention ?? LILYPAD_DEFAULT_MAX_GAP,
     }),
     strict: input.strict ?? false,
+    maxStatementTimeout: input.maxStatementTimeout ?? LILYPAD_DEFAULT_MAX_STATEMENT_TIMEOUT,
     tables: Object.freeze(tables),
   }) as unknown as LilypadDbConfig<{ [K in keyof Tables]: LilypadDbTableDefinitionOf<Tables[K]> }>;
 }

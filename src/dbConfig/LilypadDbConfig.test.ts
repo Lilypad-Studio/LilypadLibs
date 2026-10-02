@@ -45,7 +45,11 @@ describe('defineLilypadDb', () => {
       notifyChannel: 'cache_events',
       changelog: { table: 'lilypad_cache_changes', pruning: 'detect', minRetention: 3_600_000 },
       strict: false,
+      maxStatementTimeout: 60_000,
     });
+    expect(
+      defineLilypadDb({ maxStatementTimeout: false, tables: { orgs } }).maxStatementTimeout
+    ).toBe(false);
     expect(isLilypadDbTableDefinition(db.tables.users)).toBe(true);
     expect(db.tables.orgs).toMatchObject({
       key: 'orgs',
@@ -398,6 +402,8 @@ describe('defineLilypadDb', () => {
       'changelog.tabel is not an option',
     ],
     ['a strict flag that is not a boolean', { strict: 'yes' }, 'strict must be a boolean'],
+    ['a maxStatementTimeout of 0', { maxStatementTimeout: 0 }, 'maxStatementTimeout must be'],
+    ['a maxStatementTimeout of true', { maxStatementTimeout: true }, 'maxStatementTimeout must be'],
     ['a schema with a dot', { defaultSchema: 'a.b' }, 'defaultSchema must not contain a dot'],
     ['a channel longer than 63 bytes', { notifyChannel: 'c'.repeat(64) }, 'longer than 63 bytes'],
     [

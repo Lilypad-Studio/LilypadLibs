@@ -94,6 +94,7 @@ export function lilypadDbConfigTemplate({
     "  // notifyChannel: 'cache_events', // the channel of the 'listen' tables",
     "  // changelog: { table: 'lilypad_cache_changes', pruning: 'detect' }, // for the 'changelog' tables",
     '  // strict: false, // true: lilypad-doctor also reports what the database has and the config lacks',
+    '  // maxStatementTimeout: 60_000, // the longest statement_timeout lilypad-doctor accepts for its role (false: not checked)',
     empty ? '  tables: {},' : '  tables: { example },',
     '});',
     '',
