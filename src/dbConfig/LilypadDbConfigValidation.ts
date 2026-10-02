@@ -44,6 +44,7 @@ const CONFIG_OPTIONS = optionsOf<ConfigInput>({
   notifyChannel: true,
   changelog: true,
   strict: true,
+  maxStatementTimeout: true,
   tables: true,
 });
 const CHANGELOG_OPTIONS = optionsOf<NonNullable<ConfigInput['changelog']>>({
@@ -469,6 +470,10 @@ export function validateLilypadDbConfigInput(input: ConfigInput): void {
     assertNumberOption(OWNER, 'changelog.minRetention', input.changelog.minRetention, 'positive');
   }
   assertBoolean(input.strict, 'strict');
+  if (input.maxStatementTimeout !== false) {
+    // statement_timeout holds at most 2^31 - 1 ms, as a timer does
+    assertNumberOption(OWNER, 'maxStatementTimeout', input.maxStatementTimeout, 'positive-delay');
+  }
   if (!isPlainObject(input.tables)) {
     fail('tables must be an object: { <key>: <table> }.');
   }

@@ -57,6 +57,7 @@ function facts(overrides: Partial<LilypadSchemaFacts> = {}): LilypadSchemaFacts 
   return {
     version: 160000,
     database: 'app',
+    session: { role: 'app', statementTimeout: 30_000, statementTimeoutSource: 'user' },
     changelog: {
       hasTable: true,
       hasSchemaColumn: true,
@@ -1688,6 +1689,86 @@ describe('the pruning of the changelog', () => {
   });
 });
 
+describe('the statement_timeout of the session', () => {
+  const withTimeout = (statementTimeout: number | null, source: string | null = 'user') =>
+    facts({ session: { role: 'app', statementTimeout, statementTimeoutSource: source } });
+  const timeoutProblem = (result: ReturnType<typeof evaluateLilypadSchema>) =>
+    result.problems.find((problem) => problem.code === 'long-statement-timeout');
+
+  it('should warn when the role has no statement_timeout, with the ALTER ROLE and no fix', () => {
+    const result = evaluateLilypadSchema(withTimeout(0, 'default'), changelogOptions);
+
+    expect(result.ok).toBe(true);
+    expect(codes(result)).toEqual(['long-statement-timeout']);
+    const problem = timeoutProblem(result)!;
+    expect(problem.severity).toBe('warning');
+    expect(problem.fix).toBeUndefined();
+    expect(problem.message).toContain(
+      'The role "app" that the check connects as has no statement_timeout (0, from the default of PostgreSQL)'
+    );
+    expect(problem.message).toContain(`ALTER ROLE "app" SET statement_timeout = '30s';`);
+    expect(formatLilypadSchemaFixSql(result.problems)).toBe('');
+  });
+
+  it('should warn when the statement_timeout is longer than maxStatementTimeout', () => {
+    const problem = timeoutProblem(
+      evaluateLilypadSchema(withTimeout(300_000, 'database user'), changelogOptions)
+    )!;
+
+    expect(problem.message).toContain(
+      'has a statement_timeout of 5 minutes (300000 ms, from the role in this database), longer than 1 minute (maxStatementTimeout)'
+    );
+  });
+
+  it('should suggest a statement_timeout within maxStatementTimeout', () => {
+    const problem = timeoutProblem(
+      evaluateLilypadSchema(withTimeout(0), { ...changelogOptions, maxStatementTimeout: 10_500 })
+    )!;
+
+    expect(problem.message).toContain(`SET statement_timeout = '10500ms';`);
+    expect(problem.message).toContain('the statementTimeout of its gate');
+  });
+
+  it('should accept a statement_timeout up to maxStatementTimeout', () => {
+    expect(codes(evaluateLilypadSchema(withTimeout(60_000), changelogOptions))).toEqual([]);
+    expect(
+      codes(
+        evaluateLilypadSchema(withTimeout(300_000), {
+          ...changelogOptions,
+          maxStatementTimeout: 600_000,
+        })
+      )
+    ).toEqual([]);
+  });
+
+  it('should skip the check with maxStatementTimeout: false, or a setting it cannot read', () => {
+    expect(
+      codes(
+        evaluateLilypadSchema(withTimeout(0), { ...changelogOptions, maxStatementTimeout: false })
+      )
+    ).toEqual([]);
+    expect(codes(evaluateLilypadSchema(withTimeout(null, null), changelogOptions))).toEqual([]);
+  });
+
+  it('should quote the role in the ALTER ROLE, and name an unknown source as it is', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        session: { role: 'App "User"', statementTimeout: 0, statementTimeoutSource: 'override' },
+      }),
+      changelogOptions
+    );
+
+    expect(timeoutProblem(result)!.message).toContain('(0, from the override)');
+    expect(timeoutProblem(result)!.message).toContain('ALTER ROLE "App ""User""" SET');
+  });
+
+  it('should reject an invalid maxStatementTimeout', () => {
+    expect(() =>
+      evaluateLilypadSchema(facts(), { ...changelogOptions, maxStatementTimeout: -1 })
+    ).toThrow('maxStatementTimeout');
+  });
+});
+
 describe('lilypadPruneCommandRetention', () => {
   it.each([
     ['make_interval(secs => 86400)', 86_400_000],
@@ -1884,10 +1965,15 @@ describe('evaluateLilypadSchema with the tables of a config', () => {
       },
       changelogTable: 'lilypad_cache_changes',
       notifyChannel: false,
+      maxStatementTimeout: 60_000,
     });
     expect(lilypadSchemaCheckOptions(defineLilypadDb({ tables: { orgs: orgs } })).changelog).toBe(
       false
     );
+    expect(
+      lilypadSchemaCheckOptions(defineLilypadDb({ maxStatementTimeout: false, tables: { orgs } }))
+        .maxStatementTimeout
+    ).toBe(false);
   });
 
   it('should install the changelog of the config in the fixes of listen tables alone', () => {

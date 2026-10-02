@@ -12,3 +12,5 @@ export const LILYPAD_DEFAULT_DB_CONFIG_NAME = 'default';
 export const LILYPAD_DEFAULT_DB_SCHEMA = 'public';
 /** The default `maxGap` of the `changelog` strategy, and the default `minRetention` of the changelog. */
 export const LILYPAD_DEFAULT_MAX_GAP: number = 60 * 60 * 1000; // 1 hour
+/** The default `maxStatementTimeout` of a config: the longest `statement_timeout` `lilypad-doctor` accepts. */
+export const LILYPAD_DEFAULT_MAX_STATEMENT_TIMEOUT: number = 60 * 1000; // 1 minute

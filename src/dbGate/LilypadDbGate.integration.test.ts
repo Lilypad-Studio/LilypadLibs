@@ -23,7 +23,11 @@ import {
 } from './LilypadSchemaCheck';
 import { readLilypadSchemaFacts } from './LilypadSchemaFacts';
 import type { LilypadSchemaCheckOptions } from './LilypadSchemaTypes';
-import { lilypadSchemaCheckOptions, runLilypadDoctor } from './LilypadDoctor';
+import {
+  lilypadSchemaCheckOptions,
+  runLilypadDoctor,
+  type LilypadDoctorReport,
+} from './LilypadDoctor';
 import type { LilypadLoggerType } from '@/logger/LilypadLogger';
 
 type User = { id: number; name: string; role: string };
@@ -66,6 +70,8 @@ describe('LilypadDbGate (integration)', () => {
     const image = process.env.LILYPAD_TEST_PG_IMAGE ?? 'postgres:16-alpine';
     container = await new PostgreSqlContainer(image).start();
     admin = postgres(container.getConnectionUri(), { onnotice: () => {} });
+    // As lilypad-doctor recommends: the checks then report no long-statement-timeout
+    await admin`ALTER ROLE CURRENT_USER SET statement_timeout = '30s'`;
     await admin`
       CREATE TABLE users (
         id serial PRIMARY KEY,
@@ -2374,6 +2380,58 @@ describe('LilypadDbGate (integration)', () => {
       expect(() => report.assertOk()).toThrow(LilypadSchemaCheckError);
     });
 
+    it('should warn about the statement_timeout of the role it connects as', async () => {
+      // A role without a timeout of its own: the server default (0) applies
+      await admin.unsafe(`CREATE ROLE doctor_unbounded LOGIN PASSWORD 'doctor'`);
+      try {
+        const url = new URL(container.getConnectionUri());
+        url.username = 'doctor_unbounded';
+        url.password = 'doctor';
+        const config = defineLilypadDb({ tables: { users: usersInput } });
+        const timeoutProblem = (report: LilypadDoctorReport) =>
+          report.problems.find((problem) => problem.code === 'long-statement-timeout');
+
+        const unbounded = await runLilypadDoctor({ connectionString: url.href, config });
+        expect(timeoutProblem(unbounded)?.message).toContain(
+          'The role "doctor_unbounded" that the check connects as has no statement_timeout (0, from the default of PostgreSQL)'
+        );
+        expect(timeoutProblem(unbounded)?.fix).toBeUndefined();
+
+        await admin.unsafe(`ALTER ROLE doctor_unbounded SET statement_timeout = '5min'`);
+        const long = await runLilypadDoctor({ connectionString: url.href, config });
+        expect(timeoutProblem(long)?.message).toContain(
+          'has a statement_timeout of 5 minutes (300000 ms, from the role)'
+        );
+
+        const accepted = defineLilypadDb({
+          maxStatementTimeout: 600_000,
+          tables: { users: usersInput },
+        });
+        const report = await runLilypadDoctor({ connectionString: url.href, config: accepted });
+        expect(timeoutProblem(report)).toBeUndefined();
+      } finally {
+        await admin.unsafe(`DROP ROLE doctor_unbounded`);
+      }
+    });
+
+    it("should read the statement_timeout of the application's gate, which its connection sets", async () => {
+      const bounded = await LilypadDbGate.create({
+        connectionString: container.getConnectionUri(),
+        statementTimeout: 120_000,
+      });
+      try {
+        const result = await checkLilypadSchema(bounded, {
+          tables: [{ table: 'users', primaryKey: 'id' }],
+          changelog: false,
+        });
+        expect(result.problems.map((problem) => problem.message)).toEqual([
+          expect.stringContaining('(120000 ms, from the connection), longer than 1 minute'),
+        ]);
+      } finally {
+        await bounded.close();
+      }
+    });
+
     /** A new database of the container, its URL and a client of it, dropped after `run`. */
     const withDatabase = async (
       name: string,
@@ -2448,6 +2506,7 @@ describe('LilypadDbGate (integration)', () => {
           CREATE TABLE cron.job (jobid bigint, command text);
           REVOKE ALL ON SCHEMA cron FROM PUBLIC;
           CREATE ROLE doctor_app LOGIN PASSWORD 'doctor_app';
+          ALTER ROLE doctor_app SET statement_timeout = '30s';
         `);
         try {
           const report = await runLilypadDoctor({
