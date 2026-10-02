@@ -287,6 +287,15 @@ export type LilypadDbConfigInput<Tables extends Record<string, LilypadDbTableInp
    * role than the application. Defaults to 1 minute.
    */
   maxStatementTimeout?: number | false | undefined;
+  /**
+   * The role the application connects as (behind a pooler, the role the pooler connects as).
+   * `lilypad-doctor` checks its privileges (it must read the tables, their schemas and the
+   * changelog), its settings (`statement_timeout`, `session_replication_role`,
+   * `default_transaction_isolation`, `idle_session_timeout`, `default_transaction_read_only`) and
+   * row-level security for this role. Defaults to the role the doctor connects as: set it when the
+   * doctor runs as another role (e.g. a migration role). `lilypad-doctor --app-role` overrides it.
+   */
+  appRole?: string | undefined;
   /** The tables, by key: `db.tables.<key>`. */
   tables: Tables;
 };
@@ -309,6 +318,8 @@ export type LilypadDbConfig<
   };
   readonly strict: boolean;
   readonly maxStatementTimeout: number | false;
+  /** The role the application connects as (`undefined`: the role `lilypad-doctor` connects as). */
+  readonly appRole: string | undefined;
   readonly tables: Tables;
 };
 
@@ -646,6 +657,7 @@ export function defineLilypadDb<Tables extends Record<string, LilypadDbTableInpu
     }),
     strict: input.strict ?? false,
     maxStatementTimeout: input.maxStatementTimeout ?? LILYPAD_DEFAULT_MAX_STATEMENT_TIMEOUT,
+    appRole: input.appRole,
     tables: Object.freeze(tables),
   }) as unknown as LilypadDbConfig<{ [K in keyof Tables]: LilypadDbTableDefinitionOf<Tables[K]> }>;
 }

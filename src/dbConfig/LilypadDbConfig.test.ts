@@ -50,6 +50,8 @@ describe('defineLilypadDb', () => {
     expect(
       defineLilypadDb({ maxStatementTimeout: false, tables: { orgs } }).maxStatementTimeout
     ).toBe(false);
+    expect(db.appRole).toBeUndefined();
+    expect(defineLilypadDb({ appRole: 'app_user', tables: { orgs } }).appRole).toBe('app_user');
     expect(isLilypadDbTableDefinition(db.tables.users)).toBe(true);
     expect(db.tables.orgs).toMatchObject({
       key: 'orgs',
@@ -404,6 +406,8 @@ describe('defineLilypadDb', () => {
     ['a strict flag that is not a boolean', { strict: 'yes' }, 'strict must be a boolean'],
     ['a maxStatementTimeout of 0', { maxStatementTimeout: 0 }, 'maxStatementTimeout must be'],
     ['a maxStatementTimeout of true', { maxStatementTimeout: true }, 'maxStatementTimeout must be'],
+    ['an empty appRole', { appRole: '' }, 'appRole must be a non-empty string'],
+    ['an appRole with a dot', { appRole: 'app.user' }, 'appRole must not contain a dot'],
     ['a schema with a dot', { defaultSchema: 'a.b' }, 'defaultSchema must not contain a dot'],
     ['a channel longer than 63 bytes', { notifyChannel: 'c'.repeat(64) }, 'longer than 63 bytes'],
     [

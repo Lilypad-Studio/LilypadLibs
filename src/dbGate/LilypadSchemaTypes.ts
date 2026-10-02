@@ -84,6 +84,11 @@ export type LilypadSchemaCheckOptions = {
    * `false` skips it. Defaults to 1 minute.
    */
   maxStatementTimeout?: number | false | undefined;
+  /**
+   * The role the application connects as: the check reads its privileges, its settings and the
+   * row-level security that applies to it. Defaults to the role the check connects as.
+   */
+  appRole?: string | undefined;
 };
 
 export type LilypadSchemaProblemCode =
@@ -201,12 +206,100 @@ export type LilypadSchemaProblemCode =
   /** A warning of `strict`: an index is not in the description. */
   | 'undeclared-index'
   /**
-   * A warning: the session of the check has no `statement_timeout` (`0`), or one longer than
-   * `maxStatementTimeout`. Nothing then bounds a query stuck on a lock or a dead connection: it holds
-   * its connection of the pool, and its caller, for as long as it lasts. It has no fix (the role of
-   * the check may not be the role of the application): the message gives the `ALTER ROLE`.
+   * A warning: the role of the application (`appRole`, else the session of the check) has no
+   * `statement_timeout` (`0`), or one longer than `maxStatementTimeout`. Nothing then bounds a query
+   * stuck on a lock or a dead connection: it holds its connection of the pool, and its caller, for
+   * as long as it lasts. It has no fix (the setting belongs to the role, not to a migration): the
+   * message gives the `ALTER ROLE`.
    */
-  | 'long-statement-timeout';
+  | 'long-statement-timeout'
+  /** The `appRole` does not exist: its privileges and settings cannot be checked. */
+  | 'missing-app-role'
+  /**
+   * The role of the application lacks a privilege the library needs. An error for what it reads:
+   * `USAGE` on the schema of a table or of the changelog, `SELECT` on the described columns of a
+   * table, `SELECT` on the changelog (the `changelog` strategy). A warning for what the writes of
+   * `LilypadDbCache` need (`INSERT`, `UPDATE`, `DELETE`, `USAGE` on the sequence of a serial
+   * generated key), reported only when the role may write the table at all (a read-only role is not
+   * reported). The fix is the `GRANT`.
+   */
+  | 'missing-privilege'
+  /**
+   * `session_replication_role = replica` is a default of the role of the application (an error),
+   * or of other roles in this database (a warning): the changelog and notifying triggers do not
+   * fire for their writes, so the caches never learn about them (until `maxAge`).
+   */
+  | 'replica-replication-role'
+  /**
+   * A warning: the `prune` option of the changelog trigger is installed (or suggested), but the
+   * `default_transaction_isolation` of the role of the application is not `read committed`: the
+   * trigger prunes only in `READ COMMITTED` transactions, so it never prunes its writes.
+   */
+  | 'pruning-isolation'
+  /**
+   * A warning: the role of the application has an `idle_session_timeout`, which closes the
+   * connection that `LISTEN`s while it waits for notifications: each reconnection expires every
+   * entry of the `listen` caches.
+   */
+  | 'idle-session-timeout'
+  /**
+   * A warning: the check runs on a standby (`pg_is_in_recovery()`), or the role of the application
+   * has `default_transaction_read_only = on`: the writes of the library, `pg_current_xact_id()` and
+   * `LISTEN` need a writable primary.
+   */
+  | 'read-only-database'
+  /**
+   * A warning: the `NOTIFY` queue is half full or more (`pg_notification_queue_usage()`). Once full,
+   * every transaction that notifies fails at commit: a session that listens but stays in a long
+   * transaction keeps the queue from being cleaned up.
+   */
+  | 'notify-queue-usage'
+  /**
+   * The owner of the changelog trigger function (or of its prune function) lacks a privilege it
+   * runs with: `INSERT` on the changelog, `USAGE` on its schema or on the sequence of its `id`,
+   * `EXECUTE` on the prune function (and `SELECT`, `UPDATE`, `DELETE` on the changelog for the
+   * prune function). The functions run as their owner (`SECURITY DEFINER`), so every write of a
+   * cached table (or one in `every`, for the pruning) fails. The fix gives the function to the owner
+   * of the changelog.
+   */
+  | 'changelog-function-owner'
+  /**
+   * The changelog trigger function or its prune function is no longer `SECURITY DEFINER` with
+   * `search_path = pg_catalog, pg_temp` (an error: changed by hand, e.g. `ALTER FUNCTION ...
+   * SECURITY INVOKER`; the fix installs the changelog SQL again), or `PUBLIC` may execute it (a
+   * warning: the SQL revokes it).
+   */
+  | 'unsafe-changelog-function'
+  /**
+   * The changelog table lost an index the reads and the pruning use (`(table_name, xid)`,
+   * `(changed_at)`: a warning), or its `row_id` is `NOT NULL` (an error: recording a `TRUNCATE`
+   * fails, so every `TRUNCATE` of a cached table fails). The fix installs the changelog SQL again.
+   */
+  | 'changelog-shape'
+  /**
+   * Row-level security applies to the role of the application on a cached table (a warning: the
+   * caches load the rows its policies show, and share them with every user of the cache), or the
+   * changelog has row-level security (an error: the caches miss the changes the policies hide, and
+   * with `FORCE`, the triggers may fail to record them).
+   */
+  | 'row-level-security'
+  /**
+   * The table is a partition: its changelog triggers cannot have transition tables. Cache the
+   * partitioned table instead, whose triggers see the writes made through it.
+   */
+  | 'partition-table'
+  /**
+   * A warning: the table has partitions or inheritance children. The statement triggers of the
+   * table do not fire for the writes made directly to a child, so the caches miss them: write
+   * through the table itself.
+   */
+  | 'child-tables'
+  /**
+   * A warning: logical replication writes the table (a subscription), with
+   * `session_replication_role = replica`: its triggers fire only if enabled `ALWAYS`. The fix
+   * enables the changelog and notifying triggers `ALWAYS`.
+   */
+  | 'replicated-table';
 
 /**
  * `error`: the database is not what the config describes (the caches may serve stale data, the

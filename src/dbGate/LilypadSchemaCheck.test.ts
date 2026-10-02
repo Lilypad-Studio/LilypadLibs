@@ -14,7 +14,9 @@ import {
 } from './LilypadSchemaCheck';
 import type {
   LilypadCronJobInfo,
+  LilypadFunctionInfo,
   LilypadSchemaFacts,
+  LilypadTableFacts,
   LilypadTriggerInfo,
 } from './LilypadSchemaFacts';
 import { lilypadCommandDeletesFrom, lilypadPruneCommandRetention } from './LilypadSchemaPruning';
@@ -52,12 +54,30 @@ const pruneJob: LilypadCronJobInfo = {
   database: 'app',
 };
 
+/** The trigger function as the changelog SQL installs it. */
+const recordFunction: LilypadFunctionInfo = {
+  owner: 'owner',
+  securityDefiner: true,
+  config: ['search_path=pg_catalog, pg_temp'],
+  publicExecute: false,
+  ownerLacks: [],
+};
+
+/** A session of the role `app`, with a statement_timeout of 30 s. */
+const appSession: LilypadSchemaFacts['session'] = {
+  role: 'app',
+  settings: { statement_timeout: { value: '30000', source: 'user' } },
+};
+
 /** A complete installation, pruned by a pg_cron job. */
 function facts(overrides: Partial<LilypadSchemaFacts> = {}): LilypadSchemaFacts {
   return {
     version: 160000,
     database: 'app',
-    session: { role: 'app', statementTimeout: 30_000, statementTimeoutSource: 'user' },
+    session: appSession,
+    appRole: { name: 'app', exists: true, superuser: false, bypassRls: false },
+    roleSettings: [],
+    server: { inRecovery: false, notifyQueueUsage: 0 },
     changelog: {
       hasTable: true,
       hasSchemaColumn: true,
@@ -66,7 +86,17 @@ function facts(overrides: Partial<LilypadSchemaFacts> = {}): LilypadSchemaFacts 
       functionSource: null,
       schema: 'public',
       hasPruneFunction: false,
-      writers: null,
+      owner: 'owner',
+      writers: [],
+      memberWriters: [],
+      rowSecurity: false,
+      forceRowSecurity: false,
+      rowIdNotNull: false,
+      hasTableXidIndex: true,
+      hasChangedAtIndex: true,
+      recordFunction,
+      pruneFunction: null,
+      appPrivileges: { schemaUsage: true, select: true },
       oldestRowAge: 60_000,
       deletedRows: 0,
       blockedTables: [],
@@ -86,7 +116,17 @@ const noChangelog: LilypadSchemaFacts['changelog'] = {
   functionSource: null,
   schema: null,
   hasPruneFunction: false,
-  writers: null,
+  owner: null,
+  writers: [],
+  memberWriters: [],
+  rowSecurity: false,
+  forceRowSecurity: false,
+  rowIdNotNull: false,
+  hasTableXidIndex: false,
+  hasChangedAtIndex: false,
+  recordFunction: null,
+  pruneFunction: null,
+  appPrivileges: null,
   oldestRowAge: null,
   deletedRows: 0,
   blockedTables: [],
@@ -171,7 +211,7 @@ describe('evaluateLilypadSchema', () => {
       };
       const result = evaluateLilypadSchema(
         facts({
-          changelog: { ...newer, writers: 'app' },
+          changelog: { ...newer, writers: [{ role: 'app', privileges: ['INSERT'] }] },
           cron: { available: false, installed: false, database: null, jobs: null },
           tables: [
             { schema: 'public', triggers: [] },
@@ -430,7 +470,10 @@ describe('evaluateLilypadSchema', () => {
       ...options,
       tables: [...options.tables, { table: 'orders', primaryKey: 'id' }],
     });
-    const outdated = { functionComment: 'lilypad-changelog:5', writers: 'app' };
+    const outdated = {
+      functionComment: 'lilypad-changelog:5',
+      writers: [{ role: 'app', privileges: ['INSERT'] }],
+    };
 
     it('should withhold the changelog SQL, its triggers and the REVOKE of an older install', () => {
       const result = evaluateLilypadSchema(
@@ -746,13 +789,21 @@ describe('evaluateLilypadSchema', () => {
 
   it('should warn about the roles other than its owner that can write the changelog', () => {
     const result = evaluateLilypadSchema(
-      facts({ changelog: { ...facts().changelog, writers: 'PUBLIC, "app role"' } }),
+      facts({
+        changelog: {
+          ...facts().changelog,
+          writers: [
+            { role: 'PUBLIC', privileges: ['INSERT', 'UPDATE'] },
+            { role: '"app role"', privileges: ['DELETE'] },
+          ],
+        },
+      }),
       changelogOptions
     );
 
     expect(codes(result)).toEqual(['writable-changelog']);
     expect(result.ok).toBe(true);
-    expect(result.problems[0]!.message).toContain('(PUBLIC, "app role")');
+    expect(result.problems[0]!.message).toContain('(PUBLIC: INSERT, UPDATE; "app role": DELETE)');
     expect(result.problems[0]!.fix).toBe(
       'REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON "lilypad_cache_changes" FROM PUBLIC, "app role";\n'
     );
@@ -764,7 +815,7 @@ describe('evaluateLilypadSchema', () => {
         changelog: {
           ...facts().changelog,
           functionComment: 'lilypad-changelog:6',
-          writers: 'app',
+          writers: [{ role: 'app', privileges: ['INSERT'] }],
         },
       }),
       changelogOptions
@@ -1690,8 +1741,16 @@ describe('the pruning of the changelog', () => {
 });
 
 describe('the statement_timeout of the session', () => {
-  const withTimeout = (statementTimeout: number | null, source: string | null = 'user') =>
-    facts({ session: { role: 'app', statementTimeout, statementTimeoutSource: source } });
+  const withTimeout = (statementTimeout: number | null, source = 'user') =>
+    facts({
+      session: {
+        role: 'app',
+        settings:
+          statementTimeout === null
+            ? {}
+            : { statement_timeout: { value: String(statementTimeout), source } },
+      },
+    });
   const timeoutProblem = (result: ReturnType<typeof evaluateLilypadSchema>) =>
     result.problems.find((problem) => problem.code === 'long-statement-timeout');
 
@@ -1747,13 +1806,17 @@ describe('the statement_timeout of the session', () => {
         evaluateLilypadSchema(withTimeout(0), { ...changelogOptions, maxStatementTimeout: false })
       )
     ).toEqual([]);
-    expect(codes(evaluateLilypadSchema(withTimeout(null, null), changelogOptions))).toEqual([]);
+    expect(codes(evaluateLilypadSchema(withTimeout(null), changelogOptions))).toEqual([]);
   });
 
   it('should quote the role in the ALTER ROLE, and name an unknown source as it is', () => {
     const result = evaluateLilypadSchema(
       facts({
-        session: { role: 'App "User"', statementTimeout: 0, statementTimeoutSource: 'override' },
+        session: {
+          role: 'App "User"',
+          settings: { statement_timeout: { value: '0', source: 'override' } },
+        },
+        appRole: { name: 'App "User"', exists: true, superuser: false, bypassRls: false },
       }),
       changelogOptions
     );
@@ -2158,5 +2221,564 @@ describe('evaluateLilypadSchema with the tables of a config', () => {
     expect(result.problems[1]!.message).toContain(
       'The changelog trigger function notifies on one channel ("one"): give "b" a notifying trigger of its own.'
     );
+  });
+});
+
+describe('the role of the application', () => {
+  const shape: LilypadSchemaTableShape = {
+    cols: { id: { pgType: 'integer' }, name: { pgType: 'text' } },
+    unique: [],
+    foreignKeys: [],
+    indexes: [],
+    checks: [],
+    strict: false,
+  };
+  const installed = [...changelogStatements, changelogTruncate];
+  /** Facts where the role may do everything with the table, with these changes of its privileges. */
+  const withPrivileges = (privileges: Partial<NonNullable<LilypadTableFacts['appPrivileges']>>) =>
+    facts({
+      tables: [
+        {
+          schema: 'public',
+          triggers: installed,
+          columns: [
+            {
+              name: 'id',
+              type: 'integer',
+              category: 'N',
+              notNull: true,
+              hasDefault: false,
+              identity: false,
+              generated: false,
+            },
+            {
+              name: 'name',
+              type: 'text',
+              category: 'S',
+              notNull: false,
+              hasDefault: false,
+              identity: false,
+              generated: false,
+            },
+          ],
+          constraints: [
+            {
+              name: 'items_pkey',
+              type: 'p',
+              columns: ['id'],
+              referencedTable: null,
+              referencedColumns: [],
+              onDelete: 'a',
+              onUpdate: 'a',
+            },
+          ],
+          indexes: [],
+          appPrivileges: {
+            schemaUsage: true,
+            missingSelect: [],
+            canWrite: true,
+            missingInsert: [],
+            missingUpdate: [],
+            delete: true,
+            missingSequence: null,
+            ...privileges,
+          },
+        },
+      ],
+    });
+  const shaped: LilypadSchemaCheckOptions = {
+    tables: [{ table: 'items', primaryKey: 'id', shape }],
+  };
+
+  it('should report an appRole that does not exist, and skip the checks of its privileges', () => {
+    const result = evaluateLilypadSchema(
+      {
+        ...withPrivileges({ schemaUsage: false }),
+        appRole: { name: 'ghost', exists: false, superuser: false, bypassRls: false },
+      },
+      shaped
+    );
+
+    expect(codes(result)).toEqual(['missing-app-role']);
+    expect(result.ok).toBe(false);
+    expect(result.problems[0]!.message).toContain('The role "ghost" (appRole) does not exist');
+  });
+
+  it('should report what the role cannot read of a table, with the GRANT', () => {
+    const result = evaluateLilypadSchema(
+      withPrivileges({ schemaUsage: false, missingSelect: ['id', 'name'], canWrite: false }),
+      shaped
+    );
+
+    expect(codes(result)).toEqual(['missing-privilege']);
+    expect(result.problems[0]).toMatchObject({ severity: 'error', table: 'items' });
+    expect(result.problems[0]!.message).toBe(
+      'The role "app" that the check connects as lacks USAGE on the schema "public" and SELECT on the columns id, name of "items": the caches cannot read the table.'
+    );
+    expect(result.problems[0]!.fix).toBe(
+      'GRANT USAGE ON SCHEMA "public" TO "app";\nGRANT SELECT ("id", "name") ON "items" TO "app";\n'
+    );
+  });
+
+  it('should grant SELECT on the whole table without a description', () => {
+    const result = evaluateLilypadSchema(
+      withPrivileges({ missingSelect: ['id'] }),
+      changelogOptions
+    );
+
+    expect(result.problems[0]!.message).toContain('lacks SELECT on the table of "items"');
+    expect(result.problems[0]!.fix).toBe('GRANT SELECT ON "items" TO "app";\n');
+  });
+
+  it('should warn about the writes the role lacks, only when it may write the table', () => {
+    const result = evaluateLilypadSchema(
+      withPrivileges({
+        missingInsert: ['name'],
+        delete: false,
+        missingSequence: 'public.items_id_seq',
+      }),
+      shaped
+    );
+
+    expect(codes(result)).toEqual(['missing-privilege']);
+    expect(result.ok).toBe(true);
+    expect(result.problems[0]!.severity).toBe('warning');
+    expect(result.problems[0]!.message).toContain(
+      'lacks INSERT of name, DELETE, USAGE on the sequence public.items_id_seq of its generated key'
+    );
+    expect(result.problems[0]!.fix).toBe(
+      'GRANT INSERT ("name") ON "items" TO "app";\nGRANT DELETE ON "items" TO "app";\nGRANT USAGE ON SEQUENCE public.items_id_seq TO "app";\n'
+    );
+
+    // A read-only role is one by design
+    expect(
+      codes(evaluateLilypadSchema(withPrivileges({ canWrite: false, delete: false }), shaped))
+    ).toEqual([]);
+  });
+
+  it('should report a changelog the role cannot read, only when a table reads it', () => {
+    const unreadable = facts({
+      changelog: { ...facts().changelog, appPrivileges: { schemaUsage: false, select: false } },
+    });
+
+    const result = evaluateLilypadSchema(unreadable, changelogOptions);
+    expect(codes(result)).toEqual(['missing-privilege']);
+    expect(result.problems[0]).toMatchObject({ severity: 'error', table: 'lilypad_cache_changes' });
+    expect(result.problems[0]!.fix).toBe(
+      'GRANT USAGE ON SCHEMA "public" TO "app";\nGRANT SELECT ON "lilypad_cache_changes" TO "app";\n'
+    );
+
+    expect(
+      codes(
+        evaluateLilypadSchema(
+          { ...unreadable, tables: [{ schema: 'public', triggers: [] }] },
+          listenOptions
+        )
+      )
+    ).not.toContain('missing-privilege');
+  });
+
+  it('should warn when row-level security applies to the role on a cached table', () => {
+    const result = evaluateLilypadSchema(
+      facts({ tables: [{ schema: 'public', triggers: installed, rowSecurity: true }] }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['row-level-security']);
+    expect(result.problems[0]!.severity).toBe('warning');
+    expect(result.problems[0]!.fix).toBeUndefined();
+  });
+
+  it('should report row-level security on the changelog, unless only its owner reads it', () => {
+    const secured = (changes: Partial<LilypadSchemaFacts['changelog']>, owner = 'owner') =>
+      evaluateLilypadSchema(
+        facts({ changelog: { ...facts().changelog, rowSecurity: true, owner, ...changes } }),
+        changelogOptions
+      );
+
+    const result = secured({});
+    expect(codes(result)).toEqual(['row-level-security']);
+    expect(result.problems[0]!.severity).toBe('error');
+    expect(result.problems[0]!.fix).toBe(
+      'ALTER TABLE "lilypad_cache_changes" NO FORCE ROW LEVEL SECURITY;\nALTER TABLE "lilypad_cache_changes" DISABLE ROW LEVEL SECURITY;\n'
+    );
+    // The owner of the changelog bypasses it, unless FORCE
+    expect(codes(secured({}, 'app'))).toEqual([]);
+    expect(codes(secured({ forceRowSecurity: true }, 'app'))).toEqual(['row-level-security']);
+  });
+});
+
+describe('the settings of the role of the application', () => {
+  const withSettings = (
+    settings: LilypadSchemaFacts['session']['settings'],
+    changes: Partial<LilypadSchemaFacts> = {}
+  ) =>
+    facts({
+      session: { role: 'app', settings: { ...appSession.settings, ...settings } },
+      ...changes,
+    });
+
+  it('should report session_replication_role = replica for the role, with its RESET', () => {
+    const result = evaluateLilypadSchema(
+      withSettings({ session_replication_role: { value: 'replica', source: 'user' } }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['replica-replication-role']);
+    expect(result.problems[0]!.severity).toBe('error');
+    expect(result.problems[0]!.message).toContain(
+      'The role "app" that the check connects as has session_replication_role = replica, from the role'
+    );
+    expect(result.problems[0]!.fix).toBe('ALTER ROLE "app" RESET session_replication_role;\n');
+  });
+
+  it('should warn about the other roles whose default is replica, when a table needs triggers', () => {
+    const others = withSettings(
+      {},
+      {
+        roleSettings: [
+          { role: 'loader', inDatabase: true, config: ['session_replication_role=replica'] },
+          { role: 'app', inDatabase: false, config: ['statement_timeout=30s'] },
+        ],
+      }
+    );
+
+    const result = evaluateLilypadSchema(others, changelogOptions);
+    expect(codes(result)).toEqual(['replica-replication-role']);
+    expect(result.problems[0]!.severity).toBe('warning');
+    expect(result.problems[0]!.message).toContain('the default of "loader" in this database');
+
+    // Without triggers (the none strategy), the setting does not matter
+    expect(
+      codes(
+        evaluateLilypadSchema(others, {
+          tables: [{ table: 'items', primaryKey: 'id', changelog: false }],
+          changelog: false,
+        })
+      )
+    ).toEqual([]);
+  });
+
+  it('should warn when the role cannot run the prune option of the trigger', () => {
+    const pruned = (isolation: string) =>
+      withSettings(
+        { default_transaction_isolation: { value: isolation, source: 'database' } },
+        {
+          changelog: {
+            ...facts().changelog,
+            functionSource: lilypadChangelogSql({ prune: { olderThan: 24 * 3_600_000 } }),
+            hasPruneFunction: true,
+          },
+          cron: { available: false, installed: false, database: null, jobs: null },
+        }
+      );
+
+    const result = evaluateLilypadSchema(pruned('repeatable read'), changelogOptions);
+    expect(codes(result)).toEqual(['pruning-isolation']);
+    expect(result.problems[0]!.message).toContain(
+      "has default_transaction_isolation = 'repeatable read', from the database"
+    );
+    expect(codes(evaluateLilypadSchema(pruned('read committed'), changelogOptions))).toEqual([]);
+    // Pruned by pg_cron: the isolation does not matter
+    expect(
+      codes(
+        evaluateLilypadSchema(
+          withSettings({
+            default_transaction_isolation: { value: 'serializable', source: 'user' },
+          }),
+          changelogOptions
+        )
+      )
+    ).toEqual([]);
+  });
+
+  it('should warn about an idle_session_timeout when a table listens', () => {
+    const idle = (value: string) =>
+      withSettings(
+        { idle_session_timeout: { value, source: 'user' } },
+        {
+          tables: [
+            {
+              schema: 'public',
+              triggers: [
+                { ...changelogRow, changelog: false, source: notifySource('cache_events') },
+                { ...changelogTruncate, changelog: false, source: notifySource('cache_events') },
+              ],
+            },
+          ],
+        }
+      );
+
+    const result = evaluateLilypadSchema(idle('600000'), listenOptions);
+    expect(codes(result)).toEqual(['idle-session-timeout']);
+    expect(result.problems[0]!.message).toContain(
+      'an idle_session_timeout of 10 minutes, from the role'
+    );
+    expect(codes(evaluateLilypadSchema(idle('0'), listenOptions))).toEqual([]);
+    // The changelog strategy keeps no connection listening
+    expect(
+      codes(
+        evaluateLilypadSchema(
+          withSettings({ idle_session_timeout: { value: '600000', source: 'user' } }),
+          changelogOptions
+        )
+      )
+    ).toEqual([]);
+  });
+
+  it('should warn about a standby, or a role whose transactions are read-only', () => {
+    expect(
+      codes(
+        evaluateLilypadSchema(
+          facts({ server: { inRecovery: true, notifyQueueUsage: 0 } }),
+          changelogOptions
+        )
+      )
+    ).toEqual(['read-only-database']);
+    const readOnly = evaluateLilypadSchema(
+      withSettings({ default_transaction_read_only: { value: 'on', source: 'user' } }),
+      changelogOptions
+    );
+    expect(codes(readOnly)).toEqual(['read-only-database']);
+    expect(readOnly.problems[0]!.message).toContain('default_transaction_read_only = on');
+  });
+
+  it('should warn about a NOTIFY queue half full, when something notifies', () => {
+    const full = facts({ server: { inRecovery: false, notifyQueueUsage: 0.6 } });
+
+    expect(codes(evaluateLilypadSchema(full, changelogOptions))).toEqual([]);
+    const notifying = {
+      ...full,
+      changelog: { ...full.changelog, functionSource: notifySource('cache_events') },
+    };
+    const result = evaluateLilypadSchema(notifying, changelogOptions);
+    expect(codes(result)).toEqual(['notify-queue-usage']);
+    expect(result.problems[0]!.message).toContain('The NOTIFY queue is 60% full');
+  });
+
+  it('should check the statement_timeout of another appRole, from its settings', () => {
+    const app = (
+      session: LilypadSchemaFacts['session']['settings'],
+      roleSettings: LilypadSchemaFacts['roleSettings'] = []
+    ) =>
+      evaluateLilypadSchema(
+        facts({ session: { role: 'migrator', settings: session }, roleSettings }),
+        changelogOptions
+      );
+    const serverDefault = { statement_timeout: { value: '0', source: 'default' } };
+
+    const result = app(serverDefault);
+    expect(codes(result)).toEqual(['long-statement-timeout']);
+    expect(result.problems[0]!.message).toContain(
+      'The role "app" of the application (appRole) has no statement_timeout (0, from the default of PostgreSQL)'
+    );
+    expect(result.problems[0]!.message).toContain(
+      `ALTER ROLE "app" SET statement_timeout = '30s';`
+    );
+    // Its own setting, as written
+    expect(
+      codes(
+        app(serverDefault, [{ role: 'app', inDatabase: false, config: ['statement_timeout=30s'] }])
+      )
+    ).toEqual([]);
+    expect(
+      app(serverDefault, [{ role: 'app', inDatabase: true, config: ['statement_timeout=2min'] }])
+        .problems[0]!.message
+    ).toContain('of 2 minutes (120000 ms, from the role in this database)');
+    // The migration role's own setting tells nothing about the application's
+    expect(codes(app({ statement_timeout: { value: '0', source: 'user' } }))).toEqual([]);
+  });
+});
+
+describe('the changelog functions and table', () => {
+  const withChangelog = (changes: Partial<LilypadSchemaFacts['changelog']>) =>
+    facts({ changelog: { ...facts().changelog, ...changes } });
+
+  it('should give the trigger function to the owner of the changelog when its owner lacks a privilege', () => {
+    const result = evaluateLilypadSchema(
+      withChangelog({
+        recordFunction: {
+          ...recordFunction,
+          owner: 'migrator',
+          ownerLacks: ['INSERT on the changelog'],
+        },
+      }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['changelog-function-owner']);
+    expect(result.problems[0]!.severity).toBe('error');
+    expect(result.problems[0]!.message).toContain(
+      'runs as its owner "migrator" (SECURITY DEFINER), which lacks INSERT on the changelog: every write of the tables it records fails'
+    );
+    expect(result.problems[0]!.fix).toBe(
+      'ALTER FUNCTION "lilypad_cache_changes_record"() OWNER TO "owner";\n'
+    );
+  });
+
+  it('should report a privilege that the owner of the changelog lacks, without a fix', () => {
+    const result = evaluateLilypadSchema(
+      withChangelog({
+        pruneFunction: { ...recordFunction, ownerLacks: ['DELETE on the changelog'] },
+      }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['changelog-function-owner']);
+    expect(result.problems[0]!.message).toContain(
+      'The changelog prune function "lilypad_cache_changes_prune"()'
+    );
+    expect(result.problems[0]!.message).toContain('Grant them to "owner".');
+    expect(result.problems[0]!.fix).toBeUndefined();
+  });
+
+  it('should install the changelog SQL again over a function changed by hand', () => {
+    const result = evaluateLilypadSchema(
+      withChangelog({ recordFunction: { ...recordFunction, securityDefiner: false, config: [] } }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['unsafe-changelog-function']);
+    expect(result.problems[0]!.message).toContain(
+      'is not SECURITY DEFINER and has no search_path setting'
+    );
+    expect(result.problems[0]!.fix).toContain(
+      'SECURITY DEFINER SET search_path = pg_catalog, pg_temp'
+    );
+
+    const searchPath = evaluateLilypadSchema(
+      withChangelog({
+        recordFunction: { ...recordFunction, config: ['search_path=public, pg_catalog'] },
+      }),
+      changelogOptions
+    );
+    expect(searchPath.problems[0]!.message).toContain('has the search_path public,pg_catalog');
+  });
+
+  it('should revoke the execution of a function from PUBLIC', () => {
+    const result = evaluateLilypadSchema(
+      withChangelog({ recordFunction: { ...recordFunction, publicExecute: true } }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['unsafe-changelog-function']);
+    expect(result.problems[0]!.severity).toBe('warning');
+    expect(result.problems[0]!.fix).toBe(
+      'REVOKE EXECUTE ON FUNCTION "lilypad_cache_changes_record"() FROM PUBLIC;\n'
+    );
+  });
+
+  it('should withhold the fixes of the functions while a newer version installed them', () => {
+    const result = evaluateLilypadSchema(
+      withChangelog({
+        functionComment: `lilypad-changelog:${LILYPAD_CHANGELOG_VERSION + 1}`,
+        recordFunction: { ...recordFunction, publicExecute: true },
+      }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['newer-changelog', 'unsafe-changelog-function']);
+    expect(result.problems[1]!.fix).toBeUndefined();
+  });
+
+  it('should report the shape of the changelog the caches read', () => {
+    const result = evaluateLilypadSchema(
+      withChangelog({ rowIdNotNull: true, hasChangedAtIndex: false }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['changelog-shape', 'changelog-shape']);
+    expect(result.problems.map((problem) => problem.severity)).toEqual(['error', 'warning']);
+    expect(result.problems[1]!.message).toContain(
+      'has no index on (changed_at), for the lookback reads and the pruning'
+    );
+    expect(result.problems[0]!.fix).toContain('ALTER COLUMN row_id DROP NOT NULL');
+    expect(
+      formatLilypadSchemaFixSql(result.problems).match(/CREATE TABLE IF NOT EXISTS/g)
+    ).toHaveLength(1);
+  });
+});
+
+describe('the writes the triggers of a table may not see', () => {
+  it('should report a partition, without the trigger fix that would fail', () => {
+    const result = evaluateLilypadSchema(
+      facts({ tables: [{ schema: 'public', triggers: [], isPartition: true }] }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['partition-table', 'missing-changelog-trigger']);
+    expect(result.problems[0]!.severity).toBe('error');
+    expect(result.problems[1]!.fix).toBeUndefined();
+  });
+
+  it('should warn about the partitions and children of a table', () => {
+    const result = evaluateLilypadSchema(
+      facts({
+        tables: [
+          {
+            schema: 'public',
+            triggers: [...changelogStatements, changelogTruncate],
+            hasChildren: true,
+          },
+        ],
+      }),
+      changelogOptions
+    );
+
+    expect(codes(result)).toEqual(['child-tables']);
+    expect(result.problems[0]!.severity).toBe('warning');
+  });
+
+  it('should enable ALWAYS the triggers of a table that logical replication writes', () => {
+    const named = [...changelogStatements, changelogTruncate].map((trigger, index) => ({
+      ...trigger,
+      name: `items_lilypad_${index}`,
+    }));
+    const replicated = (triggers: LilypadTriggerInfo[]) =>
+      evaluateLilypadSchema(
+        facts({ tables: [{ schema: 'public', triggers, subscribed: true }] }),
+        changelogOptions
+      );
+
+    const result = replicated(named);
+    expect(codes(result)).toEqual(['replicated-table']);
+    expect(result.problems[0]!.fix).toBe(
+      named.map(({ name }) => `ALTER TABLE "items" ENABLE ALWAYS TRIGGER "${name}";\n`).join('')
+    );
+    expect(codes(replicated(named.map((trigger) => ({ ...trigger, always: true }))))).toEqual([]);
+  });
+});
+
+describe('the roles that may write the changelog', () => {
+  const writable = (changes: Partial<LilypadSchemaFacts['changelog']>, pruning?: 'external') =>
+    evaluateLilypadSchema(facts({ changelog: { ...facts().changelog, ...changes } }), {
+      ...changelogOptions,
+      changelog: { pruning },
+    });
+
+  it('should accept the DELETE of an external pruning, and revoke the rest', () => {
+    expect(
+      codes(writable({ writers: [{ role: 'pruner', privileges: ['DELETE'] }] }, 'external'))
+    ).toEqual([]);
+
+    const result = writable(
+      { writers: [{ role: 'pruner', privileges: ['DELETE', 'INSERT'] }] },
+      'external'
+    );
+    expect(result.problems[0]!.message).toContain('(pruner: INSERT)');
+    expect(result.problems[0]!.message).toContain('the external pruning needs it');
+    expect(result.problems[0]!.fix).toBe(
+      'REVOKE INSERT, UPDATE, TRUNCATE ON "lilypad_cache_changes" FROM pruner;\n'
+    );
+  });
+
+  it('should warn about the members of its owner and of pg_write_all_data, without a fix', () => {
+    const result = writable({ memberWriters: ['"app"', 'etl'] });
+
+    expect(codes(result)).toEqual(['writable-changelog']);
+    expect(result.problems[0]!.message).toContain(
+      'as members of its owner or of pg_write_all_data ("app", etl)'
+    );
+    expect(result.problems[0]!.fix).toBeUndefined();
   });
 });

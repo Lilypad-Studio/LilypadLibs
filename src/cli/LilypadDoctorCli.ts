@@ -17,7 +17,8 @@ init creates a config file to start from (see lilypad-doctor init --help).
 
 Without a command, it checks the database against a config (see defineLilypadDb): the tables,
 their columns, keys, foreign keys, indexes and checks, the triggers of the sync strategies, the
-changelog and how it is pruned, and the statement_timeout of the role it connects as. It only reads
+changelog and how it is pruned, and what the role of the application needs: its privileges, its
+settings (statement_timeout, session_replication_role...) and row-level security. It only reads
 the catalogs, and prints the SQL that fixes what it finds.
 
 Options:
@@ -28,6 +29,8 @@ Options:
                         DATABASE_URL
   --env-file <path>     Read environment variables from this file (e.g. .env); repeatable, the
                         later files win, and the variables already set win over every file
+  --app-role <name>     The role the application connects as, whose privileges and settings are
+                        checked (default: appRole of the config, else the role of --url)
   --sql                 Print only the SQL that fixes the problems (for a migration)
   --json                Print the result as JSON
   --fail-on-warnings    Exit with 1 on warnings too, not only on errors (e.g. in CI)
@@ -56,6 +59,8 @@ export type LilypadDoctorArgs =
       connectionString: string;
       /** The name or path of the config (`undefined`: the default one). */
       config?: string | undefined;
+      /** The role of the application (`undefined`: the `appRole` of the config). */
+      appRole?: string | undefined;
     };
 
 /** Reads the variables of an env file (`--env-file`), replaceable in tests. */
@@ -84,6 +89,7 @@ export function parseLilypadDoctorArgs(
       url: { type: 'string' },
       'url-env': { type: 'string' },
       'env-file': { type: 'string', multiple: true },
+      'app-role': { type: 'string' },
       sql: { type: 'boolean' },
       json: { type: 'boolean' },
       'fail-on-warnings': { type: 'boolean' },
@@ -98,6 +104,9 @@ export function parseLilypadDoctorArgs(
   }
   if (values.config?.trim() === '') {
     throw new Error('--config needs the name or the path of a config.');
+  }
+  if (values['app-role']?.trim() === '') {
+    throw new Error('--app-role needs the name of a role.');
   }
   const urlEnv = values['url-env'];
   if (values.url !== undefined && urlEnv !== undefined) {
@@ -139,6 +148,7 @@ export function parseLilypadDoctorArgs(
     failOnWarnings: values['fail-on-warnings'] ?? false,
     connectionString,
     config: values.config,
+    appRole: values['app-role'],
   };
 }
 
@@ -197,7 +207,11 @@ export async function runLilypadDoctorCli(
     return 2;
   }
   try {
-    const report = await run({ connectionString: parsed.connectionString, config });
+    const report = await run({
+      connectionString: parsed.connectionString,
+      config,
+      appRole: parsed.appRole,
+    });
     const passed = parsed.failOnWarnings ? report.problems.length === 0 : report.ok;
     if (parsed.json) {
       const { text: _text, assertOk: _assertOk, ...result } = report;

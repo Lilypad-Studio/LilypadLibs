@@ -796,7 +796,7 @@ describe('LilypadDbGate (integration)', () => {
 
         const problem = writable(await checkLilypadSchema(gate, options));
         expect(problem).toMatchObject({ severity: 'warning' });
-        expect(problem!.message).toContain('(lilypad_other)');
+        expect(problem!.message).toContain('(lilypad_other: DELETE, INSERT)');
         await admin.unsafe(problem!.fix!);
 
         expect(writable(await checkLilypadSchema(gate, options))).toBeUndefined();
@@ -2526,6 +2526,267 @@ describe('LilypadDbGate (integration)', () => {
         } finally {
           await sql.unsafe('DROP OWNED BY doctor_app; DROP ROLE doctor_app;');
         }
+      });
+    });
+
+    describe('the role of the application', () => {
+      const config = defineLilypadDb({
+        changelog: { pruning: 'external' },
+        appRole: 'role_app',
+        tables: {
+          users: { ...usersInput, sync: { strategy: 'changelog', pollInterval: 1000 } },
+          events: { tableName: 'events', primaryKey: 'id', cols: { id: {} } },
+        },
+      });
+      const codesOf = (report: LilypadDoctorReport) =>
+        report.problems.map((problem) => problem.code);
+      const problemOf = (report: LilypadDoctorReport, code: string) =>
+        report.problems.find((problem) => problem.code === code);
+
+      /** A database with the tables of the config, its changelog and triggers, and `role_app`. */
+      const withAppDatabase = (
+        name: string,
+        run: (check: () => Promise<LilypadDoctorReport>, sql: postgres.Sql) => Promise<void>
+      ) =>
+        withDatabase(name, async (url, sql) => {
+          await sql.unsafe(`
+            CREATE TABLE users (id serial PRIMARY KEY, name text NOT NULL, role text NOT NULL DEFAULT 'user');
+            CREATE TABLE events (id int PRIMARY KEY);
+            ${lilypadChangelogSql({ notifyChannel: 'cache_events' })}
+            ${lilypadChangelogTriggerSql({ table: 'users', primaryKey: 'id' })}
+            ${lilypadChangelogTriggerSql({ table: 'events', primaryKey: 'id' })}
+            DO $$ BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'role_app') THEN
+                CREATE ROLE role_app LOGIN PASSWORD 'role_app';
+              END IF;
+            END $$;
+            ALTER ROLE role_app IN DATABASE ${name} SET statement_timeout = '30s';
+          `);
+          try {
+            await run(() => runLilypadDoctor({ connectionString: url, config }), sql);
+          } finally {
+            await sql.unsafe('DROP OWNED BY role_app; DROP ROLE role_app;');
+          }
+        });
+
+      it('should report what the role cannot read, and grant it', async () => {
+        await withAppDatabase('role_privileges', async (check, sql) => {
+          const first = await check();
+          expect(codesOf(first)).toEqual([
+            'missing-privilege',
+            'missing-privilege',
+            'missing-privilege',
+          ]);
+          expect(first.problems.map((problem) => problem.table)).toEqual([
+            'public.users',
+            'public.events',
+            'lilypad_cache_changes',
+          ]);
+          expect(problemOf(first, 'missing-privilege')!.message).toContain(
+            'The role "role_app" of the application (appRole) lacks SELECT on the columns id, name, role of "public.users"'
+          );
+
+          await sql.unsafe(formatLilypadSchemaFixSql(first.problems));
+          expect((await check()).problems).toEqual([]);
+
+          // A role that may write the table needs every write of the cache
+          await sql.unsafe('GRANT INSERT (name) ON users TO role_app');
+          const writes = await check();
+          expect(codesOf(writes)).toEqual(['missing-privilege']);
+          expect(writes.problems[0]!.severity).toBe('warning');
+          await sql.unsafe(formatLilypadSchemaFixSql(writes.problems));
+          expect((await check()).problems).toEqual([]);
+        });
+      });
+
+      it('should read the settings of the role, as it gets them at login', async () => {
+        await withAppDatabase('role_settings', async (check, sql) => {
+          await sql.unsafe(`
+            GRANT SELECT ON users, events, lilypad_cache_changes TO role_app;
+            ALTER ROLE role_app IN DATABASE role_settings SET session_replication_role = replica;
+            ALTER ROLE role_app IN DATABASE role_settings SET statement_timeout = 0;
+            ALTER DATABASE role_settings SET default_transaction_read_only = on;
+            ALTER ROLE role_app IN DATABASE role_settings SET idle_session_timeout = '5min';
+          `);
+          // What the role gets at login, which the check reads without connecting as it
+          const url = container
+            .getConnectionUri()
+            .replace(/\/\/[^@]+@/, '//role_app:role_app@')
+            .replace(/\/[^/]+$/, '/role_settings');
+          const app = postgres(url, { onnotice: () => {} });
+          try {
+            const [setting] = await app`SHOW session_replication_role`;
+            expect(setting!.session_replication_role).toBe('replica');
+          } finally {
+            await app.end();
+          }
+
+          const report = await check();
+          expect(codesOf(report)).toEqual([
+            'replica-replication-role',
+            'idle-session-timeout',
+            'read-only-database',
+            'long-statement-timeout',
+          ]);
+          expect(problemOf(report, 'replica-replication-role')).toMatchObject({
+            severity: 'error',
+            fix: 'ALTER ROLE "role_app" IN DATABASE "role_settings" RESET session_replication_role;\n',
+          });
+          expect(problemOf(report, 'read-only-database')!.message).toContain('from the database');
+          expect(problemOf(report, 'idle-session-timeout')!.message).toContain(
+            'has an idle_session_timeout of 5 minutes, from the role in this database'
+          );
+          expect(problemOf(report, 'long-statement-timeout')!.message).toContain(
+            'The role "role_app" of the application (appRole) has no statement_timeout (0, from the role in this database)'
+          );
+
+          await sql.unsafe(formatLilypadSchemaFixSql(report.problems));
+          await sql.unsafe(`
+            ALTER DATABASE role_settings RESET default_transaction_read_only;
+            ALTER ROLE role_app IN DATABASE role_settings RESET statement_timeout;
+          `);
+          // The check's own statement_timeout comes from its role: the application's is unknown
+          expect(codesOf(await check())).toEqual(['idle-session-timeout']);
+
+          // A listen table: the connection that listens must not be closed for being idle
+          const listen = await runLilypadDoctor({
+            connectionString: container.getConnectionUri().replace(/\/[^/]+$/, '/role_settings'),
+            config: defineLilypadDb({
+              appRole: 'role_app',
+              maxStatementTimeout: false,
+              tables: { users: usersInput },
+            }),
+          });
+          expect(listen.problems.map((problem) => problem.code)).toEqual(['idle-session-timeout']);
+        });
+      });
+
+      it('should report an appRole that does not exist', async () => {
+        const report = await runLilypadDoctor({
+          connectionString: container.getConnectionUri(),
+          config: defineLilypadDb({ tables: { users: usersInput } }),
+          appRole: 'no_such_role',
+        });
+
+        expect(report.problems.map((problem) => problem.code)).toEqual(['missing-app-role']);
+      });
+
+      it('should report the changelog functions changed by hand, and install them again', async () => {
+        await withAppDatabase('role_functions', async (check, sql) => {
+          await sql.unsafe('GRANT SELECT ON users, events, lilypad_cache_changes TO role_app');
+          expect((await check()).problems).toEqual([]);
+
+          await sql.unsafe(`
+            ALTER FUNCTION lilypad_cache_changes_record() SECURITY INVOKER;
+            GRANT EXECUTE ON FUNCTION lilypad_cache_changes_record() TO PUBLIC;
+          `);
+          const unsafe = await check();
+          expect(codesOf(unsafe)).toEqual([
+            'unsafe-changelog-function',
+            'unsafe-changelog-function',
+          ]);
+          await sql.unsafe(formatLilypadSchemaFixSql(unsafe.problems));
+          expect((await check()).problems).toEqual([]);
+
+          // Owned by a role that cannot write the changelog: every write fails
+          await sql.unsafe(`
+            CREATE ROLE role_fn_owner;
+            ALTER FUNCTION lilypad_cache_changes_record() OWNER TO role_fn_owner;
+          `);
+          try {
+            await expect(sql`INSERT INTO users (name) VALUES ('Ada')`).rejects.toThrow(
+              'permission denied'
+            );
+            const owner = await check();
+            expect(codesOf(owner)).toEqual(['changelog-function-owner']);
+            expect(owner.problems[0]!.message).toContain(
+              'which lacks INSERT on the changelog, USAGE on the sequence of its id column'
+            );
+            await sql.unsafe(formatLilypadSchemaFixSql(owner.problems));
+            expect((await check()).problems).toEqual([]);
+            await sql`INSERT INTO users (name) VALUES ('Ada')`;
+          } finally {
+            await sql.unsafe('DROP ROLE role_fn_owner');
+          }
+        });
+      });
+
+      it('should report the row-level security, the indexes and the row_id of the changelog', async () => {
+        await withAppDatabase('role_changelog', async (check, sql) => {
+          await sql.unsafe(`
+            GRANT SELECT ON users, events, lilypad_cache_changes TO role_app;
+            ALTER TABLE lilypad_cache_changes ENABLE ROW LEVEL SECURITY;
+            DROP INDEX lilypad_cache_changes_changed_at_idx;
+            ALTER TABLE lilypad_cache_changes ALTER COLUMN row_id SET NOT NULL;
+            ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+            CREATE ROLE role_etl;
+            GRANT pg_write_all_data TO role_etl;
+          `);
+          try {
+            const report = await check();
+            expect(codesOf(report)).toEqual([
+              'writable-changelog',
+              'row-level-security',
+              'changelog-shape',
+              'changelog-shape',
+              'row-level-security',
+            ]);
+            expect(problemOf(report, 'writable-changelog')!.message).toContain('(role_etl)');
+            expect(report.problems.map((problem) => problem.severity)).toEqual([
+              'warning',
+              'error',
+              'error',
+              'warning',
+              'warning',
+            ]);
+
+            await sql.unsafe(formatLilypadSchemaFixSql(report.problems));
+            expect(codesOf(await check())).toEqual(['writable-changelog', 'row-level-security']);
+          } finally {
+            await sql.unsafe('DROP ROLE role_etl');
+          }
+        });
+      });
+
+      it('should report a partition, and the children of a partitioned table', async () => {
+        await withDatabase('role_partitions', async (url, sql) => {
+          await sql.unsafe(`
+            CREATE TABLE measures (id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at);
+            CREATE TABLE measures_2026 PARTITION OF measures FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+            ${lilypadChangelogSql({ notifyChannel: false })}
+            ${lilypadChangelogTriggerSql({ table: 'measures', primaryKey: 'id' })}
+          `);
+          const report = await runLilypadDoctor({
+            connectionString: url,
+            config: defineLilypadDb({
+              changelog: { pruning: 'external' },
+              tables: {
+                measures: {
+                  tableName: 'measures',
+                  primaryKey: 'id',
+                  cols: { id: {} },
+                  sync: { strategy: 'changelog', pollInterval: 1000 },
+                },
+                partition: {
+                  tableName: 'measures_2026',
+                  primaryKey: 'id',
+                  cols: { id: {} },
+                  sync: { strategy: 'changelog', pollInterval: 1000 },
+                },
+              },
+            }),
+          });
+
+          const triggers = report.problems.filter(
+            ({ code }) => !['undeclared-required-column', 'wrong-primary-key'].includes(code)
+          );
+          expect(triggers.map(({ code, table }) => `${code} ${table}`)).toEqual([
+            'child-tables public.measures',
+            'partition-table public.measures_2026',
+            'missing-changelog-trigger public.measures_2026',
+          ]);
+          expect(triggers[2]!.fix).toBeUndefined();
+        });
       });
     });
   });
